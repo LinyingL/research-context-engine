@@ -24,6 +24,51 @@ def test_foreign_keys_pragma_enabled(conn):
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
+def test_migrate_rolls_back_and_self_heals_on_mid_script_failure(tmp_path):
+    """T0-fix blocker regression: a migration that fails partway must not
+    leave a half-applied, permanently-stuck schema behind.
+
+    Reproduces the reported failure mode directly: a migration file whose
+    first statement succeeds and second statement is invalid SQL used to
+    leave the first CREATE TABLE committed with no schema_migrations row,
+    so every retry died on "table already exists". migrate() must instead
+    roll the whole file back, and a corrected retry must succeed cleanly.
+    """
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    broken_sql = (
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n"
+        "THIS IS NOT VALID SQL;\n"
+    )
+    (migrations_dir / "0001_init.sql").write_text(broken_sql)
+
+    conn = db.connect(":memory:")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db.migrate(conn, migrations_dir)
+
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "widgets" not in tables
+
+        applied = {
+            row[0] for row in conn.execute("SELECT version FROM schema_migrations")
+        }
+        assert 1 not in applied
+
+        # Retrying after fixing the file must succeed -- not "already exists".
+        (migrations_dir / "0001_init.sql").write_text(
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n"
+        )
+        assert db.migrate(conn, migrations_dir) == [1]
+    finally:
+        conn.close()
+
+
 # -- node type CHECK -----------------------------------------------------
 
 
@@ -50,7 +95,13 @@ def test_upsert_edge_rejects_illegal_type_in_python(conn):
     db.upsert_node(conn, "figure:fig1.png", "figure")
     with pytest.raises(ValueError):
         db.upsert_edge(
-            conn, "commit:abc", "figure:fig1.png", "haunts", "test-extractor", {}, 1.0
+            conn,
+            "commit:abc",
+            "figure:fig1.png",
+            "haunts",
+            "test-extractor",
+            {"file": "plot.py", "line": 1},
+            1.0,
         )
 
 
@@ -64,7 +115,7 @@ def test_upsert_edge_rejects_illegal_status_in_python(conn):
             "figure:fig1.png",
             "generates",
             "test-extractor",
-            {},
+            {"file": "plot.py", "line": 1},
             1.0,
             status="in_review",
         )
@@ -77,7 +128,7 @@ def test_illegal_edge_type_rejected_at_db_level(conn):
         conn.execute(
             """
             INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status)
-            VALUES (?, ?, ?, ?, '{}', 1.0, 'auto')
+            VALUES (?, ?, ?, ?, '{"file": "plot.py", "line": 1}', 1.0, 'auto')
             """,
             ("commit:abc", "figure:fig1.png", "haunts", "test-extractor"),
         )
@@ -89,9 +140,37 @@ def test_edge_foreign_key_enforced(conn):
         conn.execute(
             """
             INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status)
-            VALUES (?, ?, 'generates', 'test-extractor', '{}', 1.0, 'auto')
+            VALUES (?, ?, 'generates', 'test-extractor', '{"file": "plot.py", "line": 1}', 1.0, 'auto')
             """,
             ("commit:missing", "figure:missing.png"),
+        )
+
+
+# -- evidence-required invariant ------------------------------------------
+
+
+def test_upsert_edge_rejects_empty_evidence_in_python(conn):
+    # HANDOFF-SPEC.md section 2/4 hard invariant: no edge without evidence.
+    db.upsert_node(conn, "commit:abc", "commit")
+    db.upsert_node(conn, "figure:fig1.png", "figure")
+    with pytest.raises(ValueError):
+        db.upsert_edge(
+            conn, "commit:abc", "figure:fig1.png", "generates", "test-extractor", {}, 1.0
+        )
+
+
+def test_empty_evidence_rejected_at_db_level(conn):
+    # Proves the CHECK constraint is enforced by SQLite itself, not just by
+    # the Python-level guard in upsert_edge.
+    db.upsert_node(conn, "commit:abc", "commit")
+    db.upsert_node(conn, "figure:fig1.png", "figure")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status)
+            VALUES (?, ?, 'generates', 'test-extractor', '{}', 1.0, 'auto')
+            """,
+            ("commit:abc", "figure:fig1.png"),
         )
 
 
@@ -170,12 +249,132 @@ def test_pending_edges_is_the_confirmation_queue(conn):
     db.upsert_node(conn, "experiment:run2", "experiment")
 
     db.upsert_edge(
-        conn, "claim:paper.tex#abc123", "experiment:run1", "backed_by", "7b-judge", {}, 0.4, status="pending"
+        conn,
+        "claim:paper.tex#abc123",
+        "experiment:run1",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "87.3%", "run_metric": "accuracy=0.873"},
+        0.4,
+        status="pending",
     )
     db.upsert_edge(
-        conn, "claim:paper.tex#abc123", "experiment:run2", "backed_by", "7b-judge", {}, 0.95, status="auto"
+        conn,
+        "claim:paper.tex#abc123",
+        "experiment:run2",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "87.3%", "run_metric": "accuracy=0.871"},
+        0.95,
+        status="auto",
     )
 
     pending = db.pending_edges(conn)
     assert len(pending) == 1
     assert pending[0]["dst"] == "experiment:run1"
+
+
+# -- edge status is human-owned once acted on ------------------------------
+
+
+def test_reingest_never_overwrites_confirmed_edge_status(conn):
+    """Core trust-model regression (T0-fix blocker).
+
+    7b-judge creates a pending edge -> a human confirms it -> the same
+    extractor re-ingests overnight and tries to write status='pending'
+    again. The human's confirmation must survive: a routine machine
+    re-ingest must never reopen a confirmed (or rejected) edge.
+    """
+    db.upsert_node(conn, "claim:paper.tex#abc123", "claim")
+    db.upsert_node(conn, "experiment:run1", "experiment")
+
+    db.upsert_edge(
+        conn,
+        "claim:paper.tex#abc123",
+        "experiment:run1",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "87.3%", "run_metric": "accuracy=0.873"},
+        0.4,
+        status="pending",
+    )
+
+    # Human confirms it via the same upsert_edge path, keyed on the SAME
+    # (src, dst, type, extractor) row -- there is only one write gate.
+    db.upsert_edge(
+        conn,
+        "claim:paper.tex#abc123",
+        "experiment:run1",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "87.3%", "run_metric": "accuracy=0.873"},
+        1.0,
+        status="confirmed",
+    )
+
+    # Overnight re-ingest by the SAME extractor tries to reset it to
+    # pending -- this is the exact clobber the blocker report reproduced.
+    db.upsert_edge(
+        conn,
+        "claim:paper.tex#abc123",
+        "experiment:run1",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "87.3%", "run_metric": "accuracy=0.873 (re-extracted)"},
+        0.4,
+        status="pending",
+    )
+
+    edges = db.query_edges(
+        conn, src="claim:paper.tex#abc123", dst="experiment:run1", type="backed_by"
+    )
+    assert len(edges) == 1
+    assert edges[0]["status"] == "confirmed"
+    # evidence/confidence remain machine-owned and do keep updating.
+    assert edges[0]["evidence"]["run_metric"] == "accuracy=0.873 (re-extracted)"
+
+    # A confirmed edge must never show up back in the confirmation queue.
+    assert edges[0]["dst"] not in {e["dst"] for e in db.pending_edges(conn)}
+
+
+def test_reingest_never_overwrites_rejected_edge_status(conn):
+    db.upsert_node(conn, "claim:paper.tex#def456", "claim")
+    db.upsert_node(conn, "experiment:run3", "experiment")
+
+    db.upsert_edge(
+        conn,
+        "claim:paper.tex#def456",
+        "experiment:run3",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "12.0", "run_metric": "loss=12.0"},
+        0.3,
+        status="pending",
+    )
+    db.upsert_edge(
+        conn,
+        "claim:paper.tex#def456",
+        "experiment:run3",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "12.0", "run_metric": "loss=12.0"},
+        0.3,
+        status="rejected",
+    )
+    # Same extractor re-ingests and tries to put it back in the queue.
+    db.upsert_edge(
+        conn,
+        "claim:paper.tex#def456",
+        "experiment:run3",
+        "backed_by",
+        "7b-judge",
+        {"claim_text": "12.0", "run_metric": "loss=12.0"},
+        0.3,
+        status="pending",
+    )
+
+    edges = db.query_edges(
+        conn, src="claim:paper.tex#def456", dst="experiment:run3", type="backed_by"
+    )
+    assert len(edges) == 1
+    assert edges[0]["status"] == "rejected"

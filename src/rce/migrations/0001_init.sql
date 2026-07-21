@@ -35,7 +35,11 @@ CREATE TABLE edges (
         'cites', 'authored_by', 'backed_by', 'supports'
     )),
     extractor TEXT NOT NULL,
-    evidence TEXT NOT NULL,
+    -- Hard invariant (HANDOFF-SPEC.md section 2/4): no edge without
+    -- evidence. NOT NULL alone lets '{}' / '' through, so reject the
+    -- placeholder-empty forms explicitly; upsert_edge in db.py enforces the
+    -- same rule in Python as the first line of defense.
+    evidence TEXT NOT NULL CHECK (evidence NOT IN ('{}', '', 'null')),
     confidence REAL NOT NULL,
     -- Confirmation queue is status='pending'; no separate queue table
     -- (architecture decision, HANDOFF-SPEC.md task brief).

@@ -75,13 +75,40 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def _split_migration_script(script: str) -> list[str]:
+    """Split a migration file into individual statements for transactional apply.
+
+    `sqlite3.Cursor.executescript()` cannot participate in an explicit
+    transaction -- it forces an implicit commit before it runs and then
+    executes each statement in autocommit mode, so a mid-script failure
+    leaves earlier DDL permanently committed with no matching
+    schema_migrations row (see the migrate() docstring). Running statements
+    one at a time via conn.execute() inside an explicit transaction avoids
+    that, which requires splitting the script ourselves first.
+
+    Only handles what our hand-written DDL migrations actually contain:
+    statements terminated by ';', comments on their own '--' line (including
+    ones with a ';' inside the comment text, e.g. "TEXT; SQLite has...").
+    Not a general SQL parser -- migrations must stick to that shape.
+    """
+    code_lines = (
+        line for line in script.splitlines() if not line.strip().startswith("--")
+    )
+    return [stmt.strip() for stmt in "\n".join(code_lines).split(";") if stmt.strip()]
+
+
 def migrate(conn: sqlite3.Connection, migrations_dir: str | Path | None = None) -> list[int]:
     """Apply any migration .sql files not yet recorded in schema_migrations.
 
     Migration files are named `<version>_description.sql` and are applied in
-    ascending version order, each as its own committed step. Returns the list
-    of version numbers newly applied (empty if the schema was already
-    current -- safe to call on every startup).
+    ascending version order. Each file's statements plus its
+    schema_migrations row are applied in a single explicit transaction: if
+    any statement fails, the whole file rolls back (SQLite DDL is
+    transactional), so a version is never left partially applied with no
+    record of it -- a retry after fixing the problem starts from the same
+    clean pre-migration state instead of hitting "table already exists".
+    Returns the list of version numbers newly applied (empty if the schema
+    was already current -- safe to call on every startup).
     """
     directory = Path(migrations_dir) if migrations_dir else DEFAULT_MIGRATIONS_DIR
     conn.execute(
@@ -99,8 +126,15 @@ def migrate(conn: sqlite3.Connection, migrations_dir: str | Path | None = None) 
         version = int(path.stem.split("_", 1)[0])
         if version in applied:
             continue
-        conn.executescript(path.read_text())
-        conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
+        statements = _split_migration_script(path.read_text())
+        conn.execute("BEGIN")
+        try:
+            for statement in statements:
+                conn.execute(statement)
+            conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
+        except Exception:
+            conn.rollback()
+            raise
         conn.commit()
         newly_applied.append(version)
     return newly_applied
@@ -176,11 +210,28 @@ def upsert_edge(
     Idempotent: re-running the same extractor over the same pair with a new
     confidence/evidence/status updates the existing row rather than
     duplicating it (see the UNIQUE constraint in migrations/0001_init.sql).
+
+    `status` is human-owned once a human has acted on it (HANDOFF-SPEC.md
+    section 4: "any edge's confirm/reject ... status fields are human-write
+    only"), mirroring the human_fields protection on nodes. The UPDATE
+    branch below only lets `status` move to the incoming value when the
+    row's current status is still machine-owned ('auto' or 'pending'); once
+    it is 'confirmed' or 'rejected' a routine re-ingest by the same
+    extractor must not silently reopen or reset it. evidence/confidence are
+    machine-owned and keep updating regardless -- see
+    tests/test_db.py::test_reingest_never_overwrites_confirmed_edge_status.
+
+    Every edge must carry non-empty evidence -- "no edge without evidence"
+    is a hard invariant (HANDOFF-SPEC.md section 4/2). A placeholder like
+    `{}` is not evidence, so it is rejected here (and by the CHECK
+    constraint in migrations/0001_init.sql as a second, DB-level guard).
     """
     if type not in EDGE_TYPES:
         raise ValueError(f"unknown edge type: {type!r}")
     if status not in EDGE_STATUSES:
         raise ValueError(f"unknown edge status: {status!r}")
+    if not evidence:
+        raise ValueError("edge requires non-empty evidence")
     evidence_json = json.dumps(evidence)
     now = _now()
     conn.execute(
@@ -190,7 +241,10 @@ def upsert_edge(
         ON CONFLICT(src, dst, type, extractor) DO UPDATE SET
             evidence = excluded.evidence,
             confidence = excluded.confidence,
-            status = excluded.status,
+            status = CASE
+                WHEN edges.status IN ('confirmed', 'rejected') THEN edges.status
+                ELSE excluded.status
+            END,
             updated_at = excluded.updated_at
         """,
         (src, dst, type, extractor, evidence_json, confidence, status, now, now),
