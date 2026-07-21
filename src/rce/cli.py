@@ -1,9 +1,9 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query`.
 
 stdlib argparse only (HANDOFF-SPEC.md section 0, Occam rule 1). Orchestrates
-the existing extractors (rce.ingest.git/latex/mlflow) and rce.db (section 7
-Phase A order: git -> latex/.bib -> mlflow); writes only via
-db.upsert_node/upsert_edge, no new graph mutation logic here.
+the existing extractors (rce.ingest.git/latex/pyfig/mlflow) and rce.db
+(section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow); writes only
+via db.upsert_node/upsert_edge, no new graph mutation logic here.
 
 A project is "initialized" once `<root>/.rce/graph.db` exists (`rce init`);
 every other command requires that file and errors clearly if absent (no
@@ -24,6 +24,7 @@ from rce import db
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
+from rce.ingest import pyfig as pyfig_ingest
 
 RCE_DIRNAME = ".rce"
 DB_FILENAME = "graph.db"
@@ -138,6 +139,13 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 f"  latex: {len(inventory['tex'])} .tex, {len(inventory['bib'])} .bib "
                 f"scanned -> {_format_counts(latex_counts)}"
             )
+            # T6: static savefig() analysis, keyed to the repo's current HEAD
+            # commit (ingestion-time code state, not any historical commit).
+            head_sha = git_ingest.read_head_sha(project_root)
+            pyfig_counts = pyfig_ingest.ingest_pyfig_repo(
+                conn, project_root, inventory["py"], inventory["image"], head_sha,
+            )
+            print(f"  pyfig: {len(inventory['py'])} .py scanned -> {_format_counts(pyfig_counts)}")
             if args.mlruns:
                 mlruns_path: Path | None = Path(args.mlruns).resolve()
             else:

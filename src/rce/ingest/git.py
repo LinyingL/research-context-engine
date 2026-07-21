@@ -4,9 +4,12 @@ Shells out to system `git` (Occam rule 1: no pygit2/GitPython dependency) to
 read commit history, writing Commit/Contributor nodes and `authored_by`
 edges via rce.db's upsert_node/upsert_edge (idempotency is inherited from
 there, not reimplemented here). list_source_files() additionally inventories
-.tex/.bib/image files for T2's LaTeX/.bib ingester (HANDOFF-SPEC.md section
-5); it creates no graph nodes. Unparseable git output is skipped and logged,
-never guessed at (section 5's savefig rule: "拼不出来就放弃，不猜").
+.tex/.bib/image/.py files for T2's LaTeX/.bib ingester and T6's pyfig
+ingester (HANDOFF-SPEC.md section 5); it creates no graph nodes.
+read_head_sha() (T6) reads the repo's current HEAD commit SHA, for
+extractors that need "the commit as of ingestion time" rather than any
+historical commit. Unparseable git output is skipped and logged, never
+guessed at (section 5's savefig rule: "拼不出来就放弃，不猜").
 """
 
 from __future__ import annotations
@@ -148,7 +151,7 @@ def ingest_git_repo(conn: Connection, repo_path: str | Path) -> int:
     return ingested
 
 def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
-    """Inventory git-tracked .tex/.bib/image files, grouped by category.
+    """Inventory git-tracked .tex/.bib/image/.py files, grouped by category.
 
     Uses `git ls-files` (tracked files only, .gitignore respected for free)
     instead of a filesystem walk -- no ignore-matching logic to maintain.
@@ -156,7 +159,7 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
     """
     repo_path = Path(repo_path)
     output = _run_git(repo_path, ["ls-files"])
-    inventory: dict[str, list[str]] = {"tex": [], "bib": [], "image": []}
+    inventory: dict[str, list[str]] = {"tex": [], "bib": [], "image": [], "py": []}
     for line in output.splitlines():
         path = line.strip()
         if not path:
@@ -168,4 +171,25 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
             inventory["bib"].append(path)
         elif suffix in IMAGE_EXTENSIONS:
             inventory["image"].append(path)
+        elif suffix == ".py":
+            inventory["py"].append(path)
     return inventory
+
+
+def read_head_sha(repo_path: str | Path) -> str | None:
+    """Current HEAD commit SHA, or None for an unborn repo (no commits yet)
+    -- mirrors read_commits' treatment of that case as expected state, not a
+    failure. Any other git failure (not a repo, missing git binary, ...)
+    still raises GitIngestError via _run_git. Used by T6's pyfig ingester,
+    which needs "the commit as of ingestion time" rather than any specific
+    historical commit.
+    """
+    repo_path = Path(repo_path)
+    try:
+        raw = _run_git(repo_path, ["rev-parse", "HEAD"])
+    except GitIngestError as exc:
+        if "unknown revision" in str(exc):
+            return None
+        raise
+    sha = raw.strip()
+    return sha or None
