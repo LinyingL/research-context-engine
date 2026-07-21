@@ -1,0 +1,105 @@
+"""Tests for rce.ingest.mlflow. Hand-builds an MLflow FileStore tree under
+tmp_path (no mlflow package dependency) alongside a real git+LaTeX fixture
+(via rce.ingest.git/rce.ingest.latex) so the `implements`/`produces` edges
+have a real Commit/Figure node to match against.
+"""
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from rce import db
+from rce.ingest import git as git_ingest
+from rce.ingest import latex as latex_ingest
+from rce.ingest import mlflow as mlflow_ingest
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+@pytest.fixture
+def repo_sha(tmp_path, conn) -> str:
+    """git+LaTeX repo pre-ingested into `conn`, giving commit:<sha> and
+    figure:overview.png for the connector edges; returns HEAD sha."""
+    repo = tmp_path / "paper_repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "overview.png").write_bytes(b"\x89PNG")
+    (repo / "paper.tex").write_text("\\section{Intro}\n\\includegraphics{overview.png}\n")
+    _git(repo, "add", "paper.tex", "overview.png")
+    _git(repo, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "add paper")
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    git_ingest.ingest_git_repo(conn, repo)
+    latex_ingest.ingest_latex_repo(conn, repo, ["paper.tex"], [])
+    return sha
+
+def _write(dir_path: Path, files: dict[str, str]) -> None:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        (dir_path / name).write_text(content)
+
+def _build_run(mlruns_root: Path, run_id: str, sha: str, exp_id: str = "0") -> Path:
+    """Well-formed run: meta.yaml + params/metrics/tags + one image artifact."""
+    run_dir = mlruns_root / exp_id / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.yaml").write_text(
+        f"experiment_id: '{exp_id}'\nrun_id: {run_id}\nrun_name: golden-run\nstatus: FINISHED\n"
+    )
+    _write(run_dir / "params", {"lr": "0.01"})
+    _write(run_dir / "metrics", {"accuracy": "0 0.5 0\n1700000100000 0.87 1\n"})
+    _write(run_dir / "tags", {"mlflow.runName": "golden-run", "mlflow.source.git.commit": sha})
+    (run_dir / "artifacts").mkdir()
+    (run_dir / "artifacts" / "overview.png").write_bytes(b"\x89PNG")
+    return run_dir
+
+def test_ingest_creates_node_and_both_edges_skips_corrupted_run(tmp_path, conn, repo_sha):
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_a", repo_sha)
+    (mlruns / "0" / "run_broken" / "params").mkdir(parents=True)  # no meta.yaml -> corrupted
+
+    counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+    assert counts == {"experiments": 1, "implements": 1, "produces": 1}
+    node = db.get_node(conn, "experiment:run_a")
+    assert node["type"] == "experiment" and node["title"] == "golden-run"
+    assert node["attrs"]["status"] == "FINISHED"
+    assert node["attrs"]["params"] == {"lr": "0.01"}
+    assert node["attrs"]["metrics"] == {"accuracy": 0.87}
+    assert node["attrs"]["tags"] == {
+        "mlflow.runName": "golden-run", "mlflow.source.git.commit": repo_sha,
+    }
+    assert db.get_node(conn, "experiment:run_broken") is None  # corrupted run skipped
+    implements = db.query_edges(conn, src=f"commit:{repo_sha}", dst="experiment:run_a", type="implements")
+    assert len(implements) == 1
+    edge = implements[0]
+    assert edge["extractor"] == "mlflow" and edge["confidence"] == 1.0 and edge["status"] == "auto"
+    assert edge["evidence"] == {"run_id": "run_a", "sha": repo_sha}
+
+    produces = db.query_edges(conn, src="experiment:run_a", dst="figure:overview.png", type="produces")
+    assert len(produces) == 1
+    assert produces[0]["evidence"] == {"run_id": "run_a", "artifact_path": "overview.png"}
+
+def test_ingest_conservatively_skips_unresolvable_connectors(tmp_path, conn):
+    fake_sha = "d" * 40  # absent from the graph: no commit was ever ingested here
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_b", fake_sha)
+    db.upsert_node(conn, "figure:a/overview.png", "figure", title="a/overview.png")
+    db.upsert_node(conn, "figure:b/overview.png", "figure", title="b/overview.png")  # ambiguous basename
+
+    counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+    assert counts["implements"] == 0 and counts["produces"] == 0
+    assert db.get_node(conn, f"commit:{fake_sha}") is None  # never a placeholder
+    assert db.query_edges(conn, type="implements") == []
+    assert db.query_edges(conn, type="produces") == []
+
+def test_ingest_is_idempotent_on_repeat_run(tmp_path, conn, repo_sha):
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_a", repo_sha)
+
+    first = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+    second = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+    assert first == second == {"experiments": 1, "implements": 1, "produces": 1}
+    assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='experiment'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='implements'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='produces'").fetchone()[0] == 1

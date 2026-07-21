@@ -202,6 +202,20 @@ def get_node(conn: sqlite3.Connection, node_id: str) -> dict[str, Any] | None:
     return node
 
 
+def get_nodes_by_type(conn: sqlite3.Connection, type: str) -> list[dict[str, Any]]:
+    """All nodes of a given type, decoded like get_node -- lets an extractor
+    match existing nodes by content without raw SQL of its own (e.g.
+    rce.ingest.mlflow matching artifact basenames against figure: nodes)."""
+    rows = conn.execute("SELECT * FROM nodes WHERE type = ?", (type,)).fetchall()
+    nodes = []
+    for row in rows:
+        node = dict(row)
+        node["attrs"] = json.loads(node["attrs"])
+        node["human_fields"] = json.loads(node["human_fields"])
+        nodes.append(node)
+    return nodes
+
+
 def upsert_edge(
     conn: sqlite3.Connection,
     src: str,
