@@ -167,40 +167,61 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
 def _parse_bib_fields(body: str) -> dict[str, str]:
     """Extract title/author/year from one @entry's body, handling BibTeX's
     three value forms: {braced} (brace-counted, nested braces survive),
-    "quoted", and bare (e.g. `year = 2020`, ends at the next comma)."""
+    "quoted", and bare (e.g. `year = 2020`, ends at the next comma).
+
+    Scans with a cursor that always advances past a field's *entire* value
+    -- wanted or not -- before looking for the next field name. This is
+    required even for fields we discard (note/url/booktitle/...): a
+    finditer-style scan of the whole body would happily match a `name =`
+    substring sitting inside another field's value (e.g.
+    `note = {see author = Smith}`) and silently overwrite title/author/year
+    with garbage. Constitution: parsing must skip+log on doubt, never guess."""
     fields: dict[str, str] = {}
-    for m in _BIB_FIELD_START_RE.finditer(body):
+    pos, n = 0, len(body)
+    while pos < n:
+        m = _BIB_FIELD_START_RE.match(body, pos)
+        if not m:
+            pos += 1
+            continue
         name = m.group(1).lower()
-        if name not in _BIB_FIELDS_WANTED or name in fields:
-            continue
         start = m.end()
-        if start >= len(body):
-            continue
+        if start >= n:
+            break
         delim = body[start]
         if delim == "{":
             depth, j = 1, start + 1
-            while j < len(body) and depth > 0:
+            while j < n and depth > 0:
                 if body[j] == "{":
                     depth += 1
                 elif body[j] == "}":
                     depth -= 1
                 j += 1
             value = body[start + 1 : j - 1]
+            pos = j
         elif delim == '"':
             end = body.find('"', start + 1)
             if end == -1:
-                continue
+                break  # unterminated quote -- stop rather than guess further
             value = body[start + 1 : end]
+            pos = end + 1
         else:
             end = body.find(",", start)
-            value = body[start : end if end != -1 else len(body)]
-        fields[name] = value.strip()
+            pos = end if end != -1 else n
+            value = body[start:pos]
+        if name in _BIB_FIELDS_WANTED and name not in fields:
+            fields[name] = value.strip()
     return fields
 
 def parse_bib_entries(text: str) -> list[BibEntry]:
     """Parse @entry blocks via brace-depth counting -- not a full BibTeX
-    grammar (Occam rule 1/5: title/author/year is all v0 needs)."""
-    text = "\n".join(_strip_comment(line) for line in text.splitlines())
+    grammar (Occam rule 1/5: title/author/year is all v0 needs).
+
+    Unlike .tex, '%' has no comment meaning in BibTeX -- it is an ordinary
+    character that shows up routinely in field values (e.g.
+    `title = {Achieving 50% accuracy}`). No comment stripping happens here:
+    _strip_comment is .tex-only (see parse_tex_file). The @-anchored entry
+    scan below already ignores anything outside an @entry, so nothing
+    outside entries needs stripping either."""
     entries: list[BibEntry] = []
     for m in _BIB_ENTRY_START_RE.finditer(text):
         entry_type = m.group(1).lower()

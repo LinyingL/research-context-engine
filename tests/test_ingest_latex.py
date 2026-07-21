@@ -85,6 +85,48 @@ def test_parse_bib_entries_handles_braced_quoted_and_bare_values():
     assert entries["jones2019"].entry_type == "inproceedings"
 
 
+def test_parse_bib_entries_percent_in_field_value_is_not_a_comment():
+    # '%' has no comment meaning in BibTeX -- unlike .tex -- so a bare '%'
+    # inside a field value must survive, and must not truncate the entry
+    # (which would desync the brace-depth scan and swallow later entries).
+    bib = r"""
+@article{pct2021,
+  title = {Achieving 50% accuracy on the benchmark},
+  author = {Lee, Kim},
+  year = {2021},
+}
+
+@article{after2022,
+  title = {A Later Paper},
+  author = {Doe, Pat},
+  year = {2022},
+}
+"""
+    entries = {e.key: e for e in latex.parse_bib_entries(bib)}
+    assert entries["pct2021"].fields["title"] == "Achieving 50% accuracy on the benchmark"
+    assert entries["after2022"].fields == {
+        "title": "A Later Paper", "author": "Doe, Pat", "year": "2022",
+    }
+
+
+def test_parse_bib_entries_unwanted_field_value_does_not_leak_into_wanted_fields():
+    # A `name =` substring inside an unwanted field's value (note/url/...)
+    # must never be mistaken for a real field -- the scan must consume the
+    # whole unwanted value before looking for the next field name.
+    bib = r"""
+@article{noise2022,
+  note = {see author = Smith and year = 1999 for background},
+  title = {Correct Title},
+  author = {Real Author},
+  year = {2022},
+}
+"""
+    entries = {e.key: e for e in latex.parse_bib_entries(bib)}
+    assert entries["noise2022"].fields == {
+        "title": "Correct Title", "author": "Real Author", "year": "2022",
+    }
+
+
 def test_ingest_latex_repo_writes_nodes_edges_with_evidence_and_is_idempotent(tmp_path):
     repo = _build_repo(tmp_path)
     conn = db.connect(":memory:")
