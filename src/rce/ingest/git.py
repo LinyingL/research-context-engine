@@ -8,8 +8,13 @@ there, not reimplemented here). list_source_files() additionally inventories
 ingester (HANDOFF-SPEC.md section 5); it creates no graph nodes.
 read_head_sha() (T6) reads the repo's current HEAD commit SHA, for
 extractors that need "the commit as of ingestion time" rather than any
-historical commit. Unparseable git output is skipped and logged, never
-guessed at (section 5's savefig rule: "拼不出来就放弃，不猜").
+historical commit. blame_line() (T6 batch3-fix) resolves the commit that
+last touched one specific file:line -- used by the pyfig ingester so a
+savefig() call's src edge stays pinned to the commit that actually
+introduced that line (HANDOFF-SPEC.md section 4 erratum: "src=生成代码所在
+commit"), not whichever commit happens to be HEAD at ingestion time.
+Unparseable git output is skipped and logged, never guessed at (section 5's
+savefig rule: "拼不出来就放弃，不猜").
 """
 
 from __future__ import annotations
@@ -193,3 +198,39 @@ def read_head_sha(repo_path: str | Path) -> str | None:
         raise
     sha = raw.strip()
     return sha or None
+
+
+def blame_line(repo_path: str | Path, file_path: str, line: int) -> str | None:
+    """The commit SHA that last touched `file_path`'s `line` (1-indexed), via
+    `git blame --porcelain -L <line>,<line>`.
+
+    Returns None -- log a warning, never guess -- when:
+    - the line is a local, not-yet-committed edit (git's all-zero pseudo-sha
+      "0000...0", meaning there is no real commit to attribute it to yet)
+    - `git blame` fails outright (e.g. unborn repo, path not tracked) or its
+      output does not parse as expected
+
+    Any other outcome is a real 40-hex commit SHA already reachable from
+    HEAD's history, so callers may reference it as a Commit node id without
+    upserting that node themselves (T1's ingest_git_repo, which always runs
+    first in the CLI's ingest order, already created it).
+    """
+    try:
+        raw = _run_git(
+            Path(repo_path), ["blame", "--porcelain", "-L", f"{line},{line}", "--", file_path]
+        )
+    except GitIngestError as exc:
+        logger.warning("git blame failed for %s:%d: %s", file_path, line, exc)
+        return None
+    first_line = raw.splitlines()[0] if raw.splitlines() else ""
+    sha = first_line.split(" ", 1)[0] if first_line else ""
+    if len(sha) != 40:
+        logger.warning("could not parse git blame output for %s:%d: %r", file_path, line, first_line)
+        return None
+    if sha == "0" * 40:
+        logger.warning(
+            "%s:%d has uncommitted local changes; cannot attribute to a commit, skipping",
+            file_path, line,
+        )
+        return None
+    return sha

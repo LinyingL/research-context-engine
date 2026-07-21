@@ -139,11 +139,10 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 f"  latex: {len(inventory['tex'])} .tex, {len(inventory['bib'])} .bib "
                 f"scanned -> {_format_counts(latex_counts)}"
             )
-            # T6: static savefig() analysis, keyed to the repo's current HEAD
-            # commit (ingestion-time code state, not any historical commit).
-            head_sha = git_ingest.read_head_sha(project_root)
+            # T6: static savefig() analysis; each edge's src commit is
+            # resolved internally via git blame (batch3-fix), not HEAD.
             pyfig_counts = pyfig_ingest.ingest_pyfig_repo(
-                conn, project_root, inventory["py"], inventory["image"], head_sha,
+                conn, project_root, inventory["py"], inventory["image"],
             )
             print(f"  pyfig: {len(inventory['py'])} .py scanned -> {_format_counts(pyfig_counts)}")
             if args.mlruns:

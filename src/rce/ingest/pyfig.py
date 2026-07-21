@@ -6,7 +6,16 @@ git-tracked .py files whose first positional argument is a plain string
 literal. f-strings, name references, and any other computed expression are
 never guessed at -- HANDOFF-SPEC.md section 5: "拼不出来就放弃，不猜" -- they
 are skipped and logged. Writes `Commit --generates--> Figure` edges via
-rce.db's upsert_node/upsert_edge (idempotency inherited from there).
+rce.db's upsert_node/upsert_edge.
+
+Each edge's src commit is resolved per call site via `git blame`
+(rce.ingest.git.blame_line), pinned to whichever commit last touched that
+specific savefig(...) line -- HANDOFF-SPEC.md section 4 erratum: "src=生成
+代码所在 commit". This (not the repo's current HEAD) is what keeps a
+re-ingest idempotent: an unchanged plotting script blames to the same
+commit run after run, so upsert_edge's (src, dst, type, extractor) key is
+stable and updates the same row instead of accumulating one stale edge per
+intervening commit (batch3-fix; HEAD-keyed src was the bug).
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from rce import db
+from rce.ingest import git as git_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -132,30 +142,30 @@ def ingest_pyfig_repo(
     repo_root: str | Path,
     py_paths: list[str],
     image_paths: list[str],
-    head_sha: str | None,
 ) -> dict[str, int]:
     """Ingest savefig(...) call sites into `Commit --generates--> Figure`
     edges (HANDOFF-SPEC.md section 5 connector 5).
 
-    `head_sha` is the repo's current HEAD commit -- the src side of every
-    edge, since this is static analysis of the code *at ingestion time*
-    (HANDOFF-SPEC.md section 4, 2026-07-22 erratum: "src=生成代码所在
-    commit"), not whichever commit historically introduced a line. `None`
-    (unborn repo, no commits yet) skips the whole scan rather than inventing
-    a placeholder commit.
+    Each edge's src is resolved per call site via `git blame` (batch3-fix,
+    see module docstring) -- the commit that last touched that exact
+    savefig(...) line, not the repo's current HEAD. A repo with no HEAD
+    commit yet (unborn repo) skips the whole scan rather than inventing a
+    placeholder commit; a savefig line that is only a local, uncommitted
+    edit skips just that one call site (both logged, never guessed at).
 
     `image_paths` is the exact set of git-tracked image files (e.g. from
     rce.ingest.git.list_source_files()["image"]) a resolved literal must
     hit -- mirrors rce.ingest.latex's ghost-figure guard, so every Figure
     node created here is backed by a real repo file. Idempotent via
-    db.upsert_node/upsert_edge.
+    db.upsert_node/upsert_edge plus the stable blame-resolved src: a
+    re-ingest of an unchanged script updates the same edge row instead of
+    inserting a new one.
     """
     counts = {"generates": 0}
-    if head_sha is None:
+    if git_ingest.read_head_sha(repo_root) is None:
         logger.warning("repo has no HEAD commit yet (unborn repo); skipping savefig scan")
         return counts
 
-    commit_id = f"commit:{head_sha}"
     known_images = set(image_paths)
     for py_rel_path in py_paths:
         for call in parse_py_file(repo_root, py_rel_path):
@@ -166,6 +176,14 @@ def ingest_pyfig_repo(
                     call.py_path, call.line, call.callee, call.literal,
                 )
                 continue
+            blame_sha = git_ingest.blame_line(repo_root, call.py_path, call.line)
+            if blame_sha is None:
+                logger.warning(
+                    "%s:%d: %s(...) cannot be attributed to a commit via git blame; skipping",
+                    call.py_path, call.line, call.callee,
+                )
+                continue
+            commit_id = f"commit:{blame_sha}"
             figure_id = f"figure:{figure_path}"
             db.upsert_node(conn, figure_id, "figure", title=figure_path)
             db.upsert_edge(
