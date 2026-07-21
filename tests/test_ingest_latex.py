@@ -323,3 +323,75 @@ def test_includegraphics_image_inventory_none_disables_validation(tmp_path):
         assert db.get_node(conn, "figure:anything.png") is not None
     finally:
         conn.close()
+
+
+# -- regression fix (commit 3085680 introduced the exact-match-only ghost
+# figure guard above; it wrongly ghosted the mainstream no-extension
+# \includegraphics{name} form) --
+
+
+def test_includegraphics_without_extension_resolves_to_tracked_image(tmp_path):
+    # \includegraphics{overview} (no suffix) is ordinary, mainstream LaTeX
+    # usage -- pdflatex itself searches extensions at compile time. Must
+    # still create a node + includes edge, with the id carrying the actual
+    # tracked extension so it converges with the pyfig ingester's figure ids
+    # (HANDOFF-SPEC.md north-star triangle: Section--includes-->Figure).
+    (tmp_path / "overview.png").write_bytes(b"\x89PNG")
+    (tmp_path / "paper.tex").write_text("\\section{Intro}\n\\includegraphics{overview}\n")
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        counts = latex.ingest_latex_repo(
+            conn, tmp_path, ["paper.tex"], [], image_paths=["overview.png"]
+        )
+        assert counts["figures"] == 1
+        assert db.get_node(conn, "figure:overview.png") is not None
+
+        includes = db.query_edges(conn, dst="figure:overview.png", type="includes")
+        assert len(includes) == 1
+        assert includes[0]["src"] == "section:paper.tex#intro"
+    finally:
+        conn.close()
+
+
+def test_includegraphics_without_extension_prefers_pdf_when_both_tracked(tmp_path, caplog):
+    # overview.png and overview.pdf both tracked -- deterministic order
+    # (mirrors pdflatex's own search order) takes .pdf, and the choice is
+    # logged since it was ambiguous.
+    (tmp_path / "overview.png").write_bytes(b"\x89PNG")
+    (tmp_path / "overview.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.tex").write_text("\\section{Intro}\n\\includegraphics{overview}\n")
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        with caplog.at_level("INFO", logger="rce.ingest.latex"):
+            counts = latex.ingest_latex_repo(
+                conn, tmp_path, ["paper.tex"], [], image_paths=["overview.png", "overview.pdf"]
+            )
+        assert counts["figures"] == 1
+        assert db.get_node(conn, "figure:overview.pdf") is not None
+        assert db.get_node(conn, "figure:overview.png") is None
+        assert any(
+            "multiple tracked images" in r.message and "overview.pdf" in r.message
+            for r in caplog.records
+        )
+    finally:
+        conn.close()
+
+
+def test_includegraphics_without_extension_and_no_tracked_candidate_is_still_ghost(tmp_path, caplog):
+    # No extension of "nowhere" is tracked at all -- a real ghost figure,
+    # still skipped + logged, not silently guessed at.
+    (tmp_path / "paper.tex").write_text("\\section{Intro}\n\\includegraphics{nowhere}\n")
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        with caplog.at_level("WARNING", logger="rce.ingest.latex"):
+            counts = latex.ingest_latex_repo(
+                conn, tmp_path, ["paper.tex"], [], image_paths=["something-else.png"]
+            )
+        assert counts["figures"] == 0
+        assert db.get_node(conn, "figure:nowhere") is None
+        assert any("ghost figure" in r.message and "nowhere" in r.message for r in caplog.records)
+    finally:
+        conn.close()

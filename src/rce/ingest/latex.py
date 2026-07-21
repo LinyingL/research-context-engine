@@ -19,8 +19,19 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
+from rce.ingest import git as git_ingest
 
 logger = logging.getLogger(__name__)
+
+# Deterministic extension search order for a \includegraphics path written
+# without a suffix (e.g. \includegraphics{overview}) -- ordinary, common
+# LaTeX usage: pdflatex/latex itself tries a fixed list of extensions at
+# compile time until one is found on disk. .pdf/.png/.jpg/.jpeg first
+# (pdflatex's own priority order), the rest of git.IMAGE_EXTENSIONS
+# alphabetically -- deterministic, not a guess (HANDOFF-SPEC.md section 5).
+_EXT_SEARCH_ORDER = (".pdf", ".png", ".jpg", ".jpeg") + tuple(
+    sorted(git_ingest.IMAGE_EXTENSIONS - {".pdf", ".png", ".jpg", ".jpeg"})
+)
 
 _SECTION_RE = re.compile(r"\\(section|subsection)\*?\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}")
 _INCLUDEGRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^{}]*)\}")
@@ -87,6 +98,35 @@ def _resolve_figure_path(tex_rel_path: str, graphics_dir: str | None, raw_path: 
     if normalized == ".." or normalized.startswith("../") or posixpath.isabs(normalized):
         return None
     return normalized
+
+def _match_known_image(fig_path: str, known_images: set[str]) -> str | None:
+    """Resolve a parsed \\includegraphics path against the repo's tracked
+    image inventory, extension-aware.
+
+    \\includegraphics{overview} (no suffix) is normal, mainstream LaTeX
+    usage -- pdflatex/latex itself searches a fixed list of extensions at
+    compile time. Regression fix (commit 3085680 introduced an exact-match-
+    only ghost-figure guard that misclassified this common form as a ghost):
+    a path that already ends in one of git.IMAGE_EXTENSIONS is still matched
+    exactly against `known_images`, unchanged. A path with no image suffix
+    is instead tried against each candidate in _EXT_SEARCH_ORDER
+    (deterministic, mirrors pdflatex's own search order) and the first
+    extension present in `known_images` wins. If more than one candidate is
+    tracked (e.g. both overview.png and overview.pdf exist), that ambiguity
+    is logged at INFO so the choice stays auditable. No match at all -- a
+    real ghost figure -- returns None; the caller skips + logs a warning.
+    """
+    if posixpath.splitext(fig_path)[1].lower() in git_ingest.IMAGE_EXTENSIONS:
+        return fig_path if fig_path in known_images else None
+    hits = [f"{fig_path}{ext}" for ext in _EXT_SEARCH_ORDER if f"{fig_path}{ext}" in known_images]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        logger.info(
+            "%r matches multiple tracked images %r; using %r (deterministic "
+            "extension search order, mirrors pdflatex)", fig_path, hits, hits[0],
+        )
+    return hits[0]
 
 @dataclass(frozen=True)
 class ParsedSection:
@@ -283,8 +323,10 @@ def ingest_latex_repo(
 
     `image_paths`, if given, is the exact set of repo-tracked image paths
     (e.g. from rce.ingest.git.list_source_files()["image"]) to validate
-    \\includegraphics targets against: a resolved path outside this set is
-    a "ghost figure" (references an image the repo does not actually have)
+    \\includegraphics targets against: a resolved path with no match in this
+    set -- including via the extension-aware fallback in
+    _match_known_image() for a suffix-less \\includegraphics{name} -- is a
+    "ghost figure" (references an image the repo does not actually have)
     and is skipped + logged rather than becoming a node with no backing
     file (T5.5 review item 2). `None` (the default) disables this check
     entirely, keeping this function usable as a standalone library call
@@ -350,16 +392,21 @@ def ingest_latex_repo(
 
         for fig_link in result.figure_links:
             fig_path = fig_link.target.split(":", 1)[1]
-            if known_images is not None and fig_path not in known_images:
-                logger.warning(
-                    "%s:%d: \\includegraphics resolves to %r, which is not a tracked "
-                    "repo image; skipping (ghost figure, no node or edge created)",
-                    result.tex_path, fig_link.line, fig_path,
-                )
-                continue
-            db.upsert_node(conn, fig_link.target, "figure", title=fig_path)
+            if known_images is not None:
+                matched_path = _match_known_image(fig_path, known_images)
+                if matched_path is None:
+                    logger.warning(
+                        "%s:%d: \\includegraphics resolves to %r, which is not a tracked "
+                        "repo image under any of git.IMAGE_EXTENSIONS; skipping "
+                        "(ghost figure, no node or edge created)",
+                        result.tex_path, fig_link.line, fig_path,
+                    )
+                    continue
+                fig_path = matched_path
+            fig_id = f"figure:{fig_path}"
+            db.upsert_node(conn, fig_id, "figure", title=fig_path)
             db.upsert_edge(
-                conn, fig_link.section_id, fig_link.target, "includes",
+                conn, fig_link.section_id, fig_id, "includes",
                 extractor="latex", evidence={"file": result.tex_path, "line": fig_link.line},
                 confidence=1.0, status="auto",
             )
