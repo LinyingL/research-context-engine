@@ -74,7 +74,7 @@
 确定性层（零模型）：
 - `Commit --implements--> Experiment`（run 记录的 git SHA）
 - `Experiment --produces--> Figure`（run artifact / 输出文件名）
-- `Code --generates--> Figure`（savefig/输出路径的静态分析，证据=文件:行）
+- `Commit --generates--> Figure`（代码静态分析 savefig/输出路径；src=生成代码所在 commit，具体文件:行放 evidence。2026-07-22 勘误：原文误写 Code，8 类节点中无 Code，实现按 Commit 落地）
 - `Section --includes--> Figure`（\includegraphics 文件名）
 - `Section --cites--> Reference`（\cite key ↔ .bib）
 - `* --authored_by--> Contributor`（git 作者 / run owner）
@@ -89,7 +89,7 @@
 ## 5. 连接键清单（确定性层的全部依据）
 
 1. `\includegraphics{path}` 文件名 ↔ repo 内图片路径
-2. `\cite{key}` ↔ .bib 条目
+2. `\cite{key}` ↔ .bib 条目（含 natbib/biblatex 常见变体：\citep/\citet/\citealp/\parencite/\textcite/\autocite；bib key 匹配大小写不敏感。2026-07-22 补充，理由：真实论文多用 \citep/\citet，只匹配 \cite 会让 cites 边在真实数据上几乎不触发）
 3. W&B/MLflow run 记录的 git commit SHA ↔ repo commit
 4. run 的 artifact/输出文件名 ↔ repo 内文件
 5. 代码中 `savefig(...)` / 输出路径字面量 ↔ 图片文件（AST/正则，含常见变量拼接的保守处理：拼不出来就放弃，不猜）
