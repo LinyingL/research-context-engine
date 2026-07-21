@@ -26,10 +26,28 @@ _SECTION_RE = re.compile(r"\\(section|subsection)\*?\{([^{}]*(?:\{[^{}]*\}[^{}]*
 _INCLUDEGRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^{}]*)\}")
 _GRAPHICSPATH_RE = re.compile(r"\\graphicspath\{((?:\{[^{}]*\})+)\}")
 _GRAPHICSPATH_DIR_RE = re.compile(r"\{([^{}]*)\}")
-_CITE_RE = re.compile(r"\\cite\*?(?:\[[^\]]*\])?(?:\[[^\]]*\])?\{([^{}]*)\}")
+_CITE_RE = re.compile(
+    # natbib (\cite, \citep, \citet, \citealp -- plus capitalized \Citep/\Citet
+    # sentence-start variants) and biblatex (\parencite, \textcite, \autocite).
+    # HANDOFF-SPEC.md section 5, 2026-07-22 addendum: real papers overwhelmingly
+    # use \citep/\citet, so \cite alone leaves `cites` edges almost never firing.
+    r"\\(?:cite(?:p|t|alp)?|Citep|Citet|parencite|textcite|autocite)\*?"
+    r"(?:\[[^\]]*\])?(?:\[[^\]]*\])?\{([^{}]*)\}"
+)
 _LABEL_RE = re.compile(r"\\label\{([^{}]*)\}")
 _REF_RE = re.compile(r"\\ref\{([^{}]*)\}")
 _SLUG_INVALID_RE = re.compile(r"[^a-z0-9]+")
+
+def _normalize_bib_key(key: str) -> str:
+    """Canonical form used for ref: node IDs and cite/bib matching.
+
+    HANDOFF-SPEC.md section 5, 2026-07-22 addendum: bib key matching is
+    case-insensitive (\\cite{smith2020} must resolve against
+    @article{Smith2020}), so node IDs use this lowercase form while the
+    original as-written key is kept in the node's attrs.
+    """
+    return key.strip().lower()
+
 
 _BIB_ENTRY_START_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s}]+)\s*,")
 _BIB_FIELD_START_RE = re.compile(r"(\w+)\s*=\s*")
@@ -252,9 +270,14 @@ def ingest_latex_repo(
     Reference nodes are written for keys with no bib entry -- all before
     any `cites` edge, since edges.dst has a foreign key to nodes.id and
     must already exist at insert time. Idempotent via db.upsert_*.
+
+    Bib key matching is case-insensitive (see _normalize_bib_key): both the
+    resolved-keys set below and every ref: node ID use the lowercase form,
+    so \\cite{smith2020} resolves against @article{Smith2020} instead of
+    producing a spurious unresolved placeholder alongside the real node.
     """
     repo_root = Path(repo_root)
-    resolved_keys: set[str] = set()
+    resolved_keys: set[str] = set()  # normalized (lowercase) keys with a real bib entry
 
     for bib_rel_path in bib_paths:
         try:
@@ -263,19 +286,21 @@ def ingest_latex_repo(
             logger.warning("cannot read bib file %s: %s", bib_rel_path, exc)
             continue
         for entry in entries:
+            norm_key = _normalize_bib_key(entry.key)
             db.upsert_node(
-                conn, f"ref:{entry.key}", "reference", title=entry.fields.get("title"),
+                conn, f"ref:{norm_key}", "reference", title=entry.fields.get("title"),
                 attrs={
                     "entry_type": entry.entry_type,
                     "author": entry.fields.get("author"),
                     "year": entry.fields.get("year"),
                     "bib_file": bib_rel_path,
+                    "key": entry.key,  # original as-written casing, preserved
                 },
             )
-            resolved_keys.add(entry.key)
+            resolved_keys.add(norm_key)
 
     parsed: list[TexParseResult] = []
-    all_cited_keys: set[str] = set()
+    all_cited_keys: set[str] = set()  # normalized (lowercase)
     for tex_rel_path in tex_paths:
         try:
             result = parse_tex_file(repo_root, tex_rel_path)
@@ -283,10 +308,10 @@ def ingest_latex_repo(
             logger.warning("cannot read tex file %s: %s", tex_rel_path, exc)
             continue
         parsed.append(result)
-        all_cited_keys.update(link.target for link in result.cite_links)
+        all_cited_keys.update(_normalize_bib_key(link.target) for link in result.cite_links)
 
     for key in all_cited_keys - resolved_keys:
-        db.upsert_node(conn, f"ref:{key}", "reference", title=None, attrs={"unresolved": True})
+        db.upsert_node(conn, f"ref:{key}", "reference", title=None, attrs={"unresolved": True, "key": key})
 
     counts = {"sections": 0, "figures": 0, "cites": 0}
     for result in parsed:
@@ -307,8 +332,9 @@ def ingest_latex_repo(
             counts["figures"] += 1
 
         for cite_link in result.cite_links:
+            norm_key = _normalize_bib_key(cite_link.target)
             db.upsert_edge(
-                conn, cite_link.section_id, f"ref:{cite_link.target}", "cites",
+                conn, cite_link.section_id, f"ref:{norm_key}", "cites",
                 extractor="latex", evidence={"file": result.tex_path, "line": cite_link.line},
                 confidence=1.0, status="auto",
             )

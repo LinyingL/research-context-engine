@@ -132,6 +132,7 @@ def test_ingest_latex_repo_writes_nodes_edges_with_evidence_and_is_idempotent(tm
     conn = db.connect(":memory:")
     db.migrate(conn)
 
+    reference_counts_per_run = []
     for _ in range(2):  # second run proves idempotency
         counts = latex.ingest_latex_repo(conn, repo, ["paper.tex"], ["refs.bib"])
         assert counts == {"sections": 3, "figures": 2, "cites": 3}
@@ -155,11 +156,12 @@ def test_ingest_latex_repo_writes_nodes_edges_with_evidence_and_is_idempotent(tm
         smith = db.get_node(conn, "ref:smith2020")
         assert smith["title"] == "A Study of Things"
         assert smith["attrs"]["year"] == "2020"
+        assert smith["attrs"]["key"] == "smith2020"  # original as-written bib key
         assert "unresolved" not in smith["attrs"]
 
         # unresolved reference: cited but absent from refs.bib.
         placeholder = db.get_node(conn, "ref:unknown2099")
-        assert placeholder["attrs"] == {"unresolved": True}
+        assert placeholder["attrs"] == {"unresolved": True, "key": "unknown2099"}
 
         cites = db.query_edges(conn, src="section:paper.tex#introduction", type="cites")
         assert {e["dst"] for e in cites} == {"ref:smith2020", "ref:jones2019"}
@@ -167,6 +169,15 @@ def test_ingest_latex_repo_writes_nodes_edges_with_evidence_and_is_idempotent(tm
         assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='section'").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='figure'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='cites'").fetchone()[0] == 3
+
+        reference_counts_per_run.append(
+            conn.execute("SELECT COUNT(*) FROM nodes WHERE type='reference'").fetchone()[0]
+        )
+
+    # Idempotency gap flagged in the prior review: re-ingesting the same
+    # repo must not keep minting new reference nodes (e.g. a placeholder
+    # duplicating an already-resolved bib entry due to a casing mismatch).
+    assert reference_counts_per_run[0] == reference_counts_per_run[1] == 3
 
     conn.close()
 
@@ -179,3 +190,64 @@ def test_unresolvable_paths_never_guessed(tmp_path):
     # Escapes the repo root, and an empty path -- both unresolvable.
     assert latex._resolve_figure_path("paper.tex", None, "../../etc/passwd") is None
     assert latex._resolve_figure_path("paper.tex", None, "") is None
+
+
+# -- extended cite command coverage (HANDOFF-SPEC.md section 5, 2026-07-22) --
+
+
+def test_cite_regex_covers_natbib_and_biblatex_variants(tmp_path):
+    tex = "\n".join(
+        [
+            "\\section{Related Work}",
+            "\\citep{a2020}",
+            "\\citet{b2020}",
+            "\\citealp{c2020}",
+            "\\parencite{d2020}",
+            "\\textcite{e2020}",
+            "\\autocite{f2020}",
+            "\\Citep{g2020}",
+            "\\Citet{h2020}",
+            "\\citep[see][p. 5]{i2020}",  # optional-argument form, two brackets
+            "\\citet*{j2020}",  # starred form
+        ]
+    )
+    (tmp_path / "related.tex").write_text(tex)
+    result = latex.parse_tex_file(tmp_path, "related.tex")
+    keys = {link.target for link in result.cite_links}
+    assert keys == {
+        "a2020", "b2020", "c2020", "d2020", "e2020",
+        "f2020", "g2020", "h2020", "i2020", "j2020",
+    }
+
+
+def test_bib_key_matching_is_case_insensitive(tmp_path):
+    # \cite{smith2020} must resolve against @article{Smith2020} -- matching
+    # is case-insensitive, node IDs are lowercase-normalized, and no
+    # spurious unresolved placeholder is created alongside the real node.
+    (tmp_path / "paper.tex").write_text(
+        "\\section{Intro}\n\\cite{smith2020}\n\\citep{SMITH2020}\n"
+    )
+    (tmp_path / "refs.bib").write_text(
+        "@article{Smith2020,\n  title = {A Study of Things},\n  year = {2020},\n}\n"
+    )
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        latex.ingest_latex_repo(conn, tmp_path, ["paper.tex"], ["refs.bib"])
+
+        # Exactly one reference node, at the lowercase-normalized ID -- not
+        # split across ref:smith2020 / ref:Smith2020 / ref:SMITH2020, and no
+        # unresolved placeholder alongside it.
+        assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='reference'").fetchone()[0] == 1
+        node = db.get_node(conn, "ref:smith2020")
+        assert node is not None
+        assert node["title"] == "A Study of Things"
+        assert node["attrs"]["key"] == "Smith2020"  # original as-written casing preserved
+        assert "unresolved" not in node["attrs"]
+
+        # Both differently-cased \cite/\citep calls resolve to the same node.
+        cites = db.query_edges(conn, src="section:paper.tex#intro", type="cites")
+        assert {e["dst"] for e in cites} == {"ref:smith2020"}
+        assert len(cites) == 1  # same (src,dst,type,extractor) key -> upsert, not duplicate
+    finally:
+        conn.close()

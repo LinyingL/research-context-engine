@@ -15,7 +15,7 @@ enforced by this layer -- see HANDOFF-SPEC.md section 4):
     project:<name>              commit:<sha>
     experiment:<run_id>         figure:<repo-relative path>
     section:<tex file>#<slug>   claim:<file>#<hash>
-    ref:<bibkey>                contributor:<lowercase email>
+    ref:<lowercase bibkey>      contributor:<lowercase email>
 """
 
 from __future__ import annotations
@@ -55,6 +55,13 @@ EDGE_TYPES = frozenset(
 )
 
 EDGE_STATUSES = frozenset({"auto", "pending", "confirmed", "rejected"})
+
+# Statuses a machine extractor may write via upsert_edge. 'confirmed' and
+# 'rejected' are human-only verdicts -- a machine path must never conjure
+# them out of thin air; those two values are only ever set through
+# set_edge_status (HANDOFF-SPEC.md section 4: "any edge's confirm/reject ...
+# status fields are human-write only").
+_MACHINE_EDGE_STATUSES = frozenset({"auto", "pending"})
 
 
 def _now() -> str:
@@ -211,25 +218,38 @@ def upsert_edge(
     confidence/evidence/status updates the existing row rather than
     duplicating it (see the UNIQUE constraint in migrations/0001_init.sql).
 
-    `status` is human-owned once a human has acted on it (HANDOFF-SPEC.md
-    section 4: "any edge's confirm/reject ... status fields are human-write
-    only"), mirroring the human_fields protection on nodes. The UPDATE
-    branch below only lets `status` move to the incoming value when the
-    row's current status is still machine-owned ('auto' or 'pending'); once
-    it is 'confirmed' or 'rejected' a routine re-ingest by the same
-    extractor must not silently reopen or reset it. evidence/confidence are
-    machine-owned and keep updating regardless -- see
-    tests/test_db.py::test_reingest_never_overwrites_confirmed_edge_status.
+    `status` here is restricted to _MACHINE_EDGE_STATUSES ('auto'/'pending')
+    -- a machine path must never conjure a 'confirmed' or 'rejected' verdict
+    out of thin air, so passing either raises ValueError; use
+    set_edge_status for those. This mirrors the human_fields protection on
+    nodes (set_human_fields is the only path that writes it).
+
+    Even with that restriction, the UPDATE branch below still only lets
+    `status` move to the incoming value when the row's *current* status is
+    still machine-owned ('auto' or 'pending'); once a human has moved it to
+    'confirmed' or 'rejected' via set_edge_status, a routine re-ingest by
+    the same extractor must not silently reopen or reset it.
+    evidence/confidence are machine-owned and keep updating regardless --
+    see tests/test_db.py::test_reingest_never_overwrites_confirmed_edge_status.
 
     Every edge must carry non-empty evidence -- "no edge without evidence"
     is a hard invariant (HANDOFF-SPEC.md section 4/2). A placeholder like
     `{}` is not evidence, so it is rejected here (and by the CHECK
     constraint in migrations/0001_init.sql as a second, DB-level guard).
+
+    `confidence` must be within [0.0, 1.0] -- enforced in Python only (no
+    migration/CHECK constraint added: Occam rule 4, a range check needs no
+    schema change to enforce).
     """
     if type not in EDGE_TYPES:
         raise ValueError(f"unknown edge type: {type!r}")
-    if status not in EDGE_STATUSES:
-        raise ValueError(f"unknown edge status: {status!r}")
+    if status not in _MACHINE_EDGE_STATUSES:
+        raise ValueError(
+            f"upsert_edge only accepts machine-owned statuses {sorted(_MACHINE_EDGE_STATUSES)!r}, "
+            f"got {status!r}; use set_edge_status for confirmed/rejected"
+        )
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
     if not evidence:
         raise ValueError("edge requires non-empty evidence")
     evidence_json = json.dumps(evidence)
@@ -248,6 +268,38 @@ def upsert_edge(
             updated_at = excluded.updated_at
         """,
         (src, dst, type, extractor, evidence_json, confidence, status, now, now),
+    )
+    conn.commit()
+
+
+def set_edge_status(
+    conn: sqlite3.Connection,
+    src: str,
+    dst: str,
+    type: str,
+    extractor: str,
+    status: str,
+) -> None:
+    """Human-only write path for an edge's status (confirm/reject/correct).
+
+    Symmetric with set_human_fields on the node side: this is the sole path
+    allowed to move a status to or from 'confirmed'/'rejected'. Unlike
+    upsert_edge it accepts any of the four EDGE_STATUSES, including moving
+    an edge back out of 'confirmed'/'rejected' -- a human is allowed to
+    correct their own earlier confirm/reject mistake; a machine re-ingest
+    (upsert_edge) is not (see upsert_edge's status restriction above).
+
+    No-op if the (src, dst, type, extractor) row does not exist, matching
+    set_human_fields's behavior for an unknown node_id.
+    """
+    if status not in EDGE_STATUSES:
+        raise ValueError(f"unknown edge status: {status!r}")
+    conn.execute(
+        """
+        UPDATE edges SET status = ?, updated_at = ?
+        WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
+        """,
+        (status, _now(), src, dst, type, extractor),
     )
     conn.commit()
 

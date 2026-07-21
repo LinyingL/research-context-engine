@@ -121,6 +121,57 @@ def test_upsert_edge_rejects_illegal_status_in_python(conn):
         )
 
 
+def test_upsert_edge_rejects_confirmed_or_rejected_status_in_python(conn):
+    # upsert_edge is the machine path -- it must never be able to conjure a
+    # human verdict out of thin air. Only set_edge_status may write these.
+    db.upsert_node(conn, "commit:abc", "commit")
+    db.upsert_node(conn, "figure:fig1.png", "figure")
+    for illegal_status in ("confirmed", "rejected"):
+        with pytest.raises(ValueError):
+            db.upsert_edge(
+                conn,
+                "commit:abc",
+                "figure:fig1.png",
+                "generates",
+                "test-extractor",
+                {"file": "plot.py", "line": 1},
+                1.0,
+                status=illegal_status,
+            )
+
+
+# -- confidence range CHECK ------------------------------------------------
+
+
+def test_upsert_edge_rejects_confidence_out_of_range_in_python(conn):
+    db.upsert_node(conn, "commit:abc", "commit")
+    db.upsert_node(conn, "figure:fig1.png", "figure")
+    for bad_confidence in (-0.01, 1.01, 2.0, -5.0):
+        with pytest.raises(ValueError):
+            db.upsert_edge(
+                conn,
+                "commit:abc",
+                "figure:fig1.png",
+                "generates",
+                "test-extractor",
+                {"file": "plot.py", "line": 1},
+                bad_confidence,
+            )
+
+
+def test_upsert_edge_accepts_confidence_boundaries(conn):
+    db.upsert_node(conn, "commit:abc", "commit")
+    db.upsert_node(conn, "figure:fig1.png", "figure")
+    db.upsert_edge(
+        conn, "commit:abc", "figure:fig1.png", "generates", "test-extractor",
+        {"file": "plot.py", "line": 1}, 0.0,
+    )
+    db.upsert_edge(
+        conn, "commit:abc", "figure:fig1.png", "generates", "test-extractor",
+        {"file": "plot.py", "line": 1}, 1.0,
+    )
+
+
 def test_illegal_edge_type_rejected_at_db_level(conn):
     db.upsert_node(conn, "commit:abc", "commit")
     db.upsert_node(conn, "figure:fig1.png", "figure")
@@ -299,16 +350,11 @@ def test_reingest_never_overwrites_confirmed_edge_status(conn):
         status="pending",
     )
 
-    # Human confirms it via the same upsert_edge path, keyed on the SAME
-    # (src, dst, type, extractor) row -- there is only one write gate.
-    db.upsert_edge(
-        conn,
-        "claim:paper.tex#abc123",
-        "experiment:run1",
-        "backed_by",
-        "7b-judge",
-        {"claim_text": "87.3%", "run_metric": "accuracy=0.873"},
-        1.0,
+    # Human confirms it via set_edge_status, keyed on the SAME
+    # (src, dst, type, extractor) row -- upsert_edge cannot write 'confirmed'
+    # itself (see test_upsert_edge_rejects_confirmed_or_rejected_status_in_python).
+    db.set_edge_status(
+        conn, "claim:paper.tex#abc123", "experiment:run1", "backed_by", "7b-judge",
         status="confirmed",
     )
 
@@ -351,14 +397,8 @@ def test_reingest_never_overwrites_rejected_edge_status(conn):
         0.3,
         status="pending",
     )
-    db.upsert_edge(
-        conn,
-        "claim:paper.tex#def456",
-        "experiment:run3",
-        "backed_by",
-        "7b-judge",
-        {"claim_text": "12.0", "run_metric": "loss=12.0"},
-        0.3,
+    db.set_edge_status(
+        conn, "claim:paper.tex#def456", "experiment:run3", "backed_by", "7b-judge",
         status="rejected",
     )
     # Same extractor re-ingests and tries to put it back in the queue.
@@ -378,3 +418,52 @@ def test_reingest_never_overwrites_rejected_edge_status(conn):
     )
     assert len(edges) == 1
     assert edges[0]["status"] == "rejected"
+
+
+# -- set_edge_status: the human-only write path ----------------------------
+
+
+def test_set_edge_status_lets_human_move_between_any_status(conn):
+    # Unlike upsert_edge, set_edge_status is unrestricted: a human correcting
+    # their own earlier confirm/reject mistake may move an edge to any of
+    # the four statuses, in any order.
+    db.upsert_node(conn, "claim:paper.tex#xyz", "claim")
+    db.upsert_node(conn, "experiment:run9", "experiment")
+    db.upsert_edge(
+        conn, "claim:paper.tex#xyz", "experiment:run9", "backed_by", "7b-judge",
+        {"claim_text": "1.0", "run_metric": "loss=1.0"}, 0.5, status="pending",
+    )
+
+    for status in ("confirmed", "rejected", "pending", "confirmed", "auto"):
+        db.set_edge_status(
+            conn, "claim:paper.tex#xyz", "experiment:run9", "backed_by", "7b-judge",
+            status=status,
+        )
+        edge = db.query_edges(
+            conn, src="claim:paper.tex#xyz", dst="experiment:run9", type="backed_by"
+        )[0]
+        assert edge["status"] == status
+
+
+def test_set_edge_status_rejects_illegal_status(conn):
+    db.upsert_node(conn, "claim:paper.tex#xyz", "claim")
+    db.upsert_node(conn, "experiment:run9", "experiment")
+    db.upsert_edge(
+        conn, "claim:paper.tex#xyz", "experiment:run9", "backed_by", "7b-judge",
+        {"claim_text": "1.0", "run_metric": "loss=1.0"}, 0.5, status="pending",
+    )
+    with pytest.raises(ValueError):
+        db.set_edge_status(
+            conn, "claim:paper.tex#xyz", "experiment:run9", "backed_by", "7b-judge",
+            status="in_review",
+        )
+
+
+def test_set_edge_status_is_a_noop_on_unknown_edge(conn):
+    # Mirrors set_human_fields's behavior for an unknown node_id: no matching
+    # row means no error and no row is created.
+    db.set_edge_status(
+        conn, "claim:missing", "experiment:missing", "backed_by", "7b-judge",
+        status="confirmed",
+    )
+    assert db.query_edges(conn) == []
