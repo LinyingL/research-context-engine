@@ -261,7 +261,8 @@ def parse_bib_file(bib_path: str | Path) -> list[BibEntry]:
     return parse_bib_entries(Path(bib_path).read_text(errors="replace"))
 
 def ingest_latex_repo(
-    conn: Connection, repo_root: str | Path, tex_paths: list[str], bib_paths: list[str]
+    conn: Connection, repo_root: str | Path, tex_paths: list[str], bib_paths: list[str],
+    image_paths: list[str] | None = None,
 ) -> dict[str, int]:
     """Ingest LaTeX sources + .bib files into the provenance graph.
 
@@ -275,9 +276,26 @@ def ingest_latex_repo(
     resolved-keys set below and every ref: node ID use the lowercase form,
     so \\cite{smith2020} resolves against @article{Smith2020} instead of
     producing a spurious unresolved placeholder alongside the real node.
+    Two distinctly-cased bib keys that collide after normalization (e.g.
+    Smith2020 and smith2020 in the same or different .bib files) still
+    resolve to one node, last-write-wins -- but that overwrite is now
+    logged (T5.5 review item 1), never silent.
+
+    `image_paths`, if given, is the exact set of repo-tracked image paths
+    (e.g. from rce.ingest.git.list_source_files()["image"]) to validate
+    \\includegraphics targets against: a resolved path outside this set is
+    a "ghost figure" (references an image the repo does not actually have)
+    and is skipped + logged rather than becoming a node with no backing
+    file (T5.5 review item 2). `None` (the default) disables this check
+    entirely, keeping this function usable as a standalone library call
+    (e.g. in tests) without requiring a repo file inventory.
     """
     repo_root = Path(repo_root)
     resolved_keys: set[str] = set()  # normalized (lowercase) keys with a real bib entry
+    known_images: set[str] | None = None if image_paths is None else set(image_paths)
+    # normalized key -> as-written key of the bib entry currently stored at
+    # that key, so a later differently-cased collision can be detected.
+    seen_bib_keys: dict[str, str] = {}
 
     for bib_rel_path in bib_paths:
         try:
@@ -287,6 +305,14 @@ def ingest_latex_repo(
             continue
         for entry in entries:
             norm_key = _normalize_bib_key(entry.key)
+            prior_key = seen_bib_keys.get(norm_key)
+            if prior_key is not None and prior_key != entry.key:
+                logger.warning(
+                    "%s: bib key %r collides with already-seen key %r after "
+                    "case normalization (both -> %r); %r overwrites %r (last write wins)",
+                    bib_rel_path, entry.key, prior_key, norm_key, entry.key, prior_key,
+                )
+            seen_bib_keys[norm_key] = entry.key
             db.upsert_node(
                 conn, f"ref:{norm_key}", "reference", title=entry.fields.get("title"),
                 attrs={
@@ -323,7 +349,15 @@ def ingest_latex_repo(
             counts["sections"] += 1
 
         for fig_link in result.figure_links:
-            db.upsert_node(conn, fig_link.target, "figure", title=fig_link.target.split(":", 1)[1])
+            fig_path = fig_link.target.split(":", 1)[1]
+            if known_images is not None and fig_path not in known_images:
+                logger.warning(
+                    "%s:%d: \\includegraphics resolves to %r, which is not a tracked "
+                    "repo image; skipping (ghost figure, no node or edge created)",
+                    result.tex_path, fig_link.line, fig_path,
+                )
+                continue
+            db.upsert_node(conn, fig_link.target, "figure", title=fig_path)
             db.upsert_edge(
                 conn, fig_link.section_id, fig_link.target, "includes",
                 extractor="latex", evidence={"file": result.tex_path, "line": fig_link.line},

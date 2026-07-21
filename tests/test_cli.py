@@ -91,6 +91,67 @@ def test_ingest_on_non_git_repo_reports_clear_error(tmp_path, capsys):
     assert "git ingestion failed" in capsys.readouterr().err
 
 
+# -- T5.5 review item 5: `rce init` gitignore tip --
+
+
+def test_init_prints_gitignore_tip(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert cli.main(["init", str(project)]) == 0
+
+    out = capsys.readouterr().out
+    assert ".rce/" in out and ".gitignore" in out
+
+
+# -- T5.5 review item 4: list_source_files' GitIngestError must be caught too --
+
+
+def test_ingest_catches_git_ingest_error_from_list_source_files(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    _git(project, "init", "-q")  # unborn repo: ingest_git_repo succeeds with 0 commits
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    def _boom(_repo_path):
+        raise cli.git_ingest.GitIngestError("simulated ls-files failure")
+
+    monkeypatch.setattr(cli.git_ingest, "list_source_files", _boom)
+
+    # Before the fix this call sat outside the try/except GitIngestError
+    # block, so it propagated as an unhandled exception instead of the
+    # standard "Error: git ingestion failed: ..." / exit code 1.
+    assert cli.main(["ingest", str(project)]) == 1
+    assert "git ingestion failed" in capsys.readouterr().err
+
+
+# -- T5.5 review item 2: cli wires the git-tracked image inventory through --
+
+
+def test_ingest_skips_ghost_figure_not_tracked_by_git(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    _git(project, "init", "-q")
+    (project / "paper.tex").write_text("\\section{Intro}\n\\includegraphics{ghost.png}\n")
+    _git(project, "add", "paper.tex")  # ghost.png itself is never added/tracked
+    _git(project, "-c", "user.name=A", "-c", "user.email=a@example.com", "commit", "-m", "x")
+
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["ingest", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "figures=0" in out
+    assert "Skipped/unresolved during this run (see logs): 1" in out
+
+    conn = db.connect(project / ".rce" / "graph.db")
+    try:
+        assert db.get_node(conn, "figure:ghost.png") is None
+    finally:
+        conn.close()
+
+
 def test_full_pipeline_init_ingest_status_query(paper_repo, monkeypatch, capsys):
     repo, _sha = paper_repo
 

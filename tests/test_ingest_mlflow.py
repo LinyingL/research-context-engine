@@ -103,3 +103,38 @@ def test_ingest_is_idempotent_on_repeat_run(tmp_path, conn, repo_sha):
     assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='experiment'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='implements'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='produces'").fetchone()[0] == 1
+
+
+# -- T5.5 review item 3: unified skip verbosity + experiment-level tags/ --
+
+
+def test_sha_not_in_graph_skip_is_logged_at_warning_not_info(tmp_path, conn, caplog):
+    # Was logger.info -- must now be logger.warning so the CLI's shared
+    # warning-based skip counter (rce.ingest logger hierarchy) picks it up.
+    fake_sha = "e" * 40
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_b", fake_sha)
+
+    with caplog.at_level("INFO", logger="rce.ingest.mlflow"):
+        counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts["implements"] == 0
+    skip_records = [r for r in caplog.records if "not found in graph" in r.message]
+    assert len(skip_records) == 1
+    assert skip_records[0].levelname == "WARNING"
+
+
+def test_experiment_level_tags_dir_is_silently_skipped_not_reported_corrupted(tmp_path, conn, repo_sha, caplog):
+    # mlruns/<exp_id>/tags/ is MLflow's own experiment-tag storage, not a run
+    # dir -- it has no meta.yaml, so before this fix it was misreported as a
+    # "corrupted run" (a WARNING). It must now be silently skipped instead.
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_a", repo_sha)
+    _write(mlruns / "0" / "tags", {"mlflow.note.content": "some experiment-level note"})
+
+    with caplog.at_level("WARNING", logger="rce.ingest.mlflow"):
+        counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts == {"experiments": 1, "implements": 1, "produces": 1}  # tags/ contributes nothing
+    assert db.get_node(conn, "experiment:tags") is None  # never mistaken for a run
+    assert not any("corrupted" in r.message or "no meta.yaml" in r.message for r in caplog.records)

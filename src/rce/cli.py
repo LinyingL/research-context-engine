@@ -107,6 +107,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"Initialized RCE project at {rce_dir} (project node: {project_id})")
     if applied:
         print(f"Applied migrations: {applied}")
+    # T5.5 review item 5: a nudge only -- RCE never edits the user's own
+    # files (HANDOFF-SPEC.md section 2, "零习惯改变"), so this is printed,
+    # not applied.
+    print(f"Tip: add '{RCE_DIRNAME}/' to your project's .gitignore -- RCE will not do this for you.")
     return 0
 
 
@@ -118,12 +122,17 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             print(f"Ingesting {project_root}")
             try:
                 commits = git_ingest.ingest_git_repo(conn, project_root)
+                inventory = git_ingest.list_source_files(project_root)
             except git_ingest.GitIngestError as exc:
                 raise CliError(f"git ingestion failed: {exc}") from exc
             print(f"  git: {commits} commit(s) ingested")
-            inventory = git_ingest.list_source_files(project_root)
+            # inventory["image"] lets the latex ingester reject "ghost figures"
+            # (\includegraphics targets not actually tracked in the repo, T5.5
+            # review item 2) -- this cli entry point always passes it; the
+            # library function itself keeps it optional (None = no validation).
             latex_counts = latex_ingest.ingest_latex_repo(
-                conn, project_root, inventory["tex"], inventory["bib"]
+                conn, project_root, inventory["tex"], inventory["bib"],
+                image_paths=inventory["image"],
             )
             print(
                 f"  latex: {len(inventory['tex'])} .tex, {len(inventory['bib'])} .bib "

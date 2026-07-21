@@ -251,3 +251,75 @@ def test_bib_key_matching_is_case_insensitive(tmp_path):
         assert len(cites) == 1  # same (src,dst,type,extractor) key -> upsert, not duplicate
     finally:
         conn.close()
+
+
+# -- T5.5 review item 1: bib key collision is now logged, not silent --
+
+
+def test_bib_key_collision_after_normalization_is_logged(tmp_path, caplog):
+    # Two distinctly-cased keys collide onto the same ref: node id. Behavior
+    # is unchanged (last one written wins), but the overwrite must now be
+    # visible via logger.warning instead of happening silently.
+    (tmp_path / "refs.bib").write_text(
+        "@article{Smith2020,\n  title = {First},\n  year = {2020},\n}\n"
+        "@article{smith2020,\n  title = {Second},\n  year = {2021},\n}\n"
+    )
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        with caplog.at_level("WARNING", logger="rce.ingest.latex"):
+            latex.ingest_latex_repo(conn, tmp_path, [], ["refs.bib"])
+
+        assert any(
+            "collides" in r.message and "Smith2020" in r.message and "smith2020" in r.message
+            for r in caplog.records
+        )
+        # Only one node exists at the shared normalized id; last write wins.
+        assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='reference'").fetchone()[0] == 1
+        node = db.get_node(conn, "ref:smith2020")
+        assert node["title"] == "Second"
+    finally:
+        conn.close()
+
+
+# -- T5.5 review item 2: ghost figure nodes must not be created --
+
+
+def test_includegraphics_path_not_in_image_inventory_is_skipped(tmp_path, caplog):
+    (tmp_path / "figs").mkdir()
+    (tmp_path / "figs" / "overview.png").write_bytes(b"\x89PNG")
+    (tmp_path / "paper.tex").write_text(
+        "\\section{Intro}\n"
+        "\\includegraphics{figs/overview.png}\n"  # tracked -- kept
+        "\\includegraphics{figs/ghost.png}\n"  # not tracked -- ghost, must be skipped
+    )
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        with caplog.at_level("WARNING", logger="rce.ingest.latex"):
+            counts = latex.ingest_latex_repo(
+                conn, tmp_path, ["paper.tex"], [], image_paths=["figs/overview.png"]
+            )
+
+        assert counts["figures"] == 1  # only the tracked one counted
+        assert db.get_node(conn, "figure:figs/overview.png") is not None
+        assert db.get_node(conn, "figure:figs/ghost.png") is None  # no ghost node
+        assert db.query_edges(conn, dst="figure:figs/ghost.png") == []  # no ghost edge
+        assert any("ghost figure" in r.message and "figs/ghost.png" in r.message for r in caplog.records)
+    finally:
+        conn.close()
+
+
+def test_includegraphics_image_inventory_none_disables_validation(tmp_path):
+    # Default (image_paths=None) keeps this function usable standalone, e.g.
+    # in tests that don't build a full repo file inventory -- unresolved
+    # image paths are accepted exactly as before this change.
+    (tmp_path / "paper.tex").write_text("\\section{Intro}\n\\includegraphics{anything.png}\n")
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        counts = latex.ingest_latex_repo(conn, tmp_path, ["paper.tex"], [])
+        assert counts["figures"] == 1
+        assert db.get_node(conn, "figure:anything.png") is not None
+    finally:
+        conn.close()

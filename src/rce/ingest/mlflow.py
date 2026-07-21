@@ -6,7 +6,10 @@ upsert_node/upsert_edge (idempotency inherited from there). Corrupted runs
 and unresolvable connector keys are skipped + logged, never guessed: an
 absent git SHA never becomes a placeholder Commit node, an ambiguous
 artifact basename never guesses a Figure (HANDOFF-SPEC.md section 0/5).
-Top-level `models/`/`.trash/` are MLflow-internal, not experiment dirs.
+Top-level `models/`/`.trash/` are MLflow-internal, not experiment dirs, and
+neither is an experiment-level `tags/` dir (`mlruns/<exp_id>/tags/`, holding
+experiment tags rather than a run) -- both are silently skipped rather than
+misreported as a corrupted run (T5.5 review item 3).
 """
 
 from __future__ import annotations
@@ -22,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 _ARTIFACT_IMAGE_EXTENSIONS = frozenset({".png", ".pdf", ".jpg", ".svg"})
 _RESERVED_TOP_LEVEL_DIRS = frozenset({"models", ".trash"})
+# Directory names under mlruns/<exp_id>/ that are MLflow-internal bookkeeping,
+# not a run_id -- currently just experiment-level tags/ (mlruns/<exp>/tags/,
+# holding experiment tags, distinct from a run's own <run_id>/tags/). Run ids
+# are MLflow-generated UUIDs, never this literal name, so the check is safe.
+_RESERVED_EXPERIMENT_SUBDIRS = frozenset({"tags"})
 
 # "关键 tags" (T3 brief): tags/ also holds noisy housekeeping entries (e.g.
 # mlflow.log-model.history, a large JSON blob); attrs keeps only this
@@ -86,7 +94,10 @@ def _iter_run_dirs(mlruns_root: Path):
     for exp_dir in sorted(p for p in mlruns_root.iterdir() if p.is_dir()):
         if exp_dir.name in _RESERVED_TOP_LEVEL_DIRS:
             continue
-        yield from sorted(p for p in exp_dir.iterdir() if p.is_dir())
+        for candidate in sorted(p for p in exp_dir.iterdir() if p.is_dir()):
+            if candidate.name in _RESERVED_EXPERIMENT_SUBDIRS:
+                continue  # MLflow-internal (e.g. experiment-level tags/), not a run -- silent skip
+            yield candidate
 
 def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, int]:
     """Per run: upsert Experiment node `experiment:<run_id>` (attrs:
@@ -152,7 +163,10 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
                 )
                 counts["implements"] += 1
             else:
-                logger.info(
+                # T5.5 review item 3: was logger.info -- promoted to warning so this
+                # skip is counted in the CLI's shared skip total (verify-after-each-
+                # -file: same "rce.ingest" logger hierarchy as latex.py/git.py skips).
+                logger.warning(
                     "run %s references commit %s not found in graph; skipping "
                     "implements edge (no placeholder commit created)", run_id, sha,
                 )
