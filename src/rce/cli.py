@@ -1,9 +1,9 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query`.
 
 stdlib argparse only (HANDOFF-SPEC.md section 0, Occam rule 1). Orchestrates
-the existing extractors (rce.ingest.git/latex/pyfig/mlflow) and rce.db
-(section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow); writes only
-via db.upsert_node/upsert_edge, no new graph mutation logic here.
+the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
+(section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow -> wandb);
+writes only via db.upsert_node/upsert_edge, no new graph mutation logic here.
 
 A project is "initialized" once `<root>/.rce/graph.db` exists (`rce init`);
 every other command requires that file and errors clearly if absent (no
@@ -26,6 +26,7 @@ from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
 from rce.ingest import pyfig as pyfig_ingest
+from rce.ingest import wandb as wandb_ingest
 
 RCE_DIRNAME = ".rce"
 DB_FILENAME = "graph.db"
@@ -156,6 +157,17 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 print(f"  mlflow: {mlruns_path} -> {_format_counts(mlflow_counts)}")
             else:
                 print("  mlflow: skipped (no --mlruns given and no mlruns/ directory found)")
+            if args.wandb:
+                entity, sep, wandb_project = args.wandb.partition("/")
+                if not sep or not entity or not wandb_project:
+                    raise CliError(f"--wandb expects 'entity/project', got {args.wandb!r}")
+                try:
+                    wandb_counts = wandb_ingest.ingest_wandb_project(conn, entity, wandb_project)
+                except wandb_ingest.WandbError as exc:
+                    raise CliError(f"wandb ingestion failed: {exc}") from exc
+                print(f"  wandb: {args.wandb} -> {_format_counts(wandb_counts)}")
+            else:
+                print("  wandb: skipped (no --wandb given)")
             skipped = warnings.count
         print("Ingest summary (whole graph):")
         _print_graph_counts(conn)
@@ -230,6 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mlruns", default=None,
         help="MLflow local FileStore dir (default: <path>/mlruns if present)",
+    )
+    p.add_argument(
+        "--wandb", default=None, metavar="ENTITY/PROJECT",
+        help=(
+            "W&B entity/project to ingest, e.g. 'acme/my-project' "
+            "(requires the WANDB_API_KEY env var; see rce.ingest.wandb)"
+        ),
     )
     p.set_defaults(func=cmd_ingest)
 
