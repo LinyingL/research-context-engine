@@ -50,11 +50,12 @@ def test_transform_creates_node_and_both_edges_strips_media_blob(conn):
     assert len(implements) == 1
     edge = implements[0]
     assert edge["extractor"] == "wandb" and edge["confidence"] == 1.0 and edge["status"] == "auto"
-    assert edge["evidence"] == {"run_id": "run_a", "sha": sha}
+    # (T10) db.upsert_edge now wraps evidence as {"occurrences": [...]}.
+    assert edge["evidence"] == {"occurrences": [{"run_id": "run_a", "sha": sha}]}
 
     produces = db.query_edges(conn, src="experiment:run_a", dst="figure:overview.png", type="produces")
     assert len(produces) == 1
-    assert produces[0]["evidence"] == {"run_id": "run_a", "file_name": "overview.png"}
+    assert produces[0]["evidence"] == {"occurrences": [{"run_id": "run_a", "file_name": "overview.png"}]}
 
 def test_transform_conservatively_skips_unresolvable_connectors(conn):
     fake_sha = "d" * 40  # never ingested as a commit: node

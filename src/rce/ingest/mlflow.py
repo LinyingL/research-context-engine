@@ -108,12 +108,27 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
     is skipped + logged, never guessed; a run dir with no readable
     meta.yaml is corrupted and skipped entirely. Idempotent via db.upsert_*.
     Returns counts of nodes and each edge type written.
+
+    T10: if any run has no mlflow.source.git.commit tag at all (as opposed
+    to a tagged sha that just isn't in the graph -- that case is already
+    logged per-run above), one summary warning is logged at the end of this
+    function -- "N of M runs have no git commit tag; implements edges cannot
+    be built" -- rather than per-run noise across dozens/hundreds of runs.
     """
     mlruns_root = Path(mlruns_root)
     counts = {"experiments": 0, "implements": 0, "produces": 0}
     if not mlruns_root.is_dir():
         logger.warning("mlruns directory not found: %s", mlruns_root)
         return counts
+
+    # T10: a run with no mlflow.source.git.commit tag at all (as opposed to
+    # one whose tagged sha just isn't in the graph, handled separately below)
+    # used to be entirely silent -- no implements edge, no log line, nothing
+    # to notice. A real testbed had 32/32 runs missing the tag with zero
+    # visibility into why no implements edges existed. Counted here and
+    # reported as one summary line at the end of ingest, not per-run (avoids
+    # log spam across dozens/hundreds of runs).
+    runs_missing_git_tag = 0
 
     # Built once (this module never writes figure: nodes) via
     # db.get_nodes_by_type, keeping raw SQL confined to db.py.
@@ -170,6 +185,8 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
                     "run %s references commit %s not found in graph; skipping "
                     "implements edge (no placeholder commit created)", run_id, sha,
                 )
+        else:
+            runs_missing_git_tag += 1
 
         artifacts_dir = run_dir / "artifacts"
         for artifact_path in sorted(artifacts_dir.rglob("*")) if artifacts_dir.is_dir() else []:
@@ -191,5 +208,11 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
                 confidence=1.0, status="auto",
             )
             counts["produces"] += 1
+
+    if runs_missing_git_tag:
+        logger.warning(
+            "%d of %d runs have no git commit tag; implements edges cannot be built",
+            runs_missing_git_tag, counts["experiments"],
+        )
 
     return counts

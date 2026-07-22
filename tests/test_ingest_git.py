@@ -80,7 +80,8 @@ def test_ingest_creates_commit_and_contributor_and_edge(repo, conn):
     assert edge["extractor"] == "git"
     assert edge["confidence"] == 1.0
     assert edge["status"] == "auto"
-    assert edge["evidence"] == {"sha": sha}
+    # (T10) db.upsert_edge now wraps evidence as {"occurrences": [...]}.
+    assert edge["evidence"] == {"occurrences": [{"sha": sha}]}
 
 def test_ingest_lowercases_contributor_identity(repo, conn):
     _commit(repo, "a.py", "x\n", "msg", "Alice", "Alice@Example.COM")

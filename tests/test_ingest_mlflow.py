@@ -74,11 +74,12 @@ def test_ingest_creates_node_and_both_edges_skips_corrupted_run(tmp_path, conn, 
     assert len(implements) == 1
     edge = implements[0]
     assert edge["extractor"] == "mlflow" and edge["confidence"] == 1.0 and edge["status"] == "auto"
-    assert edge["evidence"] == {"run_id": "run_a", "sha": repo_sha}
+    # (T10) db.upsert_edge now wraps evidence as {"occurrences": [...]}.
+    assert edge["evidence"] == {"occurrences": [{"run_id": "run_a", "sha": repo_sha}]}
 
     produces = db.query_edges(conn, src="experiment:run_a", dst="figure:overview.png", type="produces")
     assert len(produces) == 1
-    assert produces[0]["evidence"] == {"run_id": "run_a", "artifact_path": "overview.png"}
+    assert produces[0]["evidence"] == {"occurrences": [{"run_id": "run_a", "artifact_path": "overview.png"}]}
 
 def test_ingest_conservatively_skips_unresolvable_connectors(tmp_path, conn):
     fake_sha = "d" * 40  # absent from the graph: no commit was ever ingested here
@@ -138,3 +139,50 @@ def test_experiment_level_tags_dir_is_silently_skipped_not_reported_corrupted(tm
     assert counts == {"experiments": 1, "implements": 1, "produces": 1}  # tags/ contributes nothing
     assert db.get_node(conn, "experiment:tags") is None  # never mistaken for a run
     assert not any("corrupted" in r.message or "no meta.yaml" in r.message for r in caplog.records)
+
+
+# -- T10: summarized visibility for runs with no git commit tag at all -----
+
+
+def _build_run_without_git_tag(mlruns_root: Path, run_id: str, exp_id: str = "0") -> Path:
+    """A well-formed run with no mlflow.source.git.commit tag at all -- the
+    real testbed failure mode (32/32 runs), distinct from _build_run's
+    tagged-sha-not-in-graph case tested above."""
+    run_dir = mlruns_root / exp_id / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.yaml").write_text(
+        f"experiment_id: '{exp_id}'\nrun_id: {run_id}\nrun_name: no-tag-run\nstatus: FINISHED\n"
+    )
+    _write(run_dir / "tags", {"mlflow.runName": "no-tag-run"})  # no git.commit tag
+    return run_dir
+
+
+def test_runs_with_no_git_tag_are_summarized_once_not_per_run(tmp_path, conn, repo_sha, caplog):
+    # Before this fix, a run missing the tag entirely was completely
+    # silent -- no edge, no log line. Must now produce exactly one summary
+    # warning covering all such runs, not one line per run (log-spam guard).
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_a", repo_sha)  # has the tag -- must not count
+    _build_run_without_git_tag(mlruns, "run_no_tag_1")
+    _build_run_without_git_tag(mlruns, "run_no_tag_2")
+
+    with caplog.at_level("WARNING", logger="rce.ingest.mlflow"):
+        counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts["experiments"] == 3
+    assert counts["implements"] == 1  # only run_a
+    summary_records = [r for r in caplog.records if "no git commit tag" in r.message]
+    assert len(summary_records) == 1  # one summary line, not per-run
+    assert summary_records[0].message == (
+        "2 of 3 runs have no git commit tag; implements edges cannot be built"
+    )
+
+
+def test_no_summary_warning_when_all_runs_have_git_tag(tmp_path, conn, repo_sha, caplog):
+    mlruns = tmp_path / "mlruns"
+    _build_run(mlruns, "run_a", repo_sha)
+
+    with caplog.at_level("WARNING", logger="rce.ingest.mlflow"):
+        mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert not any("no git commit tag" in r.message for r in caplog.records)

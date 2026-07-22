@@ -21,12 +21,22 @@ enforced by this layer -- see HANDOFF-SPEC.md section 4):
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+# Cap on how many distinct evidence occurrences one edge accumulates (T10:
+# candidate-1 testbed found a figure \included twice in the same section
+# silently lost the first occurrence's evidence to the UNIQUE(src,dst,type,
+# extractor) upsert -- see upsert_edge/_merge_edge_evidence). Past this,
+# the oldest occurrence is dropped and the drop is logged, never silent.
+_MAX_EDGE_EVIDENCE_OCCURRENCES = 20
 
 NODE_TYPES = frozenset(
     {
@@ -216,6 +226,48 @@ def get_nodes_by_type(conn: sqlite3.Connection, type: str) -> list[dict[str, Any
     return nodes
 
 
+def _merge_edge_evidence(existing_evidence_json: str | None, new_evidence: dict[str, Any]) -> str:
+    """Fold `new_evidence` into an edge's evidence, returning the encoded JSON.
+
+    Every edge's evidence is stored as `{"occurrences": [dict, ...]}` --
+    even a first-ever occurrence uses this shape, so every reader has one
+    structure to handle (T10: candidate-1 testbed regression -- a figure
+    \\included twice in the same section used to lose the first occurrence's
+    evidence outright, because the old ON CONFLICT branch overwrote
+    `evidence` wholesale). A pre-T10 row stored evidence as a bare dict with
+    no wrapper; this is a read-time migration only (schema untouched, Occam
+    rule 4) -- such a row is treated as a single legacy occurrence rather
+    than requiring a schema/data migration.
+
+    Dedupes by content: an evidence dict equal to one already present is not
+    appended again, so a repeated idempotent re-ingest of the same line does
+    not grow the list. Caps at `_MAX_EDGE_EVIDENCE_OCCURRENCES`, dropping the
+    oldest occurrences and logging a warning when the cap is exceeded --
+    never silently, and never unbounded.
+    """
+    if existing_evidence_json is None:
+        occurrences: list[Any] = []
+    else:
+        existing = json.loads(existing_evidence_json)
+        if isinstance(existing, dict) and isinstance(existing.get("occurrences"), list):
+            occurrences = list(existing["occurrences"])
+        else:
+            occurrences = [existing]  # legacy bare-evidence row, pre-T10
+
+    if new_evidence not in occurrences:
+        occurrences.append(new_evidence)
+
+    if len(occurrences) > _MAX_EDGE_EVIDENCE_OCCURRENCES:
+        dropped = len(occurrences) - _MAX_EDGE_EVIDENCE_OCCURRENCES
+        occurrences = occurrences[dropped:]
+        logger.warning(
+            "edge evidence occurrences exceeded cap of %d; dropped %d oldest entr%s",
+            _MAX_EDGE_EVIDENCE_OCCURRENCES, dropped, "y" if dropped == 1 else "ies",
+        )
+
+    return json.dumps({"occurrences": occurrences})
+
+
 def upsert_edge(
     conn: sqlite3.Connection,
     src: str,
@@ -228,9 +280,12 @@ def upsert_edge(
 ) -> None:
     """Insert or update an edge, keyed on (src, dst, type, extractor).
 
-    Idempotent: re-running the same extractor over the same pair with a new
-    confidence/evidence/status updates the existing row rather than
-    duplicating it (see the UNIQUE constraint in migrations/0001_init.sql).
+    Idempotent: re-running the same extractor over the same pair updates the
+    existing row rather than duplicating it (see the UNIQUE constraint in
+    migrations/0001_init.sql) -- but unlike confidence/status, `evidence` is
+    never overwritten wholesale. It accumulates as
+    `{"occurrences": [...]}`; see `_merge_edge_evidence` for the merge/dedup/
+    cap rules (T10).
 
     `status` here is restricted to _MACHINE_EDGE_STATUSES ('auto'/'pending')
     -- a machine path must never conjure a 'confirmed' or 'rejected' verdict
@@ -238,13 +293,13 @@ def upsert_edge(
     set_edge_status for those. This mirrors the human_fields protection on
     nodes (set_human_fields is the only path that writes it).
 
-    Even with that restriction, the UPDATE branch below still only lets
-    `status` move to the incoming value when the row's *current* status is
-    still machine-owned ('auto' or 'pending'); once a human has moved it to
-    'confirmed' or 'rejected' via set_edge_status, a routine re-ingest by
-    the same extractor must not silently reopen or reset it.
-    evidence/confidence are machine-owned and keep updating regardless --
-    see tests/test_db.py::test_reingest_never_overwrites_confirmed_edge_status.
+    Even with that restriction, an existing row's status only moves to the
+    incoming value when its *current* status is still machine-owned ('auto'
+    or 'pending'); once a human has moved it to 'confirmed' or 'rejected' via
+    set_edge_status, a routine re-ingest by the same extractor must not
+    silently reopen or reset it. evidence/confidence are machine-owned and
+    keep updating regardless -- see
+    tests/test_db.py::test_reingest_never_overwrites_confirmed_edge_status.
 
     Every edge must carry non-empty evidence -- "no edge without evidence"
     is a hard invariant (HANDOFF-SPEC.md section 4/2). A placeholder like
@@ -266,23 +321,30 @@ def upsert_edge(
         raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
     if not evidence:
         raise ValueError("edge requires non-empty evidence")
-    evidence_json = json.dumps(evidence)
     now = _now()
-    conn.execute(
-        """
-        INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(src, dst, type, extractor) DO UPDATE SET
-            evidence = excluded.evidence,
-            confidence = excluded.confidence,
-            status = CASE
-                WHEN edges.status IN ('confirmed', 'rejected') THEN edges.status
-                ELSE excluded.status
-            END,
-            updated_at = excluded.updated_at
-        """,
-        (src, dst, type, extractor, evidence_json, confidence, status, now, now),
-    )
+    existing = conn.execute(
+        "SELECT evidence, status FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+        (src, dst, type, extractor),
+    ).fetchone()
+    if existing is None:
+        evidence_json = json.dumps({"occurrences": [evidence]})
+        conn.execute(
+            """
+            INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (src, dst, type, extractor, evidence_json, confidence, status, now, now),
+        )
+    else:
+        evidence_json = _merge_edge_evidence(existing["evidence"], evidence)
+        effective_status = existing["status"] if existing["status"] in ("confirmed", "rejected") else status
+        conn.execute(
+            """
+            UPDATE edges SET evidence = ?, confidence = ?, status = ?, updated_at = ?
+            WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
+            """,
+            (evidence_json, confidence, effective_status, now, src, dst, type, extractor),
+        )
     conn.commit()
 
 

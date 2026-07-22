@@ -57,7 +57,8 @@ def test_trace_walks_upstream_and_paper_side_from_figure(conn):
     produces_hop = next(h for h in result["hops"] if h["type"] == "produces")
     assert produces_hop["extractor"] == "test" and produces_hop["status"] == "auto"
     assert produces_hop["confidence"] == 0.9
-    assert produces_hop["evidence"] == {"note": "experiment:run1->figure:overview.png"}
+    # (T10) db.upsert_edge now wraps evidence as {"occurrences": [...]}.
+    assert produces_hop["evidence"] == {"occurrences": [{"note": "experiment:run1->figure:overview.png"}]}
 
 
 def test_trace_respects_max_hops(conn):

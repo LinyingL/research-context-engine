@@ -49,6 +49,14 @@ _LABEL_RE = re.compile(r"\\label\{([^{}]*)\}")
 _REF_RE = re.compile(r"\\ref\{([^{}]*)\}")
 _SLUG_INVALID_RE = re.compile(r"[^a-z0-9]+")
 
+# T10 (candidate-2 testbed regression): a \cite in the abstract/introduction,
+# before the paper's first \section, used to be dropped outright -- real
+# papers routinely cite prior work before any \section command. Such
+# citations now attach to this synthetic per-file section instead of being
+# lost; see parse_tex_file's cite-link handling below.
+_PREAMBLE_SLUG = "preamble"
+_PREAMBLE_TITLE = "Preamble/Abstract"
+
 def _normalize_bib_key(key: str) -> str:
     """Canonical form used for ref: node IDs and cite/bib matching.
 
@@ -147,7 +155,7 @@ class Link:
 class TexParseResult:
     tex_path: str
     sections: list[ParsedSection]
-    section_attrs: dict[str, dict[str, list]]
+    section_attrs: dict[str, dict[str, Any]]
     figure_links: list[Link]
     cite_links: list[Link]
 
@@ -160,18 +168,29 @@ class BibEntry:
 def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
     """Parse one .tex file, line by line. \\label/\\ref are recorded only
     onto the current section's attrs -- v0 adds no new edge type for them
-    (architecture decision, see deviations). A figure/cite/label/ref before
-    the first \\section has no Section to attach to and is skipped+logged:
-    the ontology has no document-level fallback node.
+    (architecture decision, see deviations). A figure/label/ref before the
+    first \\section still has no Section to attach to and is skipped+logged:
+    the ontology has no document-level fallback node for those.
+
+    A \\cite (or \\citep/\\citet/etc.) before the first \\section is the one
+    exception (T10, candidate-2 testbed regression): real papers routinely
+    cite prior work in the abstract or introduction before any \\section
+    command, and dropping those citations silently loses real evidence. Such
+    citations attach instead to a synthetic `section:<tex_rel_path>#preamble`
+    node (title "Preamble/Abstract", `attrs["synthetic"] = True`), created
+    lazily -- only emitted into `sections`/`section_attrs` (and so only ever
+    upserted as a node) when at least one such citation is actually present.
     """
     text = (Path(repo_root) / tex_rel_path).read_text(errors="replace")
     sections: list[ParsedSection] = []
-    section_attrs: dict[str, dict[str, list]] = {}
+    section_attrs: dict[str, dict[str, Any]] = {}
     figure_links: list[Link] = []
     cite_links: list[Link] = []
     slug_counts: dict[str, int] = {}
     current_id: str | None = None
     graphics_dir: str | None = None
+    preamble_id = f"section:{tex_rel_path}#{_PREAMBLE_SLUG}"
+    preamble_first_line: int | None = None
 
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = _strip_comment(raw_line)
@@ -208,17 +227,27 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
             figure_links.append(Link(current_id, f"figure:{resolved}", lineno))
 
         for cite_match in _CITE_RE.finditer(line):
-            if current_id is None:
-                logger.warning("%s:%d: \\cite before any \\section; skipping", tex_rel_path, lineno)
-                continue
+            cite_section_id = current_id
+            if cite_section_id is None:
+                # T10: attach to the synthetic preamble section instead of
+                # dropping -- see this function's docstring.
+                cite_section_id = preamble_id
+                if preamble_first_line is None:
+                    preamble_first_line = lineno
             for key in (k.strip() for k in cite_match.group(1).split(",")):
                 if key:
-                    cite_links.append(Link(current_id, key, lineno))
+                    cite_links.append(Link(cite_section_id, key, lineno))
 
         if current_id is not None:
             for attr_name, pattern in (("labels", _LABEL_RE), ("refs", _REF_RE)):
                 for m in pattern.finditer(line):
                     section_attrs[current_id][attr_name].append({"name": m.group(1).strip(), "line": lineno})
+
+    if preamble_first_line is not None:
+        # Inserted first: textually, any preamble citation precedes every
+        # real \section in the file.
+        sections.insert(0, ParsedSection(preamble_id, _PREAMBLE_TITLE, "preamble", preamble_first_line))
+        section_attrs[preamble_id] = {"labels": [], "refs": [], "synthetic": True}
 
     return TexParseResult(tex_rel_path, sections, section_attrs, figure_links, cite_links)
 

@@ -146,8 +146,9 @@ def test_ingest_latex_repo_writes_nodes_edges_with_evidence_and_is_idempotent(tm
             "section:paper.tex#introduction", "section:paper.tex#motivation",
         }
         fig_line = _line_containing(TEX_CONTENT, "includegraphics[width")
+        # (T10) db.upsert_edge now wraps evidence as {"occurrences": [...]}.
         assert [e for e in includes if e["src"] == "section:paper.tex#introduction"][0]["evidence"] == {
-            "file": "paper.tex", "line": fig_line,
+            "occurrences": [{"file": "paper.tex", "line": fig_line}],
         }
         for edge in includes:
             assert edge["extractor"] == "latex" and edge["confidence"] == 1.0 and edge["status"] == "auto"
@@ -190,6 +191,69 @@ def test_unresolvable_paths_never_guessed(tmp_path):
     # Escapes the repo root, and an empty path -- both unresolvable.
     assert latex._resolve_figure_path("paper.tex", None, "../../etc/passwd") is None
     assert latex._resolve_figure_path("paper.tex", None, "") is None
+
+
+# -- T10 (candidate-2 testbed regression): preamble/abstract citations -----
+# were silently dropped -- \cite before the first \section (i.e. in the
+# abstract or introduction) now attaches to a synthetic
+# section:<file>#preamble node instead of being lost.
+
+
+def test_parse_tex_file_attaches_preamble_cite_to_synthetic_section(tmp_path):
+    (tmp_path / "paper.tex").write_text(
+        "\\begin{abstract}\nSee \\cite{early2020} for background.\n\\end{abstract}\n"
+        "\\section{Intro}\n\\cite{late2021}\n"
+    )
+    result = latex.parse_tex_file(tmp_path, "paper.tex")
+
+    preamble_id = "section:paper.tex#preamble"
+    assert result.cite_links[0] == latex.Link(preamble_id, "early2020", 2)
+    assert result.cite_links[1].section_id == "section:paper.tex#intro"
+
+    # Synthetic section is present, first in document order, correctly tagged.
+    assert result.sections[0].id == preamble_id
+    assert result.sections[0].title == "Preamble/Abstract"
+    assert result.section_attrs[preamble_id]["synthetic"] is True
+    assert result.section_attrs[preamble_id]["labels"] == []
+    assert result.section_attrs[preamble_id]["refs"] == []
+
+
+def test_parse_tex_file_no_preamble_section_when_no_cite_precedes_first_section(tmp_path):
+    # Lazy creation: a file with no preamble citation gets no synthetic node.
+    (tmp_path / "paper.tex").write_text("\\section{Intro}\n\\cite{a2020}\n")
+    result = latex.parse_tex_file(tmp_path, "paper.tex")
+    assert all(s.id != "section:paper.tex#preamble" for s in result.sections)
+    assert "section:paper.tex#preamble" not in result.section_attrs
+
+
+def test_ingest_latex_repo_creates_preamble_node_and_cites_edge(tmp_path):
+    (tmp_path / "paper.tex").write_text(
+        "\\cite{foo2020}\n\\section{Intro}\n\\cite{bar2021}\n"
+    )
+    (tmp_path / "refs.bib").write_text(
+        "@article{foo2020,\n  title = {Foo},\n  year = {2020},\n}\n"
+        "@article{bar2021,\n  title = {Bar},\n  year = {2021},\n}\n"
+    )
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        counts = latex.ingest_latex_repo(conn, tmp_path, ["paper.tex"], ["refs.bib"])
+        assert counts == {"sections": 2, "figures": 0, "cites": 2}  # preamble + Intro
+
+        preamble = db.get_node(conn, "section:paper.tex#preamble")
+        assert preamble is not None
+        assert preamble["type"] == "section"
+        assert preamble["title"] == "Preamble/Abstract"
+        assert preamble["attrs"]["synthetic"] is True
+        assert preamble["attrs"]["tex_path"] == "paper.tex"
+
+        preamble_cites = db.query_edges(conn, src="section:paper.tex#preamble", type="cites")
+        assert {e["dst"] for e in preamble_cites} == {"ref:foo2020"}
+
+        intro_cites = db.query_edges(conn, src="section:paper.tex#intro", type="cites")
+        assert {e["dst"] for e in intro_cites} == {"ref:bar2021"}
+    finally:
+        conn.close()
 
 
 # -- extended cite command coverage (HANDOFF-SPEC.md section 5, 2026-07-22) --

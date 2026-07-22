@@ -84,7 +84,11 @@ def test_ingest_pyfig_repo_literal_fstring_missing_file_and_idempotent(tmp_path,
         root_edge = next(e for e in edges if e["dst"] == "figure:figs/plot.png")
         assert root_edge["extractor"] == "pyfig" and root_edge["confidence"] == 1.0
         assert root_edge["status"] == "auto"
-        assert root_edge["evidence"] == {"file": "scripts/gen.py", "line": 3, "callee": "plt.savefig"}
+        # (T10) db.upsert_edge now wraps evidence as {"occurrences": [...]};
+        # re-running with identical evidence (idempotency) dedupes to one.
+        assert root_edge["evidence"] == {
+            "occurrences": [{"file": "scripts/gen.py", "line": 3, "callee": "plt.savefig"}]
+        }
         assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='generates'").fetchone()[0] == 2
 
         assert db.get_node(conn, "figure:no_such_file.png") is None
@@ -216,7 +220,8 @@ def test_module_constant_fstring_folds_successfully(tmp_path):
         edges = db.query_edges(conn, src=f"commit:{gen_sha}", type="generates")
         assert len(edges) == 1
         assert edges[0]["dst"] == "figure:figs/loss.png"
-        assert edges[0]["evidence"]["folded_from"] == "f'{SAVE_DIR}/loss.png'"
+        # (T10) evidence lives under the single occurrence's dict now.
+        assert edges[0]["evidence"]["occurrences"][0]["folded_from"] == "f'{SAVE_DIR}/loss.png'"
     finally:
         conn.close()
 
