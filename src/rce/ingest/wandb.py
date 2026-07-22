@@ -34,12 +34,17 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
+from rce.ingest import git as git_ingest
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.wandb.ai"
 _HTTP_TIMEOUT_SECONDS = 30
-_ARTIFACT_IMAGE_EXTENSIONS = frozenset({".png", ".pdf", ".jpg", ".svg"})
+# T11: reuse git.IMAGE_EXTENSIONS as the single source of truth for what
+# counts as an image file, rather than a local, narrower duplicate (the old
+# literal set here was missing .jpeg/.eps/.gif/.tiff/.tif, so e.g. a .jpeg
+# run file could never match a figure: node).
+_ARTIFACT_IMAGE_EXTENSIONS = git_ingest.IMAGE_EXTENSIONS
 _MEDIA_BLOB_MARKER = "_type"  # wandb's own marker for Table/Image/Histogram refs
 _MAX_STRING_LEN = 4000  # longer config/summary string values are truncated, not stored whole
 
@@ -106,7 +111,12 @@ def fetch_wandb_runs(
     entity: str, project: str, api_key: str | None = None, base_url: str = DEFAULT_BASE_URL,
 ) -> list[dict[str, Any]]:
     """Fetch every run's raw GraphQL node for entity/project, paginating via
-    the runs connection's cursor. Network + auth only -- no graph writes."""
+    the runs connection's cursor. Network + auth only -- no graph writes.
+
+    T11: connection/edges/pageInfo/endCursor are all structurally validated
+    below -- an unexpected shape (API change, non-standard server) raises
+    WandbError with context, never a bare KeyError.
+    """
     key = _resolve_api_key(api_key)
     runs: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -120,12 +130,40 @@ def fetch_wandb_runs(
                 f"W&B project not found or not accessible: {entity}/{project} "
                 "(check the name and that the key can read it)"
             )
-        connection = project_data["runs"]
-        runs.extend(edge["node"] for edge in connection["edges"])
-        page_info = connection["pageInfo"]
+        connection = project_data.get("runs")
+        if not isinstance(connection, dict):
+            raise WandbError(
+                f"W&B GraphQL response for {entity}/{project} is missing a "
+                f"valid 'runs' connection: {project_data!r}"
+            )
+        edges = connection.get("edges")
+        if not isinstance(edges, list):
+            raise WandbError(
+                f"W&B GraphQL response for {entity}/{project} has a malformed "
+                f"'runs.edges' (expected a list): {connection!r}"
+            )
+        for edge in edges:
+            node = edge.get("node") if isinstance(edge, dict) else None
+            if not isinstance(node, dict):
+                raise WandbError(
+                    f"W&B GraphQL response for {entity}/{project} has a run "
+                    f"edge missing its 'node': {edge!r}"
+                )
+            runs.append(node)
+        page_info = connection.get("pageInfo")
+        if not isinstance(page_info, dict):
+            raise WandbError(
+                f"W&B GraphQL response for {entity}/{project} has a malformed "
+                f"'runs.pageInfo' (expected a dict): {connection!r}"
+            )
         if not page_info.get("hasNextPage"):
             break
-        cursor = page_info["endCursor"]
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            raise WandbError(
+                f"W&B GraphQL pageInfo.hasNextPage is true but 'endCursor' is "
+                f"missing for {entity}/{project}: {page_info!r}"
+            )
     return runs
 
 # -- transform layer: pure functions of already-fetched JSON; no network --
@@ -159,8 +197,13 @@ def _parse_json_blob(raw: Any, run_id: str, field_name: str) -> dict[str, Any]:
 
 def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, int]:
     """Write each run's Experiment node + implements/produces edges via
-    rce.db. Idempotent via db.upsert_node/upsert_edge."""
+    rce.db. Idempotent via db.upsert_node/upsert_edge.
+
+    T11: counts["produces"] counts distinct (experiment, figure) edges
+    actually affected, not files scanned -- mirrors rce.ingest.mlflow.
+    """
     counts = {"experiments": 0, "implements": 0, "produces": 0}
+    produces_edges: set[tuple[str, str]] = set()
 
     figure_basenames: dict[str, list[str]] = {}  # built once, mirrors rce.ingest.mlflow
     for node in db.get_nodes_by_type(conn, "figure"):
@@ -222,8 +265,9 @@ def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, in
                 evidence={"run_id": run_id, "file_name": file_name},
                 confidence=1.0, status="auto",
             )
-            counts["produces"] += 1
+            produces_edges.add((experiment_id, matches[0]))
 
+    counts["produces"] = len(produces_edges)
     return counts
 
 def ingest_wandb_project(

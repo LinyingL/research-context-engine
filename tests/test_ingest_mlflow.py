@@ -106,6 +106,48 @@ def test_ingest_is_idempotent_on_repeat_run(tmp_path, conn, repo_sha):
     assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='produces'").fetchone()[0] == 1
 
 
+# -- T11: shared IMAGE_EXTENSIONS + produces counted by unique edge, not by file --
+
+
+def test_jpeg_artifact_recognized_via_shared_image_extensions(tmp_path, conn):
+    # Regression guard: _ARTIFACT_IMAGE_EXTENSIONS now reuses
+    # git.IMAGE_EXTENSIONS, which includes .jpeg -- the old local frozenset
+    # here did not, so a .jpeg artifact could never match a figure: node.
+    db.upsert_node(conn, "figure:chart.jpeg", "figure", title="chart.jpeg")
+    mlruns = tmp_path / "mlruns"
+    run_dir = mlruns / "0" / "run_jpeg"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.yaml").write_text(
+        "experiment_id: '0'\nrun_id: run_jpeg\nrun_name: jpeg-run\nstatus: FINISHED\n"
+    )
+    (run_dir / "artifacts").mkdir()
+    (run_dir / "artifacts" / "chart.jpeg").write_bytes(b"\xff\xd8\xff")
+
+    counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts["produces"] == 1
+    produces = db.query_edges(conn, src="experiment:run_jpeg", dst="figure:chart.jpeg", type="produces")
+    assert len(produces) == 1
+
+
+def test_produces_count_is_not_inflated_by_duplicate_basename_artifacts(tmp_path, conn, repo_sha):
+    # Two artifact files with the same basename in different subdirectories
+    # of one run both resolve to the same single figure match, so both
+    # upsert the *same* (experiment, figure) edge -- must count as 1, not 2.
+    mlruns = tmp_path / "mlruns"
+    run_dir = _build_run(mlruns, "run_a", repo_sha)
+    (run_dir / "artifacts" / "checkpoint_1").mkdir()
+    (run_dir / "artifacts" / "checkpoint_1" / "overview.png").write_bytes(b"\x89PNG")
+
+    counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts == {"experiments": 1, "implements": 1, "produces": 1}
+    assert conn.execute("SELECT COUNT(*) FROM edges WHERE type='produces'").fetchone()[0] == 1
+    produces = db.query_edges(conn, src="experiment:run_a", dst="figure:overview.png", type="produces")
+    assert len(produces) == 1
+    assert len(produces[0]["evidence"]["occurrences"]) == 2  # both files still recorded as evidence
+
+
 # -- T5.5 review item 3: unified skip verbosity + experiment-level tags/ --
 
 

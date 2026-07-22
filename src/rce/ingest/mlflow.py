@@ -20,10 +20,15 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from rce import db
+from rce.ingest import git as git_ingest
 
 logger = logging.getLogger(__name__)
 
-_ARTIFACT_IMAGE_EXTENSIONS = frozenset({".png", ".pdf", ".jpg", ".svg"})
+# T11: reuse git.IMAGE_EXTENSIONS as the single source of truth for what
+# counts as an image file, rather than a local, narrower duplicate (the old
+# literal set here was missing .jpeg/.eps/.gif/.tiff/.tif, so e.g. a .jpeg
+# artifact could never match a figure: node).
+_ARTIFACT_IMAGE_EXTENSIONS = git_ingest.IMAGE_EXTENSIONS
 _RESERVED_TOP_LEVEL_DIRS = frozenset({"models", ".trash"})
 # Directory names under mlruns/<exp_id>/ that are MLflow-internal bookkeeping,
 # not a run_id -- currently just experiment-level tags/ (mlruns/<exp>/tags/,
@@ -107,7 +112,8 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
     basename uniquely matches an existing figure: node. No/ambiguous match
     is skipped + logged, never guessed; a run dir with no readable
     meta.yaml is corrupted and skipped entirely. Idempotent via db.upsert_*.
-    Returns counts of nodes and each edge type written.
+    T11: counts["produces"] counts distinct (experiment, figure) edges
+    actually affected, not artifact files scanned.
 
     T10: if any run has no mlflow.source.git.commit tag at all (as opposed
     to a tagged sha that just isn't in the graph -- that case is already
@@ -129,6 +135,10 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
     # reported as one summary line at the end of ingest, not per-run (avoids
     # log spam across dozens/hundreds of runs).
     runs_missing_git_tag = 0
+
+    # T11: distinct (experiment, figure) pairs actually upserted -- see
+    # counts["produces"] note in this function's docstring.
+    produces_edges: set[tuple[str, str]] = set()
 
     # Built once (this module never writes figure: nodes) via
     # db.get_nodes_by_type, keeping raw SQL confined to db.py.
@@ -207,7 +217,7 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
                 },
                 confidence=1.0, status="auto",
             )
-            counts["produces"] += 1
+            produces_edges.add((experiment_id, matches[0]))
 
     if runs_missing_git_tag:
         logger.warning(
@@ -215,4 +225,5 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
             runs_missing_git_tag, counts["experiments"],
         )
 
+    counts["produces"] = len(produces_edges)
     return counts
