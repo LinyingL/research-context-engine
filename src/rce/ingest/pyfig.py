@@ -3,10 +3,23 @@ layer (T6, HANDOFF-SPEC.md section 5 connector 5). Uses stdlib `ast` (Occam
 rule 1/2: no third-party AST/regex library) to find
 `plt.savefig("...")`/`fig.savefig("...")`/`savefig("...")` call sites in
 git-tracked .py files whose first positional argument is a plain string
-literal. f-strings, name references, and any other computed expression are
-never guessed at -- HANDOFF-SPEC.md section 5: "拼不出来就放弃，不猜" -- they
-are skipped and logged. Writes `Commit --generates--> Figure` edges via
-rce.db's upsert_node/upsert_edge.
+literal, or one of a narrow set of same-file constant-foldable expressions
+(T9, see `_fold_expr`/`_collect_module_string_constants`). Anything outside
+those shapes is never guessed at -- HANDOFF-SPEC.md section 5: "拼不出来就
+放弃，不猜" -- it is skipped and logged. Writes `Commit --generates--> Figure`
+edges via rce.db's upsert_node/upsert_edge.
+
+T9: a name folds only if assigned exactly once, as a plain single-target
+`NAME = "..."` statement directly in the module's top-level body (never
+inside if/for/try/def/class), to a bare string literal. Given that table,
+three shapes fold: an f-string whose every interpolation is itself
+foldable; `"+"` concatenation of foldable operands; `os.path.join(...)`
+whose every argument is foldable. `pathlib.Path`'s `/` operator is
+deliberately excluded -- it dispatches on the left operand's runtime type,
+which would mean guessing at cross-module semantics rather than
+deterministic same-file analysis (architecture decision, not an
+oversight). Anything else makes the expression unfoldable; skipped and
+logged exactly as pre-T9.
 
 Each edge's src commit is resolved per call site via `git blame`
 (rce.ingest.git.blame_line), pinned to whichever commit last touched that
@@ -36,12 +49,15 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class SavefigCall:
     """One savefig(...) call site found by the AST scan, before path
-    resolution -- `literal` is the raw string exactly as written in source."""
+    resolution -- `literal` is the resolved string (verbatim, or folded per
+    T9). `folded_from` is None for a plain literal, else the original
+    expression's exact source text (T9 evidence trail)."""
 
     py_path: str
     line: int
     callee: str
     literal: str
+    folded_from: str | None = None
 
 
 def _callee_name(func: ast.expr) -> str | None:
@@ -59,23 +75,143 @@ def _callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def _first_arg_literal(call: ast.Call) -> str | None:
-    """The first positional argument's value, only when it is a plain string
-    literal. f-strings (ast.JoinedStr), name references, attribute access,
-    concatenation, and any other expression all return None here --
-    constitution: never guess at a path that isn't spelled out verbatim."""
+def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level names foldable into a savefig(...) expression (T9).
+
+    Two order-independent passes over `tree.body` only (never `ast.walk`,
+    so a name assigned inside if/for/try/def/class is never counted --
+    excludes conditional assignment for free). Pass 1 counts every
+    top-level touch of a name: `Assign` (incl. tuple/list-unpacking and
+    chained `a = b = ...`), `AugAssign`, `AnnAssign` -- so a name touched
+    more than once anywhere is flagged regardless of order ("重复赋值的名字
+    不折叠"). Pass 2 keeps only a name whose sole touch was a single-target
+    `NAME = "..."` Assign with a string-literal right-hand side. An
+    imported name is excluded the same way: import statements produce no
+    `Assign` node at all.
+    """
+    touch_count: dict[str, int] = {}
+
+    def _touch(name: str) -> None:
+        touch_count[name] = touch_count.get(name, 0) + 1
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    _touch(target.id)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for elt in target.elts:
+                        if isinstance(elt, ast.Name):
+                            _touch(elt.id)
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            _touch(stmt.target.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            _touch(stmt.target.id)
+
+    values: dict[str, str] = {}
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue  # multi-target chain or tuple/list unpacking -- never single-name-foldable
+        name = stmt.targets[0].id
+        if touch_count.get(name, 0) != 1:
+            continue  # reassigned (or also touched via AugAssign/AnnAssign) -- ambiguous
+        if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+            values[name] = stmt.value.value
+    return values
+
+
+def _is_os_path_join(func: ast.expr) -> bool:
+    """Matches only the dotted attribute chain `os.path.join` -- not an
+    aliased import, which would need tracking imports, not a syntactic check."""
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "join"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "path"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "os"
+    )
+
+
+def _fold_expr(expr: ast.expr, constants: dict[str, str]) -> str | None:
+    """Fold `expr` to a string using only literals and `constants` (T9).
+    Supports exactly three shapes (see module docstring for why
+    `pathlib.Path`'s `/` is excluded): an f-string whose every
+    interpolation has no conversion/format-spec and itself folds; `"+"`
+    concatenation of two foldable operands; `os.path.join(...)` (no
+    `**kwargs`/`*args`) whose every argument folds, joined with
+    `posixpath.join` to match this module's forward-slash convention. Any
+    other component returns None -- treated exactly like an unresolvable
+    literal: skip and log, never guess at a partial path.
+    """
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value
+    if isinstance(expr, ast.Name):
+        return constants.get(expr.id)
+    if isinstance(expr, ast.JoinedStr):
+        parts: list[str] = []
+        for value in expr.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                if value.conversion != -1 or value.format_spec is not None:
+                    return None
+                folded = _fold_expr(value.value, constants)
+                if folded is None:
+                    return None
+                parts.append(folded)
+            else:
+                return None
+        return "".join(parts)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left = _fold_expr(expr.left, constants)
+        right = _fold_expr(expr.right, constants)
+        if left is None or right is None:
+            return None
+        return left + right
+    if isinstance(expr, ast.Call) and _is_os_path_join(expr.func):
+        if expr.keywords:
+            return None
+        join_parts: list[str] = []
+        for arg in expr.args:
+            if isinstance(arg, ast.Starred):
+                return None
+            folded = _fold_expr(arg, constants)
+            if folded is None:
+                return None
+            join_parts.append(folded)
+        if not join_parts:
+            return None
+        return posixpath.join(*join_parts)
+    return None
+
+
+def _resolve_first_arg(
+    call: ast.Call, constants: dict[str, str]
+) -> tuple[str, ast.expr | None] | None:
+    """Resolve savefig(...)'s first arg. Returns `(value, folded_expr)`:
+    `folded_expr` is None for a plain literal (unchanged pre-T9), else the
+    original AST node (T9) -- caller extracts its exact source text for the
+    evidence trail. None if unresolvable (not a literal, not foldable)."""
     if not call.args:
         return None
     first = call.args[0]
     if isinstance(first, ast.Constant) and isinstance(first.value, str):
-        return first.value
-    return None
+        return first.value, None
+    folded = _fold_expr(first, constants)
+    if folded is None:
+        return None
+    return folded, first
 
 
 def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[SavefigCall]:
     """Scan one .py file for savefig(...) call sites. A file that fails to
     parse (SyntaxError -- e.g. non-Python source under a .py extension) is
-    skipped + logged, not fatal to the whole ingest run."""
+    skipped + logged, not fatal to the whole ingest run. Module-level string
+    constants are collected once per file (T9) so every call site can fold
+    against the same table."""
     path = Path(repo_root) / py_rel_path
     try:
         text = path.read_text(errors="replace")
@@ -88,6 +224,8 @@ def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[SavefigCall]:
         logger.warning("%s: cannot parse as Python (%s); skipping file", py_rel_path, exc)
         return []
 
+    module_constants = _collect_module_string_constants(tree)
+
     calls: list[SavefigCall] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -95,15 +233,19 @@ def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[SavefigCall]:
         callee = _callee_name(node.func)
         if callee is None:
             continue
-        literal = _first_arg_literal(node)
-        if literal is None:
+        resolved = _resolve_first_arg(node, module_constants)
+        if resolved is None:
             logger.warning(
                 "%s:%d: %s(...) first argument is not a string literal "
                 "(f-string/variable/expression); skipping, not guessing",
                 py_rel_path, node.lineno, callee,
             )
             continue
-        calls.append(SavefigCall(py_rel_path, node.lineno, callee, literal))
+        literal, folded_expr = resolved
+        folded_from = None
+        if folded_expr is not None:
+            folded_from = ast.get_source_segment(text, folded_expr) or ast.unparse(folded_expr)
+        calls.append(SavefigCall(py_rel_path, node.lineno, callee, literal, folded_from))
     return calls
 
 
@@ -156,10 +298,10 @@ def ingest_pyfig_repo(
     `image_paths` is the exact set of git-tracked image files (e.g. from
     rce.ingest.git.list_source_files()["image"]) a resolved literal must
     hit -- mirrors rce.ingest.latex's ghost-figure guard, so every Figure
-    node created here is backed by a real repo file. Idempotent via
-    db.upsert_node/upsert_edge plus the stable blame-resolved src: a
-    re-ingest of an unchanged script updates the same edge row instead of
-    inserting a new one.
+    node created here is backed by a real repo file. Runs identically
+    whether `call.literal` is a plain literal or was constant-folded (T9):
+    folding is never a pass around this guard. Idempotent via
+    db.upsert_node/upsert_edge plus the stable blame-resolved src.
     """
     counts = {"generates": 0}
     if git_ingest.read_head_sha(repo_root) is None:
@@ -185,10 +327,13 @@ def ingest_pyfig_repo(
                 continue
             commit_id = f"commit:{blame_sha}"
             figure_id = f"figure:{figure_path}"
+            evidence = {"file": call.py_path, "line": call.line, "callee": call.callee}
+            if call.folded_from is not None:
+                evidence["folded_from"] = call.folded_from  # T9: folded argument only
             db.upsert_node(conn, figure_id, "figure", title=figure_path)
             db.upsert_edge(
                 conn, commit_id, figure_id, "generates", extractor="pyfig",
-                evidence={"file": call.py_path, "line": call.line, "callee": call.callee},
+                evidence=evidence,
                 confidence=1.0, status="auto",
             )
             counts["generates"] += 1

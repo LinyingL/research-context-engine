@@ -60,10 +60,10 @@ def test_ingest_pyfig_repo_literal_fstring_missing_file_and_idempotent(tmp_path,
     (repo / "scripts" / "local.png").write_bytes(b"\x89PNG")
     (repo / "scripts" / "gen.py").write_text(
         "import matplotlib.pyplot as plt\n"
-        "name = 'plot'\n"
+        "name = str('plot')\n"  # RHS not a plain string literal -- not T9-foldable
         "plt.savefig('figs/plot.png')\n"  # resolves relative to repo root
         "plt.savefig('local.png')\n"  # only resolves relative to scripts/
-        "plt.savefig(f'{name}.png')\n"  # f-string -- skip
+        "plt.savefig(f'{name}.png')\n"  # f-string over a non-foldable name -- skip
         "plt.savefig('no_such_file.png')\n"  # not a tracked image -- skip
     )
     gen_sha = _commit_all(repo, "add gen.py and figures")
@@ -183,5 +183,112 @@ def test_unborn_repo_skips_entire_scan(tmp_path, caplog):
         assert counts == {"generates": 0}
         assert db.query_edges(conn, type="generates") == []
         assert any("unborn repo" in r.message for r in caplog.records)
+    finally:
+        conn.close()
+
+
+# --- T9: same-file module constant folding -----------------------------------
+
+
+def test_module_constant_fstring_folds_successfully(tmp_path):
+    """T9: a module-level string constant inside an f-string folds to a real
+    path; the generates edge's evidence records `folded_from`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "figs").mkdir()
+    (repo / "figs" / "loss.png").write_bytes(b"\x89PNG")
+    (repo / "gen.py").write_text(
+        "import matplotlib.pyplot as plt\n"
+        "SAVE_DIR = 'figs'\n"
+        "plt.savefig(f'{SAVE_DIR}/loss.png')\n"
+    )
+    gen_sha = _commit_all(repo, "add gen.py with module constant f-string")
+    known_images = ["figs/loss.png"]
+
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        git_ingest.ingest_git_repo(conn, repo)
+        counts = pyfig.ingest_pyfig_repo(conn, repo, ["gen.py"], known_images)
+        assert counts == {"generates": 1}
+
+        edges = db.query_edges(conn, src=f"commit:{gen_sha}", type="generates")
+        assert len(edges) == 1
+        assert edges[0]["dst"] == "figure:figs/loss.png"
+        assert edges[0]["evidence"]["folded_from"] == "f'{SAVE_DIR}/loss.png'"
+    finally:
+        conn.close()
+
+
+def test_parse_py_file_skips_fstring_with_loop_variable(tmp_path, caplog):
+    """A for-loop-bound name is not a top-level Assign target -- never
+    folded; the f-string call site is skipped and logged as pre-T9."""
+    (tmp_path / "gen.py").write_text(
+        "for i in range(1):\n"
+        "    plt.savefig(f'figs/{i}.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+def test_parse_py_file_skips_reassigned_module_constant(tmp_path, caplog):
+    """A name assigned twice at module level is ambiguous and must not
+    fold (HANDOFF-SPEC.md T9: "重复赋值的名字不折叠")."""
+    (tmp_path / "gen.py").write_text(
+        "SAVE_DIR = 'figs'\n"
+        "SAVE_DIR = 'figs2'\n"
+        "plt.savefig(f'{SAVE_DIR}/loss.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+def test_parse_py_file_folds_os_path_join_mixed_forms(tmp_path):
+    """os.path.join(...) folds when every argument is either a plain
+    string literal or a foldable module-level constant (T9)."""
+    (tmp_path / "gen.py").write_text(
+        "import os\n"
+        "SAVE_DIR = 'out'\n"
+        "plt.savefig(os.path.join(SAVE_DIR, 'loss.png'))\n"
+    )
+    calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert [(c.literal, c.folded_from) for c in calls] == [
+        ("out/loss.png", "os.path.join(SAVE_DIR, 'loss.png')"),
+    ]
+
+
+def test_folded_path_not_a_tracked_image_is_still_caught(tmp_path, caplog):
+    """A folded path must still pass the tracked-image verification --
+    folding is not a free pass around the ghost-figure guard."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "figs").mkdir()
+    (repo / "figs" / "other.png").write_bytes(b"\x89PNG")  # exists, but not the folded target
+    (repo / "gen.py").write_text(
+        "import matplotlib.pyplot as plt\n"
+        "SAVE_DIR = 'figs'\n"
+        "plt.savefig(f'{SAVE_DIR}/missing.png')\n"
+    )
+    _commit_all(repo, "add gen.py with folded path to a missing file")
+    known_images = ["figs/other.png"]
+
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        git_ingest.ingest_git_repo(conn, repo)
+        with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+            counts = pyfig.ingest_pyfig_repo(conn, repo, ["gen.py"], known_images)
+        assert counts == {"generates": 0}
+        assert db.query_edges(conn, type="generates") == []
+        assert any(
+            "does not resolve to a tracked repo image" in r.message and "missing.png" in r.message
+            for r in caplog.records
+        )
     finally:
         conn.close()
