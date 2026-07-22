@@ -7,7 +7,10 @@ name = "rce"
 version = "0.1.0"
 description = "Research Context Engine -- local provenance graph over git/LaTeX/W&B for research projects."
 requires-python = ">=3.11"
-dependencies = []
+# "mcp" (official Model Context Protocol SDK): the project's first runtime
+# dependency, approved by Owner 2026-07-22 for T5 (constitution section 0,
+# Occam rule 1 -- official SDK over a hand-rolled stdio/JSON-RPC protocol).
+dependencies = ["mcp>=1.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

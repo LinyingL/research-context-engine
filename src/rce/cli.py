@@ -21,6 +21,7 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from rce import db
+from rce import mcp_server
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
@@ -239,10 +240,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("node_id", help="node id, e.g. figure:overview.png")
     p.set_defaults(func=cmd_query)
 
+    # `mcp`'s own args (--path etc.) are parsed by rce.mcp_server.main itself,
+    # not by this parser -- see the argv[0] == "mcp" interception in main()
+    # below. Registered here only so it shows up in `rce --help`'s command
+    # list; its own --help is served by mcp_server's parser instead (prog
+    # "rce mcp"), which is why it takes no arguments here.
+    sub.add_parser(
+        "mcp",
+        help="Start the MCP stdio server (product's primary interface); args pass through, e.g. 'rce mcp --path .'",
+    )
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "mcp":
+        # Pass-through per T5's architecture: rce.mcp_server.main does its own
+        # argument parsing (e.g. --path), so forward the remainder untouched
+        # rather than re-declaring the same options in this parser.
+        return mcp_server.main(argv[1:])
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
