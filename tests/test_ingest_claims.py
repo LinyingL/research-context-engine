@@ -221,6 +221,134 @@ See Table~\ref{tab:results} and \citep{smith2020} from 2024 on page 12.
     assert claims.parse_tex_claims(repo, "paper.tex") == []  # no decimal-bearing number on that line
 
 
+# --- Real-paper misextraction audit (P1) -----------------------------------
+#
+# A full manual audit of 70 extracted claims across two real papers found
+# only 38 (54.3%) were genuine assertions; all 32 misextractions fell into
+# exactly three categories below. Category (a) alone accounted for 26 of
+# the 32 (81%) -- one paper's own method name, "1.58-bit", printed 26 times.
+
+
+def test_skips_hyphenated_compound_modifier_numbers(tmp_path):
+    # Category (a), 26/32 (81%) of the audited misextractions: a decimal
+    # number glued to a unit/count word by a hyphen is a compound modifier
+    # (adjective), not a quantitative claim -- "1.58-bit precision" is the
+    # real paper's own method name, not an assertion. Deterministic syntax
+    # rule (number immediately followed by "-<letter>"), not a threshold; it
+    # has no false-claim direction, only a false-skip one -- a genuine claim
+    # shaped the same way ("a 2.3-point improvement") is also skipped, which
+    # DESIGN.md section 0 ("never guess") accepts. Integer forms like
+    # "4-shot"/"8-bit"/"3-fold" never even reach this rule: they lack a
+    # decimal point, so _CLAIM_RE's plain/math alternatives (which require
+    # one) never match them regardless.
+    repo = _repo(
+        tmp_path,
+        r"""\section{Method}
+We call this quantization scheme 1.58-bit precision, following BitNet.
+A 2.3-point improvement over the baseline would be a real claim (skipped anyway, known trade-off).
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_blanks_begin_environment_required_and_optional_args(tmp_path):
+    # Category (b), 5/32 of the audited misextractions: _OPTIONAL_ARG_RE
+    # only sees a command's OWN [...] argument, never the [...]/{...}
+    # arguments attached to \begin{env} itself -- subfigure/minipage/
+    # wrapfigure carry a layout-length argument there in nearly every real
+    # paper. This is independent of _SKIP_ENV_NAMES: subfigure/minipage
+    # don't skip their body (real prose can follow), but their own opening
+    # arguments are never prose either way.
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+\begin{subfigure}[b]{0.45\textwidth}
+We reach 87.3\% accuracy in this panel.
+\end{subfigure}
+
+\begin{minipage}[t]{0.48\linewidth}
+Final figure stays 33.3\%.
+\end{minipage}
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"87.3", "33.3"}  # 0.45/0.48 (layout args) excluded, body prose kept
+
+
+def test_blanks_href_url_argument_but_not_display_text(tmp_path):
+    # Category (c), 1/32 of the audited misextractions but present in
+    # nearly every paper: \href{https://doi.org/10.21105/joss.03998}{...}
+    # extracted "10.21105" as a bare claim. Only \href's FIRST argument (the
+    # URL) is blanked -- the second argument is display prose and may carry
+    # a real claim.
+    repo = _repo(
+        tmp_path,
+        r"""\section{References}
+See our software paper \href{https://doi.org/10.21105/joss.03998}{JOSS, reporting a 12.5\% speedup}.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"12.5"}  # DOI's "10.21105" excluded, display text's real claim kept
+
+
+def test_blanks_url_command_argument(tmp_path):
+    # \url{https://arxiv.org/abs/2402.17764} extracted "2402.17764" as a
+    # bare claim before \url joined the required-arg blanking whitelist.
+    repo = _repo(
+        tmp_path,
+        r"""\section{References}
+Code is available at \url{https://arxiv.org/abs/2402.17764}.
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_blanks_bare_url_typed_directly_in_prose(tmp_path):
+    # A URL with no \url/\href wrapper at all -- the whole URL span is
+    # blanked, not just the argument of a recognised command.
+    repo = _repo(
+        tmp_path,
+        r"""\section{References}
+See https://arxiv.org/abs/2402.17764 for the full experimental details.
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_still_recognizes_real_claims_from_the_audited_papers(tmp_path):
+    # Positive control: none of the three skip rules above should touch a
+    # genuine assertion. All four sentences are taken verbatim from the two
+    # real papers behind the P1 misextraction audit.
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+we reach 87.3\% accuracy
+
+contains 1.26 trillion tokens
+
+$e = 0.6$
+
+error below 3\%
+""",
+    )
+    forms = {(c.printed_number, c.unit_form) for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert forms == {
+        ("87.3", "percent"),
+        ("1.26", "plain"),
+        ("0.6", "fraction"),
+        ("3", "percent"),
+    }
+
+
 def test_precision_normalization_derived_from_printed_digits():
     # 87.3% -> 0.873 at 3dp (1 printed decimal + 2 for the percent shift).
     assert claims._normalize("87.3", "percent") == (claims.Decimal("0.873"), 3)

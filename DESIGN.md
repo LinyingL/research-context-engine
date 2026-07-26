@@ -137,6 +137,18 @@ project. Nothing here requires metadata entry:
 Every one of these skips and logs rather than guessing when the key does not
 resolve cleanly.
 
+**Known limitation (connector 7).** A number immediately followed by a
+hyphen and a letter (`1.58-bit`, `3-fold`) is always treated as a compound
+modifier and skipped, never scanned as a claim — a deterministic syntax
+rule, not a tuned threshold. It has no false-claim direction, only a
+false-skip one: a genuine claim shaped the same way (`a 2.3-point
+improvement`) is skipped too. Section 0's "never guess" accepts that cost.
+For the same reason, a `\begin{env}`'s own argument groups (e.g. the layout
+length after `\begin{subfigure}`, or a `\begin{tabular}` column spec), the
+URL argument of `\url`/`\href`, and a bare `https://...` typed directly in
+prose are all blanked before number-scanning — a DOI or arXiv id's digits
+are not a claim about the paper's own results.
+
 ## Section 7 — Roadmap
 
 **Now.** The deterministic layer across git, LaTeX/BibTeX, `savefig()` static

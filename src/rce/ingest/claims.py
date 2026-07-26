@@ -21,12 +21,34 @@ substring pre-compile, unlike a `\cite` key). Deliberately a whitelist:
 `\textbf`/`\emph` keep their braces untouched because their argument may
 itself carry a real prose claim.
 
+A `\begin{env}` marker's own optional/required argument groups -- e.g.
+`\begin{subfigure}[b]{0.45\textwidth}` or `\begin{tabular}{lcc}` -- are
+blanked the same way, regardless of whether `env` is itself one of
+`_SKIP_ENV_NAMES`: that list decides whether the environment's *body* is
+skipped, not whether its own opening arguments are prose (they never are).
+`\url{...}`'s single required argument is blanked via the same whitelist
+mechanism as `\ref`/`\cite` above (a URL is an identifier, not prose);
+`\href{url}{text}` is special-cased so only its first argument (the URL) is
+blanked -- the second argument is display prose and may carry a real claim.
+A bare `https://...` URL typed directly in prose is blanked as its own span
+for the same reason -- otherwise a DOI's or arXiv id's digits (`10.21105`,
+`2402.17764`) present as a scannable plain-form number.
+
 Recognised forms, all requiring the number as literally printed:
 `\SI{87.3}{\percent}` and `87.3\%` (unit_form "percent"); `$92.1$` and bare
 `0.873` (unit_form "fraction" if in [0, 1] else "plain"). The bare/math forms
 require a decimal point, matching the spec's own examples -- this is also
 how integer-only section/figure/table numbers, page references, and years
 are excluded, with no separate numeric-range guess.
+
+A number immediately followed by a hyphen and a letter (`1.58-bit`,
+`3-fold`) is always skipped and logged, never scanned as a claim -- it is a
+compound modifier (an adjective built from the number), not a quantitative
+assertion. This is a deterministic syntax rule, not a tuned threshold, and
+it has no false-claim direction: the cost is that a genuine claim shaped
+the same way (`a 2.3-point improvement`) is also skipped. DESIGN.md section
+0 ("never guess") accepts that cost -- a missed claim is a normal outcome,
+a fabricated one is a defect.
 
 `_normalize`/`_round_half_up` implement the no-guessed-tolerance match rule:
 two values are a candidate match iff equal once both are rounded to the
@@ -66,9 +88,13 @@ _SKIP_ENV_NAMES = (
 )
 _SKIP_BEGIN_RE = re.compile(rf"\\begin\{{(?:{_SKIP_ENV_NAMES})\}}")
 _SKIP_END_RE = re.compile(rf"\\end\{{(?:{_SKIP_ENV_NAMES})\}}")
-# `\begin{tabularx}{\linewidth}{lcc}`-style trailing args need no special
-# handling: once the begin marker is seen, _blank_skip_regions already
-# blanks the rest of that line regardless of what follows.
+# `\begin{tabularx}{\linewidth}{lcc}`-style trailing args on one of these
+# skip-envs need no special handling here: once the begin marker is seen,
+# _blank_skip_regions already blanks the rest of that line regardless of
+# what follows. _BEGIN_ARGS_RE below (near _ARG_BLANK_RE) handles the
+# general case -- any \begin{env}'s own argument groups, whether or not env
+# is a skip-env (subfigure/minipage/wrapfigure never skip their body, but
+# their opening arguments are never prose either).
 
 # `\[ ... \]` has unambiguous open/close tokens, so it folds into the same
 # begin/end depth counter as the environments above. `$$` is not a distinct
@@ -96,24 +122,53 @@ _OPTIONAL_ARG_RE = re.compile(r"\\[A-Za-z]+\*?((?:\[[^\[\]]*\])+)")
 # missing a decimal-bearing filename is the safe failure direction here).
 _ARG_BLANK_CMDS = (
     r"ref|label|cite(?:p|t|alp)?|Citep|Citet|parencite|textcite|autocite"
-    r"|input|include|vspace|hspace|scalebox|resizebox|setlength"
+    r"|input|include|vspace|hspace|scalebox|resizebox|setlength|url"
 )
 _ARG_BLANK_RE = re.compile(
     rf"\\(?:{_ARG_BLANK_CMDS})(?![A-Za-z])\*?"
     rf"((?:\s*(?:\[[^\[\]]*\]|\{{[^{{}}]*\}}))+)"
 )
 
+# A `\begin{<env>}` marker's own optional/required argument groups -- e.g.
+# the `[b]{0.45\textwidth}` after `\begin{subfigure}`, or the `{lcc}` column
+# spec after `\begin{tabular}` -- are never prose, independent of whether
+# `env` is one of _SKIP_ENV_NAMES (that list is about the environment's
+# *body*, not its own opening arguments). Any environment name, not a
+# whitelist: an environment's own arguments are categorically not prose,
+# unlike a command's required argument (hence _ARG_BLANK_CMDS staying a
+# whitelist).
+_BEGIN_ARGS_RE = re.compile(
+    r"\\begin\{[A-Za-z]+\*?\}"
+    r"((?:\s*(?:\[[^\[\]]*\]|\{[^{}]*\}))+)"
+)
+
+# `\href{url}{text}` -- only the URL (first argument) is blanked; the
+# second argument is display prose and may itself carry a real claim, so
+# \href cannot simply join _ARG_BLANK_CMDS (which blanks every argument of
+# a whitelisted command).
+_HREF_URL_ARG_RE = re.compile(r"\\href(?![A-Za-z])\*?\{([^{}]*)\}")
+
+# A bare `https://...`/`http://...` URL typed directly in prose, with no
+# \url/\href wrapper. `{`/`}` are excluded from the char class so a match
+# starting inside `\url{...}`/`\href{...}{...}` stops cleanly at the
+# closing brace instead of consuming past it -- overlap with those two
+# regexes above is harmless (blanking the same span twice).
+_BARE_URL_RE = re.compile(r"(https?://[^\s{}]+)")
+
 
 def _blank_command_args(line: str) -> str:
-    """Blank every command's optional `[...]` argument, plus the
-    whitelisted commands' required `{...}` argument(s) -- replaced with
-    spaces so column offsets (and _extract_sentence) stay correct. Runs
-    before number-scanning so e.g.
-    `\\includegraphics[width=0.8\\textwidth]{overview.png}` and
-    `\\ref{fig:2.1}` never present a scannable digit; `\\SI{87.3}{\\percent}`
-    is untouched (\\SI is not in _ARG_BLANK_CMDS and has no `[...]`)."""
+    """Blank every command's optional `[...]` argument, the whitelisted
+    commands' required `{...}` argument(s), a `\\begin{env}`'s own argument
+    groups, the URL argument of `\\url`/`\\href`, and any bare URL in prose
+    -- replaced with spaces so column offsets (and _extract_sentence) stay
+    correct. Runs before number-scanning so e.g.
+    `\\includegraphics[width=0.8\\textwidth]{overview.png}`,
+    `\\ref{fig:2.1}`, `\\begin{subfigure}[b]{0.45\\textwidth}`, and
+    `\\href{https://doi.org/10.21105/joss.03998}{...}` never present a
+    scannable digit; `\\SI{87.3}{\\percent}` is untouched (\\SI is not in
+    _ARG_BLANK_CMDS and has no `[...]`)."""
     chars = list(line)
-    for regex in (_OPTIONAL_ARG_RE, _ARG_BLANK_RE):
+    for regex in (_OPTIONAL_ARG_RE, _ARG_BLANK_RE, _BEGIN_ARGS_RE, _HREF_URL_ARG_RE, _BARE_URL_RE):
         for m in regex.finditer(line):
             for i in range(m.start(1), m.end(1)):
                 chars[i] = " "
@@ -131,6 +186,15 @@ _CLAIM_RE = re.compile(
     rf"|(?<![\w.\\])(?P<plain>\d+\.\d+)(?!\.\d)(?!\w)"
 )
 _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
+
+# A number immediately followed by "-<letter>" (`1.58-bit`, `3-fold`) is a
+# compound modifier, not a claim -- deterministic syntax rule, no tuned
+# threshold (see module docstring for the accepted false-skip trade-off).
+# Applied as a post-match filter in the parse loop below, rather than
+# folded into _CLAIM_RE itself, so the skip can be logged with file/line/
+# raw text -- matching how every other skip decision in this module is
+# discoverable, not silent.
+_COMPOUND_MODIFIER_RE = re.compile(r"-[A-Za-z]")
 
 # Both extractors already writing experiment nodes (mlflow/wandb) put their
 # numeric metrics under one of these attrs keys -- see
@@ -299,6 +363,14 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
 
         sentence_seq: dict[tuple[int, int], int] = {}  # per-sentence-bounds counter, not per-line
         for m in _CLAIM_RE.finditer(line):
+            if _COMPOUND_MODIFIER_RE.match(line, m.end()):
+                logger.debug(
+                    "%s:%d: skipping %r -- number immediately followed by a "
+                    "hyphenated word (compound modifier, e.g. \"1.58-bit\"), "
+                    "not a prose claim",
+                    tex_rel_path, lineno, m.group(0),
+                )
+                continue
             if m.group("si") is not None:
                 unit_form, printed_number = "percent", m.group("si")
             elif m.group("pct") is not None:
