@@ -1,13 +1,24 @@
-"""RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query`.
+"""RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query` /
+`trace`.
 
 stdlib argparse only (HANDOFF-SPEC.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
 (section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow -> wandb);
 writes only via db.upsert_node/upsert_edge, no new graph mutation logic here.
+`trace` reuses rce.query.trace() directly -- multi-hop traversal logic lives
+in exactly one place.
 
 A project is "initialized" once `<root>/.rce/graph.db` exists (`rce init`);
 every other command requires that file and errors clearly if absent (no
 guessing, per the constitution).
+
+Positioning ruling 2026-07-22 (Owner): RCE is a local-first standalone tool;
+MCP is one optional exit among several, not a requirement. Concretely: (1)
+`rce.mcp_server` is imported lazily, only inside the `mcp` subcommand branch
+of main() below, so every other subcommand works with the optional 'mcp'
+extra uninstalled (see pyproject.toml); (2) `trace` exists here so multi-hop
+provenance is a full CLI feature, not something only reachable through an AI
+client's MCP tool calls.
 """
 
 from __future__ import annotations
@@ -19,9 +30,9 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from sqlite3 import Connection
+from typing import Any
 
-from rce import db
-from rce import mcp_server
+from rce import db, query
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
@@ -229,6 +240,83 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_occurrence(occurrence: dict[str, Any]) -> str:
+    """Render one evidence occurrence dict as a readable string.
+
+    Special-cases the common {"file": ..., "line": ...} shape (latex/pyfig
+    extractors) as "file:line"; every other key (sha, run_id, artifact_path,
+    callee, ...) falls back to sorted "key=value" pairs. This only reformats
+    keys that are actually present -- it never invents fields an extractor
+    didn't record.
+    """
+    remaining = dict(occurrence)
+    parts: list[str] = []
+    if "file" in remaining and "line" in remaining:
+        parts.append(f"{remaining.pop('file')}:{remaining.pop('line')}")
+    parts.extend(f"{key}={remaining[key]}" for key in sorted(remaining))
+    return ", ".join(parts) if parts else "(no detail)"
+
+
+def _format_evidence_summary(evidence: dict[str, Any]) -> str:
+    """Expand an edge's evidence into a readable summary.
+
+    db.upsert_edge stores evidence as {"occurrences": [dict, ...]} (T10); a
+    pre-T10 bare-evidence dict (see db._merge_edge_evidence's docstring) is
+    treated as its own single occurrence rather than requiring a migration.
+    """
+    occurrences = evidence.get("occurrences")
+    if not isinstance(occurrences, list):
+        occurrences = [evidence]
+    return "; ".join(_format_occurrence(occ) for occ in occurrences)
+
+
+def _format_trace_human(node_id: str, max_hops: int, result: dict[str, Any]) -> str:
+    """Indented, evidence-expanded text for `rce trace` (no --json)."""
+    if not result["hops"]:
+        return f"Node {node_id} exists but has no provenance edges recorded."
+    lines = [f"Provenance trace for {node_id} (max_hops={max_hops}):"]
+    for hop in result["hops"]:
+        indent = "  " * hop["depth"]
+        lines.append(f"{indent}[depth {hop['depth']}] {hop['src']} --{hop['type']}--> {hop['dst']}")
+        lines.append(
+            f"{indent}    extractor={hop['extractor']} confidence={hop['confidence']:.2f} "
+            f"status={hop['status']}"
+        )
+        lines.append(f"{indent}    evidence: {_format_evidence_summary(hop['evidence'])}")
+    return "\n".join(lines)
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    project_root = _resolve_project_root(".")
+    conn = db.connect(_require_db(project_root))
+    try:
+        result = query.trace(conn, args.node_id, max_hops=args.hops)
+    finally:
+        conn.close()
+
+    if not result["found"]:
+        print(f"No such node: {args.node_id}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(_format_trace_human(args.node_id, args.hops, result))
+    return 0
+
+
+def _import_mcp_server():
+    """Lazy import for the optional 'mcp' extra (positioning ruling
+    2026-07-22): rce.mcp_server does `from mcp.server.fastmcp import
+    FastMCP` at module scope, so importing it eagerly at this module's top
+    would make every `rce` subcommand require the mcp package. Only the
+    `mcp` subcommand needs it. Raises ImportError if the extra isn't
+    installed; the caller turns that into a clear, actionable message.
+    """
+    from rce import mcp_server
+
+    return mcp_server
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rce", description="Research Context Engine CLI.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -255,18 +343,40 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="Show node/edge counts and the pending confirmation queue")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("query", help="Show a node and its incoming/outgoing edges with evidence")
+    p = sub.add_parser(
+        "query",
+        help=(
+            "Show a node and its immediate (single-hop) incoming/outgoing edges with "
+            "evidence; use 'trace' for multi-hop provenance"
+        ),
+    )
     p.add_argument("node_id", help="node id, e.g. figure:overview.png")
     p.set_defaults(func=cmd_query)
 
+    p = sub.add_parser(
+        "trace",
+        help="Walk the multi-hop provenance chain from a node (see 'query' for single-hop)",
+    )
+    p.add_argument("node_id", help="node id, e.g. figure:overview.png")
+    p.add_argument("--hops", type=int, default=4, help="max traversal depth (default: 4)")
+    p.add_argument(
+        "--json", action="store_true", help="output structured JSON instead of human-readable text"
+    )
+    p.set_defaults(func=cmd_trace)
+
     # `mcp`'s own args (--path etc.) are parsed by rce.mcp_server.main itself,
     # not by this parser -- see the argv[0] == "mcp" interception in main()
-    # below. Registered here only so it shows up in `rce --help`'s command
-    # list; its own --help is served by mcp_server's parser instead (prog
-    # "rce mcp"), which is why it takes no arguments here.
+    # below, which also lazy-imports rce.mcp_server (via _import_mcp_server)
+    # so every other subcommand keeps working with the optional 'mcp' extra
+    # uninstalled. Registered here only so it shows up in `rce --help`'s
+    # command list; its own --help is served by mcp_server's parser instead
+    # (prog "rce mcp"), which is why it takes no arguments here.
     sub.add_parser(
         "mcp",
-        help="Start the MCP stdio server (product's primary interface); args pass through, e.g. 'rce mcp --path .'",
+        help=(
+            "optional: expose the graph to MCP-capable clients (requires "
+            "pip install \"rce[mcp]\"); args pass through, e.g. 'rce mcp --path .'"
+        ),
     )
 
     return parser
@@ -275,6 +385,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "mcp":
+        try:
+            mcp_server = _import_mcp_server()
+        except ImportError as exc:
+            print(
+                "Error: the 'mcp' subcommand requires the optional 'mcp' extra, "
+                "which is not installed (MCP is one of several optional exits, "
+                "not a requirement to use rce). Install it with: "
+                'pip install "rce[mcp]"\n'
+                f"(underlying error: {exc})",
+                file=sys.stderr,
+            )
+            return 1
         # Pass-through per T5's architecture: rce.mcp_server.main does its own
         # argument parsing (e.g. --path), so forward the remainder untouched
         # rather than re-declaring the same options in this parser.

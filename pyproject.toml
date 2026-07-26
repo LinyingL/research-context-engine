@@ -7,13 +7,21 @@ name = "rce"
 version = "0.1.0"
 description = "Research Context Engine -- local provenance graph over git/LaTeX/W&B for research projects."
 requires-python = ">=3.11"
-# "mcp" (official Model Context Protocol SDK): the project's first runtime
-# dependency, approved by Owner 2026-07-22 for T5 (constitution section 0,
-# Occam rule 1 -- official SDK over a hand-rolled stdio/JSON-RPC protocol).
-dependencies = ["mcp>=1.0"]
+# Zero required runtime third-party dependencies (positioning ruling
+# 2026-07-22: RCE is a local-first standalone tool, not an MCP product --
+# MCP is one optional exit among several, not a requirement to install the
+# engine). See [project.optional-dependencies] below.
+dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# "mcp" (official Model Context Protocol SDK) backs only rce.mcp_server /
+# `rce mcp` (constitution section 0, Occam rule 1 -- official SDK over a
+# hand-rolled stdio/JSON-RPC protocol); every other subcommand works without
+# it. Install with: pip install "rce[mcp]"
+mcp = ["mcp>=1.0"]
+# dev pulls in mcp too, so tests/test_mcp_server.py keeps running under the
+# full test suite.
+dev = ["pytest>=8", "mcp>=1.0"]
 
 [project.scripts]
 rce = "rce.cli:main"

@@ -1,7 +1,9 @@
-"""Tests for rce.cli (T4): init -> ingest -> status -> query via cli.main()
-against a real git+LaTeX+.bib+MLflow fixture (subprocess `git`, no mocking).
+"""Tests for rce.cli (T4): init -> ingest -> status -> query -> trace via
+cli.main() against a real git+LaTeX+.bib+MLflow fixture (subprocess `git`,
+no mocking).
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -181,3 +183,73 @@ def test_full_pipeline_init_ingest_status_query(paper_repo, monkeypatch, capsys)
 
     assert cli.main(["query", "figure:does-not-exist.png"]) == 1
     assert "No such node: figure:does-not-exist.png" in capsys.readouterr().err
+
+
+# -- Owner ruling 2026-07-22: `rce trace` gives non-MCP users full multi-hop
+# provenance (reuses rce.query.trace(), no logic duplicated here) --
+
+
+def test_trace_human_readable_shows_indented_evidence_chain(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    cli.main(["ingest", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    assert cli.main(["trace", "figure:overview.png"]) == 0
+    out = capsys.readouterr().out
+    assert "Provenance trace for figure:overview.png (max_hops=4):" in out
+    assert "section:paper.tex#intro --includes--> figure:overview.png" in out
+    assert "extractor=latex" in out and "confidence=1.00" in out and "status=auto" in out
+    # occurrences expanded to a readable "file:line" form, not a raw JSON blob
+    assert "evidence: paper.tex:2" in out
+
+
+def test_trace_json_outputs_structured_result(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    cli.main(["ingest", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    assert cli.main(["trace", "figure:overview.png", "--hops", "2", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["found"] is True
+    assert any(
+        h["type"] == "includes" and h["dst"] == "figure:overview.png" for h in result["hops"]
+    )
+
+
+def test_trace_missing_node_reports_clear_error(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    assert cli.main(["trace", "figure:does-not-exist.png"]) == 1
+    assert "No such node: figure:does-not-exist.png" in capsys.readouterr().err
+
+
+def test_trace_node_with_no_edges_says_so_not_fabricated(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    assert cli.main(["trace", f"project:{repo.name}"]) == 0
+    assert "no provenance edges recorded" in capsys.readouterr().out
+
+
+# -- Owner ruling 2026-07-22: `mcp` is optional; missing the extra must not
+# affect any other subcommand and must fail with a clear, actionable message --
+
+
+def test_mcp_command_reports_clear_error_when_mcp_extra_not_installed(monkeypatch, capsys):
+    def _boom():
+        raise ImportError("No module named 'mcp'")
+
+    monkeypatch.setattr(cli, "_import_mcp_server", _boom)
+
+    assert cli.main(["mcp", "--path", "."]) == 1
+    err = capsys.readouterr().err
+    assert "Error" in err and 'pip install "rce[mcp]"' in err
