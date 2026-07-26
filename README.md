@@ -1,5 +1,7 @@
 # RCE — Research Context Engine
 
+[![tests](https://github.com/LinyingL/research-context-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/LinyingL/research-context-engine/actions/workflows/tests.yml)
+
 A **local-first** provenance engine for research projects. It reads your
 existing git repo, LaTeX/.bib sources, and W&B/MLflow run history, and builds
 a queryable evidence graph that answers one question: *where did this result
