@@ -6,7 +6,10 @@ pattern.
 """
 
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from rce import db
 from rce.ingest import git as git_ingest
@@ -392,6 +395,64 @@ def test_parse_py_file_still_skips_pathlib_slash_operator(tmp_path, caplog):
         "from pathlib import Path\n"
         "SAVE_DIR = Path('figs')\n"
         "plt.savefig(SAVE_DIR / 'loss.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+# -- Opus re-review blocker fix: three more rebinding forms
+# `_count_all_name_bindings` never counted at all -- Lambda parameters,
+# `match` capture patterns, and PEP 695 `type` aliases -- each letting a
+# reused name still fold to its stale module-level literal. Confirmed via
+# `git show HEAD` against the pre-fix module (see completion report) that
+# every case below mis-folded to `'figures/f1.png'` before this patch.
+
+
+def test_parse_py_file_skips_lambda_parameter_shadowing_module_constant(tmp_path, caplog):
+    """A lambda parameter reuses a module constant's name and shadows it
+    inside the lambda body at runtime, exactly like a `def`'s parameter --
+    must not fold to the stale top-level literal."""
+    (tmp_path / "gen.py").write_text(
+        "OUT = 'figures'\n"
+        "save = lambda OUT: plt.savefig(OUT + '/f1.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+def test_parse_py_file_skips_match_case_capture_shadowing_module_constant(tmp_path, caplog):
+    """A `match` `case` capture pattern (`case ['save', OUT]:`) rebinds the
+    name for the rest of the match body, shadowing a same-named module
+    constant -- must not fold."""
+    (tmp_path / "gen.py").write_text(
+        "OUT = 'figures'\n"
+        "cmd = ['save', 'runtime_dir']\n"
+        "match cmd:\n"
+        "    case ['save', OUT]:\n"
+        "        plt.savefig(OUT + '/f1.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="PEP 695 `type` alias statement requires Python 3.12+",
+)
+def test_parse_py_file_skips_type_alias_shadowing_module_constant(tmp_path, caplog):
+    """A PEP 695 `type OUT = ...` alias rebinds the name at module level, so
+    it must count as a second touch and block the fold. Skipped (not
+    failed) below Python 3.12, where this syntax does not parse at all."""
+    (tmp_path / "gen.py").write_text(
+        "OUT = 'figures'\n"
+        "type OUT = str\n"
+        "plt.savefig(OUT + '/f1.png')\n"
     )
     with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
         calls = pyfig.parse_py_file(tmp_path, "gen.py")
