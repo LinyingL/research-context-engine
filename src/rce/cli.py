@@ -1,5 +1,5 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query` /
-`trace`.
+`trace` / `confirm` (F3).
 
 stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
@@ -19,6 +19,12 @@ of main() below, so every other subcommand works with the optional 'mcp'
 extra uninstalled (see pyproject.toml); (2) `trace` exists here so multi-hop
 provenance is a full CLI feature, not something only reachable through an AI
 client's MCP tool calls.
+
+F3 (Blocker C): `status --pending`/`confirm` give the zero-dependency
+baseline its own human-confirmation path -- previously the sole writer of
+`edges.status` was the optional `mcp` extra's `rce_confirm_edge`,
+contradicting DESIGN.md section 2 now that ingest writes real `pending`
+edges. stdlib argparse only.
 """
 
 from __future__ import annotations
@@ -103,6 +109,39 @@ def _print_graph_counts(conn: Connection) -> None:
     print(f"  Nodes: {_format_counts(node_counts)}")
     print(f"  Edges: {_format_counts(edge_counts)}")
     print(f"  Pending confirmation queue: {len(db.pending_edges(conn))}")
+
+
+def _ordered_edges(edges: list[dict]) -> list[dict]:
+    """Deterministic order shared by `status --pending` and `confirm
+    --index`, so the Nth edge one prints is the Nth edge the other resolves."""
+    return sorted(edges, key=lambda e: (e["src"], e["dst"], e["type"], e["extractor"]))
+
+
+def _format_pending_line(index: int, edge: dict) -> str:
+    return (
+        f"  [{index}] {edge['src']} --{edge['type']}--> {edge['dst']} "
+        f"extractor={edge['extractor']} confidence={edge['confidence']:.2f} "
+        f"evidence={_format_evidence_summary(edge['evidence'])}"
+    )
+
+
+def _print_pending_queue(conn: Connection, limit: int | None) -> None:
+    """Every pending edge, detailed enough to act on via `confirm`. `limit`
+    (no invented default -- unset prints all) truncates display only, and
+    only ever with an explicit notice, never silently."""
+    queue = _ordered_edges(db.pending_edges(conn))
+    print(f"Pending confirmation queue ({len(queue)}):")
+    if not queue:
+        print("  (empty)")
+        return
+    shown = queue if limit is None else queue[:limit]
+    for i, edge in enumerate(shown, start=1):
+        print(_format_pending_line(i, edge))
+    if limit is not None and len(queue) > limit:
+        print(
+            f"  ... truncated: showing {limit} of {len(queue)} pending edge(s) -- pass a larger "
+            f"--limit to see more. Indices are only valid for this run's own listing."
+        )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -202,6 +241,49 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         print(f"Project: {project_root}")
         _print_graph_counts(conn)
+        if args.pending:  # purely additive -- omitting it reproduces the prior output exactly
+            _print_pending_queue(conn, args.limit)
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """Thin wrapper over db.set_edge_status, mirroring
+    rce.mcp_server.confirm_edge's contract. Identifies the edge by its 4
+    identity columns, or by `--index` into a freshly re-queried queue."""
+    project_root = _resolve_project_root(args.path)
+    conn = db.connect(_require_db(project_root))
+    try:
+        positional = (args.src, args.dst, args.type, args.extractor)
+        if args.index is not None:
+            if any(v is not None for v in positional):
+                raise CliError("--index cannot be combined with the src/dst/type/extractor positional args")
+            queue = _ordered_edges(db.query_edges(conn, status=args.from_status))
+            if not 1 <= args.index <= len(queue):
+                raise CliError(
+                    f"--index {args.index} out of range: the {args.from_status!r} queue has "
+                    f"{len(queue)} edge(s) right now -- indices are 1-based and re-sorted on "
+                    f"every run, so re-check with 'rce status --pending' immediately before use"
+                )
+            edge = queue[args.index - 1]
+            src, dst, edge_type, extractor = edge["src"], edge["dst"], edge["type"], edge["extractor"]
+        else:
+            if any(v is None for v in positional):
+                raise CliError(
+                    "confirm requires either all four positional args (src dst type extractor) "
+                    "or --index (with --from-status)"
+                )
+            src, dst, edge_type, extractor = positional
+
+        matches = [
+            e for e in db.query_edges(conn, src=src, dst=dst, type=edge_type) if e["extractor"] == extractor
+        ]
+        if not matches:
+            raise CliError(f"no such edge: {src} --{edge_type}--> {dst} (extractor={extractor})")
+        old_status = matches[0]["status"]
+        db.set_edge_status(conn, src, dst, edge_type, extractor, args.status)
+        print(f"Edge {src} --{edge_type}--> {dst} (extractor={extractor}): {old_status} -> {args.status}")
     finally:
         conn.close()
     return 0
@@ -378,6 +460,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="Show node/edge counts and the pending confirmation queue")
     p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--pending", action="store_true",
+        help="also list each pending edge (src/dst/type/extractor/confidence/evidence) for 'rce confirm'",
+    )
+    p.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="cap how many pending edges --pending prints (default: no cap); truncation is always stated, never silent",
+    )
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser(
@@ -404,6 +494,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="output structured JSON instead of human-readable text"
     )
     p.set_defaults(func=cmd_trace)
+
+    p = sub.add_parser(
+        "confirm",
+        help="Human confirm/reject one edge (writes via db.set_edge_status) -- no mcp extra required",
+    )
+    p.add_argument("src", nargs="?", default=None, help="edge src node id, e.g. claim:paper.tex#abc123")
+    p.add_argument("dst", nargs="?", default=None, help="edge dst node id, e.g. experiment:run_a")
+    p.add_argument("type", nargs="?", default=None, help="edge type, e.g. backed_by")
+    p.add_argument("extractor", nargs="?", default=None, help="edge extractor, e.g. claims")
+    p.add_argument(
+        "--status", required=True, choices=["confirmed", "rejected"], help="new human verdict",
+    )
+    p.add_argument(
+        "--index", type=int, default=None, metavar="N",
+        help=(
+            "alternative to the 4 positional args: 1-based position in the --from-status queue, "
+            "re-queried/re-sorted by THIS invocation in the same order as 'status --pending'. Not "
+            "a stable id -- another confirm or ingest run can shift what index N means"
+        ),
+    )
+    p.add_argument(
+        "--from-status", default="pending", choices=sorted(db.EDGE_STATUSES),
+        help="status to select --index from (default: pending)",
+    )
+    p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_confirm)
 
     # `mcp`'s own args (--path etc.) are parsed by rce.mcp_server.main itself,
     # not by this parser -- see the argv[0] == "mcp" interception in main()

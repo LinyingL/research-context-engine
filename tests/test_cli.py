@@ -53,6 +53,24 @@ def paper_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, sha
 
 
+@pytest.fixture
+def claim_repo(tmp_path: Path) -> Path:
+    """One quantitative claim (87.3% accuracy) + a matching MLflow metric --
+    ingest produces exactly one pending `backed_by` edge (kept separate
+    from `paper_repo`, whose tests assert an *empty* pending queue)."""
+    repo = tmp_path / "claim_repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "paper.tex").write_text("\\section{Results}\nOur model achieves 87.3\\% accuracy.\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=A", "-c", "user.email=a@example.com", "commit", "-m", "add paper")
+    run_dir = repo / "mlruns" / "0" / "run_a"
+    (run_dir / "metrics").mkdir(parents=True)
+    (run_dir / "meta.yaml").write_text("experiment_id: '0'\nrun_id: run_a\nstatus: FINISHED\n")
+    (run_dir / "metrics" / "accuracy").write_text("0 0.873 0\n")
+    return repo
+
+
 def test_init_creates_db_and_project_node_idempotently(tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
@@ -327,3 +345,99 @@ def test_mcp_command_reports_clear_error_when_mcp_extra_not_installed(monkeypatc
     assert cli.main(["mcp", "--path", "."]) == 1
     err = capsys.readouterr().err
     assert "Error" in err and 'pip install "rce[mcp]"' in err
+
+
+# -- F3: status --pending / confirm -- human confirmation path, no mcp extra required --
+
+
+def _sole_pending_edge(project_root: Path) -> dict:
+    conn = db.connect(project_root / ".rce" / "graph.db")
+    try:
+        return db.pending_edges(conn)[0]
+    finally:
+        conn.close()
+
+
+def test_status_pending_lists_details_and_is_backward_compatible(claim_repo, capsys):
+    cli.main(["init", str(claim_repo)])
+    cli.main(["ingest", str(claim_repo)])
+    capsys.readouterr()
+
+    # Backward compatibility: no --pending -> output unchanged from before F3.
+    assert cli.main(["status", "--path", str(claim_repo)]) == 0
+    out = capsys.readouterr().out
+    assert "Pending confirmation queue: 1" in out and "-->" not in out
+
+    assert cli.main(["status", "--path", str(claim_repo), "--pending"]) == 0
+    out = capsys.readouterr().out
+    assert "Pending confirmation queue (1):" in out
+    assert "claim:paper.tex#" in out and "--backed_by--> experiment:run_a" in out
+    assert "extractor=claims" in out and "confidence=1.00" in out and "paper.tex:2" in out
+
+
+def test_status_pending_empty_queue_reports_empty(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["status", "--path", str(project), "--pending"]) == 0
+    out = capsys.readouterr().out
+    assert "Pending confirmation queue (0):" in out and "(empty)" in out
+
+
+def test_confirm_missing_args_then_no_such_edge_then_success_then_index_out_of_range(claim_repo, capsys):
+    cli.main(["init", str(claim_repo)])
+    cli.main(["ingest", str(claim_repo)])
+    capsys.readouterr()
+
+    assert cli.main(
+        ["confirm", "claim:nope#0", "experiment:nope", "--status", "confirmed", "--path", str(claim_repo)]
+    ) == 1
+    assert "requires either all four positional args" in capsys.readouterr().err
+
+    assert cli.main(
+        ["confirm", "claim:nope#0", "experiment:nope", "backed_by", "claims",
+         "--status", "confirmed", "--path", str(claim_repo)]
+    ) == 1
+    assert "no such edge" in capsys.readouterr().err
+
+    edge = _sole_pending_edge(claim_repo)
+    assert cli.main(
+        ["confirm", edge["src"], edge["dst"], edge["type"], edge["extractor"],
+         "--status", "confirmed", "--path", str(claim_repo)]
+    ) == 0
+    assert "pending -> confirmed" in capsys.readouterr().out
+
+    # Queue is now empty (that edge was just confirmed) -- --index 1 must be
+    # reported as out of range, never crash or silently pick another edge.
+    assert cli.main(["confirm", "--index", "1", "--status", "rejected", "--path", str(claim_repo)]) == 1
+    assert "out of range" in capsys.readouterr().err
+
+
+def test_confirm_then_reingest_never_overwrites_human_judgement(claim_repo, capsys):
+    """End-to-end: confirm via the CLI, then re-ingest -- the verdict must survive."""
+    cli.main(["init", str(claim_repo)])
+    cli.main(["ingest", str(claim_repo)])
+    capsys.readouterr()
+    edge = _sole_pending_edge(claim_repo)
+
+    cli.main(
+        ["confirm", edge["src"], edge["dst"], edge["type"], edge["extractor"],
+         "--status", "confirmed", "--path", str(claim_repo)]
+    )
+    capsys.readouterr()
+
+    assert cli.main(["ingest", str(claim_repo)]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["status", "--path", str(claim_repo), "--pending"]) == 0
+    assert "Pending confirmation queue (0):" in capsys.readouterr().out
+
+    conn = db.connect(claim_repo / ".rce" / "graph.db")
+    try:
+        updated = [e for e in db.query_edges(conn, src=edge["src"], dst=edge["dst"], type=edge["type"])
+                   if e["extractor"] == edge["extractor"]][0]
+        assert updated["status"] == "confirmed"
+    finally:
+        conn.close()

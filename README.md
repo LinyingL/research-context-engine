@@ -28,11 +28,18 @@ its own from the command line.
 - `rce trace <node-id> [--path P] [--hops N] [--json]` — walk the multi-hop
   provenance chain outward from a node (default 4 hops, must be >= 1);
   `--json` for scripting.
-- `rce status [--path P]` — whole-graph node/edge counts and the pending
-  confirmation queue.
+- `rce status [--path P] [--pending] [--limit N]` — whole-graph node/edge
+  counts and the pending confirmation queue's size; `--pending` also lists
+  each pending edge (src/dst/type/extractor/confidence/evidence), so it can
+  be reviewed and acted on without the optional `mcp` extra.
+- `rce confirm <src> <dst> <type> <extractor> --status confirmed|rejected`
+  (or `rce confirm --index N --status ...` against the queue `--pending`
+  just showed) — confirm or reject one pending edge; the baseline
+  counterpart to the optional MCP server's `rce_confirm_edge` tool.
 
-`--path` defaults to `.` for `query`/`trace`/`status`, so they also work
-by `cd`-ing into the project root first and dropping `--path` entirely.
+`--path` defaults to `.` for `query`/`trace`/`status`/`confirm`, so they
+also work by `cd`-ing into the project root first and dropping `--path`
+entirely.
 
 ## Optional: MCP
 
@@ -51,12 +58,15 @@ Everything above works without it.
 ## Design principles
 
 - **Deterministic first.** Git/LaTeX/.bib/run-log parsing is plain code
-  (AST, regex, standard APIs) with zero model calls. A local 7B semantic
-  layer (Phase B, not yet implemented) will add confidence-scored semantic
-  edges on top; it will never be load-bearing for the core graph. `Claim`
-  nodes and the `backed_by`/`supports` edge types are reserved in the schema
-  today but not yet populated, so seeing zeros for them in `rce status` is
-  expected, not a bug.
+  (AST, regex, standard APIs) with zero model calls. `Claim` nodes and
+  `backed_by` candidate edges are already populated this way: a claim's
+  printed number is matched against experiment metrics with no model
+  involved, and every candidate is written `status=pending` for a human (or
+  the semantic layer below) to confirm or reject — the extractor itself
+  never does. A local 7B semantic layer (Phase B, not yet implemented) will
+  review those candidates and add confidence-scored `supports` edges on
+  top; it will never be load-bearing for the core graph. `supports` is
+  still schema-only until then.
 - **Every edge is evidence-carrying.** No edge exists without a recorded
   extractor, an evidence pointer (file:line / commit SHA / run ID), and a
   confidence score.
