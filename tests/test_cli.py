@@ -185,6 +185,32 @@ def test_full_pipeline_init_ingest_status_query(paper_repo, monkeypatch, capsys)
     assert "No such node: figure:does-not-exist.png" in capsys.readouterr().err
 
 
+# -- README blocker fix (2026-07-26): status/query/trace must be runnable
+# from a cwd other than the project root, via --path, exactly like the
+# README's Quick start block -- without this, the third Quick start line
+# (`rce trace ...`) fails with "no RCE project at <cwd>" when run verbatim.
+
+
+def test_status_query_trace_work_via_path_flag_from_other_cwd(paper_repo, tmp_path, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    assert cli.main(["init", str(repo)]) == 0
+    assert cli.main(["ingest", str(repo)]) == 0
+    capsys.readouterr()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert cli.main(["status", "--path", str(repo)]) == 0
+    assert "figure=1" in capsys.readouterr().out
+
+    assert cli.main(["query", "figure:overview.png", "--path", str(repo)]) == 0
+    assert "Node: figure:overview.png (figure)" in capsys.readouterr().out
+
+    assert cli.main(["trace", "figure:overview.png", "--path", str(repo), "--hops", "4"]) == 0
+    assert "Provenance trace for figure:overview.png" in capsys.readouterr().out
+
+
 # -- Owner ruling 2026-07-22: `rce trace` gives non-MCP users full multi-hop
 # provenance (reuses rce.query.trace(), no logic duplicated here) --
 
@@ -238,6 +264,54 @@ def test_trace_node_with_no_edges_says_so_not_fabricated(paper_repo, monkeypatch
 
     assert cli.main(["trace", f"project:{repo.name}"]) == 0
     assert "no provenance edges recorded" in capsys.readouterr().out
+
+
+# -- T-blocker fix (2026-07-26): `--hops 0` (or negative) must never silently
+# report "no provenance edges recorded" for a node that demonstrably has
+# edges -- it must be rejected outright, before any traversal runs --
+
+
+def test_trace_rejects_hops_zero_on_a_node_that_has_edges(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    cli.main(["ingest", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    # Sanity check first: this node genuinely has provenance edges (latex
+    # `includes` + mlflow `produces`), so a "no edges recorded" verdict for
+    # it at any --hops value would be a fabricated statement.
+    assert cli.main(["query", "figure:overview.png"]) == 0
+    assert "Incoming edges (2):" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["trace", "figure:overview.png", "--hops", "0"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--hops" in err and "must be >= 1" in err
+
+
+def test_trace_rejects_negative_hops(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["trace", "figure:overview.png", "--hops", "-1"])
+    assert excinfo.value.code == 2
+
+
+def test_trace_json_includes_max_hops_for_scripted_consumers(paper_repo, monkeypatch, capsys):
+    repo, _sha = paper_repo
+    cli.main(["init", str(repo)])
+    cli.main(["ingest", str(repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(repo)
+
+    assert cli.main(["trace", "figure:overview.png", "--hops", "2", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["max_hops"] == 2
 
 
 # -- Owner ruling 2026-07-22: `mcp` is optional; missing the extra must not

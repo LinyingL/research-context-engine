@@ -12,7 +12,7 @@ SQLite file inside your project (`.rce/graph.db`).
 pip install -e .            # zero required third-party dependencies
 rce init /path/to/project   # creates .rce/graph.db
 rce ingest /path/to/project [--mlruns DIR] [--wandb entity/project]
-rce trace figure:overview.png --hops 4
+rce trace figure:overview.png --path /path/to/project --hops 4
 ```
 
 None of the above touch any AI client — `rce` is a complete, useful tool on
@@ -21,12 +21,16 @@ its own from the command line.
 - `rce init <path>` — initialize the graph database for a project.
 - `rce ingest <path>` — scan git history, LaTeX/.bib sources, and
   (optionally) MLflow/W&B runs into the graph.
-- `rce query <node-id>` — show one node and its immediate, single-hop edges,
-  with evidence.
-- `rce trace <node-id> [--hops N] [--json]` — walk the multi-hop provenance
-  chain outward from a node (default 4 hops); `--json` for scripting.
-- `rce status` — whole-graph node/edge counts and the pending confirmation
-  queue.
+- `rce query <node-id> [--path P]` — show one node and its immediate,
+  single-hop edges, with evidence.
+- `rce trace <node-id> [--path P] [--hops N] [--json]` — walk the multi-hop
+  provenance chain outward from a node (default 4 hops, must be >= 1);
+  `--json` for scripting.
+- `rce status [--path P]` — whole-graph node/edge counts and the pending
+  confirmation queue.
+
+`--path` defaults to `.` for `query`/`trace`/`status`, so they also work
+by `cd`-ing into the project root first and dropping `--path` entirely.
 
 ## Optional: MCP
 
@@ -45,9 +49,12 @@ Everything above works without it.
 ## Design principles
 
 - **Deterministic first.** Git/LaTeX/.bib/run-log parsing is plain code
-  (AST, regex, standard APIs) with zero model calls; a local 7B model is
-  layered on top only for semantic edges, never load-bearing for the core
-  graph.
+  (AST, regex, standard APIs) with zero model calls. A local 7B semantic
+  layer (Phase B, not yet implemented) will add confidence-scored semantic
+  edges on top; it will never be load-bearing for the core graph. `Claim`
+  nodes and the `backed_by`/`supports` edge types are reserved in the schema
+  today but not yet populated, so seeing zeros for them in `rce status` is
+  expected, not a bug.
 - **Every edge is evidence-carrying.** No edge exists without a recorded
   extractor, an evidence pointer (file:line / commit SHA / run ID), and a
   confidence score.

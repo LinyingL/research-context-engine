@@ -189,7 +189,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    project_root = _resolve_project_root(".")
+    project_root = _resolve_project_root(args.path)
     conn = db.connect(_require_db(project_root))
     try:
         print(f"Project: {project_root}")
@@ -208,7 +208,7 @@ def _print_edge(edge: dict, other_side: str, direction: str) -> None:
 
 
 def cmd_query(args: argparse.Namespace) -> int:
-    project_root = _resolve_project_root(".")
+    project_root = _resolve_project_root(args.path)
     conn = db.connect(_require_db(project_root))
     try:
         node = db.get_node(conn, args.node_id)
@@ -287,7 +287,7 @@ def _format_trace_human(node_id: str, max_hops: int, result: dict[str, Any]) -> 
 
 
 def cmd_trace(args: argparse.Namespace) -> int:
-    project_root = _resolve_project_root(".")
+    project_root = _resolve_project_root(args.path)
     conn = db.connect(_require_db(project_root))
     try:
         result = query.trace(conn, args.node_id, max_hops=args.hops)
@@ -298,7 +298,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
         print(f"No such node: {args.node_id}", file=sys.stderr)
         return 1
     if args.json:
-        print(json.dumps(result, sort_keys=True))
+        # max_hops is echoed back explicitly (T-blocker fix, 2026-07-26) so a
+        # scripted consumer can tell how far this trace was allowed to walk,
+        # rather than inferring it from an argv it may not have access to.
+        print(json.dumps({**result, "max_hops": args.hops}, sort_keys=True))
     else:
         print(_format_trace_human(args.node_id, args.hops, result))
     return 0
@@ -315,6 +318,31 @@ def _import_mcp_server():
     from rce import mcp_server
 
     return mcp_server
+
+
+def _positive_hops(value: str) -> int:
+    """argparse `type=` for `--hops`: must be an integer >= 1.
+
+    T-blocker fix (2026-07-26): query.trace()'s BFS loop is `range(1,
+    max_hops + 1)`, so max_hops <= 0 makes it not execute at all -- the
+    traversal never even looks at the start node's own directly-incident
+    edges. The result is hops=[], which _format_trace_human then reports as
+    "Node X exists but has no provenance edges recorded", a false statement
+    for any node that actually has edges (confirmed via `rce query` showing
+    incoming/outgoing edges the same run). Rejecting <= 0 here, before the
+    traversal ever runs, is preferred over rewording the empty-result
+    message: with --hops >= 1 guaranteed, depth 1 always inspects every edge
+    touching the start node regardless of the hop budget (db.EDGE_TYPES ==
+    query.TRACE_EDGE_TYPES, so no edge type is untraceable), so an empty
+    result is then always a truthful "zero edges touch this node".
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--hops must be >= 1, got {parsed}")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -341,6 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("status", help="Show node/edge counts and the pending confirmation queue")
+    p.add_argument("--path", default=".", help="project root (default: '.')")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser(
@@ -351,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("node_id", help="node id, e.g. figure:overview.png")
+    p.add_argument("--path", default=".", help="project root (default: '.')")
     p.set_defaults(func=cmd_query)
 
     p = sub.add_parser(
@@ -358,7 +388,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Walk the multi-hop provenance chain from a node (see 'query' for single-hop)",
     )
     p.add_argument("node_id", help="node id, e.g. figure:overview.png")
-    p.add_argument("--hops", type=int, default=4, help="max traversal depth (default: 4)")
+    p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--hops", type=_positive_hops, default=4, help="max traversal depth (default: 4, must be >= 1)"
+    )
     p.add_argument(
         "--json", action="store_true", help="output structured JSON instead of human-readable text"
     )
