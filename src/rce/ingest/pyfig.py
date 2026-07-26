@@ -16,9 +16,9 @@ string literal -- AND that name is touched nowhere else in the entire file
 `tree.body`, so this also excludes a name reassigned inside if/for/try/
 with/def at module level, reused as a function or lambda parameter or
 local variable, captured by a `match` pattern, aliased by a PEP 695 `type`
-statement, declared `global`/`nonlocal`, imported, or deleted -- see
-`_count_all_name_bindings` for the exact, non-exhaustive enumeration this
-scan recognizes). Given that table, three shapes fold: an
+statement or bound by one of its type parameters, declared `global`/
+`nonlocal`, imported, or deleted -- see `_count_all_name_bindings` for the
+exact, non-exhaustive enumeration this scan recognizes). Given that table, three shapes fold: an
 f-string whose every interpolation is itself foldable; `"+"` concatenation
 of foldable operands; `os.path.join(...)` whose every argument is foldable.
 `pathlib.Path`'s `/` operator is deliberately excluded -- it dispatches on
@@ -122,15 +122,23 @@ def _count_all_name_bindings(tree: ast.Module) -> dict[str, int]:
     silently reopen this same class of bug (2026-07 Opus re-review
     blocker fix: Lambda parameters, `match` capture patterns, and
     `TypeAlias` names were the three forms missing before this fix, each
-    letting a rebound name still fold to its stale module-level literal).
+    letting a rebound name still fold to its stale module-level literal;
+    a later review pass found a fourth: PEP 695 type parameters --
+    `def plot[OUT](x)` / `class P[OUT]` / `type Alias[OUT] = ...` bind
+    `OUT` via `.type_params`, which was never visited).
     Forms counted today: `Assign`/`AugAssign`/`AnnAssign`/`NamedExpr`
     (walrus) targets; `For`/`AsyncFor` targets; `With`/`AsyncWith`
     `optional_vars`; `ExceptHandler.name`; comprehension targets;
     `FunctionDef`/`AsyncFunctionDef`/`ClassDef` names and every parameter
     name; `Lambda` parameter names; `global`/`nonlocal` declarations;
     import (as-)names; `Delete` targets; `match` capture patterns
-    (`MatchAs`/`MatchStar` `.name`, `MatchMapping.rest`); and, on Python
-    3.12+ only, a PEP 695 `type NAME = ...` statement's `TypeAlias.name`.
+    (`MatchAs`/`MatchStar` `.name`, `MatchMapping.rest`); on Python 3.12+
+    only, a PEP 695 `type NAME = ...` statement's `TypeAlias.name`; and,
+    also 3.12+ only, every PEP 695 type parameter (`TypeVar`/`ParamSpec`/
+    `TypeVarTuple`) bound via `.type_params` on a `FunctionDef`/
+    `AsyncFunctionDef`/`ClassDef`/`TypeAlias` -- `p.name` there is a plain
+    `str`, not a `Name` node, so it is touched directly rather than via
+    `_touch_binding_target`.
     """
     touch_count: dict[str, int] = {}
 
@@ -158,6 +166,15 @@ def _count_all_name_bindings(tree: ast.Module) -> dict[str, int]:
                 _touch_binding_target(generator.target, touch)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             touch(node.name)
+            # PEP 695 type parameters (`def plot[OUT](x)` / `class P[OUT]` /
+            # `class P[**OUT]`) bind OUT for the rest of the def/class body --
+            # `getattr` with a default empty tuple is enough (no isinstance
+            # check needed): on Python <3.12 `type_params` simply doesn't
+            # exist on these nodes, so this is naturally a no-op there.
+            # `p.name` is a plain `str` (TypeVar/ParamSpec/TypeVarTuple all
+            # expose it that way), so it is touched directly.
+            for type_param in getattr(node, "type_params", ()):
+                touch(type_param.name)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = node.args
                 for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
@@ -194,6 +211,10 @@ def _count_all_name_bindings(tree: ast.Module) -> dict[str, int]:
             # _TYPE_ALIAS_NODE_TYPE above); `.name` is itself a `Name` node,
             # so it goes through the same target-walker as Assign/For/etc.
             _touch_binding_target(node.name, touch)
+            # `type Alias[OUT] = ...` also binds OUT via .type_params, same
+            # str-valued `.name` as the FunctionDef/ClassDef branch above.
+            for type_param in getattr(node, "type_params", ()):
+                touch(type_param.name)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 touch(name)

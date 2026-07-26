@@ -460,6 +460,125 @@ def test_parse_py_file_skips_type_alias_shadowing_module_constant(tmp_path, capl
     assert any("not guessing" in r.message for r in caplog.records)
 
 
+# --- T12: exhaustive name-binding-form table (ends the whack-a-mole) -------
+# Three consecutive review passes each caught a different Python name-
+# binding grammar form `_count_all_name_bindings` didn't yet count (Lambda
+# parameters, `match` captures, PEP 695 `type` aliases -- see the tests
+# above -- and, this round, PEP 695 type parameters -- see the pyfig.py fix
+# alongside this table). Patching one shape per review doesn't converge, so
+# this table enumerates every Python name-binding form the authors are
+# aware of and asserts none of them ever lets `OUT` fold into the trailing
+# savefig(...) call. The next missed form gets caught by construction, not
+# by a fourth review pass.
+#
+# None of these sources are executed, only ast.parse'd, so a source only
+# needs to be syntactically valid, not runtime-correct -- e.g.
+# `def f(**OUT): plt.savefig(OUT + '/f1.png')` is nonsense if run, but is
+# exactly the AST shape under test (does `**OUT`'s binding get counted?).
+#
+# Run against the code before this change's pyfig.py fix, this table failed
+# on exactly 5 of the PEP 695 rows below -- type_param_typevar,
+# type_param_paramspec, type_param_typevartuple, class_type_param, and
+# type_alias_type_param (type_alias_name alone was already handled) -- all
+# five fold clean after the fix (see completion report for the raw before/
+# after run).
+_SAVE = "plt.savefig(OUT + '/f1.png')"
+
+_NAME_BINDING_FORMS: list[tuple[str, str]] = [
+    ("plain_reassignment", f"OUT = 'figures'\nOUT = 'figures2'\n{_SAVE}\n"),
+    ("aug_assign", f"OUT = 'figures'\nOUT += '_sub'\n{_SAVE}\n"),
+    ("annotated_assign", f"OUT = 'figures'\nOUT: str = 'other'\n{_SAVE}\n"),
+    ("tuple_unpack", f"OUT = 'figures'\nOUT, other = 'a', 'b'\n{_SAVE}\n"),
+    ("list_unpack", f"OUT = 'figures'\n[OUT, other] = ['a', 'b']\n{_SAVE}\n"),
+    ("starred_unpack", f"OUT = 'figures'\n*rest, OUT = ['a', 'b']\n{_SAVE}\n"),
+    ("chained_assign", f"OUT = 'figures'\nother = OUT = 'stale'\n{_SAVE}\n"),
+    ("walrus", f"OUT = 'figures'\n_ = (OUT := 'other')\n{_SAVE}\n"),
+    ("for_target", f"OUT = 'figures'\nfor OUT in ['a']:\n    pass\n{_SAVE}\n"),
+    ("async_for_target",
+     f"OUT = 'figures'\n\nasync def f():\n    async for OUT in agen():\n        pass\n    {_SAVE}\n"),
+    ("with_as", f"OUT = 'figures'\nwith open('x') as OUT:\n    pass\n{_SAVE}\n"),
+    ("async_with_as",
+     f"OUT = 'figures'\n\nasync def f():\n    async with actx() as OUT:\n        pass\n    {_SAVE}\n"),
+    ("except_as", f"OUT = 'figures'\ntry:\n    pass\nexcept Exception as OUT:\n    pass\n{_SAVE}\n"),
+    ("listcomp_target", f"OUT = 'figures'\n_ = [x for OUT in range(3)]\n{_SAVE}\n"),
+    ("setcomp_target", f"OUT = 'figures'\n_ = {{x for OUT in range(3)}}\n{_SAVE}\n"),
+    ("dictcomp_target", f"OUT = 'figures'\n_ = {{OUT: 1 for OUT in range(3)}}\n{_SAVE}\n"),
+    ("genexp_target", f"OUT = 'figures'\n_ = (x for OUT in range(3))\n{_SAVE}\n"),
+    ("nested_comp_target", f"OUT = 'figures'\n_ = [y for x in range(3) for OUT in range(3)]\n{_SAVE}\n"),
+    ("async_comp_target",
+     f"OUT = 'figures'\n\nasync def f():\n    _ = [x async for OUT in agen()]\n    {_SAVE}\n"),
+    ("funcdef_name", f"OUT = 'figures'\ndef OUT():\n    pass\n{_SAVE}\n"),
+    ("asyncfuncdef_name", f"OUT = 'figures'\nasync def OUT():\n    pass\n{_SAVE}\n"),
+    ("classdef_name", f"OUT = 'figures'\nclass OUT:\n    pass\n{_SAVE}\n"),
+    ("param_posonly", f"OUT = 'figures'\ndef f(OUT, /):\n    {_SAVE}\n"),
+    ("param_normal", f"OUT = 'figures'\ndef f(OUT):\n    {_SAVE}\n"),
+    ("param_normal_default", f"OUT = 'figures'\ndef f(OUT='d'):\n    {_SAVE}\n"),
+    ("param_kwonly", f"OUT = 'figures'\ndef f(*, OUT):\n    {_SAVE}\n"),
+    ("param_kwonly_default", f"OUT = 'figures'\ndef f(*, OUT='d'):\n    {_SAVE}\n"),
+    ("param_vararg", f"OUT = 'figures'\ndef f(*OUT):\n    {_SAVE}\n"),
+    ("param_kwarg", f"OUT = 'figures'\ndef f(**OUT):\n    {_SAVE}\n"),
+    ("lambda_posonly", f"OUT = 'figures'\nsave = lambda OUT, /: OUT\n{_SAVE}\n"),
+    ("lambda_normal", f"OUT = 'figures'\nsave = lambda OUT: OUT\n{_SAVE}\n"),
+    ("lambda_normal_default", f"OUT = 'figures'\nsave = lambda OUT='d': OUT\n{_SAVE}\n"),
+    ("lambda_kwonly", f"OUT = 'figures'\nsave = lambda *, OUT: OUT\n{_SAVE}\n"),
+    ("lambda_kwonly_default", f"OUT = 'figures'\nsave = lambda *, OUT='d': OUT\n{_SAVE}\n"),
+    ("lambda_vararg", f"OUT = 'figures'\nsave = lambda *OUT: OUT\n{_SAVE}\n"),
+    ("lambda_kwarg", f"OUT = 'figures'\nsave = lambda **OUT: OUT\n{_SAVE}\n"),
+    ("global_decl", f"OUT = 'figures'\ndef f():\n    global OUT\n    OUT = 'other'\n    {_SAVE}\n"),
+    ("nonlocal_decl",
+     f"OUT = 'figures'\ndef outer():\n    OUT = 'mid'\n    def inner():\n"
+     f"        nonlocal OUT\n        OUT = 'other'\n        {_SAVE}\n"),
+    ("import_stmt", f"OUT = 'figures'\nimport os as OUT\n{_SAVE}\n"),
+    ("from_import_stmt", f"OUT = 'figures'\nfrom os import path as OUT\n{_SAVE}\n"),
+    ("del_stmt", f"OUT = 'figures'\ndel OUT\n{_SAVE}\n"),
+    ("match_as", f"OUT = 'figures'\nmatch [1]:\n    case [OUT]:\n        {_SAVE}\n"),
+    ("match_star", f"OUT = 'figures'\nmatch [1, 2]:\n    case [*OUT]:\n        {_SAVE}\n"),
+    ("match_mapping_rest", f"OUT = 'figures'\nmatch {{'a': 1}}:\n    case {{**OUT}}:\n        {_SAVE}\n"),
+]
+
+_PEP695_FORMS: list[tuple[str, str]] = [
+    ("type_param_typevar", f"OUT = 'figures'\ndef plot[OUT](x):\n    {_SAVE}\n"),
+    ("type_param_paramspec", f"OUT = 'figures'\ndef plot[**OUT](x):\n    {_SAVE}\n"),
+    ("type_param_typevartuple", f"OUT = 'figures'\ndef plot[*OUT](x):\n    {_SAVE}\n"),
+    ("class_type_param", f"OUT = 'figures'\nclass P[OUT]:\n    pass\n{_SAVE}\n"),
+    ("type_alias_name", f"OUT = 'figures'\ntype OUT = str\n{_SAVE}\n"),
+    ("type_alias_type_param", f"OUT = 'figures'\ntype Alias[OUT] = list\n{_SAVE}\n"),
+]
+
+# Positive controls: a name that is genuinely foldable, or whose only extra
+# appearance is a *read* (never a binding target), must still fold --
+# otherwise the fixes above could over-correct into "nothing ever folds",
+# which is a functional regression, not a safe default.
+_POSITIVE_CONTROLS: list[tuple[str, str]] = [
+    ("plain_single_assign", f"OUT = 'figures'\n{_SAVE}\n"),
+    ("os_path_join", "import os\nOUT = 'figures'\nplt.savefig(os.path.join(OUT, 'f1.png'))\n"),
+    ("decorator_reads_not_binds",
+     f"OUT = 'figures'\n\n@OUT\ndef f():\n    {_SAVE}\n"),
+]
+
+
+@pytest.mark.parametrize("name,source", _NAME_BINDING_FORMS, ids=[f[0] for f in _NAME_BINDING_FORMS])
+def test_name_binding_form_never_folds(tmp_path, name, source):
+    (tmp_path / "gen.py").write_text(source)
+    calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == [], f"{name} unexpectedly folded: {calls}"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 syntax requires Python 3.12+")
+@pytest.mark.parametrize("name,source", _PEP695_FORMS, ids=[f[0] for f in _PEP695_FORMS])
+def test_pep695_binding_form_never_folds(tmp_path, name, source):
+    (tmp_path / "gen.py").write_text(source)
+    calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == [], f"{name} unexpectedly folded: {calls}"
+
+
+@pytest.mark.parametrize("name,source", _POSITIVE_CONTROLS, ids=[f[0] for f in _POSITIVE_CONTROLS])
+def test_positive_control_still_folds(tmp_path, name, source):
+    (tmp_path / "gen.py").write_text(source)
+    calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls != [], f"{name} expected to fold but did not"
+
+
 def test_folded_path_not_a_tracked_image_is_still_caught(tmp_path, caplog):
     """A folded path must still pass the tracked-image verification --
     folding is not a free pass around the ghost-figure guard."""
