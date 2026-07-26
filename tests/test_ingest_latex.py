@@ -226,6 +226,67 @@ def test_parse_tex_file_no_preamble_section_when_no_cite_precedes_first_section(
     assert "section:paper.tex#preamble" not in result.section_attrs
 
 
+def test_parse_tex_file_real_section_titled_preamble_does_not_collide_with_synthetic(tmp_path):
+    """T-blocker regression: a real \\section{Preamble} (any title that
+    slugifies to "preamble") used to collide with the synthetic preamble
+    node's id, and the lazy synthetic-section block unconditionally
+    overwrote the shared section_attrs entry -- discarding the real
+    section's already-collected labels and mislabeling it synthetic=True.
+    """
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\n"
+        "\\citep{early2020}\n"
+        "\\section{Preamble}\n"
+        "\\label{sec:pre}\n"
+    )
+    result = latex.parse_tex_file(tmp_path, "paper.tex")
+
+    synthetic_id = "section:paper.tex#preamble"
+    real_id = "section:paper.tex#preamble-2"  # numbered -- no longer collides
+
+    assert [s.id for s in result.sections] == [synthetic_id, real_id]
+
+    assert result.section_attrs[synthetic_id]["synthetic"] is True
+    assert result.section_attrs[synthetic_id]["labels"] == []
+    assert result.section_attrs[synthetic_id]["refs"] == []
+
+    # The real section's own attrs must survive untouched -- not clobbered
+    # by the synthetic block that runs after it in the file.
+    assert "synthetic" not in result.section_attrs[real_id]
+    assert result.section_attrs[real_id]["labels"] == [{"name": "sec:pre", "line": 4}]
+
+    assert result.cite_links[0].section_id == synthetic_id
+
+
+def test_ingest_latex_repo_preserves_real_section_when_it_collides_with_preamble_slug(tmp_path):
+    (tmp_path / "paper.tex").write_text(
+        "\\citep{early2020}\n\\section{Preamble}\n\\label{sec:pre}\n"
+    )
+    (tmp_path / "refs.bib").write_text(
+        "@article{early2020,\n  title = {Early},\n  year = {2020},\n}\n"
+    )
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        counts = latex.ingest_latex_repo(conn, tmp_path, ["paper.tex"], ["refs.bib"])
+        # Two distinct section nodes (synthetic preamble + real "Preamble"
+        # section) -- counts must match what actually lands in the DB, not
+        # over-count a since-deduped id.
+        assert counts == {"sections": 2, "figures": 0, "cites": 1}
+        assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='section'").fetchone()[0] == 2
+
+        synthetic = db.get_node(conn, "section:paper.tex#preamble")
+        assert synthetic["attrs"]["synthetic"] is True
+        assert synthetic["attrs"]["labels"] == []
+
+        real = db.get_node(conn, "section:paper.tex#preamble-2")
+        assert real is not None
+        assert "synthetic" not in real["attrs"]
+        assert real["attrs"]["labels"] == [{"name": "sec:pre", "line": 3}]
+    finally:
+        conn.close()
+
+
 def test_ingest_latex_repo_creates_preamble_node_and_cites_edge(tmp_path):
     (tmp_path / "paper.tex").write_text(
         "\\cite{foo2020}\n\\section{Intro}\n\\cite{bar2021}\n"

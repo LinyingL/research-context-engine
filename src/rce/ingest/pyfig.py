@@ -10,16 +10,20 @@ those shapes is never guessed at -- HANDOFF-SPEC.md section 5: "拼不出来就
 edges via rce.db's upsert_node/upsert_edge.
 
 T9: a name folds only if assigned exactly once, as a plain single-target
-`NAME = "..."` statement directly in the module's top-level body (never
-inside if/for/try/def/class), to a bare string literal. Given that table,
-three shapes fold: an f-string whose every interpolation is itself
-foldable; `"+"` concatenation of foldable operands; `os.path.join(...)`
-whose every argument is foldable. `pathlib.Path`'s `/` operator is
-deliberately excluded -- it dispatches on the left operand's runtime type,
-which would mean guessing at cross-module semantics rather than
-deterministic same-file analysis (architecture decision, not an
-oversight). Anything else makes the expression unfoldable; skipped and
-logged exactly as pre-T9.
+`NAME = "..."` statement directly in the module's top-level body, to a bare
+string literal -- AND that name is touched nowhere else in the entire file
+(T-blocker fix: "touched" is checked via a whole-file `ast.walk`, not just
+`tree.body`, so this also excludes a name reassigned inside if/for/try/
+with/def at module level, reused as a function parameter or local variable,
+declared `global`/`nonlocal`, imported, or deleted -- see
+`_count_all_name_bindings`). Given that table, three shapes fold: an
+f-string whose every interpolation is itself foldable; `"+"` concatenation
+of foldable operands; `os.path.join(...)` whose every argument is foldable.
+`pathlib.Path`'s `/` operator is deliberately excluded -- it dispatches on
+the left operand's runtime type, which would mean guessing at cross-module
+semantics rather than deterministic same-file analysis (architecture
+decision, not an oversight). Anything else makes the expression unfoldable;
+skipped and logged exactly as pre-T9.
 
 Each edge's src commit is resolved per call site via `git blame`
 (rce.ingest.git.blame_line), pinned to whichever commit last touched that
@@ -39,6 +43,7 @@ import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Connection
+from typing import Callable
 
 from rce import db
 from rce.ingest import git as git_ingest
@@ -75,38 +80,111 @@ def _callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
-    """Module-level names foldable into a savefig(...) expression (T9).
+def _touch_binding_target(target: ast.expr, touch: Callable[[str], None]) -> None:
+    """Recursively record every bare name a single binding target touches --
+    a plain `Name`, or a `Tuple`/`List`/`Starred` unpacking pattern nested
+    arbitrarily deep (e.g. `a, (b, *c) = ...`). `Attribute`/`Subscript`
+    targets (`obj.attr = ...`, `d[k] = ...`) bind no bare name, so they are
+    not touched at all."""
+    if isinstance(target, ast.Name):
+        touch(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            _touch_binding_target(elt, touch)
+    elif isinstance(target, ast.Starred):
+        _touch_binding_target(target.value, touch)
 
-    Two order-independent passes over `tree.body` only (never `ast.walk`,
-    so a name assigned inside if/for/try/def/class is never counted --
-    excludes conditional assignment for free). Pass 1 counts every
-    top-level touch of a name: `Assign` (incl. tuple/list-unpacking and
-    chained `a = b = ...`), `AugAssign`, `AnnAssign` -- so a name touched
-    more than once anywhere is flagged regardless of order ("重复赋值的名字
-    不折叠"). Pass 2 keeps only a name whose sole touch was a single-target
-    `NAME = "..."` Assign with a string-literal right-hand side. An
-    imported name is excluded the same way: import statements produce no
-    `Assign` node at all.
+
+def _count_all_name_bindings(tree: ast.Module) -> dict[str, int]:
+    """Count every name-binding touch anywhere in the whole file (T-blocker
+    fix, replaces a `tree.body`-only scan -- see `_collect_module_string_
+    constants`'s docstring for why that was insufficient). Uses `ast.walk`
+    over the entire tree, so a binding nested inside if/for/try/with/def at
+    module level -- invisible to a `tree.body`-only scan -- is counted, and
+    so is a same-named binding inside a function's own scope (parameter,
+    local variable, `global`/`nonlocal` declaration) that would otherwise
+    silently shadow a module-level constant of the same name.
+
+    Every binding form that introduces or rebinds a plain name is counted:
+    `Assign`/`AugAssign`/`AnnAssign`/`NamedExpr` (walrus) targets,
+    `For`/`AsyncFor` targets, `With`/`AsyncWith` `optional_vars`,
+    `ExceptHandler.name`, comprehension targets, `FunctionDef`/
+    `AsyncFunctionDef`/`ClassDef` names and every parameter name,
+    `global`/`nonlocal` declarations, import (as-)names, and `Delete`
+    targets.
     """
     touch_count: dict[str, int] = {}
 
-    def _touch(name: str) -> None:
+    def touch(name: str) -> None:
         touch_count[name] = touch_count.get(name, 0) + 1
 
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    _touch(target.id)
-                elif isinstance(target, (ast.Tuple, ast.List)):
-                    for elt in target.elts:
-                        if isinstance(elt, ast.Name):
-                            _touch(elt.id)
-        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
-            _touch(stmt.target.id)
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            _touch(stmt.target.id)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                _touch_binding_target(target, touch)
+        elif isinstance(node, ast.NamedExpr):  # walrus (D := ...)
+            _touch_binding_target(node.target, touch)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            _touch_binding_target(node.target, touch)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    _touch_binding_target(item.optional_vars, touch)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name is not None:
+                touch(node.name)
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for generator in node.generators:
+                _touch_binding_target(generator.target, touch)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            touch(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args
+                for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+                    touch(arg.arg)
+                if args.vararg is not None:
+                    touch(args.vararg.arg)
+                if args.kwarg is not None:
+                    touch(args.kwarg.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                touch(name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                touch(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                touch(alias.asname or alias.name)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                _touch_binding_target(target, touch)
+
+    return touch_count
+
+
+def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level names foldable into a savefig(...) expression (T9,
+    T-blocker fix).
+
+    Pass 1 (`_count_all_name_bindings`) counts every name binding anywhere
+    in the *whole file*, not just `tree.body` -- see that function's
+    docstring for the full list of binding forms and why a `tree.body`-only
+    scan missed reassignments nested inside if/for/try/with/def at module
+    level, and same-name shadowing inside a function's own scope (a
+    savefig() call inside `def plot(D): ...` must never fold using the
+    module-level D -- the function's own D parameter shadows it at
+    runtime).
+
+    Pass 2 keeps only a name whose *sole* touch (count == 1) is a top-level
+    `NAME = "..."` Assign directly in `tree.body`, to a bare string literal
+    -- unchanged from pre-fix. Any name touched anywhere else in the file
+    (conditionally, in a loop, imported, deleted, declared global, used as a
+    parameter or function/class name, ...) is excluded regardless of how
+    many times it looks foldable at the top level -- HANDOFF-SPEC.md
+    section 5: "拼不出来就放弃，不猜".
+    """
+    touch_count = _count_all_name_bindings(tree)
 
     values: dict[str, str] = {}
     for stmt in tree.body:
@@ -116,7 +194,7 @@ def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
             continue  # multi-target chain or tuple/list unpacking -- never single-name-foldable
         name = stmt.targets[0].id
         if touch_count.get(name, 0) != 1:
-            continue  # reassigned (or also touched via AugAssign/AnnAssign) -- ambiguous
+            continue  # touched elsewhere in the file -- ambiguous, don't fold
         if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
             values[name] = stmt.value.value
     return values

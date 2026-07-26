@@ -1,4 +1,7 @@
 import sqlite3
+import threading
+import time
+from unittest import mock
 
 import pytest
 
@@ -582,3 +585,146 @@ def test_set_edge_status_is_a_noop_on_unknown_edge(conn):
         status="confirmed",
     )
     assert db.query_edges(conn) == []
+
+
+# -- upsert_edge atomicity under concurrency (T-blocker regression) --------
+#
+# ec535b7 turned upsert_edge's single "INSERT ... ON CONFLICT DO UPDATE"
+# statement (status CASE evaluated atomically by SQLite) into a two-step
+# Python-level SELECT then INSERT/UPDATE, with no explicit transaction
+# around the pair. The tests below use real file-backed databases (multiple
+# connections, `:memory:` is private per-connection and can't reproduce
+# this) to prove the fix: upsert_edge now wraps the read and the write in
+# one BEGIN IMMEDIATE transaction, so another connection can never observe
+# or act on the gap between them.
+
+
+def test_upsert_edge_survives_concurrent_human_confirm(tmp_path):
+    """Interleaved read -- human confirm -- write.
+
+    Before the fix: upsert_edge's SELECT could read status='pending', then
+    a human's set_edge_status(confirmed) on a different connection could
+    land, and upsert_edge's subsequent UPDATE would overwrite it back to
+    'pending' using the stale value it already read -- silently reopening a
+    human-confirmed edge (HANDOFF-SPEC.md section 4: status fields are
+    human-write only). The fix makes upsert_edge's SELECT+write one atomic
+    transaction, so a concurrent confirm can never land inside that window:
+    it either fully precedes the transaction (upsert_edge's own status-
+    preservation logic then keeps it) or fully follows it (applied after
+    upsert_edge has already committed) -- confirmed survives either way.
+    """
+    db_path = tmp_path / "graph.db"
+    conn = db.connect(db_path)
+    db.migrate(conn)
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim")
+    db.upsert_node(conn, "experiment:run1", "experiment")
+    db.upsert_edge(
+        conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", "7b-judge",
+        {"claim_text": "87.3%", "run_metric": "accuracy=0.873"}, 0.4, status="pending",
+    )
+    conn.close()
+
+    # paused_merge stands in for the exact gap the bug lived in: it runs
+    # strictly after upsert_edge's internal SELECT and strictly before its
+    # internal UPDATE, while upsert_edge's BEGIN IMMEDIATE still holds the
+    # write lock. Sleeping there (instead of returning immediately) gives
+    # confirm_worker, on a genuinely separate OS thread and connection, time
+    # to attempt its own write and block on that lock -- proving the two
+    # operations cannot interleave.
+    original_merge = db._merge_edge_evidence
+
+    def paused_merge(existing_evidence_json, new_evidence):
+        result = original_merge(existing_evidence_json, new_evidence)
+        time.sleep(0.3)
+        return result
+
+    def confirm_worker():
+        time.sleep(0.05)  # let the re-ingest below enter its transaction first
+        confirm_conn = db.connect(db_path)
+        try:
+            db.set_edge_status(
+                confirm_conn, "claim:paper.tex#abc", "experiment:run1", "backed_by",
+                "7b-judge", status="confirmed",
+            )
+        finally:
+            confirm_conn.close()
+
+    worker = threading.Thread(target=confirm_worker)
+    worker.start()
+    try:
+        reingest_conn = db.connect(db_path)
+        try:
+            with mock.patch.object(db, "_merge_edge_evidence", side_effect=paused_merge):
+                # Overnight re-ingest by the same extractor, interleaved
+                # (via paused_merge) with the human confirm above.
+                db.upsert_edge(
+                    reingest_conn, "claim:paper.tex#abc", "experiment:run1", "backed_by",
+                    "7b-judge", {"claim_text": "87.3%", "run_metric": "accuracy=0.873 (re-extracted)"},
+                    0.4, status="pending",
+                )
+        finally:
+            reingest_conn.close()
+    finally:
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    verify_conn = db.connect(db_path)
+    try:
+        edges = db.query_edges(
+            verify_conn, src="claim:paper.tex#abc", dst="experiment:run1", type="backed_by"
+        )
+        assert len(edges) == 1
+        assert edges[0]["status"] == "confirmed"
+    finally:
+        verify_conn.close()
+
+
+def test_upsert_edge_concurrent_first_write_does_not_raise_integrity_error(tmp_path):
+    """Two connections upserting the very same brand-new edge at once.
+
+    Before the fix, both connections' SELECTs could see `existing is None`
+    and both attempt the INSERT branch; the second hit
+    sqlite3.IntegrityError on the UNIQUE(src,dst,type,extractor) constraint
+    instead of merging like a normal re-upsert would. BEGIN IMMEDIATE
+    serializes the two calls completely, so the second always sees the
+    first's row and takes the UPDATE/merge branch instead.
+    """
+    db_path = tmp_path / "graph.db"
+    conn = db.connect(db_path)
+    db.migrate(conn)
+    db.upsert_node(conn, "commit:aaa", "commit")
+    db.upsert_node(conn, "figure:f1.png", "figure")
+    conn.close()
+
+    errors: list[BaseException] = []
+    start_barrier = threading.Barrier(2)
+
+    def worker(line: int) -> None:
+        worker_conn = db.connect(db_path)
+        try:
+            start_barrier.wait(timeout=5)
+            db.upsert_edge(
+                worker_conn, "commit:aaa", "figure:f1.png", "generates", "pyfig",
+                {"file": "plot.py", "line": line}, 0.9,
+            )
+        except BaseException as exc:  # noqa: BLE001 -- surfaced via `errors`, not swallowed
+            errors.append(exc)
+        finally:
+            worker_conn.close()
+
+    threads = [threading.Thread(target=worker, args=(line,)) for line in (10, 20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not errors, f"concurrent upsert_edge raised: {errors!r}"
+
+    verify_conn = db.connect(db_path)
+    try:
+        edges = db.query_edges(verify_conn, src="commit:aaa", dst="figure:f1.png", type="generates")
+        assert len(edges) == 1
+        occurrences = edges[0]["evidence"]["occurrences"]
+        assert {o["line"] for o in occurrences} == {10, 20}
+    finally:
+        verify_conn.close()

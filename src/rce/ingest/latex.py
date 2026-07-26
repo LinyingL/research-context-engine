@@ -180,13 +180,26 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
     node (title "Preamble/Abstract", `attrs["synthetic"] = True`), created
     lazily -- only emitted into `sections`/`section_attrs` (and so only ever
     upserted as a node) when at least one such citation is actually present.
+
+    T-blocker fix: `slug_counts` is seeded with an entry for the reserved
+    preamble slug before the main loop runs, so a real `\\section{Preamble}`
+    (or any title that slugifies to "preamble") is numbered `preamble-2`
+    instead of colliding with the synthetic node's id. Without this, the
+    real section's id and `preamble_id` were identical, and the lazy
+    synthetic-section block below unconditionally overwrote that shared
+    `section_attrs` entry -- silently discarding the real section's already-
+    collected labels/refs and mislabeling it `synthetic: True`. The
+    `setdefault`/dedup guards below are a second, defensive layer against
+    that same clobber for any collision this seeding doesn't anticipate.
     """
     text = (Path(repo_root) / tex_rel_path).read_text(errors="replace")
     sections: list[ParsedSection] = []
     section_attrs: dict[str, dict[str, Any]] = {}
     figure_links: list[Link] = []
     cite_links: list[Link] = []
-    slug_counts: dict[str, int] = {}
+    # Seeded so a real \section whose title slugifies to "preamble" is
+    # numbered preamble-2 rather than colliding with preamble_id below.
+    slug_counts: dict[str, int] = {_PREAMBLE_SLUG: 1}
     current_id: str | None = None
     graphics_dir: str | None = None
     preamble_id = f"section:{tex_rel_path}#{_PREAMBLE_SLUG}"
@@ -245,9 +258,13 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
 
     if preamble_first_line is not None:
         # Inserted first: textually, any preamble citation precedes every
-        # real \section in the file.
-        sections.insert(0, ParsedSection(preamble_id, _PREAMBLE_TITLE, "preamble", preamble_first_line))
-        section_attrs[preamble_id] = {"labels": [], "refs": [], "synthetic": True}
+        # real \section in the file. Both guards below are defensive
+        # (slug_counts above should already prevent id collision with a
+        # real section) -- never silently clobber or duplicate an existing
+        # entry for this id.
+        if not any(s.id == preamble_id for s in sections):
+            sections.insert(0, ParsedSection(preamble_id, _PREAMBLE_TITLE, "preamble", preamble_first_line))
+        section_attrs.setdefault(preamble_id, {"labels": [], "refs": [], "synthetic": True})
 
     return TexParseResult(tex_rel_path, sections, section_attrs, figure_links, cite_links)
 

@@ -267,6 +267,138 @@ def test_parse_py_file_folds_os_path_join_mixed_forms(tmp_path):
     ]
 
 
+# -- T-blocker fix: touch-count scan must cover the whole file, not just
+# tree.body, and must respect function scope -- otherwise a name that is
+# conditionally, nestedly, or locally reassigned still folds to its stale
+# top-level literal. Each case below gives the name a real top-level
+# `NAME = "..."` assignment (so pre-fix's tree.body-only scan saw exactly
+# one touch and folded it) plus a second, differently-shaped touch that
+# pre-fix code couldn't see -- reproducing the report's over-eager fold.
+
+
+def test_parse_py_file_skips_conditional_if_and_module_level_for_reassignment(tmp_path, caplog):
+    (tmp_path / "gen.py").write_text(
+        "import argparse\n"
+        "OUT = 'figures'\n"
+        "args = argparse.Namespace(out=None)\n"
+        "if args.out:\n"
+        "    OUT = args.out\n"
+        "plt.savefig(OUT + '/f1.png')\n"
+        "\n"
+        "D = 'other_figures'\n"
+        "for D in ['a', 'b']:\n"
+        "    pass\n"
+        "plt.savefig(D + '/f2.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert sum("not guessing" in r.message for r in caplog.records) == 2
+
+
+def test_parse_py_file_skips_try_except_with_and_walrus_reassignment(tmp_path, caplog):
+    (tmp_path / "gen.py").write_text(
+        "import os\n"
+        "TDIR = 'stale_figs'\n"
+        "try:\n"
+        "    TDIR = os.environ['FIGDIR']\n"
+        "except Exception:\n"
+        "    pass\n"
+        "plt.savefig(TDIR + '/f1.png')\n"
+        "\n"
+        "WDIR = 'stale_figs'\n"
+        "with open('x.txt') as WDIR:\n"
+        "    pass\n"
+        "plt.savefig(WDIR + '/f2.png')\n"
+        "\n"
+        "EDIR = 'stale_figs'\n"
+        "try:\n"
+        "    pass\n"
+        "except Exception as EDIR:\n"
+        "    pass\n"
+        "plt.savefig(EDIR + '/f3.png')\n"
+        "\n"
+        "WALRUS = 'stale_figs'\n"
+        "if (WALRUS := 'other'):\n"
+        "    pass\n"
+        "plt.savefig(WALRUS + '/f4.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert sum("not guessing" in r.message for r in caplog.records) == 4
+
+
+def test_parse_py_file_skips_name_shadowed_inside_function_scope(tmp_path, caplog):
+    """A module-level constant whose name is reused as a function parameter,
+    a function-local variable, or a `global`-declared name inside a
+    function must never be folded into a savefig() call in that function --
+    the call site actually receives that function's own local/global-
+    written value at runtime, not the module constant (T-blocker fix: the
+    old scan had zero function-scope awareness)."""
+    (tmp_path / "gen.py").write_text(
+        "D = 'module_figs'\n"
+        "\n"
+        "def plot_param(D):\n"
+        "    plt.savefig(D + '/x.png')\n"
+        "\n"
+        "def plot_local():\n"
+        "    D = 'local_figs'\n"
+        "    plt.savefig(D + '/y.png')\n"
+        "\n"
+        "def plot_global():\n"
+        "    global D\n"
+        "    D = 'overridden'\n"
+        "    plt.savefig(D + '/z.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert sum("not guessing" in r.message for r in caplog.records) == 3
+
+
+def test_parse_py_file_skips_name_touched_by_delete_after_assignment(tmp_path, caplog):
+    (tmp_path / "gen.py").write_text(
+        "D = 'module_figs'\n"
+        "del D\n"
+        "plt.savefig(D + '/after_del.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+def test_parse_py_file_still_skips_imported_name_never_folds(tmp_path, caplog):
+    """Guard test (no reassignment involved): an imported name was already
+    correctly excluded pre-fix (an import produces no Assign node at all) --
+    confirm the whole-file touch-count rewrite didn't regress this."""
+    (tmp_path / "gen.py").write_text(
+        "from config import OUT\n"
+        "plt.savefig(OUT + '/f1.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
+def test_parse_py_file_still_skips_pathlib_slash_operator(tmp_path, caplog):
+    """Guard test: pathlib's `/` path-join operator is deliberately excluded
+    from T9 folding (dispatches on the left operand's runtime type -- see
+    module docstring); confirm the touch-count rewrite didn't accidentally
+    start folding it."""
+    (tmp_path / "gen.py").write_text(
+        "from pathlib import Path\n"
+        "SAVE_DIR = Path('figs')\n"
+        "plt.savefig(SAVE_DIR / 'loss.png')\n"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == []
+    assert any("not guessing" in r.message for r in caplog.records)
+
+
 def test_folded_path_not_a_tracked_image_is_still_caught(tmp_path, caplog):
     """A folded path must still pass the tracked-image verification --
     folding is not a free pass around the ghost-figure guard."""

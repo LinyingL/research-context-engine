@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DEFAULT_MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+# upsert_edge wraps its read-then-write in one BEGIN IMMEDIATE transaction
+# (see upsert_edge). Under contention -- another connection already holding
+# the write lock -- SQLite's own busy_timeout (the `timeout` argument to
+# sqlite3.connect(), 5s by default) transparently retries for a while before
+# raising sqlite3.OperationalError("database is locked"). This is a small,
+# bounded application-level retry on top of that, for the rare case the
+# busy_timeout itself is exceeded (e.g. a slow disk or an unusually long
+# competing transaction).
+_UPSERT_EDGE_MAX_ATTEMPTS = 5
+_UPSERT_EDGE_RETRY_DELAY_SECONDS = 0.05
 
 # Cap on how many distinct evidence occurrences one edge accumulates (T10:
 # candidate-1 testbed found a figure \included twice in the same section
@@ -301,6 +313,24 @@ def upsert_edge(
     keep updating regardless -- see
     tests/test_db.py::test_reingest_never_overwrites_confirmed_edge_status.
 
+    Atomicity (T-blocker fix): the SELECT above and the following INSERT/
+    UPDATE run inside one `BEGIN IMMEDIATE` transaction, not as two
+    autocommitted statements. `BEGIN IMMEDIATE` grabs SQLite's write lock up
+    front, before the SELECT even runs, so no other connection can write
+    this exact (src, dst, type, extractor) row between our read and our
+    write. Without this, the two-step "SELECT here, decide, write there"
+    was racy in two concrete ways: (1) two connections upserting the same
+    brand-new edge concurrently could both see `existing is None` and both
+    attempt the INSERT -- the loser crashed on the
+    UNIQUE(src,dst,type,extractor) constraint instead of merging; (2) a
+    human's set_edge_status() landing on a different connection between our
+    SELECT and our UPDATE was silently clobbered by this call's own write,
+    computed from the by-then-stale `existing["status"]` it had already
+    read -- reopening a confirmed/rejected edge is exactly what the
+    status-preservation logic above exists to prevent. See
+    tests/test_db.py::test_upsert_edge_survives_concurrent_human_confirm and
+    ::test_upsert_edge_concurrent_first_write_does_not_raise_integrity_error.
+
     Every edge must carry non-empty evidence -- "no edge without evidence"
     is a hard invariant (HANDOFF-SPEC.md section 4/2). A placeholder like
     `{}` is not evidence, so it is rejected here (and by the CHECK
@@ -322,30 +352,54 @@ def upsert_edge(
     if not evidence:
         raise ValueError("edge requires non-empty evidence")
     now = _now()
-    existing = conn.execute(
-        "SELECT evidence, status FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
-        (src, dst, type, extractor),
-    ).fetchone()
-    if existing is None:
-        evidence_json = json.dumps({"occurrences": [evidence]})
-        conn.execute(
-            """
-            INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (src, dst, type, extractor, evidence_json, confidence, status, now, now),
-        )
-    else:
-        evidence_json = _merge_edge_evidence(existing["evidence"], evidence)
-        effective_status = existing["status"] if existing["status"] in ("confirmed", "rejected") else status
-        conn.execute(
-            """
-            UPDATE edges SET evidence = ?, confidence = ?, status = ?, updated_at = ?
-            WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
-            """,
-            (evidence_json, confidence, effective_status, now, src, dst, type, extractor),
-        )
-    conn.commit()
+
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(_UPSERT_EDGE_MAX_ATTEMPTS):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            # Could not even acquire the write lock yet -- another
+            # connection's transaction is in the way; back off and retry.
+            last_error = exc
+            time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        try:
+            existing = conn.execute(
+                "SELECT evidence, status FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                (src, dst, type, extractor),
+            ).fetchone()
+            if existing is None:
+                evidence_json = json.dumps({"occurrences": [evidence]})
+                conn.execute(
+                    """
+                    INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (src, dst, type, extractor, evidence_json, confidence, status, now, now),
+                )
+            else:
+                evidence_json = _merge_edge_evidence(existing["evidence"], evidence)
+                effective_status = existing["status"] if existing["status"] in ("confirmed", "rejected") else status
+                conn.execute(
+                    """
+                    UPDATE edges SET evidence = ?, confidence = ?, status = ?, updated_at = ?
+                    WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
+                    """,
+                    (evidence_json, confidence, effective_status, now, src, dst, type, extractor),
+                )
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            last_error = exc
+            time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            return
+    assert last_error is not None
+    raise last_error
 
 
 def set_edge_status(
