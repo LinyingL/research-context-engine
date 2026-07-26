@@ -36,6 +36,7 @@ in this module.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -174,15 +175,25 @@ def _blank_skip_regions(lines: list[str]) -> list[str]:
     return blanked
 
 
-def _extract_sentence(line: str, start: int, end: int) -> str:
-    """Sentence containing line[start:end], scoped to this one source line
-    (LaTeX line breaks don't track prose sentences; Occam rule 5). Truncated
-    to _MAX_SENTENCE_LEN for storage only."""
+def _sentence_bounds(line: str, start: int, end: int) -> tuple[int, int]:
+    """Start/end offsets of the sentence containing line[start:end], scoped
+    to this one source line (LaTeX line breaks don't track prose sentences;
+    Occam rule 5). Factored out of `_extract_sentence` so the parse loop can
+    also use it to group same-sentence matches for `seq_in_sentence` (see
+    `_content_id`) without deriving sentence identity a second, possibly
+    inconsistent way."""
     left = 0
     for m in _SENTENCE_END_RE.finditer(line, 0, start):
         left = m.end()
     right_match = _SENTENCE_END_RE.search(line, end)
     right = right_match.end() if right_match else len(line)
+    return left, right
+
+
+def _extract_sentence(line: str, start: int, end: int) -> str:
+    """Sentence containing line[start:end]. Truncated to _MAX_SENTENCE_LEN
+    for storage only."""
+    left, right = _sentence_bounds(line, start, end)
     sentence = line[left:right].strip()
     if len(sentence) > _MAX_SENTENCE_LEN:
         sentence = sentence[: _MAX_SENTENCE_LEN - 1].rstrip() + "…"
@@ -210,6 +221,44 @@ def _normalize(raw: str, unit_form: str) -> tuple[Decimal, int]:
 
 def _round_half_up(value: Decimal, places: int) -> Decimal:
     return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+
+
+# Hex digits of the sha256 digest kept in a claim id (F2). An id-length
+# convention, not a match/scoring threshold -- DESIGN.md section 0's "never
+# guess" governs match *decisions* (the rounding rule above), not how many
+# hash characters make an id string practically collision-free.
+_ID_HASH_HEX_LEN = 16
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_for_id(sentence: str) -> str:
+    """Collapse whitespace and case before hashing, so cosmetic
+    re-formatting (rewrapped lines, trailing spaces, a stray capital) never
+    changes a claim's id. Hashing input only -- attrs still store `sentence`
+    exactly as printed."""
+    return _WHITESPACE_RE.sub(" ", sentence).strip().lower()
+
+
+def _content_id(
+    tex_rel_path: str, section_id: str | None, sentence: str, raw: str, seq_in_sentence: int
+) -> str:
+    """Content-addressed claim id (F2, DESIGN.md section 4):
+    `claim:<tex path>#<sha256 prefix>` over (owning section's slug,
+    whitespace/case-normalized sentence, the number's own literal form as
+    printed, its position among same-sentence numbers).
+
+    Inserting, deleting, or reordering unrelated lines never changes this id
+    -- only the claim's own sentence, its printed number, or its section
+    does. That is the point: a line-number-based id let an unrelated edit
+    shift a claim onto another claim's former id, silently inheriting that
+    other claim's human confirm/reject verdict (the bug this replaces).
+    `seq_in_sentence` (not the raw literal alone) is what separates two
+    claims that both happen to print, say, "0.5" within the same sentence.
+    """
+    key = "\x1f".join([section_id or "", _normalize_for_id(sentence), raw, str(seq_in_sentence)])
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:_ID_HASH_HEX_LEN]
+    return f"claim:{tex_rel_path}#{digest}"
 
 
 @dataclass(frozen=True)
@@ -248,7 +297,7 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
             current_section_id = sections[sec_idx].id
             sec_idx += 1
 
-        seq = 0
+        sentence_seq: dict[tuple[int, int], int] = {}  # per-sentence-bounds counter, not per-line
         for m in _CLAIM_RE.finditer(line):
             if m.group("si") is not None:
                 unit_form, printed_number = "percent", m.group("si")
@@ -259,14 +308,17 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
                 unit_form = "fraction" if 0 <= float(printed_number) <= 1 else "plain"
 
             value, places = _normalize(printed_number, unit_form)
-            seq += 1
+            bounds = _sentence_bounds(line, m.start(), m.end())
+            seq_in_sentence = sentence_seq.get(bounds, 0) + 1
+            sentence_seq[bounds] = seq_in_sentence
+            sentence = _extract_sentence(line, m.start(), m.end())
             claims.append(
                 ParsedClaim(
-                    id=f"claim:{tex_rel_path}#{lineno}-{seq}",
+                    id=_content_id(tex_rel_path, current_section_id, sentence, m.group(0), seq_in_sentence),
                     tex_path=tex_rel_path,
                     line=lineno,
                     section_id=current_section_id,
-                    sentence=_extract_sentence(line, m.start(), m.end()),
+                    sentence=sentence,
                     raw=m.group(0),
                     printed_number=printed_number,
                     unit_form=unit_form,
@@ -304,6 +356,55 @@ def _match_candidates(
     ]
 
 
+def _cleanup_orphaned_claims(
+    conn: Connection, scanned_tex_paths: set[str], seen_ids: set[str]
+) -> dict[str, int]:
+    """Remove claim nodes (and their backed_by edges) this extractor produced
+    from one of `scanned_tex_paths` on some earlier run but did not produce
+    again this run (F2) -- e.g. the claim's line was deleted, or its section,
+    sentence, or printed number changed enough to hash to a different id.
+    Without this, every edit accumulates orphaned claim nodes forever.
+
+    Scoped to `scanned_tex_paths`: a claim node whose recorded tex_path is
+    not one of the files *successfully* re-parsed this run is left
+    untouched. This deliberately excludes a path that was requested but
+    failed to read (see `ingest_claims_repo`'s OSError handling) -- a
+    transient read failure is not evidence the claims in that file are gone,
+    and must never be treated as though it were (DESIGN.md section 0,
+    "never guess").
+
+    Conservative by construction (DESIGN.md section 0, "humans own
+    judgement" / section 2, "re-ingestion leaves confirmed and rejected
+    edges alone"): a claim with a confirmed/rejected backed_by edge is never
+    deleted even once orphaned, only logged for manual resolution. Only
+    auto/pending orphans -- no recorded human judgement -- are deleted.
+    """
+    removed_claims = 0
+    removed_edges = 0
+    preserved = 0
+    for node in db.get_nodes_by_type(conn, "claim"):
+        if node["id"] in seen_ids or node["attrs"].get("tex_path") not in scanned_tex_paths:
+            continue
+        claim_edges = [e for e in db.query_edges(conn, src=node["id"]) if e["extractor"] == "claims"]
+        human_judged = [e for e in claim_edges if e["status"] in ("confirmed", "rejected")]
+        if human_judged:
+            preserved += 1
+            logger.info(
+                "claim %s no longer produced re-ingesting %s, but has %d human-judged "
+                "backed_by edge(s); preserving for manual review, not deleting",
+                node["id"], node["attrs"].get("tex_path"), len(human_judged),
+            )
+            continue
+        removed_edges += db.delete_edges_for_node(conn, node["id"], extractor="claims")
+        db.delete_node(conn, node["id"])
+        removed_claims += 1
+    return {
+        "claims_removed": removed_claims,
+        "backed_by_edges_removed": removed_edges,
+        "claims_preserved_with_human_judgement": preserved,
+    }
+
+
 def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[str]) -> dict[str, int]:
     """Ingest claim nodes and candidate (pending) backed_by edges.
 
@@ -312,9 +413,18 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
     via db.upsert_node/upsert_edge; confidence is 1.0 for a unique hit or
     1/N across N candidates for the same claim (Owner-confirmed rule, see
     task report) -- never a tuned/guessed number.
+
+    After (re-)ingesting every successfully-read tex path, orphaned claim
+    nodes from those same paths -- ones this extractor produced before but
+    did not produce again this run -- are cleaned up; see
+    `_cleanup_orphaned_claims` (F2). A path that fails to read (below) is
+    excluded from that cleanup scope, not treated as evidence its claims are
+    gone.
     """
     counts = {"claims": 0, "candidates": 0}
     metrics = _collect_experiment_metrics(conn)
+    seen_ids: set[str] = set()
+    scanned_paths: set[str] = set()
 
     for tex_rel_path in tex_paths:
         try:
@@ -322,8 +432,10 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
         except OSError as exc:
             logger.warning("cannot read tex file %s: %s", tex_rel_path, exc)
             continue
+        scanned_paths.add(tex_rel_path)
 
         for claim in claims:
+            seen_ids.add(claim.id)
             attrs: dict[str, Any] = {
                 "sentence": claim.sentence,
                 "value": claim.value,
@@ -363,4 +475,5 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
                 )
                 counts["candidates"] += 1
 
+    counts.update(_cleanup_orphaned_claims(conn, scanned_paths, seen_ids))
     return counts

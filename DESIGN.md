@@ -74,6 +74,17 @@ duplicating: `commit:<sha>`, `figure:<repo-relative-path>`,
 `section:<tex-file>#<slug>`, `reference:<lowercased-bib-key>`,
 `experiment:<run-id>`, `contributor:<lowercased-email>`.
 
+`claim:<tex-file>#<content-hash>` is content-addressed rather than
+position-addressed: the hash covers the owning section's slug, the claim's
+sentence (whitespace/case-normalized), the number's own printed literal, and
+its position among any other numbers in the same sentence -- never the line
+number. Inserting, deleting, or reordering unrelated lines therefore leaves
+every claim's id unchanged; only editing the claim's own text or its printed
+number produces a new id, which is correct -- at that point a human's
+earlier confirm/reject on the old claim genuinely no longer applies. A
+line-anchored id would instead let an unrelated edit shift a claim onto
+another claim's former id, silently inheriting that claim's human verdict.
+
 Edge types, grouped by the layer that produces them:
 
 | Edge | Meaning | Layer |

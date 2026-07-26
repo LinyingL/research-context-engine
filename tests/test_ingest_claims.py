@@ -3,12 +3,26 @@ deterministic backed_by candidate generation. No real git needed -- only a
 tmp_path .tex file plus an in-memory graph with pre-seeded experiment nodes.
 """
 
+import logging
+import re
 from pathlib import Path
 
 from rce import db
 from rce.ingest import claims
 
 TEX_87_3_PCT = "\\section{Results}\nWe reach 87.3\\% accuracy.\n"
+
+# ingest_claims_repo's counts dict always carries the F2 orphan-cleanup keys
+# alongside "claims"/"candidates" -- most tests below expect a no-op cleanup
+# (nothing orphaned yet), so spread this in rather than repeating all three
+# zeroes at every call site.
+_NO_CLEANUP = {
+    "claims_removed": 0,
+    "backed_by_edges_removed": 0,
+    "claims_preserved_with_human_judgement": 0,
+}
+
+_CLAIM_ID_RE = r"^claim:paper\.tex#[0-9a-f]{16}$"
 
 
 def _repo(tmp_path: Path, tex: str) -> Path:
@@ -220,7 +234,7 @@ def test_claim_matches_metric_rounded_to_its_own_printed_precision(tmp_path):
     conn = _seeded_conn(run_a={"accuracy": 0.87312})  # rounds to 0.873 at 3dp -> matches
 
     counts = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
-    assert counts == {"claims": 1, "candidates": 1}
+    assert counts == {**_NO_CLEANUP, "claims": 1, "candidates": 1}
 
     edge = db.query_edges(conn, type="backed_by")[0]
     assert edge["dst"] == "experiment:run_a"
@@ -234,7 +248,7 @@ def test_claim_does_not_match_metric_that_rounds_differently(tmp_path):
     repo = _repo(tmp_path, TEX_87_3_PCT)
     conn = _seeded_conn(run_a={"accuracy": 0.8735})
 
-    assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {"claims": 1, "candidates": 0}
+    assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {**_NO_CLEANUP, "claims": 1, "candidates": 0}
     assert db.query_edges(conn, type="backed_by") == []
 
 
@@ -242,7 +256,7 @@ def test_multiple_experiments_each_become_a_pending_candidate_with_split_confide
     repo = _repo(tmp_path, TEX_87_3_PCT)
     conn = _seeded_conn(run_a={"accuracy": 0.87312}, run_b={"acc": 0.8731})
 
-    assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {"claims": 1, "candidates": 2}
+    assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {**_NO_CLEANUP, "claims": 1, "candidates": 2}
     edges = db.query_edges(conn, type="backed_by")
     assert {e["dst"] for e in edges} == {"experiment:run_a", "experiment:run_b"}
     assert all(e["status"] == "pending" and e["confidence"] == 0.5 for e in edges)
@@ -252,7 +266,7 @@ def test_zero_hit_claim_creates_node_but_no_edge(tmp_path):
     repo = _repo(tmp_path, TEX_87_3_PCT)
     conn = _seeded_conn(run_a={"accuracy": 0.5})
 
-    assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {"claims": 1, "candidates": 0}
+    assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {**_NO_CLEANUP, "claims": 1, "candidates": 0}
     assert db.query_edges(conn, type="backed_by") == []
     claim_nodes = db.get_nodes_by_type(conn, "claim")
     assert len(claim_nodes) == 1
@@ -266,7 +280,133 @@ def test_ingest_claims_repo_is_idempotent_with_stable_ids(tmp_path):
 
     first = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
     second = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
-    assert first == second == {"claims": 1, "candidates": 1}
+    assert first == second == {**_NO_CLEANUP, "claims": 1, "candidates": 1}
     assert len(db.get_nodes_by_type(conn, "claim")) == 1
     assert len(db.query_edges(conn, type="backed_by")) == 1
-    assert db.get_nodes_by_type(conn, "claim")[0]["id"] == "claim:paper.tex#2-1"
+    claim_id = db.get_nodes_by_type(conn, "claim")[0]["id"]
+    assert re.match(_CLAIM_ID_RE, claim_id), claim_id
+    # Content-addressed (F2): the id is a pure function of section + sentence
+    # + printed number + intra-sentence position -- recomputing it from the
+    # same inputs the extractor used must land on the exact same id.
+    assert claim_id == claims._content_id("paper.tex", "section:paper.tex#results", "We reach 87.3\\% accuracy.", "87.3\\%", 1)
+
+
+# --- F2: content-addressed ids + orphan cleanup ----------------------------
+#
+# Reproduces the review-reported regression directly: with the old
+# `claim:<path>#<line>-<seq>` id, inserting one line at the top of the file
+# shifted every later claim's line number, so a claim's human confirm/reject
+# silently reattached to whatever claim now happened to land on its old
+# line -- and the claim's *own*, now-orphaned old id was left behind forever
+# (claim nodes growing 31 -> 51, backed_by 8 -> 15 purely from edits, per the
+# review's own count).
+
+_TWO_CLAIMS_TEX = (
+    "\\section{Results}\n"
+    "We reach 87.3\\% accuracy.\n"
+    "The baseline gets 50.0\\% accuracy.\n"
+)
+
+
+def test_reingest_after_top_of_file_insertion_keeps_human_judgement_on_correct_claim(tmp_path):
+    repo = _repo(tmp_path, _TWO_CLAIMS_TEX)
+    conn = _seeded_conn(run_a={"accuracy": 0.873}, run_b={"accuracy": 0.500})
+
+    claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    nodes_before = {n["attrs"]["raw"]: n["id"] for n in db.get_nodes_by_type(conn, "claim")}
+    assert nodes_before.keys() == {"87.3\\%", "50.0\\%"}
+    claim_a_id, claim_b_id = nodes_before["87.3\\%"], nodes_before["50.0\\%"]
+
+    # A human confirms the real 87.3% claim and rejects the 50.0% one.
+    db.set_edge_status(conn, claim_a_id, "experiment:run_a", "backed_by", "claims", "confirmed")
+    db.set_edge_status(conn, claim_b_id, "experiment:run_b", "backed_by", "claims", "rejected")
+
+    # Insert an unrelated line at the very top of the file -- both claims'
+    # line numbers shift by 1; neither claim's own text changes at all.
+    (tmp_path / "paper.tex").write_text("% inserted note\n" + _TWO_CLAIMS_TEX)
+    second_counts = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+
+    nodes_after = {n["attrs"]["raw"]: n["id"] for n in db.get_nodes_by_type(conn, "claim")}
+    assert nodes_after == nodes_before  # same ids reappear -- no misattribution, no orphans
+    assert len(db.get_nodes_by_type(conn, "claim")) == 2  # no growth from the edit
+    assert second_counts["claims_removed"] == 0
+
+    edge_a = db.query_edges(conn, src=claim_a_id, dst="experiment:run_a", type="backed_by")[0]
+    edge_b = db.query_edges(conn, src=claim_b_id, dst="experiment:run_b", type="backed_by")[0]
+    assert edge_a["status"] == "confirmed"  # the correct claim's confirm survived the edit
+    assert edge_b["status"] == "rejected"  # the correct claim's reject survived, not lost
+
+
+def test_repeated_unrelated_edits_do_not_accumulate_orphaned_claim_nodes(tmp_path):
+    # Regression: the review found claim nodes growing 31 -> 51 and
+    # backed_by edges 8 -> 15 purely from repeated edits, no new claims.
+    repo = _repo(tmp_path, TEX_87_3_PCT)
+    conn = _seeded_conn(run_a={"accuracy": 0.87312})
+
+    claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    for i in range(5):
+        (tmp_path / "paper.tex").write_text(f"% unrelated edit {i}\n" + TEX_87_3_PCT)
+        claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+
+    assert len(db.get_nodes_by_type(conn, "claim")) == 1
+    assert len(db.query_edges(conn, type="backed_by")) == 1
+
+
+def test_orphaned_pending_claim_is_removed_once_its_sentence_disappears(tmp_path):
+    repo = _repo(tmp_path, TEX_87_3_PCT)
+    conn = _seeded_conn(run_a={"accuracy": 0.87312})
+
+    first = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    assert first["claims"] == 1 and len(db.get_nodes_by_type(conn, "claim")) == 1
+
+    (tmp_path / "paper.tex").write_text("\\section{Results}\nNothing quantitative here.\n")
+    second = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+
+    assert second == {
+        "claims": 0, "candidates": 0,
+        "claims_removed": 1, "backed_by_edges_removed": 1,
+        "claims_preserved_with_human_judgement": 0,
+    }
+    assert db.get_nodes_by_type(conn, "claim") == []
+    assert db.query_edges(conn, type="backed_by") == []
+
+
+def test_unreadable_tex_path_is_not_treated_as_evidence_its_claims_are_gone(tmp_path):
+    # A transient read failure (file deleted/locked between an upstream
+    # inventory snapshot and this read) must never be treated as evidence
+    # that a file's claims disappeared -- DESIGN.md section 0, "never
+    # guess". Simulated by removing the file from disk while still passing
+    # its name in tex_paths, exactly as a moments-earlier inventory would.
+    repo = _repo(tmp_path, TEX_87_3_PCT)
+    conn = _seeded_conn(run_a={"accuracy": 0.87312})
+
+    first = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    assert first["claims"] == 1
+
+    (tmp_path / "paper.tex").unlink()
+    second = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+
+    assert second["claims"] == 0
+    assert second["claims_removed"] == 0  # not wiped out just because the read failed
+    assert len(db.get_nodes_by_type(conn, "claim")) == 1
+
+
+def test_orphaned_claim_with_human_judgement_is_preserved_and_logged(tmp_path, caplog):
+    repo = _repo(tmp_path, TEX_87_3_PCT)
+    conn = _seeded_conn(run_a={"accuracy": 0.87312})
+
+    claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    claim_id = db.get_nodes_by_type(conn, "claim")[0]["id"]
+    db.set_edge_status(conn, claim_id, "experiment:run_a", "backed_by", "claims", "rejected")
+
+    # The claim's sentence disappears entirely (not merely shifted/reworded).
+    (tmp_path / "paper.tex").write_text("\\section{Results}\nNothing quantitative here.\n")
+    with caplog.at_level(logging.INFO, logger="rce.ingest.claims"):
+        counts = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+
+    assert counts["claims_removed"] == 0
+    assert counts["claims_preserved_with_human_judgement"] == 1
+    assert db.get_node(conn, claim_id) is not None  # node kept, not deleted
+    edge = db.query_edges(conn, src=claim_id, dst="experiment:run_a", type="backed_by")[0]
+    assert edge["status"] == "rejected"  # human verdict untouched
+    assert any("human-judged" in r.message for r in caplog.records)

@@ -728,3 +728,60 @@ def test_upsert_edge_concurrent_first_write_does_not_raise_integrity_error(tmp_p
         assert {o["line"] for o in occurrences} == {10, 20}
     finally:
         verify_conn.close()
+
+
+# --- delete_node / delete_edges_for_node (F2 orphan-cleanup primitives) ----
+
+
+def test_delete_edges_for_node_removes_edges_on_either_side(conn):
+    db.upsert_node(conn, "claim:paper.tex#aaa", "claim")
+    db.upsert_node(conn, "experiment:run1", "experiment")
+    db.upsert_node(conn, "experiment:run2", "experiment")
+    db.upsert_edge(conn, "claim:paper.tex#aaa", "experiment:run1", "backed_by", "claims", {"line": 1}, 1.0, status="pending")
+    db.upsert_edge(conn, "claim:paper.tex#aaa", "experiment:run2", "backed_by", "claims", {"line": 1}, 1.0, status="pending")
+
+    removed = db.delete_edges_for_node(conn, "claim:paper.tex#aaa")
+
+    assert removed == 2
+    assert db.query_edges(conn, src="claim:paper.tex#aaa") == []
+
+
+def test_delete_edges_for_node_scoped_to_extractor_leaves_other_extractors_alone(conn):
+    # F2's orphan cleanup must only ever touch the edges its own extractor
+    # produced -- never another extractor's judgement on the same node.
+    db.upsert_node(conn, "claim:paper.tex#aaa", "claim")
+    db.upsert_node(conn, "experiment:run1", "experiment")
+    db.upsert_edge(conn, "claim:paper.tex#aaa", "experiment:run1", "backed_by", "claims", {"line": 1}, 1.0, status="pending")
+    db.upsert_edge(conn, "claim:paper.tex#aaa", "experiment:run1", "backed_by", "7b-judge", {"line": 1}, 0.8, status="pending")
+
+    removed = db.delete_edges_for_node(conn, "claim:paper.tex#aaa", extractor="claims")
+
+    assert removed == 1
+    remaining = db.query_edges(conn, src="claim:paper.tex#aaa")
+    assert len(remaining) == 1 and remaining[0]["extractor"] == "7b-judge"
+
+
+def test_delete_node_removes_the_node(conn):
+    db.upsert_node(conn, "claim:paper.tex#aaa", "claim")
+    db.delete_node(conn, "claim:paper.tex#aaa")
+    assert db.get_node(conn, "claim:paper.tex#aaa") is None
+
+
+def test_delete_node_is_a_noop_for_a_missing_id(conn):
+    db.delete_node(conn, "claim:does-not-exist")  # must not raise
+
+
+def test_delete_node_after_delete_edges_for_node_does_not_violate_foreign_keys(conn):
+    # foreign_keys=ON (see connect()) means edges.src/dst reference
+    # nodes.id with no CASCADE -- deleting a node with edges still pointing
+    # at it must fail; deleting the edges first must then let it succeed.
+    db.upsert_node(conn, "claim:paper.tex#aaa", "claim")
+    db.upsert_node(conn, "experiment:run1", "experiment")
+    db.upsert_edge(conn, "claim:paper.tex#aaa", "experiment:run1", "backed_by", "claims", {"line": 1}, 1.0, status="pending")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.delete_node(conn, "claim:paper.tex#aaa")
+
+    db.delete_edges_for_node(conn, "claim:paper.tex#aaa")
+    db.delete_node(conn, "claim:paper.tex#aaa")
+    assert db.get_node(conn, "claim:paper.tex#aaa") is None

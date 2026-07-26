@@ -434,6 +434,45 @@ def set_edge_status(
     conn.commit()
 
 
+def delete_edges_for_node(
+    conn: sqlite3.Connection, node_id: str, *, extractor: str | None = None
+) -> int:
+    """Delete edges with `node_id` as src OR dst, optionally scoped to one
+    `extractor`. Returns the number of rows deleted.
+
+    Must run before `delete_node` for this node when foreign_keys=ON (the
+    default, see `connect`): edges.src/dst reference nodes.id with no ON
+    DELETE CASCADE, so a node with edges still pointing at it cannot be
+    deleted directly. Extractor-scoped orphan cleanup (F2, see
+    rce.ingest.claims) is the first caller -- it must delete only the edges
+    its own extractor produced, never another extractor's judgement on the
+    same node.
+    """
+    clauses = ["(src = ? OR dst = ?)"]
+    params: list[Any] = [node_id, node_id]
+    if extractor is not None:
+        clauses.append("extractor = ?")
+        params.append(extractor)
+    cursor = conn.execute(f"DELETE FROM edges WHERE {' AND '.join(clauses)}", params)
+    conn.commit()
+    return cursor.rowcount
+
+
+def delete_node(conn: sqlite3.Connection, node_id: str) -> None:
+    """Hard-delete a node by id. No-op if it does not exist.
+
+    This is a machine-side orphan-cleanup primitive (F2, see
+    rce.ingest.claims), not a general-purpose deletion API and not a human
+    write path -- it carries none of set_human_fields/set_edge_status's
+    protections. Callers are responsible for confirming first that no
+    human-owned state (a confirmed/rejected edge) depends on this node; the
+    FK constraint only guarantees no edges reference it (see
+    delete_edges_for_node), not that deleting it was the right call.
+    """
+    conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+    conn.commit()
+
+
 def query_edges(
     conn: sqlite3.Connection,
     src: str | None = None,
