@@ -79,9 +79,26 @@ def _read_flat_dir(dir_path: Path) -> dict[str, str]:
 
 def _read_metrics_dir(dir_path: Path) -> dict[str, float]:
     """metrics/<name>: one 'timestamp value step' line per logged point;
-    last line is the final value. Unparseable file skipped + logged."""
+    last line is the final value. Unparseable file skipped + logged.
+
+    Entries whose name starts with '.' are skipped outright, before ever
+    being opened -- MLflow leaves these behind as its own leftover
+    temp-write artifacts (real example seen in a production mlruns tree:
+    `.train_loss_step.81KBZ3` sitting next to `train_loss_step`, both files
+    with an identical last-line value). Before this filter, iterdir()
+    handed both to the loop below as if they were two independent metrics,
+    so every metric written this way was silently ingested twice under two
+    different names -- inflating claim `backed_by` candidate counts and
+    diluting confidence for every affected claim. Counted and logged once
+    per directory rather than per file, matching this module's other
+    summary-not-per-item skip logging (see `runs_missing_git_tag` in
+    `ingest_mlflow_dir`)."""
     result: dict[str, float] = {}
+    skipped_dotfiles = 0
     for entry in sorted(dir_path.iterdir()) if dir_path.is_dir() else []:
+        if entry.name.startswith("."):
+            skipped_dotfiles += 1
+            continue
         if not entry.is_file():
             continue
         lines = [l for l in entry.read_text(errors="replace").splitlines() if l.strip()]
@@ -93,6 +110,12 @@ def _read_metrics_dir(dir_path: Path) -> dict[str, float]:
             result[entry.name] = float(parts[1])
         except ValueError:
             logger.warning("skipping non-numeric metric value in %s: %r", entry, parts[1])
+    if skipped_dotfiles:
+        logger.info(
+            "skipped %d dot-prefixed entr%s in %s (MLflow temp/leftover files, "
+            "e.g. '.train_loss_step.81KBZ3'), not ingested as metrics",
+            skipped_dotfiles, "y" if skipped_dotfiles == 1 else "ies", dir_path,
+        )
     return result
 
 def _iter_run_dirs(mlruns_root: Path):

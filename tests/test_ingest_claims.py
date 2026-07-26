@@ -369,6 +369,7 @@ def test_claim_matches_metric_rounded_to_its_own_printed_precision(tmp_path):
     assert edge["status"] == "pending"  # machine path never writes "confirmed"/"auto" here
     assert edge["confidence"] == 1.0
     assert edge["evidence"]["occurrences"][0]["metric"] == "accuracy"
+    assert edge["evidence"]["occurrences"][0]["candidate_count"] == 1
 
 
 def test_claim_does_not_match_metric_that_rounds_differently(tmp_path):
@@ -380,14 +381,19 @@ def test_claim_does_not_match_metric_that_rounds_differently(tmp_path):
     assert db.query_edges(conn, type="backed_by") == []
 
 
-def test_multiple_experiments_each_become_a_pending_candidate_with_split_confidence(tmp_path):
+def test_multiple_experiments_each_become_a_pending_candidate_at_full_confidence(tmp_path):
+    # Owner decision (P2): confidence stays 1.0 regardless of candidate
+    # count -- match-rule reliability, not which candidate is correct.
+    # Ambiguity is recorded in evidence.candidate_count instead of being
+    # diluted into the confidence number.
     repo = _repo(tmp_path, TEX_87_3_PCT)
     conn = _seeded_conn(run_a={"accuracy": 0.87312}, run_b={"acc": 0.8731})
 
     assert claims.ingest_claims_repo(conn, repo, ["paper.tex"]) == {**_NO_CLEANUP, "claims": 1, "candidates": 2}
     edges = db.query_edges(conn, type="backed_by")
     assert {e["dst"] for e in edges} == {"experiment:run_a", "experiment:run_b"}
-    assert all(e["status"] == "pending" and e["confidence"] == 0.5 for e in edges)
+    assert all(e["status"] == "pending" and e["confidence"] == 1.0 for e in edges)
+    assert all(e["evidence"]["occurrences"][0]["candidate_count"] == 2 for e in edges)
 
 
 def test_zero_hit_claim_creates_node_but_no_edge(tmp_path):

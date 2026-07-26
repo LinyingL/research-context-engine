@@ -228,3 +228,61 @@ def test_no_summary_warning_when_all_runs_have_git_tag(tmp_path, conn, repo_sha,
         mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
 
     assert not any("no git commit tag" in r.message for r in caplog.records)
+
+
+# -- real-data bug: dot-prefixed MLflow temp/leftover metric files were --
+# -- ingested as duplicate metrics (e.g. ".train_loss_step.81KBZ3" next --
+# -- to "train_loss_step", same value -> every metric double-counted)   --
+
+
+def test_dot_prefixed_leftover_metric_files_are_skipped_not_duplicated(tmp_path, conn, repo_sha, caplog):
+    # Real mlruns tree observed exactly this: a leftover MLflow temp file
+    # ".train_loss_step.81KBZ3" sitting alongside "train_loss_step" with an
+    # identical last-line value, plus ".grad_norm_step.ZxvZE4" alongside
+    # "grad_norm_step" -- before this fix, iterdir() (no dotfile filtering)
+    # ingested both names as independent metrics, silently doubling the
+    # candidate count (and diluting confidence) for every claim they backed.
+    mlruns = tmp_path / "mlruns"
+    run_dir = _build_run(mlruns, "run_a", repo_sha)  # already has metrics/accuracy
+    _write(
+        run_dir / "metrics",
+        {
+            ".train_loss_step.81KBZ3": "0 0.42 0\n1700000100000 0.42 1\n",
+            ".grad_norm_step.ZxvZE4": "0 1.1 0\n1700000100000 1.1 1\n",
+        },
+    )
+
+    with caplog.at_level("INFO", logger="rce.ingest.mlflow"):
+        counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts == {"experiments": 1, "implements": 1, "produces": 1}
+    node = db.get_node(conn, "experiment:run_a")
+    # Only the real metric survives; neither dot-prefixed leftover file
+    # becomes a metric of its own, and no metric name is duplicated.
+    assert node["attrs"]["metrics"] == {"accuracy": 0.87}
+    assert not any(name.startswith(".") for name in node["attrs"]["metrics"])
+
+    skip_records = [r for r in caplog.records if "dot-prefixed" in r.message]
+    assert len(skip_records) == 1
+    assert "2" in skip_records[0].message  # both leftover files counted in one summary line
+
+
+def test_dot_prefixed_dir_entry_in_metrics_is_also_skipped(tmp_path, conn):
+    # Defensive: a dot-prefixed *directory* (not just a file) under metrics/
+    # must be skipped the same way -- the name check runs before is_file(),
+    # so this never reaches (and fails on) entry.read_text().
+    mlruns = tmp_path / "mlruns"
+    run_dir = mlruns / "0" / "run_dotdir"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.yaml").write_text(
+        "experiment_id: '0'\nrun_id: run_dotdir\nrun_name: dotdir-run\nstatus: FINISHED\n"
+    )
+    (run_dir / "metrics").mkdir()
+    (run_dir / "metrics" / "accuracy").write_text("0 0.5 0\n1700000100000 0.87 1\n")
+    (run_dir / "metrics" / ".DS_Store").mkdir()  # dot-prefixed dir, not a metric file
+
+    counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns)
+
+    assert counts["experiments"] == 1
+    node = db.get_node(conn, "experiment:run_dotdir")
+    assert node["attrs"]["metrics"] == {"accuracy": 0.87}

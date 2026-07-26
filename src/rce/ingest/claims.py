@@ -482,9 +482,23 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
 
     Must run after experiment nodes exist (mlflow/wandb) -- with none yet in
     the graph, every claim would trivially get zero candidates. Idempotent
-    via db.upsert_node/upsert_edge; confidence is 1.0 for a unique hit or
-    1/N across N candidates for the same claim (Owner-confirmed rule, see
-    task report) -- never a tuned/guessed number.
+    via db.upsert_node/upsert_edge.
+
+    confidence is always 1.0, whether a claim has one candidate or several
+    (Owner decision, P2). Precision-matching itself is deterministic and
+    exact -- the rounding rule either finds a candidate or it doesn't, with
+    no tunable tolerance -- so confidence here expresses "the match rule is
+    reliable," not "this is the one true candidate." *Which* candidate is
+    correct, when there is more than one, is a judgement call, and
+    judgement belongs to a human or the semantic layer, never to the
+    deterministic extractor. Diluting confidence to 1/N used to try to
+    smuggle that judgement in as a decimal; it does not survive contact
+    with a human reading the graph, who cannot tell a genuinely
+    lower-confidence match from an ambiguous one at a glance. Instead, every
+    candidate edge carries how many candidates the claim matched in
+    `evidence["candidate_count"]`, and every candidate is still written
+    `status="pending"` regardless of count -- ambiguity is visible in the
+    evidence, not laundered into the confidence number.
 
     After (re-)ingesting every successfully-read tex path, orphaned claim
     nodes from those same paths -- ones this extractor produced before but
@@ -525,13 +539,13 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
             matches = _match_candidates(claim, metrics)
             if not matches:
                 continue  # a claim with no backing candidate is itself information -- node only, no edge
-            if len(matches) > 1:
+            candidate_count = len(matches)
+            if candidate_count > 1:
                 logger.info(
                     "%s:%d: claim %r has %d backed_by candidates: %s",
-                    tex_rel_path, claim.line, claim.raw, len(matches),
+                    tex_rel_path, claim.line, claim.raw, candidate_count,
                     ", ".join(f"{eid}:{name}" for eid, name, _ in matches),
                 )
-            confidence = 1.0 / len(matches)
             for exp_id, metric_name, metric_value in matches:
                 db.upsert_edge(
                     conn, claim.id, exp_id, "backed_by", extractor="claims",
@@ -542,8 +556,12 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
                         "metric_value": metric_value,
                         "claim_raw": claim.raw,
                         "claim_value": claim.value,
+                        "candidate_count": candidate_count,
                     },
-                    confidence=confidence, status="pending",
+                    # Owner decision (P2): confidence is always 1.0 -- see
+                    # this function's docstring for why ambiguity belongs in
+                    # candidate_count, not in a diluted confidence number.
+                    confidence=1.0, status="pending",
                 )
                 counts["candidates"] += 1
 

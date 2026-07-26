@@ -103,9 +103,23 @@ Edge types, grouped by the layer that produces them:
 metrics by rounding both to the precision the claim itself was printed with,
 never a tuned tolerance. Every candidate is written `status=pending` — the
 extractor never confirms or rejects one; that judgement is left to the
-semantic layer or a human via the confirmation queue. `supports` still has no
-extractor and exists in the schema only; it belongs to the optional
-local-model layer described in section 7.
+semantic layer or a human via the confirmation queue.
+
+Confidence on a `backed_by` candidate is always `1.0`, whether a claim
+matches one experiment or several. Precision-matching is deterministic and
+exact — the rounding rule either finds a candidate or it doesn't, with no
+tunable tolerance — so confidence expresses the reliability of the match
+*rule*, not which candidate is the correct one. That second question is a
+judgement call, and judgement belongs to the semantic layer or a human, never
+the extractor; diluting confidence to `1/N` across `N` candidates used to
+smuggle a guess about "which one" into a decimal that looked precise but
+wasn't. Instead, ambiguity is recorded plainly: every candidate edge's
+evidence carries `candidate_count`, the total number of experiments that
+claim matched, so a reviewer sees "3 candidates" rather than inferring it
+from a confidence of `0.33`.
+
+`supports` still has no extractor and exists in the schema only; it belongs
+to the optional local-model layer described in section 7.
 
 ## Section 5 — Connection keys
 
@@ -148,6 +162,20 @@ length after `\begin{subfigure}`, or a `\begin{tabular}` column spec), the
 URL argument of `\url`/`\href`, and a bare `https://...` typed directly in
 prose are all blanked before number-scanning — a DOI or arXiv id's digits
 are not a claim about the paper's own results.
+
+**Known limitation (connector 7, no local run store).** A paper repository
+that never has a local MLflow/W&B run history — the normal case for a
+`showyourwork`-style repository, and for most already-published LaTeX
+repositories in general — gets zero `experiment:` nodes. With no experiment
+metrics to compare against, every quantitative claim's `backed_by` candidate
+set is structurally empty, not merely small: the claim node is still
+created, but no candidate edge of any kind follows. This is not a bug. The
+deterministic layer only connects evidence that already exists in the
+project; a repository with no recorded runs has no run evidence to connect,
+and RCE does not invent a placeholder experiment to compare against. A user
+comparing RCE's output across repositories should expect an all-claims,
+no-`backed_by` result from this class of repo rather than mistake it for a
+broken extractor.
 
 ## Section 7 — Roadmap
 
