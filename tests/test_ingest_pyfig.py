@@ -5,6 +5,7 @@ real throwaway repos via subprocess `git`, following tests/test_ingest_git.py's
 pattern.
 """
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -554,7 +555,40 @@ _POSITIVE_CONTROLS: list[tuple[str, str]] = [
     ("os_path_join", "import os\nOUT = 'figures'\nplt.savefig(os.path.join(OUT, 'f1.png'))\n"),
     ("decorator_reads_not_binds",
      f"OUT = 'figures'\n\n@OUT\ndef f():\n    {_SAVE}\n"),
+    # The shape every edge in the real testbed uses -- guards against a change
+    # that silently breaks f-string folding while the negative table stays green.
+    ("fstring_interpolation", "OUT = 'figures'\nplt.savefig(f'{OUT}/f1.png')\n"),
 ]
+
+
+def test_star_import_disables_folding_for_the_whole_file(tmp_path, caplog):
+    """`from x import *` can bind any name, so no touch count is trustworthy;
+    the whole file gives up folding rather than guessing (HANDOFF-SPEC section 5)."""
+    (tmp_path / "gen.py").write_text(
+        f"OUT = 'figures'\nfrom cfg import *\n{_SAVE}\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        calls = pyfig.parse_py_file(tmp_path, "gen.py")
+    assert calls == [], "star import must disable folding, not fold a possibly-rebound name"
+    assert any("star import" in r.message for r in caplog.records)
+
+
+def test_star_import_before_the_constant_also_disables_folding(tmp_path):
+    """Order does not matter: the import may rebind the name after assignment
+    at runtime regardless of where it appears."""
+    (tmp_path / "gen.py").write_text(
+        f"from cfg import *\nOUT = 'figures'\n{_SAVE}\n"
+    )
+    assert pyfig.parse_py_file(tmp_path, "gen.py") == []
+
+
+def test_plain_from_import_still_allows_unrelated_constants_to_fold(tmp_path):
+    """Only star imports are blanket-disabling -- a named import binds a
+    knowable name and must not disable folding of other constants."""
+    (tmp_path / "gen.py").write_text(
+        f"from cfg import something\nOUT = 'figures'\n{_SAVE}\n"
+    )
+    assert pyfig.parse_py_file(tmp_path, "gen.py") != []
 
 
 @pytest.mark.parametrize("name,source", _NAME_BINDING_FORMS, ids=[f[0] for f in _NAME_BINDING_FORMS])

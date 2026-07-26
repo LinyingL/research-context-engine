@@ -231,6 +231,15 @@ def _count_all_name_bindings(tree: ast.Module) -> dict[str, int]:
     return touch_count
 
 
+def _has_star_import(tree: ast.Module) -> bool:
+    """True if the file contains `from x import *` anywhere."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and any(alias.name == "*" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+
+
 def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
     """Module-level names foldable into a savefig(...) expression (T9,
     T-blocker fix).
@@ -251,7 +260,18 @@ def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
     parameter or function/class name, ...) is excluded regardless of how
     many times it looks foldable at the top level -- HANDOFF-SPEC.md
     section 5: "拼不出来就放弃，不猜".
+
+    A `from x import *` anywhere disables folding for the whole file: the
+    set of names it binds is only knowable by importing that module, so no
+    per-name touch count can be trusted. Giving up is the conservative
+    reading of the same rule.
     """
+    if _has_star_import(tree):
+        logger.warning(
+            "star import found; skipping constant folding for this file, not guessing"
+        )
+        return {}
+
     touch_count = _count_all_name_bindings(tree)
 
     values: dict[str, str] = {}
