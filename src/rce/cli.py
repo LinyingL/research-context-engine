@@ -33,6 +33,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db, query
+from rce.ingest import claims as claims_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
@@ -179,6 +180,13 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 print(f"  wandb: {args.wandb} -> {_format_counts(wandb_counts)}")
             else:
                 print("  wandb: skipped (no --wandb given)")
+            # Phase B (task B1): claim extraction + deterministic backed_by
+            # candidate generation. Must run last -- it matches claim
+            # numbers against experiment nodes' metrics, so mlflow/wandb
+            # (just above) have to have already written those nodes, or
+            # every claim would trivially get zero candidates.
+            claims_counts = claims_ingest.ingest_claims_repo(conn, project_root, inventory["tex"])
+            print(f"  claims: {_format_counts(claims_counts)}")
             skipped = warnings.count
         print("Ingest summary (whole graph):")
         _print_graph_counts(conn)
