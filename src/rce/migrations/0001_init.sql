@@ -1,6 +1,6 @@
 -- Migration 0001: initial provenance graph schema.
 --
--- Node and edge types are fixed by HANDOFF-SPEC.md section 4 (ontology v0).
+-- Node and edge types are fixed by DESIGN.md section 4 (ontology v0).
 -- Do not add types here without updating the spec first -- the CHECK
 -- constraints below are the enforcement mechanism for that contract.
 
@@ -27,7 +27,7 @@ CREATE TABLE edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     src TEXT NOT NULL REFERENCES nodes(id),
     dst TEXT NOT NULL REFERENCES nodes(id),
-    -- Edge types per HANDOFF-SPEC.md section 4 (deterministic + 7B layers).
+    -- Edge types per DESIGN.md section 4 (deterministic + 7B layers).
     -- 'summarized_as' is intentionally excluded: the spec models it as a
     -- node-attribute summary, not an edge.
     type TEXT NOT NULL CHECK (type IN (
@@ -35,14 +35,14 @@ CREATE TABLE edges (
         'cites', 'authored_by', 'backed_by', 'supports'
     )),
     extractor TEXT NOT NULL,
-    -- Hard invariant (HANDOFF-SPEC.md section 2/4): no edge without
+    -- Hard invariant (DESIGN.md section 2/4): no edge without
     -- evidence. NOT NULL alone lets '{}' / '' through, so reject the
     -- placeholder-empty forms explicitly; upsert_edge in db.py enforces the
     -- same rule in Python as the first line of defense.
     evidence TEXT NOT NULL CHECK (evidence NOT IN ('{}', '', 'null')),
     confidence REAL NOT NULL,
     -- Confirmation queue is status='pending'; no separate queue table
-    -- (architecture decision, HANDOFF-SPEC.md task brief).
+    -- (architecture decision, DESIGN.md task brief).
     status TEXT NOT NULL CHECK (status IN ('auto', 'pending', 'confirmed', 'rejected')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),

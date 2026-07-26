@@ -62,4 +62,4 @@ Everything above works without it.
   says so explicitly — it never guesses or fabricates a chain to look
   useful.
 
-See `HANDOFF-SPEC.md` for the full product specification.
+See `DESIGN.md` for the full product specification.

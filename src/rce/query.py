@@ -7,7 +7,7 @@ rce.mcp_server calls trace(), but so could the CLI or a future web view.
 Reads only through rce.db's public functions (get_node/query_edges) -- no
 raw SQL here, per db.py's module contract.
 
-HANDOFF-SPEC.md section 4 groups the traversable types as "upstream" (source
+DESIGN.md section 4 groups the traversable types as "upstream" (source
 direction: implements/produces/generates, e.g. Commit->Experiment->Figure)
 and "paper-side" (citation direction: includes/cites/backed_by/supports,
 e.g. Section->Figure, Section->Reference); authored_by rides along
@@ -25,7 +25,7 @@ from typing import Any
 
 from rce import db
 
-# Edge types that make up a provenance chain (HANDOFF-SPEC.md section 4).
+# Edge types that make up a provenance chain (DESIGN.md section 4).
 UPSTREAM_EDGE_TYPES = frozenset({"implements", "produces", "generates"})
 PAPER_EDGE_TYPES = frozenset({"includes", "cites", "backed_by", "supports"})
 TRACE_EDGE_TYPES = UPSTREAM_EDGE_TYPES | PAPER_EDGE_TYPES | {"authored_by"}

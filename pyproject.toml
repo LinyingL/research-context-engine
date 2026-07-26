@@ -6,7 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "rce"
 version = "0.1.0"
 description = "Research Context Engine -- local provenance graph over git/LaTeX/W&B for research projects."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["research", "provenance", "reproducibility", "latex", "mlflow", "graph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
 # Zero required runtime third-party dependencies (positioning ruling
 # 2026-07-22: RCE is a local-first standalone tool, not an MCP product --
 # MCP is one optional exit among several, not a requirement to install the

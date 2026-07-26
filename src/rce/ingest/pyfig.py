@@ -1,11 +1,11 @@
 """Deterministic savefig() static analysis ingester -- zero-model extractor
-layer (T6, HANDOFF-SPEC.md section 5 connector 5). Uses stdlib `ast` (Occam
+layer (T6, DESIGN.md section 5 connector 5). Uses stdlib `ast` (Occam
 rule 1/2: no third-party AST/regex library) to find
 `plt.savefig("...")`/`fig.savefig("...")`/`savefig("...")` call sites in
 git-tracked .py files whose first positional argument is a plain string
 literal, or one of a narrow set of same-file constant-foldable expressions
 (T9, see `_fold_expr`/`_collect_module_string_constants`). Anything outside
-those shapes is never guessed at -- HANDOFF-SPEC.md section 5: "拼不出来就
+those shapes is never guessed at -- DESIGN.md section 5: "拼不出来就
 放弃，不猜" -- it is skipped and logged. Writes `Commit --generates--> Figure`
 edges via rce.db's upsert_node/upsert_edge.
 
@@ -29,7 +29,7 @@ skipped and logged exactly as pre-T9.
 
 Each edge's src commit is resolved per call site via `git blame`
 (rce.ingest.git.blame_line), pinned to whichever commit last touched that
-specific savefig(...) line -- HANDOFF-SPEC.md section 4 erratum: "src=生成
+specific savefig(...) line -- DESIGN.md section 4 erratum: "src=生成
 代码所在 commit". This (not the repo's current HEAD) is what keeps a
 re-ingest idempotent: an unchanged plotting script blames to the same
 commit run after run, so upsert_edge's (src, dst, type, extractor) key is
@@ -101,7 +101,7 @@ def _touch_binding_target(target: ast.expr, touch: Callable[[str], None]) -> Non
 # Python 3.12+; this project requires >=3.11 (pyproject.toml). Looked up
 # once via getattr with a default so a missing attribute never raises --
 # writing `ast.TypeAlias` directly in the isinstance check below would blow
-# up on 3.11 before HANDOFF-SPEC.md's "don't guess" rule ever got a chance
+# up on 3.11 before DESIGN.md's "don't guess" rule ever got a chance
 # to apply.
 _TYPE_ALIAS_NODE_TYPE = getattr(ast, "TypeAlias", None)
 
@@ -258,7 +258,7 @@ def _collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
     -- unchanged from pre-fix. Any name touched anywhere else in the file
     (conditionally, in a loop, imported, deleted, declared global, used as a
     parameter or function/class name, ...) is excluded regardless of how
-    many times it looks foldable at the top level -- HANDOFF-SPEC.md
+    many times it looks foldable at the top level -- DESIGN.md
     section 5: "拼不出来就放弃，不猜".
 
     A `from x import *` anywhere disables folding for the whole file: the
@@ -434,7 +434,7 @@ def _resolve_figure_target(py_rel_path: str, literal: str, known_images: set[str
     convention as rce.ingest.latex), then fall back to the script's own
     directory (the common `plt.savefig("out.png")` case). Must land on a
     real git-tracked image file (`known_images`) -- otherwise unresolved,
-    never a guessed Figure node (HANDOFF-SPEC.md section 5)."""
+    never a guessed Figure node (DESIGN.md section 5)."""
     root_candidate = _normalize_candidate(".", literal)
     if root_candidate is not None and root_candidate in known_images:
         return root_candidate
@@ -452,7 +452,7 @@ def ingest_pyfig_repo(
     image_paths: list[str],
 ) -> dict[str, int]:
     """Ingest savefig(...) call sites into `Commit --generates--> Figure`
-    edges (HANDOFF-SPEC.md section 5 connector 5).
+    edges (DESIGN.md section 5 connector 5).
 
     Each edge's src is resolved per call site via `git blame` (batch3-fix,
     see module docstring) -- the commit that last touched that exact

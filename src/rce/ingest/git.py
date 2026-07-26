@@ -5,13 +5,13 @@ read commit history, writing Commit/Contributor nodes and `authored_by`
 edges via rce.db's upsert_node/upsert_edge (idempotency is inherited from
 there, not reimplemented here). list_source_files() additionally inventories
 .tex/.bib/image/.py files for T2's LaTeX/.bib ingester and T6's pyfig
-ingester (HANDOFF-SPEC.md section 5); it creates no graph nodes.
+ingester (DESIGN.md section 5); it creates no graph nodes.
 read_head_sha() (T6) reads the repo's current HEAD commit SHA, for
 extractors that need "the commit as of ingestion time" rather than any
 historical commit. blame_line() (T6 batch3-fix) resolves the commit that
 last touched one specific file:line -- used by the pyfig ingester so a
 savefig() call's src edge stays pinned to the commit that actually
-introduced that line (HANDOFF-SPEC.md section 4 erratum: "src=生成代码所在
+introduced that line (DESIGN.md section 4 erratum: "src=生成代码所在
 commit"), not whichever commit happens to be HEAD at ingestion time.
 Unparseable git output is skipped and logged, never guessed at (section 5's
 savefig rule: "拼不出来就放弃，不猜").

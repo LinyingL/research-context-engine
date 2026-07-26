@@ -5,13 +5,13 @@ Every other module must read and write the graph exclusively through the
 functions in this file -- no other module should run raw SQL against the
 nodes/edges tables directly.
 
-Schema-level invariant (HANDOFF-SPEC.md section 4): `nodes.human_fields` is
+Schema-level invariant (DESIGN.md section 4): `nodes.human_fields` is
 owned by humans only (confirmation/correction/annotation). Machine ingestion
 (`upsert_node`) must never overwrite it -- see the SQL in `upsert_node` and
 the enforcement test in tests/test_db.py.
 
 Deterministic node ID conventions (caller's responsibility to construct, not
-enforced by this layer -- see HANDOFF-SPEC.md section 4):
+enforced by this layer -- see DESIGN.md section 4):
     project:<name>              commit:<sha>
     experiment:<run_id>         figure:<repo-relative path>
     section:<tex file>#<slug>   claim:<file>#<hash>
@@ -81,7 +81,7 @@ EDGE_STATUSES = frozenset({"auto", "pending", "confirmed", "rejected"})
 # Statuses a machine extractor may write via upsert_edge. 'confirmed' and
 # 'rejected' are human-only verdicts -- a machine path must never conjure
 # them out of thin air; those two values are only ever set through
-# set_edge_status (HANDOFF-SPEC.md section 4: "any edge's confirm/reject ...
+# set_edge_status (DESIGN.md section 4: "any edge's confirm/reject ...
 # status fields are human-write only").
 _MACHINE_EDGE_STATUSES = frozenset({"auto", "pending"})
 
@@ -332,7 +332,7 @@ def upsert_edge(
     ::test_upsert_edge_concurrent_first_write_does_not_raise_integrity_error.
 
     Every edge must carry non-empty evidence -- "no edge without evidence"
-    is a hard invariant (HANDOFF-SPEC.md section 4/2). A placeholder like
+    is a hard invariant (DESIGN.md section 4/2). A placeholder like
     `{}` is not evidence, so it is rejected here (and by the CHECK
     constraint in migrations/0001_init.sql as a second, DB-level guard).
 

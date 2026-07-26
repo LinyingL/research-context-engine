@@ -1,5 +1,5 @@
 """RCE's MCP stdio server (T5) -- the product's primary interface
-(HANDOFF-SPEC.md section 1/7: the user's existing AI assistant is the front
+(DESIGN.md section 1/7: the user's existing AI assistant is the front
 end; this is what it talks to).
 
 Built on the official `mcp` SDK's FastMCP wrapper rather than hand-rolling

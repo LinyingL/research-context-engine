@@ -5,7 +5,7 @@ map, params/metrics/tags are one-value-per-file). Writes via rce.db's
 upsert_node/upsert_edge (idempotency inherited from there). Corrupted runs
 and unresolvable connector keys are skipped + logged, never guessed: an
 absent git SHA never becomes a placeholder Commit node, an ambiguous
-artifact basename never guesses a Figure (HANDOFF-SPEC.md section 0/5).
+artifact basename never guesses a Figure (DESIGN.md section 0/5).
 Top-level `models/`/`.trash/` are MLflow-internal, not experiment dirs, and
 neither is an experiment-level `tags/` dir (`mlruns/<exp_id>/tags/`, holding
 experiment tags rather than a run) -- both are silently skipped rather than

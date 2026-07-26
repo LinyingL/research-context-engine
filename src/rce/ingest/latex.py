@@ -5,7 +5,7 @@ library (Occam rule 1/5: \\section, \\includegraphics, \\cite, and .bib
 @entry are simple enough that a hand-rolled scanner is less code and less
 risk than a new dependency). Writes via rce.db's upsert_node/upsert_edge,
 inheriting idempotency from there. Anything not safely resolvable is
-skipped and logged, never guessed (HANDOFF-SPEC.md section 5).
+skipped and logged, never guessed (DESIGN.md section 5).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # LaTeX usage: pdflatex/latex itself tries a fixed list of extensions at
 # compile time until one is found on disk. .pdf/.png/.jpg/.jpeg first
 # (pdflatex's own priority order), the rest of git.IMAGE_EXTENSIONS
-# alphabetically -- deterministic, not a guess (HANDOFF-SPEC.md section 5).
+# alphabetically -- deterministic, not a guess (DESIGN.md section 5).
 _EXT_SEARCH_ORDER = (".pdf", ".png", ".jpg", ".jpeg") + tuple(
     sorted(git_ingest.IMAGE_EXTENSIONS - {".pdf", ".png", ".jpg", ".jpeg"})
 )
@@ -40,7 +40,7 @@ _GRAPHICSPATH_DIR_RE = re.compile(r"\{([^{}]*)\}")
 _CITE_RE = re.compile(
     # natbib (\cite, \citep, \citet, \citealp -- plus capitalized \Citep/\Citet
     # sentence-start variants) and biblatex (\parencite, \textcite, \autocite).
-    # HANDOFF-SPEC.md section 5, 2026-07-22 addendum: real papers overwhelmingly
+    # DESIGN.md section 5, 2026-07-22 addendum: real papers overwhelmingly
     # use \citep/\citet, so \cite alone leaves `cites` edges almost never firing.
     r"\\(?:cite(?:p|t|alp)?|Citep|Citet|parencite|textcite|autocite)\*?"
     r"(?:\[[^\]]*\])?(?:\[[^\]]*\])?\{([^{}]*)\}"
@@ -60,7 +60,7 @@ _PREAMBLE_TITLE = "Preamble/Abstract"
 def _normalize_bib_key(key: str) -> str:
     """Canonical form used for ref: node IDs and cite/bib matching.
 
-    HANDOFF-SPEC.md section 5, 2026-07-22 addendum: bib key matching is
+    DESIGN.md section 5, 2026-07-22 addendum: bib key matching is
     case-insensitive (\\cite{smith2020} must resolve against
     @article{Smith2020}), so node IDs use this lowercase form while the
     original as-written key is kept in the node's attrs.

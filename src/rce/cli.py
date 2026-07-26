@@ -1,7 +1,7 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query` /
 `trace`.
 
-stdlib argparse only (HANDOFF-SPEC.md section 0, Occam rule 1). Orchestrates
+stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
 (section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow -> wandb);
 writes only via db.upsert_node/upsert_edge, no new graph mutation logic here.
@@ -122,7 +122,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if applied:
         print(f"Applied migrations: {applied}")
     # T5.5 review item 5: a nudge only -- RCE never edits the user's own
-    # files (HANDOFF-SPEC.md section 2, "零习惯改变"), so this is printed,
+    # files (DESIGN.md section 2, "零习惯改变"), so this is printed,
     # not applied.
     print(f"Tip: add '{RCE_DIRNAME}/' to your project's .gitignore -- RCE will not do this for you.")
     return 0
