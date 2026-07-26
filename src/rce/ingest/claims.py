@@ -5,10 +5,21 @@ generates candidates; never confirms one -- every edge is `status="pending"`
 
 Line-by-line, reusing rce.ingest.latex's `_strip_comment` and its
 `parse_tex_file` section list (no section-parsing logic duplicated here,
-Occam rule 5). Skipped, never guessed: `tabular`/`equation`/`align`
-environment bodies (not prose). `\ref`/`\cite` produce no literal digit in
-the .tex source (the number exists only post-compile), so both are excluded
-by construction.
+Occam rule 5). Skipped, never guessed, by blanking (spaces, so line/column
+positions never shift) before number-scanning runs: non-prose environment
+bodies -- tables (`tabular`/`tabularx`/`longtable`/`tabu`/`array`),
+equations (`equation*`/`align*`/`gather*`/`multline*`/`eqnarray*`/
+`displaymath`), verbatim-like bodies (`verbatim`/`lstlisting`/`minted`) --
+plus `\[ ... \]`/`$$ ... $$` display-math spans; every command's optional
+`[...]` argument (a key=value option block, never prose); and the required
+`{...}` argument(s) of a whitelisted set of commands whose argument is a
+typographic value or identifier rather than prose -- `\ref`, `\label`, the
+`\cite` family, `\input`, `\include`, `\vspace`, `\hspace`, `\scalebox`,
+`\resizebox`, `\setlength` -- so e.g. `\ref{fig:2.1}` never presents "2.1"
+as a claim (a label target routinely contains a literal decimal-point
+substring pre-compile, unlike a `\cite` key). Deliberately a whitelist:
+`\textbf`/`\emph` keep their braces untouched because their argument may
+itself carry a real prose claim.
 
 Recognised forms, all requiring the number as literally printed:
 `\SI{87.3}{\percent}` and `87.3\%` (unit_form "percent"); `$92.1$` and bare
@@ -42,8 +53,71 @@ _MAX_SENTENCE_LEN = 240  # display/storage cap only, not a matching decision
 
 # Environments whose contents are not prose -- blanked out (replaced with
 # spaces, preserving line/column positions) before number-scanning runs.
-_SKIP_BEGIN_RE = re.compile(r"\\begin\{(?:tabular|equation\*?|align\*?)\}")
-_SKIP_END_RE = re.compile(r"\\end\{(?:tabular|equation\*?|align\*?)\}")
+# Table cells are the worst contamination path (a metric-shaped number is
+# exactly what lives there), so every table-like name in common use is
+# listed, not just plain `tabular`. Ordering within the alternation doesn't
+# matter -- the mandatory literal `\}` right after it already forces a
+# full-name match (`tabular` can't partially match `tabularx}`).
+_SKIP_ENV_NAMES = (
+    r"tabularx|tabular|tabu|longtable|array"
+    r"|equation\*?|align\*?|gather\*?|multline\*?|eqnarray\*?|displaymath"
+    r"|verbatim|lstlisting|minted"
+)
+_SKIP_BEGIN_RE = re.compile(rf"\\begin\{{(?:{_SKIP_ENV_NAMES})\}}")
+_SKIP_END_RE = re.compile(rf"\\end\{{(?:{_SKIP_ENV_NAMES})\}}")
+# `\begin{tabularx}{\linewidth}{lcc}`-style trailing args need no special
+# handling: once the begin marker is seen, _blank_skip_regions already
+# blanks the rest of that line regardless of what follows.
+
+# `\[ ... \]` has unambiguous open/close tokens, so it folds into the same
+# begin/end depth counter as the environments above. `$$` is not a distinct
+# open-vs-close token -- both delimiters of a pair are the same two
+# characters -- so it is a separate open/close toggle instead.
+_DISPLAY_BRACKET_OPEN_RE = re.compile(r"\\\[")
+_DISPLAY_BRACKET_CLOSE_RE = re.compile(r"\\\]")
+_DOLLAR_DOLLAR_RE = re.compile(r"\$\$")
+
+# Every command's optional `[...]` argument is a key=value option block,
+# never prose (e.g. width=0.8\textwidth in
+# `\includegraphics[width=0.8\textwidth]{overview.png}`) -- blanked
+# regardless of which command it follows. `[A-Za-z]+` (not an alternation
+# of specific names) matches a command name in full, so there is no
+# partial-prefix risk against _ARG_BLANK_CMDS below.
+_OPTIONAL_ARG_RE = re.compile(r"\\[A-Za-z]+\*?((?:\[[^\[\]]*\])+)")
+
+# Commands whose required {...} argument is a typographic value or
+# identifier (a label/cite key, a file path, a length, a scale factor)
+# rather than prose. Deliberately a whitelist: anything not listed here
+# (`\textbf{...}`, `\emph{...}`, a plain paragraph) keeps its braces
+# untouched, since its argument may itself carry a real claim.
+# `(?![A-Za-z])` blocks a same-prefix false match (e.g. "include" against
+# "includegraphics", not in this list -- its {path} keeps its braces;
+# missing a decimal-bearing filename is the safe failure direction here).
+_ARG_BLANK_CMDS = (
+    r"ref|label|cite(?:p|t|alp)?|Citep|Citet|parencite|textcite|autocite"
+    r"|input|include|vspace|hspace|scalebox|resizebox|setlength"
+)
+_ARG_BLANK_RE = re.compile(
+    rf"\\(?:{_ARG_BLANK_CMDS})(?![A-Za-z])\*?"
+    rf"((?:\s*(?:\[[^\[\]]*\]|\{{[^{{}}]*\}}))+)"
+)
+
+
+def _blank_command_args(line: str) -> str:
+    """Blank every command's optional `[...]` argument, plus the
+    whitelisted commands' required `{...}` argument(s) -- replaced with
+    spaces so column offsets (and _extract_sentence) stay correct. Runs
+    before number-scanning so e.g.
+    `\\includegraphics[width=0.8\\textwidth]{overview.png}` and
+    `\\ref{fig:2.1}` never present a scannable digit; `\\SI{87.3}{\\percent}`
+    is untouched (\\SI is not in _ARG_BLANK_CMDS and has no `[...]`)."""
+    chars = list(line)
+    for regex in (_OPTIONAL_ARG_RE, _ARG_BLANK_RE):
+        for m in regex.finditer(line):
+            for i in range(m.start(1), m.end(1)):
+                chars[i] = " "
+    return "".join(chars)
+
 
 _NUM = r"\d+(?:\.\d+)?"
 # Alternation order is significant: SI/percent forms are tried before the
@@ -64,25 +138,36 @@ _METRIC_ATTR_KEYS = ("metrics", "summary_metrics")
 
 
 def _blank_skip_regions(lines: list[str]) -> list[str]:
-    """Replace tabular/equation/align bodies with spaces, char-for-char, so
-    positions (and sentence extraction) stay correct. `depth` threads across
-    lines -- a real table/equation commonly spans several."""
+    """Replace non-prose environment bodies and display-math spans with
+    spaces, char-for-char, so positions (and sentence extraction) stay
+    correct. `depth` (environments, `\\[...\\]`) and `dollar_open` (`$$`
+    pairs) both thread across lines -- a real table/equation/display-math
+    span commonly spans several."""
     depth = 0
+    dollar_open = False
     blanked: list[str] = []
     for line in lines:
         chars = list(line)
         markers = sorted(
-            [(m.start(), m.end(), 1) for m in _SKIP_BEGIN_RE.finditer(line)]
-            + [(m.start(), m.end(), -1) for m in _SKIP_END_RE.finditer(line)]
+            [(m.start(), m.end(), "begin") for m in _SKIP_BEGIN_RE.finditer(line)]
+            + [(m.start(), m.end(), "end") for m in _SKIP_END_RE.finditer(line)]
+            + [(m.start(), m.end(), "begin") for m in _DISPLAY_BRACKET_OPEN_RE.finditer(line)]
+            + [(m.start(), m.end(), "end") for m in _DISPLAY_BRACKET_CLOSE_RE.finditer(line)]
+            + [(m.start(), m.end(), "dollar") for m in _DOLLAR_DOLLAR_RE.finditer(line)]
         )
         cursor = 0
-        for start, end, delta in markers:
-            if depth > 0:
+        for start, end, kind in markers:
+            if depth > 0 or dollar_open:
                 for i in range(cursor, start):
                     chars[i] = " "
-            depth = max(0, depth + delta)
+            if kind == "begin":
+                depth += 1
+            elif kind == "end":
+                depth = max(0, depth - 1)
+            else:  # "dollar" -- $$ has no distinct open/close spelling, so toggle
+                dollar_open = not dollar_open
             cursor = end
-        if depth > 0:
+        if depth > 0 or dollar_open:
             for i in range(cursor, len(chars)):
                 chars[i] = " "
         blanked.append("".join(chars))
@@ -150,7 +235,8 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
     text = (repo_root / tex_rel_path).read_text(errors="replace")
     raw_lines = text.splitlines()
     stripped = [_strip_comment(line) for line in raw_lines]
-    blanked = _blank_skip_regions(stripped)
+    no_command_args = [_blank_command_args(line) for line in stripped]
+    blanked = _blank_skip_regions(no_command_args)
 
     sections = parse_tex_file(repo_root, tex_rel_path).sections  # ascending by line
 

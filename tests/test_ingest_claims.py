@@ -71,6 +71,132 @@ Final figure stays 11.1\%.
     assert printed == {"87.3", "11.1"}  # table/equation/align contents excluded
 
 
+def test_skips_tabularx_and_longtable_environments(tmp_path):
+    # Regression: the old regex required `tabular` immediately followed by
+    # `}`, so `tabularx}`/`longtable}` never matched at all -- table cells
+    # are exactly where a metric-shaped number lives, the worst
+    # contamination path.
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+\begin{tabularx}{\linewidth}{lcc}
+87.3 & 92.1 & 0.5 \\
+\end{tabularx}
+
+\begin{longtable}{lcc}
+11.1 & 22.2 \\
+\end{longtable}
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_skips_gather_multline_and_eqnarray_environments(tmp_path):
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+\begin{gather}
+y = 0.5
+\end{gather}
+
+\begin{multline}
+z = 0.6
+\end{multline}
+
+\begin{eqnarray}
+w = 0.7
+\end{eqnarray}
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_skips_display_bracket_and_dollar_dollar_math(tmp_path):
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+\[
+q = 0.8
+\]
+
+$$
+r = 0.9
+$$
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_skips_verbatim_environment_digits(tmp_path):
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+\begin{verbatim}
+0.123
+\end{verbatim}
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_skips_includegraphics_optional_width_arg(tmp_path):
+    # Regression: every figure in a real paper carries `width=0.NN`, which
+    # used to be scanned as a bare plain-form claim (and, with a metric
+    # that happened to round the same way, matched it).
+    repo = _repo(
+        tmp_path,
+        r"""\section{Overview}
+\includegraphics[width=0.8\textwidth]{overview.png}
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_skips_ref_and_label_with_decimal_looking_targets(tmp_path):
+    # Regression: `\ref{fig:2.1}`/`\label{tab:3.2}` were scanned as plain
+    # claims "2.1"/"3.2" -- unlike a `\cite` key, a label target routinely
+    # contains a literal decimal-point-shaped substring pre-compile.
+    repo = _repo(
+        tmp_path,
+        r"""\section{Overview}
+See~\ref{fig:2.1} and \ref{sec:4.2}.
+\label{tab:3.2}
+
+Final figure stays 33.3\%.
+""",
+    )
+    printed = {c.printed_number for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert printed == {"33.3"}
+
+
+def test_command_arg_blanking_does_not_touch_textbf_or_emph_prose(tmp_path):
+    # Guard against over-correction: \textbf/\emph are not in the
+    # arg-blanking whitelist because their argument can carry a real claim.
+    repo = _repo(
+        tmp_path,
+        r"""\section{Results}
+\textbf{We highlight 55.5\% in bold} and \emph{a raw ratio of 0.873}.
+""",
+    )
+    forms = {(c.printed_number, c.unit_form) for c in claims.parse_tex_claims(repo, "paper.tex")}
+    assert forms == {("55.5", "percent"), ("0.873", "fraction")}
+
+
 def test_skips_ref_cite_years_and_page_numbers(tmp_path):
     repo = _repo(
         tmp_path,
