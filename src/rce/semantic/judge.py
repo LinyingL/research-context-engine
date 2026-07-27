@@ -171,6 +171,35 @@ def _primary_occurrence(evidence: dict[str, Any]) -> dict[str, Any]:
     return dict(evidence) if isinstance(evidence, dict) else {}
 
 
+def _log_skipped_occurrences(edge: dict[str, Any], reviewed_occurrence: dict[str, Any]) -> None:
+    """Warn when an edge carries more than one occurrence (DESIGN.md section
+    4: one experiment can contribute more than one matching metric to the
+    same claim, so rce.ingest.claims merges them onto a single edge -- this
+    is exactly why candidate_count counts (experiment, metric) pairs rather
+    than distinct experiments). `_primary_occurrence` only ever hands the
+    model the last one; every other occurrence on this edge is never shown
+    to the model at all. Previously that was silent -- a human reading
+    `rce status --pending` could be pushed to reject a candidate whose real
+    supporting metric the judge never looked at, with no record that
+    anything was skipped. This does not change what gets reviewed (Occam
+    rule 4: reviewing every occurrence would mean one model call per
+    occurrence instead of one per edge, a larger behavior change than this
+    bug fix calls for) -- it only makes the omission visible.
+    """
+    occurrences = edge["evidence"].get("occurrences")
+    if not isinstance(occurrences, list) or len(occurrences) <= 1:
+        return
+    skipped_metrics = [o.get("metric") for o in occurrences if o is not reviewed_occurrence]
+    if not skipped_metrics:
+        return
+    logger.warning(
+        "judge: edge %s --backed_by--> %s has %d matched occurrences from this claim/"
+        "experiment pair; reviewing only metric=%r and skipping unreviewed metric(s) %s "
+        "-- their support for this claim was never judged",
+        edge["src"], edge["dst"], len(occurrences), reviewed_occurrence.get("metric"), skipped_metrics,
+    )
+
+
 def _round_for_display(value: Any, ndigits: int = _METRIC_DISPLAY_NDIGITS) -> Any:
     if isinstance(value, bool):
         return value
@@ -340,6 +369,7 @@ def review_pending_backed_by(
 
         context = _gather_run_context(experiment_node)
         occurrence = _primary_occurrence(edge["evidence"])
+        _log_skipped_occurrences(edge, occurrence)
         user_prompt = _build_prompt(claim_node, occurrence, context)
 
         try:
@@ -380,6 +410,14 @@ def review_pending_backed_by(
                 "model": getattr(backend, "model", None),
                 "reviewed_at": _now_iso(),
                 "run_id": edge["dst"],
+                # Attribution (Opus-review blocker fix): which occurrence's
+                # metric the model actually saw. Without this, a verdict on
+                # an edge with several matched metrics (see
+                # _log_skipped_occurrences) was unattributed -- a human
+                # reading `rce status --pending` had no way to tell which
+                # metric the "related"/"reason" text was even about.
+                "metric": occurrence.get("metric"),
+                "metric_value": occurrence.get("metric_value"),
             }
             db.set_edge_semantic_review(conn, edge["src"], edge["dst"], edge["type"], edge["extractor"], semantic_review)
             outcome.written = True

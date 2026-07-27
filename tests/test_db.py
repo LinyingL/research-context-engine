@@ -423,6 +423,87 @@ def test_set_edge_semantic_review_is_a_noop_on_unknown_edge(conn):
     assert db.query_edges(conn) == []
 
 
+def test_set_edge_semantic_review_survives_concurrent_upsert_edge(tmp_path):
+    """Interleaved SELECT -- concurrent occurrence commit -- UPDATE.
+
+    Opus-review blocker: before the fix, set_edge_semantic_review's SELECT
+    and UPDATE ran as two separate autocommitted statements with no
+    transaction around them. Reproduced directly: a concurrent connection
+    committed a new occurrence between those two statements, and
+    set_edge_semantic_review's UPDATE then overwrote `evidence` with its own
+    stale in-memory copy, destroying the newly-committed occurrence -- a
+    realistic window since a judge run stalls on model latency per edge
+    while `rce ingest` runs in another process. The fix wraps the SELECT and
+    UPDATE in one BEGIN IMMEDIATE transaction (mirroring upsert_edge's own
+    T-blocker fix and its concurrency test below), so a concurrent
+    upsert_edge can never land inside that window: it is either fully
+    applied before this function's SELECT, or fully after its commit --
+    either way, both the new occurrence and the semantic_review survive.
+    """
+    db_path = tmp_path / "graph.db"
+    conn = db.connect(db_path)
+    db.migrate(conn)
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim")
+    db.upsert_node(conn, "experiment:run1", "experiment")
+    db.upsert_edge(
+        conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", "claims",
+        {"metric": "m1", "metric_value": 1.0}, 1.0, status="pending",
+    )
+    conn.close()
+
+    # paused_apply stands in for the exact gap the bug lived in: it runs
+    # strictly after set_edge_semantic_review's internal SELECT and strictly
+    # before its internal UPDATE, while its BEGIN IMMEDIATE still holds the
+    # write lock. Sleeping there gives ingest_worker, on a genuinely separate
+    # OS thread and connection, time to attempt its own write and block on
+    # that lock -- proving the two operations cannot interleave.
+    original_apply = db._apply_semantic_review
+
+    def paused_apply(existing_evidence_json, semantic_review):
+        result = original_apply(existing_evidence_json, semantic_review)
+        time.sleep(0.3)
+        return result
+
+    def ingest_worker():
+        time.sleep(0.05)  # let set_edge_semantic_review enter its transaction first
+        ingest_conn = db.connect(db_path)
+        try:
+            db.upsert_edge(
+                ingest_conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", "claims",
+                {"metric": "m2", "metric_value": 2.0}, 1.0, status="pending",
+            )
+        finally:
+            ingest_conn.close()
+
+    worker = threading.Thread(target=ingest_worker)
+    worker.start()
+    try:
+        judge_conn = db.connect(db_path)
+        try:
+            with mock.patch.object(db, "_apply_semantic_review", side_effect=paused_apply):
+                db.set_edge_semantic_review(
+                    judge_conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", "claims",
+                    {"related": False, "reason": "coincidental", "better_match": None},
+                )
+        finally:
+            judge_conn.close()
+    finally:
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    verify_conn = db.connect(db_path)
+    try:
+        edges = db.query_edges(
+            verify_conn, src="claim:paper.tex#abc", dst="experiment:run1", type="backed_by"
+        )
+        assert len(edges) == 1
+        occurrence_metrics = {o["metric"] for o in edges[0]["evidence"]["occurrences"]}
+        assert occurrence_metrics == {"m1", "m2"}  # neither occurrence was lost
+        assert edges[0]["evidence"]["semantic_review"]["reason"] == "coincidental"
+    finally:
+        verify_conn.close()
+
+
 def test_upsert_edge_reingest_preserves_semantic_review_sibling_key(conn):
     # A routine re-ingest by the deterministic extractor (upsert_edge) must
     # never silently erase a semantic-layer annotation living beside

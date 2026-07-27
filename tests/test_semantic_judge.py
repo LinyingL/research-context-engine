@@ -129,6 +129,9 @@ def test_normal_review_writes_semantic_review_and_leaves_status_pending(conn):
         "better_match": "quantization",
         "model": "fake-model",
         "run_id": experiment_id,
+        # Attribution: which occurrence (metric/value) the model actually saw.
+        "metric": "grad_norm_epoch",
+        "metric_value": 1.5786,
     }
     # occurrences evidence (the deterministic match) is untouched
     assert edge["evidence"]["occurrences"][0]["metric"] == "grad_norm_epoch"
@@ -264,6 +267,76 @@ def test_rerun_overwrites_semantic_review_without_disturbing_occurrences(conn):
         }
     ]
     assert edge["status"] == "pending"
+
+
+def test_multi_occurrence_edge_attributes_review_and_logs_skipped_metrics(conn, caplog):
+    """Opus-review blocker: when one experiment contributes two or more
+    matching metrics to the same claim, rce.ingest.claims calls upsert_edge
+    repeatedly on the SAME (src, dst, type, extractor) key, so they merge
+    into ONE edge with several occurrences (DESIGN.md section 4 -- this is
+    exactly why candidate_count counts (experiment, metric) pairs). The
+    judge only ever hands the model the last occurrence; before this fix the
+    resulting semantic_review recorded no metric at all (unattributed) and
+    no log recorded which occurrence(s) were skipped, so a human could be
+    pushed to reject a candidate whose real supporting metric was never
+    reviewed."""
+    claim_id = "claim:paper.tex#multi"
+    experiment_id = "experiment:run_multi"
+    db.upsert_node(
+        conn, claim_id, "claim", title="Our run reaches 1.58.",
+        attrs={"sentence": "Our run reaches 1.58.", "raw": "1.58", "printed_number": "1.58", "value": 1.58},
+    )
+    db.upsert_node(
+        conn, experiment_id, "experiment", title="run_multi",
+        attrs={
+            "run_id": "run_multi",
+            "params": {"quantization": "1_58b"},
+            "metrics": {"grad_norm_epoch": 1.58, "val_ratio": 1.58},
+        },
+    )
+    # Two matches for the SAME (claim, experiment) pair collapse onto one
+    # edge with two occurrences, exactly as rce.ingest.claims produces them.
+    for metric_name, metric_value in (("grad_norm_epoch", 1.58), ("val_ratio", 1.58)):
+        db.upsert_edge(
+            conn, claim_id, experiment_id, "backed_by", extractor="claims",
+            evidence={
+                "file": "paper.tex", "line": 2, "metric": metric_name, "metric_value": metric_value,
+                "claim_raw": "1.58", "claim_value": 1.58, "candidate_count": 2,
+            },
+            confidence=1.0, status="pending",
+        )
+
+    backend = _FakeBackend(responses=[
+        {"related": True, "reason": "matches val_ratio", "better_match": None},
+    ])
+
+    with caplog.at_level(logging.WARNING):
+        result = semantic_judge.review_pending_backed_by(conn, backend, dry_run=False)
+
+    outcome = result.reviewed[0]
+    assert outcome.written is True
+
+    edge = _sole_edge(conn, claim_id, experiment_id)
+    review = edge["evidence"]["semantic_review"]
+    # Attribution: the reviewed occurrence's metric/value is now recorded,
+    # so the verdict is traceable to exactly what the model saw.
+    assert review["metric"] == "val_ratio"
+    assert review["metric_value"] == 1.58
+    # The skipped occurrence (grad_norm_epoch) is logged, never silent.
+    assert "grad_norm_epoch" in caplog.text
+    assert "skip" in caplog.text.lower()
+
+
+def test_single_occurrence_edge_logs_nothing_about_skipped_metrics(conn, caplog):
+    # Sanity counterpart: the common case (one occurrence) must not log a
+    # spurious "skipped" warning.
+    _seed_pending_edge(conn)
+    backend = _FakeBackend(responses=[{"related": True, "reason": "ok", "better_match": None}])
+
+    with caplog.at_level(logging.WARNING):
+        semantic_judge.review_pending_backed_by(conn, backend, dry_run=False)
+
+    assert "skip" not in caplog.text.lower()
 
 
 def test_judge_never_calls_set_edge_status(conn, monkeypatch):

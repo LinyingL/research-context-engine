@@ -36,6 +36,10 @@ its own from the command line.
   (or `rce confirm --index N --status ...` against the queue `--pending`
   just showed) — confirm or reject one pending edge; the baseline
   counterpart to the optional MCP server's `rce_confirm_edge` tool.
+- `rce judge [--path P] [--limit N] [--dry-run]` — optional semantic layer:
+  a local model reviews pending `backed_by` candidates and annotates each
+  with its opinion (`evidence.semantic_review`). It never confirms or
+  rejects anything — see "Design principles" below.
 
 `--path` defaults to `.` for `query`/`trace`/`status`/`confirm`, so they
 also work by `cd`-ing into the project root first and dropping `--path`
@@ -61,12 +65,17 @@ Everything above works without it.
   (AST, regex, standard APIs) with zero model calls. `Claim` nodes and
   `backed_by` candidate edges are already populated this way: a claim's
   printed number is matched against experiment metrics with no model
-  involved, and every candidate is written `status=pending` for a human (or
-  the semantic layer below) to confirm or reject — the extractor itself
-  never does. A local 7B semantic layer (Phase B, not yet implemented) will
-  review those candidates and add confidence-scored `supports` edges on
-  top; it will never be load-bearing for the core graph. `supports` is
-  still schema-only until then.
+  involved, and every candidate is written `status=pending` for a human to
+  confirm or reject — the extractor itself never does, and neither can the
+  semantic layer below.
+- **Humans own judgement.** A local semantic layer (`rce judge`) is
+  implemented: it reviews pending `backed_by` candidates and attaches a
+  model's opinion to each as `evidence.semantic_review`. It is structurally
+  forbidden from confirming or rejecting anything — it can only annotate;
+  moving an edge to `confirmed`/`rejected` is a separate, human-only write
+  path (`rce confirm`). Confidence-scored `supports` edges are a planned
+  extension on top of this same annotation-only layer; `supports` is still
+  schema-only until then.
 - **Every edge is evidence-carrying.** No edge exists without a recorded
   extractor, an evidence pointer (file:line / commit SHA / run ID), and a
   confidence score.

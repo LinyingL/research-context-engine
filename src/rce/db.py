@@ -448,6 +448,30 @@ def set_edge_status(
     conn.commit()
 
 
+def _apply_semantic_review(existing_evidence_json: str, semantic_review: dict[str, Any]) -> str:
+    """Fold `semantic_review` into an edge's evidence as a sibling key next to
+    `occurrences`, returning the encoded JSON.
+
+    Split out from `set_edge_semantic_review` for the same reason
+    `_merge_edge_evidence` is split out of `upsert_edge`: it gives a
+    concurrency test a precise seam to patch (simulate the SELECT-to-UPDATE
+    window taking a while) without reaching into SQL string internals -- see
+    tests/test_db.py::test_set_edge_semantic_review_survives_concurrent_upsert_edge.
+
+    Carries forward any existing sibling key other than `semantic_review`
+    unchanged (currently only `occurrences`), matching `_merge_edge_evidence`'s
+    own passthrough so a judge re-run and a routine re-ingest can never
+    clobber each other's half of the evidence.
+    """
+    existing = json.loads(existing_evidence_json)
+    if isinstance(existing, dict) and isinstance(existing.get("occurrences"), list):
+        evidence = {k: v for k, v in existing.items()}
+    else:
+        evidence = {"occurrences": [existing] if existing else []}  # legacy bare-evidence row
+    evidence["semantic_review"] = semantic_review
+    return json.dumps(evidence)
+
+
 def set_edge_semantic_review(
     conn: sqlite3.Connection,
     src: str,
@@ -473,31 +497,63 @@ def set_edge_semantic_review(
 
     Overwrites any previous `semantic_review` on this edge (a re-run
     judgement supersedes the old one) but never touches `occurrences` --
-    read via the same "existing dict, minus occurrences, carried forward"
-    logic `_merge_edge_evidence` uses for its own sibling-key passthrough,
-    so a judge re-run and a routine re-ingest can never clobber each other's
-    half of the evidence.
+    read via `_apply_semantic_review`'s "existing dict, minus
+    semantic_review, carried forward" logic, so a judge re-run and a
+    routine re-ingest can never clobber each other's half of the evidence.
+
+    Atomicity (Opus-review blocker fix, same bug class as `upsert_edge`'s
+    T-blocker fix above): the SELECT and the following UPDATE run inside one
+    `BEGIN IMMEDIATE` transaction, with the same bounded retry loop
+    `upsert_edge` uses (`_UPSERT_EDGE_MAX_ATTEMPTS`). Before this fix, the
+    SELECT and UPDATE were two separate autocommitted statements with no
+    transaction around them: a concurrent `upsert_edge` call (e.g. `rce
+    ingest` running in another process while a judge run stalls on model
+    latency for this edge) could commit a brand-new occurrence in the gap
+    between them, and this function's UPDATE would then overwrite `evidence`
+    with its own stale in-memory copy, silently destroying that occurrence.
+    `BEGIN IMMEDIATE` grabs the write lock before the SELECT even runs, so no
+    other connection can write this exact (src, dst, type, extractor) row
+    inside that window -- a concurrent upsert_edge either fully precedes
+    this transaction or fully follows it. See
+    tests/test_db.py::test_set_edge_semantic_review_survives_concurrent_upsert_edge.
 
     No-op if the (src, dst, type, extractor) row does not exist, matching
     `set_human_fields`/`set_edge_status`'s behavior for an unknown target.
     """
-    row = conn.execute(
-        "SELECT evidence FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
-        (src, dst, type, extractor),
-    ).fetchone()
-    if row is None:
-        return
-    existing = json.loads(row["evidence"])
-    if isinstance(existing, dict) and isinstance(existing.get("occurrences"), list):
-        evidence = {k: v for k, v in existing.items()}
-    else:
-        evidence = {"occurrences": [existing] if existing else []}  # legacy bare-evidence row
-    evidence["semantic_review"] = semantic_review
-    conn.execute(
-        "UPDATE edges SET evidence = ?, updated_at = ? WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
-        (json.dumps(evidence), _now(), src, dst, type, extractor),
-    )
-    conn.commit()
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(_UPSERT_EDGE_MAX_ATTEMPTS):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        try:
+            row = conn.execute(
+                "SELECT evidence FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                (src, dst, type, extractor),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return
+            evidence_json = _apply_semantic_review(row["evidence"], semantic_review)
+            conn.execute(
+                "UPDATE edges SET evidence = ?, updated_at = ? WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                (evidence_json, _now(), src, dst, type, extractor),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            last_error = exc
+            time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            return
+    assert last_error is not None
+    raise last_error
 
 
 def delete_edges_for_node(
