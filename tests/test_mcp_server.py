@@ -42,6 +42,34 @@ def test_trace_result_node_with_no_edges_says_so(conn):
     assert "no provenance edges" in mcp_server.format_trace_text("project:solo", result)
 
 
+def test_trace_result_and_text_show_current_claim_line_for_backed_by(conn):
+    """Regression (2026-07-27): rce_trace must recover a backed_by hop's
+    claim line via `hop["source_location"]` (rce.query.trace, see
+    rce.query.claim_source_location) even though rce.ingest.claims no
+    longer writes "line" into the edge's persisted evidence at all -- a
+    prior commit fixed this only for `rce status --pending`'s own display,
+    silently leaving the MCP `rce_trace` tool (and `rce trace`/`--json`)
+    without the line."""
+    db.upsert_node(
+        conn, "claim:paper.tex#abc", "claim",
+        attrs={"tex_path": "paper.tex", "line": 2, "sentence": "We reach 87.3% accuracy."},
+    )
+    db.upsert_node(conn, "experiment:run_a", "experiment")
+    _mk(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", extractor="claims",
+        evidence={"file": "paper.tex", "metric": "accuracy", "metric_value": 0.873},
+        status="pending",
+    )
+
+    result = mcp_server.trace_result(conn, "experiment:run_a")
+    hop = next(h for h in result["hops"] if h["type"] == "backed_by")
+    assert hop["source_location"] == {"file": "paper.tex", "line": 2}
+    assert "line" not in hop["evidence"]["occurrences"][0]
+
+    text = mcp_server.format_trace_text("experiment:run_a", result)
+    assert "source_location=paper.tex:2" in text
+
+
 def test_find_nodes_case_insensitive_substring(conn):
     db.upsert_node(conn, "figure:Overview.png", "figure", title="Overview Figure")
     db.upsert_node(conn, "figure:other.png", "figure", title="Something else")

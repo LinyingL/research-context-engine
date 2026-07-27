@@ -264,6 +264,30 @@ def test_trace_json_outputs_structured_result(paper_repo, monkeypatch, capsys):
     )
 
 
+def test_trace_shows_current_claim_line_for_backed_by_edge(claim_repo, monkeypatch, capsys):
+    """Regression (2026-07-27): a prior commit backfilled the claim's
+    current line into `rce status --pending`'s own display only, silently
+    regressing `rce trace` (both human text and --json) versus the commit
+    before that one -- which had the line baked directly into the
+    `backed_by` edge's evidence. Both now read `hop["source_location"]`,
+    injected uniformly by rce.query.trace (see rce.query.claim_source_location)."""
+    cli.main(["init", str(claim_repo)])
+    cli.main(["ingest", str(claim_repo)])
+    capsys.readouterr()
+    monkeypatch.chdir(claim_repo)
+
+    assert cli.main(["trace", "experiment:run_a"]) == 0
+    out = capsys.readouterr().out
+    assert "--backed_by--> experiment:run_a" in out
+    assert "paper.tex:2" in out
+
+    assert cli.main(["trace", "experiment:run_a", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    hop = next(h for h in result["hops"] if h["type"] == "backed_by")
+    assert hop["source_location"] == {"file": "paper.tex", "line": 2}
+    assert "line" not in hop["evidence"]["occurrences"][0]  # never persisted, query-time only
+
+
 def test_trace_missing_node_reports_clear_error(paper_repo, monkeypatch, capsys):
     repo, _sha = paper_repo
     cli.main(["init", str(repo)])
@@ -373,6 +397,30 @@ def test_status_pending_lists_details_and_is_backward_compatible(claim_repo, cap
     assert "Pending confirmation queue (1):" in out
     assert "claim:paper.tex#" in out and "--backed_by--> experiment:run_a" in out
     assert "extractor=claims" in out and "confidence=1.00" in out and "paper.tex:2" in out
+
+
+def test_status_pending_omits_metric_field_for_legacy_semantic_review_without_it(claim_repo, capsys):
+    """A `semantic_review` written before the metric-attribution fix
+    (0de0603) has no "metric" key at all -- displaying it must omit the
+    field entirely, not print the misleading `metric=None`."""
+    cli.main(["init", str(claim_repo)])
+    cli.main(["ingest", str(claim_repo)])
+    capsys.readouterr()
+
+    conn = db.connect(claim_repo / ".rce" / "graph.db")
+    try:
+        edge = db.pending_edges(conn)[0]
+        db.set_edge_semantic_review(
+            conn, edge["src"], edge["dst"], edge["type"], edge["extractor"],
+            {"related": True, "reason": "looks fine", "model": "legacy-model"},  # no "metric" key
+        )
+    finally:
+        conn.close()
+
+    assert cli.main(["status", "--path", str(claim_repo), "--pending"]) == 0
+    out = capsys.readouterr().out
+    assert "metric=None" not in out
+    assert "related=True" in out and "reason='looks fine'" in out
 
 
 def test_status_pending_empty_queue_reports_empty(tmp_path, capsys):

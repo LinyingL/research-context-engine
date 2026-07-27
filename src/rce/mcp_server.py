@@ -66,6 +66,12 @@ def trace_result(conn: Connection, node_id: str, max_hops: int = 4) -> dict[str,
 
 
 def format_trace_text(node_id: str, result: dict[str, Any]) -> str:
+    """Human-readable trace text. Each hop's `source_location` (query-time-
+    resolved claim line -- see rce.query.claim_source_location/trace) is
+    surfaced as `file:line` right in the summary line when present, not
+    just left buried in the raw `evidence` JSON dump -- the full structured
+    `result` (source_location included) is also appended separately by the
+    `rce_trace` tool below, for a scripted consumer."""
     if not result["found"]:
         return f"No such node: {node_id}"
     if not result["hops"]:
@@ -73,10 +79,12 @@ def format_trace_text(node_id: str, result: dict[str, Any]) -> str:
     lines = [f"Provenance trace for {node_id}:"]
     for hop in result["hops"]:
         evidence = json.dumps(hop["evidence"], sort_keys=True)
+        location = hop.get("source_location")
+        location_note = f", source_location={location['file']}:{location['line']}" if location else ""
         lines.append(
             f"  [{hop['depth']}] {hop['src']} --{hop['type']}--> {hop['dst']} "
             f"(extractor={hop['extractor']}, confidence={hop['confidence']:.2f}, "
-            f"status={hop['status']}) evidence={evidence}"
+            f"status={hop['status']}{location_note}) evidence={evidence}"
         )
     return "\n".join(lines)
 

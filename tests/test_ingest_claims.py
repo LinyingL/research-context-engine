@@ -369,7 +369,11 @@ def test_claim_matches_metric_rounded_to_its_own_printed_precision(tmp_path):
     assert edge["status"] == "pending"  # machine path never writes "confirmed"/"auto" here
     assert edge["confidence"] == 1.0
     assert edge["evidence"]["occurrences"][0]["metric"] == "accuracy"
-    assert edge["evidence"]["occurrences"][0]["candidate_count"] == 1
+    # candidate_count is an edge-level sibling of "occurrences" (DESIGN.md
+    # section 4, architecture ruling 2026-07-27), not part of any one
+    # occurrence's own identity -- see the regression test below for why.
+    assert "candidate_count" not in edge["evidence"]["occurrences"][0]
+    assert edge["evidence"]["candidate_count"] == 1
 
 
 def test_claim_does_not_match_metric_that_rounds_differently(tmp_path):
@@ -393,7 +397,10 @@ def test_multiple_experiments_each_become_a_pending_candidate_at_full_confidence
     edges = db.query_edges(conn, type="backed_by")
     assert {e["dst"] for e in edges} == {"experiment:run_a", "experiment:run_b"}
     assert all(e["status"] == "pending" and e["confidence"] == 1.0 for e in edges)
-    assert all(e["evidence"]["occurrences"][0]["candidate_count"] == 2 for e in edges)
+    # candidate_count lives as a sibling of "occurrences" now, not nested
+    # inside the one occurrence each of these edges carries.
+    assert all("candidate_count" not in e["evidence"]["occurrences"][0] for e in edges)
+    assert all(e["evidence"]["candidate_count"] == 2 for e in edges)
 
 
 def test_zero_hit_claim_creates_node_but_no_edge(tmp_path):
@@ -522,9 +529,50 @@ def test_repeated_line_shifting_edits_do_not_grow_edge_occurrences(tmp_path):
     assert "line" not in edge["evidence"]["occurrences"][0]
 
     # The claim's *current* line is not lost -- it is tracked on the claim
-    # node's own attrs, which rce.cli reads from for display (see
-    # rce.cli._current_claim_line) now that the occurrence no longer has it.
+    # node's own attrs, and resolved at query time by
+    # rce.query.claim_source_location (used by rce.cli's status --pending
+    # and rce.query.trace's hops alike) now that the occurrence no longer
+    # has it.
     assert db.get_nodes_by_type(conn, "claim")[0]["attrs"]["line"] == max(lines_seen)
+
+
+def test_repeated_new_matching_experiments_do_not_grow_edge_occurrences(tmp_path):
+    """Regression (this round's fix, sibling bug to the line-shift fix
+    above, same root cause): before this fix, `candidate_count` -- how many
+    (experiment, metric) pairs the claim matches *in total* -- lived inside
+    each occurrence dict rather than as a sibling of "occurrences". Since
+    db._merge_edge_evidence dedupes by whole-dict equality, incrementally
+    adding a brand-new experiment that also matches this claim's number
+    changed the claim's global candidate_count -- which changed the content
+    of an *already-existing* edge's own occurrence dict (metric/value
+    unchanged), which made it look "new" and minted a fresh entry on that
+    edge every single time, even though the paper's text and that edge's
+    actual matched metric never changed. Real-world repro: 25 incrementally
+    added matching runs grew one edge's occurrence count from 1 towards
+    db._MAX_EDGE_EVIDENCE_OCCURRENCES (20), tripping the drop-oldest cap and
+    rendering the same match 20 times in `rce status --pending`.
+    candidate_count is now passed as `edge_attrs` to db.upsert_edge, stored
+    as a sibling of "occurrences" and overwritten to the latest value each
+    time -- so every edge's own occurrence count must stay at exactly 1
+    throughout, while candidate_count keeps reflecting the current total.
+    """
+    repo = _repo(tmp_path, TEX_87_3_PCT)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    for i in range(25):
+        db.upsert_node(
+            conn, f"experiment:run_{i}", "experiment", attrs={"metrics": {"accuracy": 0.87312}},
+        )
+        claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+
+    claim_id = db.get_nodes_by_type(conn, "claim")[0]["id"]
+    edges = db.query_edges(conn, src=claim_id, type="backed_by")
+    assert len(edges) == 25  # one edge per matching experiment
+    for edge in edges:
+        assert len(edge["evidence"]["occurrences"]) == 1  # never grows from unrelated new candidates
+        assert "candidate_count" not in edge["evidence"]["occurrences"][0]
+        assert edge["evidence"]["candidate_count"] == 25  # reflects the latest global match count
 
 
 def test_orphaned_pending_claim_is_removed_once_its_sentence_disappears(tmp_path):

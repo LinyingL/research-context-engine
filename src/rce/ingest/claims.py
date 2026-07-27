@@ -507,22 +507,46 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
     excluded from that cleanup scope, not treated as evidence its claims are
     gone.
 
-    Each candidate's evidence occurrence deliberately omits `line` (bug fix,
-    same root cause F2 fixed for the claim node id itself -- DESIGN.md
-    section 4: a claim's id is content-addressed, never line-addressed,
-    precisely so an unrelated edit elsewhere in the file cannot change it).
-    Before this fix the occurrence dict *did* carry the claim's line number,
-    and db._merge_edge_evidence dedupes by whole-dict equality -- so any
-    edit that merely shifted later lines (e.g. inserting a comment above the
-    claim) produced a "new" occurrence every re-ingest even though the match
-    itself never changed, silently growing towards
-    db._MAX_EDGE_EVIDENCE_OCCURRENCES on a long-lived paper with no new
-    information gained. The occurrence's identity is now exactly
-    (file, metric, metric_value, claim_raw, claim_value, candidate_count) --
-    stable across line shifts, still specific to this exact match. The
-    claim's *current* line is not lost: it lives on the claim node's own
-    `attrs["line"]` (kept current by `upsert_node` every re-ingest), which
-    is what `rce.cli` reads for `status`/`trace` display instead.
+    Three separate layers of identity are load-bearing here (DESIGN.md
+    section 4, architecture ruling 2026-07-27) -- conflating any two of them
+    is exactly what the two bugs below used to do:
+
+      * **Occurrence** (one matched pair): identity is exactly
+        (file, metric, metric_value, claim_raw, claim_value) -- deliberately
+        excluding anything that can change without the match itself
+        changing. `line` was the first field removed (F2's sibling bug):
+        db._merge_edge_evidence dedupes by whole-dict equality, so an
+        occurrence dict carrying the claim's line number made an unrelated
+        edit above the claim (shifting only later lines) look like a "new"
+        occurrence on every re-ingest, silently growing towards
+        db._MAX_EDGE_EVIDENCE_OCCURRENCES with no new information gained.
+        `candidate_count` was the second field removed (this fix, same root
+        cause): it is not a property of any one matched pair at all -- see
+        the next bullet -- so leaving it inside the occurrence dict meant an
+        unrelated *new* experiment elsewhere that happened to also match
+        this claim changed the global count, which changed this occurrence
+        dict's content, which `db._merge_edge_evidence`'s whole-dict-equality
+        dedup then saw as "different" from the last time -- minting a fresh
+        occurrence on this edge for every such addition even though the
+        metric/value this edge actually matched never changed. 25
+        incrementally-added matching experiments reproduced this exactly:
+        one edge's occurrence count climbed 1 -> 20 and started tripping the
+        cap, with the paper's own text never touched.
+      * **Edge-level fact**: `candidate_count` -- how many (experiment,
+        metric) pairs the claim matches *in total*, across every experiment
+        -- describes the whole claim/edge, not the occurrence just written.
+        It is passed as `edge_attrs` to `db.upsert_edge`, which stores it as
+        a sibling key next to `occurrences` (same mechanism `semantic_review`
+        already uses) and overwrites it wholesale to the latest value on
+        every call, never accumulating -- see `db._merge_edge_evidence`.
+      * **Query-time resolution**: the claim's *current* line is not stored
+        in any persisted evidence at all. It lives on the claim node's own
+        `attrs["line"]` (kept current by `upsert_node` every re-ingest), and
+        `rce.query.trace`/`rce.query.claim_source_location` resolve it at
+        read time -- the single place every consumer (`rce status
+        --pending`, `rce trace`/`--json`, `rce query`, and the MCP
+        `rce_trace` tool) gets one consistent number from, instead of each
+        display path growing its own copy.
     """
     counts = {"claims": 0, "candidates": 0}
     metrics = _collect_experiment_metrics(conn)
@@ -566,25 +590,34 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
             for exp_id, metric_name, metric_value in matches:
                 db.upsert_edge(
                     conn, claim.id, exp_id, "backed_by", extractor="claims",
-                    # No "line" here (bug fix) -- see this function's
-                    # docstring: the claim's line shifts with unrelated
-                    # edits, but this evidence dict's whole-dict identity is
-                    # what db._merge_edge_evidence dedupes on, so a variable
-                    # line kept minting "new" occurrences for the same
-                    # match. The claim's current line lives on the claim
-                    # node's own attrs (set a few lines above), not here.
+                    # No "line" here (bug fix, F2's sibling): the claim's
+                    # line shifts with unrelated edits, but this evidence
+                    # dict's whole-dict identity is what
+                    # db._merge_edge_evidence dedupes on, so a variable line
+                    # kept minting "new" occurrences for the same match. The
+                    # claim's current line lives on the claim node's own
+                    # attrs (set a few lines above); rce.query resolves it
+                    # at read time instead (see this function's docstring).
                     evidence={
                         "file": claim.tex_path,
                         "metric": metric_name,
                         "metric_value": metric_value,
                         "claim_raw": claim.raw,
                         "claim_value": claim.value,
-                        "candidate_count": candidate_count,
                     },
                     # Owner decision (P2): confidence is always 1.0 -- see
                     # this function's docstring for why ambiguity belongs in
                     # candidate_count, not in a diluted confidence number.
                     confidence=1.0, status="pending",
+                    # candidate_count is an edge-level fact (this function's
+                    # docstring), not part of any one occurrence's identity
+                    # -- same bug class as "line" above, this time triggered
+                    # by an unrelated *new* experiment elsewhere changing the
+                    # claim's global match count on every re-ingest. Passed
+                    # as edge_attrs so db.upsert_edge stores it as a sibling
+                    # of "occurrences", overwritten to the latest value each
+                    # time rather than folded into the deduped occurrence.
+                    edge_attrs={"candidate_count": candidate_count},
                 )
                 counts["candidates"] += 1
 

@@ -238,7 +238,11 @@ def get_nodes_by_type(conn: sqlite3.Connection, type: str) -> list[dict[str, Any
     return nodes
 
 
-def _merge_edge_evidence(existing_evidence_json: str | None, new_evidence: dict[str, Any]) -> str:
+def _merge_edge_evidence(
+    existing_evidence_json: str | None,
+    new_evidence: dict[str, Any],
+    edge_attrs: dict[str, Any] | None = None,
+) -> str:
     """Fold `new_evidence` into an edge's evidence, returning the encoded JSON.
 
     Every edge's evidence is stored as `{"occurrences": [dict, ...]}` --
@@ -257,17 +261,35 @@ def _merge_edge_evidence(existing_evidence_json: str | None, new_evidence: dict[
     oldest occurrences and logging a warning when the cap is exceeded --
     never silently, and never unbounded.
 
-    Sibling keys other than "occurrences" -- currently only `semantic_review`,
-    written by `set_edge_semantic_review` for the S2 semantic judge -- are
-    carried forward unchanged whenever present on the existing row. This
-    function only ever touches `occurrences`; any other top-level key is
-    passed through as-is so a routine re-ingest (the only caller of
-    upsert_edge, hence of this function) can never silently erase a
-    semantic-layer annotation living beside it. This is why the semantic
-    layer's own writes go through `set_edge_semantic_review` instead of
-    reusing this function directly -- that function updates only the
-    `semantic_review` key and leaves `occurrences` (and any other sibling)
-    exactly as this function last left them.
+    Sibling keys other than "occurrences" -- `semantic_review` (written by
+    `set_edge_semantic_review` for the S2 semantic judge) and whatever
+    `edge_attrs` below folds in -- are carried forward unchanged whenever
+    present on the existing row and not touched by this call. This function
+    only ever *appends* to `occurrences`; every other top-level key is
+    passed through as-is unless `edge_attrs` explicitly overwrites it, so a
+    routine re-ingest (the only caller of upsert_edge, hence of this
+    function) can never silently erase a semantic-layer annotation living
+    beside it. This is why the semantic layer's own writes go through
+    `set_edge_semantic_review` instead of reusing this function directly --
+    that function updates only the `semantic_review` key and leaves
+    `occurrences` (and any other sibling) exactly as this function last left
+    them.
+
+    `edge_attrs` (DESIGN.md section 4, T-blocker fix 2026-07-27): sibling
+    keys describing the whole edge/claim rather than the one occurrence
+    just written -- e.g. `candidate_count`, the number of (experiment,
+    metric) pairs a claim matches in total, which is a global fact about
+    the claim, not about any single matched pair. These are merged with a
+    plain dict `.update()` -- overwritten wholesale to their latest value on
+    every call, never accumulated -- because unlike `occurrences` a global
+    count has no history worth keeping, only a current value. This is also
+    why such a fact must never be folded into `new_evidence` (the
+    occurrence) instead: `new_evidence not in occurrences` dedupes by whole-
+    dict equality, so a field that changes on every unrelated re-ingest
+    (candidate_count grows every time an unrelated new experiment starts
+    matching the same claim) would make an otherwise-identical occurrence
+    look "new" every time and mint a fresh entry forever -- exactly the bug
+    `rce.ingest.claims` used to have before `candidate_count` moved here.
     """
     extra: dict[str, Any] = {}
     if existing_evidence_json is None:
@@ -291,6 +313,9 @@ def _merge_edge_evidence(existing_evidence_json: str | None, new_evidence: dict[
             _MAX_EDGE_EVIDENCE_OCCURRENCES, dropped, "y" if dropped == 1 else "ies",
         )
 
+    if edge_attrs:
+        extra.update(edge_attrs)  # overwrite to latest value, never accumulate
+
     return json.dumps({"occurrences": occurrences, **extra})
 
 
@@ -303,6 +328,8 @@ def upsert_edge(
     evidence: dict[str, Any],
     confidence: float,
     status: str = "auto",
+    *,
+    edge_attrs: dict[str, Any] | None = None,
 ) -> None:
     """Insert or update an edge, keyed on (src, dst, type, extractor).
 
@@ -312,6 +339,17 @@ def upsert_edge(
     never overwritten wholesale. It accumulates as
     `{"occurrences": [...]}`; see `_merge_edge_evidence` for the merge/dedup/
     cap rules (T10).
+
+    `edge_attrs` (DESIGN.md section 4, T-blocker fix 2026-07-27): optional
+    sibling keys stored alongside `occurrences` in the same evidence dict --
+    e.g. `candidate_count` on a `backed_by` edge, a global fact about the
+    whole claim/edge, not about the one occurrence this call is writing.
+    Overwritten wholesale to the latest value on every call, never
+    accumulated (unlike `occurrences`) -- see `_merge_edge_evidence`. Keeping
+    such facts out of `evidence` (the occurrence argument) matters: that
+    dict's identity is what dedup compares by, so a value that changes on
+    every unrelated re-ingest would make an otherwise-unchanged occurrence
+    look "new" forever.
 
     `status` here is restricted to _MACHINE_EDGE_STATUSES ('auto'/'pending')
     -- a machine path must never conjure a 'confirmed' or 'rejected' verdict
@@ -382,8 +420,18 @@ def upsert_edge(
                 "SELECT evidence, status FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
                 (src, dst, type, extractor),
             ).fetchone()
+            # Called with exactly 2 positional args when edge_attrs is falsy
+            # (the overwhelmingly common case) rather than always passing a
+            # 3rd `None` -- tests/test_db.py's concurrency tests mock this
+            # exact function with a 2-arg stand-in
+            # (test_upsert_edge_survives_concurrent_human_confirm's
+            # paused_merge), so preserving the original call shape whenever
+            # edge_attrs isn't in play keeps that mock working unchanged.
             if existing is None:
-                evidence_json = json.dumps({"occurrences": [evidence]})
+                if edge_attrs:
+                    evidence_json = _merge_edge_evidence(None, evidence, edge_attrs)
+                else:
+                    evidence_json = _merge_edge_evidence(None, evidence)
                 conn.execute(
                     """
                     INSERT INTO edges (src, dst, type, extractor, evidence, confidence, status, created_at, updated_at)
@@ -392,7 +440,10 @@ def upsert_edge(
                     (src, dst, type, extractor, evidence_json, confidence, status, now, now),
                 )
             else:
-                evidence_json = _merge_edge_evidence(existing["evidence"], evidence)
+                if edge_attrs:
+                    evidence_json = _merge_edge_evidence(existing["evidence"], evidence, edge_attrs)
+                else:
+                    evidence_json = _merge_edge_evidence(existing["evidence"], evidence)
                 effective_status = existing["status"] if existing["status"] in ("confirmed", "rejected") else status
                 conn.execute(
                     """

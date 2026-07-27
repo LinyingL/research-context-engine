@@ -186,15 +186,23 @@ def _log_skipped_occurrences(edge: dict[str, Any], reviewed_occurrence: dict[str
     occurrence instead of one per edge, a larger behavior change than this
     bug fix calls for) -- it only makes the omission visible.
 
-    Deduped by metric NAME, not by occurrence identity (bug fix): two
-    occurrence dicts for the same (metric, value) match but recorded at
-    different source lines (rce.ingest.claims writes the claim's *current*
-    line into each occurrence -- see that module) are a different Python
-    object from `reviewed_occurrence` even though they describe the exact
-    same metric that was just reviewed. Comparing by `is not` therefore used
-    to list the reviewed metric itself as "skipped, never judged" -- a
-    self-contradictory warning fired on the single most common case (an
-    edit above the claim that does not change the match at all). Comparing
+    Deduped by metric NAME, not by occurrence identity (bug fix): an
+    occurrence's identity (DESIGN.md section 4, architecture ruling
+    2026-07-27) is exactly (file, metric, metric_value, claim_raw,
+    claim_value) -- it never carries the claim's line (resolved at query
+    time instead, see rce.query.claim_source_location) or the edge-level
+    `candidate_count` (a sibling of `occurrences`, see
+    db.upsert_edge's `edge_attrs`), so two occurrence dicts naming the same
+    metric can still exist as distinct Python objects if the *value* an
+    experiment reports for that metric changes between two ingests (e.g. a
+    training run's logged metric is overwritten). Comparing `reviewed_occurrence`
+    against the rest by `is not` would then treat that other, differently-
+    valued-but-same-name occurrence as "skipped, never judged" -- a
+    self-contradictory warning naming the very metric that was just
+    reviewed. (Before this and the F2 line-shift fix, the same failure mode
+    was even easier to trigger: any occurrence dict still carrying a `line`
+    field made an edit that merely shifted the claim's line produce a
+    "new," distinct-by-identity object for the exact same match.) Comparing
     metric *names* instead means a genuinely different, never-reviewed
     metric is the only thing that can appear here; if the set difference is
     empty (every occurrence names the same metric that was reviewed),
@@ -259,17 +267,29 @@ def _valid_match_names(context: dict[str, Any]) -> set[str]:
 
 
 def _build_prompt(
-    claim_node: dict[str, Any], occurrence: dict[str, Any], context: dict[str, Any]
+    claim_node: dict[str, Any],
+    occurrence: dict[str, Any],
+    context: dict[str, Any],
+    candidate_count: Any,
 ) -> str:
     """The user-turn prompt: (a) the claim's full sentence and its printed
     number, (b) the metric the deterministic layer matched it to, (c) the
-    full run context from `_gather_run_context` (task requirement 2)."""
+    full run context from `_gather_run_context` (task requirement 2).
+
+    `candidate_count` is passed in separately rather than read off
+    `occurrence` (bug fix, DESIGN.md section 4, architecture ruling
+    2026-07-27): it is an edge-level fact -- how many (experiment, metric)
+    pairs the claim matches in total -- stored by rce.ingest.claims as a
+    sibling of `occurrences` (via db.upsert_edge's `edge_attrs`), not inside
+    any single occurrence, so `occurrence.get("candidate_count")` would
+    always read `None` for a real edge produced today. The caller reads it
+    from the edge's own `evidence["candidate_count"]` instead.
+    """
     attrs = claim_node.get("attrs") or {}
     sentence = attrs.get("sentence") or claim_node.get("title") or ""
     printed_number = occurrence.get("claim_raw") or attrs.get("raw") or attrs.get("printed_number")
     matched_metric = occurrence.get("metric", "<unknown>")
     matched_value = occurrence.get("metric_value")
-    candidate_count = occurrence.get("candidate_count")
     rounded_metrics = {
         name: _round_for_display(val) for name, val in sorted(context["metrics"].items())
     }
@@ -405,7 +425,11 @@ def review_pending_backed_by(
         context = _gather_run_context(experiment_node)
         occurrence = _primary_occurrence(edge["evidence"])
         _log_skipped_occurrences(edge, occurrence)
-        user_prompt = _build_prompt(claim_node, occurrence, context)
+        # candidate_count is an edge-level sibling of "occurrences" (see
+        # _build_prompt's docstring), read off the edge's evidence directly
+        # rather than off the one occurrence being reviewed.
+        candidate_count = edge["evidence"].get("candidate_count")
+        user_prompt = _build_prompt(claim_node, occurrence, context, candidate_count)
 
         try:
             instance = backend.complete_json(

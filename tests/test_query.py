@@ -91,3 +91,57 @@ def test_trace_collects_multiple_extractors_on_same_edge_pair(conn):
 
     result = query.trace(conn, "figure:overview.png")
     assert {h["extractor"] for h in result["hops"]} == {"pyfig-ast", "manual-note"}
+
+
+# -- claim_source_location / trace's "source_location" hop field -----------
+#
+# Regression (2026-07-27): a `backed_by` edge's evidence never carries the
+# claim's line (rce.ingest.claims -- it shifts with unrelated edits and
+# evidence is deduped by whole-dict equality). A prior commit backfilled
+# the line for `rce status --pending`'s own display only, silently
+# regressing `rce trace`/`--json` and the MCP `rce_trace` tool (both read
+# query.trace() directly) versus the commit before that one, which had the
+# line baked into evidence. None of the 272 tests at the time caught it --
+# these do, at the lowest level the bug actually lived in.
+
+
+def test_claim_source_location_returns_none_for_non_claim_node(conn):
+    db.upsert_node(conn, "figure:overview.png", "figure")
+    assert query.claim_source_location(conn, "figure:overview.png") is None
+
+
+def test_claim_source_location_returns_none_for_missing_node(conn):
+    assert query.claim_source_location(conn, "claim:paper.tex#nope") is None
+
+
+def test_claim_source_location_returns_none_when_line_not_recorded(conn):
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim", attrs={"tex_path": "paper.tex"})
+    assert query.claim_source_location(conn, "claim:paper.tex#abc") is None
+
+
+def test_claim_source_location_returns_current_file_and_line(conn):
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim", attrs={"tex_path": "paper.tex", "line": 5})
+    assert query.claim_source_location(conn, "claim:paper.tex#abc") == {"file": "paper.tex", "line": 5}
+
+
+def test_trace_injects_source_location_on_backed_by_hop_from_claim_attrs(conn):
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim", attrs={"tex_path": "paper.tex", "line": 2})
+    db.upsert_node(conn, "experiment:run_a", "experiment")
+    _mk(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", extractor="claims",
+        evidence={"file": "paper.tex", "metric": "accuracy", "metric_value": 0.873},
+        status="pending",
+    )
+
+    result = query.trace(conn, "experiment:run_a")
+    hop = next(h for h in result["hops"] if h["type"] == "backed_by")
+    assert hop["source_location"] == {"file": "paper.tex", "line": 2}
+    assert "line" not in hop["evidence"]["occurrences"][0]  # never written back into evidence
+
+
+def test_trace_source_location_is_none_with_no_claim_endpoint(conn):
+    _mk_nodes(conn, ("commit:abc", "commit"), ("figure:overview.png", "figure"))
+    _mk(conn, "commit:abc", "figure:overview.png", "generates")
+
+    result = query.trace(conn, "figure:overview.png")
+    assert result["hops"][0]["source_location"] is None

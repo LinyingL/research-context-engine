@@ -134,7 +134,9 @@ def _format_semantic_review_suffix(evidence: dict[str, Any]) -> str:
     display -- the edge's `status` is untouched by judge and stays whatever
     it already was (pending, per the constitution).
 
-    Includes `metric=` (bug fix): a `backed_by` edge can carry several
+    Includes `metric=` (bug fix), omitted entirely for an older edge whose
+    `semantic_review` predates this attribution field rather than printing
+    a misleading `metric=None`: a `backed_by` edge can carry several
     (experiment, metric) candidate pairs (see `candidate_count`), but
     `rce.semantic.judge` only ever reviews one occurrence per edge and
     records which one in `semantic_review["metric"]`/`["metric_value"]`
@@ -147,38 +149,29 @@ def _format_semantic_review_suffix(evidence: dict[str, Any]) -> str:
     if not isinstance(review, dict):
         return ""
     flag = "[FLAGGED: model says likely unrelated] " if review.get("related") is False else ""
+    metric_note = f"metric={review['metric']!r} " if "metric" in review else ""
     better = review.get("better_match")
     better_note = f" better_match={better!r}" if better else ""
     return (
-        f"\n      semantic_review: {flag}metric={review.get('metric')!r} "
+        f"\n      semantic_review: {flag}{metric_note}"
         f"related={review.get('related')!r} reason={review.get('reason')!r}"
         f"{better_note} (model={review.get('model')!r})"
     )
 
 
-def _current_claim_line(conn: Connection, edge: dict) -> int | None:
-    """The claim node's *current* line number for a `backed_by` edge, for
-    display only (bug fix companion to rce.ingest.claims no longer writing
-    a `line` into each occurrence -- see that module's docstring for why:
-    the line shifts with any unrelated edit above the claim, and evidence
-    is deduped by whole-dict equality, so a stable per-occurrence identity
-    requires dropping it there). The claim node's own `attrs["line"]` is
-    always kept current by `upsert_node` on every re-ingest, so this is the
-    single place display code reads it from instead."""
-    if edge["type"] != "backed_by":
-        return None
-    claim_node = db.get_node(conn, edge["src"])
-    if claim_node is None:
-        return None
-    line = claim_node["attrs"].get("line")
-    return line if isinstance(line, int) else None
+def _display_line(location: dict[str, Any] | None) -> int | None:
+    """Pull the plain `line` int out of `query.claim_source_location`'s
+    `{"file", "line"}` result, for `_format_occurrence`'s `display_line`
+    parameter (which only ever wants the int, not the file)."""
+    return location["line"] if location else None
 
 
 def _format_pending_line(index: int, edge: dict, conn: Connection) -> str:
+    location = query.claim_source_location(conn, edge["src"]) if edge["type"] == "backed_by" else None
     return (
         f"  [{index}] {edge['src']} --{edge['type']}--> {edge['dst']} "
         f"extractor={edge['extractor']} confidence={edge['confidence']:.2f} "
-        f"evidence={_format_evidence_summary(edge['evidence'], display_line=_current_claim_line(conn, edge))}"
+        f"evidence={_format_evidence_summary(edge['evidence'], display_line=_display_line(location))}"
         f"{_format_semantic_review_suffix(edge['evidence'])}"
     )
 
@@ -449,9 +442,9 @@ def _format_occurrence(occurrence: dict[str, Any], display_line: int | None = No
     `display_line` fills in a missing "line" for display only (never
     written back to the occurrence dict in the database) -- `backed_by`
     occurrences from rce.ingest.claims no longer carry one (see
-    rce.cli._current_claim_line), so the caller passes the claim node's
-    current line here to keep the "file:line" rendering instead of falling
-    back to a bare "file=...".
+    rce.query.claim_source_location), so the caller passes the claim
+    node's current line here to keep the "file:line" rendering instead of
+    falling back to a bare "file=...".
     """
     remaining = dict(occurrence)
     if display_line is not None and "file" in remaining and "line" not in remaining:
@@ -481,7 +474,16 @@ def _format_evidence_summary(evidence: dict[str, Any], display_line: int | None 
 
 
 def _format_trace_human(node_id: str, max_hops: int, result: dict[str, Any]) -> str:
-    """Indented, evidence-expanded text for `rce trace` (no --json)."""
+    """Indented, evidence-expanded text for `rce trace` (no --json).
+
+    `hop["source_location"]` (query.trace's uniform, query-time-resolved
+    claim line -- see rce.query.claim_source_location) is unwrapped to its
+    plain `line` int and threaded through as `_format_evidence_summary`'s
+    `display_line`, exactly like `_format_pending_line` does for `status
+    --pending` -- the same value, read through the same function, so the
+    two display paths can never drift the way they did when only one of
+    them was patched to backfill it.
+    """
     if not result["hops"]:
         return f"Node {node_id} exists but has no provenance edges recorded."
     lines = [f"Provenance trace for {node_id} (max_hops={max_hops}):"]
@@ -492,7 +494,8 @@ def _format_trace_human(node_id: str, max_hops: int, result: dict[str, Any]) -> 
             f"{indent}    extractor={hop['extractor']} confidence={hop['confidence']:.2f} "
             f"status={hop['status']}"
         )
-        lines.append(f"{indent}    evidence: {_format_evidence_summary(hop['evidence'])}")
+        display_line = _display_line(hop.get("source_location"))
+        lines.append(f"{indent}    evidence: {_format_evidence_summary(hop['evidence'], display_line)}")
     return "\n".join(lines)
 
 

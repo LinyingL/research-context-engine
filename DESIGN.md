@@ -20,7 +20,10 @@ optional enhancement layer, never a prerequisite.
 **Evidence or nothing.** Every edge carries the extractor that produced it, a
 pointer to the evidence (`file:line`, run id, commit SHA), a confidence value,
 and a status. An edge without evidence cannot be stored — the database
-rejects it.
+rejects it. `backed_by` is the one exception to `file:line` being a stored
+literal: its pointer is `file` plus the claim's *current* line, and the line
+half is resolved at query time rather than persisted, precisely because an
+unrelated edit elsewhere in the file shifts it (section 4, connector 7).
 
 **Never guess.** When a path cannot be resolved, a SHA is not in the graph, or
 a filename matches more than one candidate, the extractor skips and logs. A
@@ -64,6 +67,23 @@ The confirmation queue is not a third table; it is `edges` filtered by
 
 Evidence accumulates rather than overwrites: when the same figure is included
 twice in one section, both call sites are kept as occurrences on one edge.
+This "one occurrence per call site" framing belongs to `includes`/`cites`/
+`generates`; `backed_by` occurrences are identified differently — (file,
+metric, metric_value, claim_raw, claim_value), deliberately never the
+claim's line — so they no longer distinguish call sites at all. Two
+occurrences on one `backed_by` edge mean the same claim matched two
+different (metric, value) pairs on the same experiment, not the same match
+observed at two source locations (section 4's `backed_by` row and "Machine
+annotation vs. human judgement" below).
+
+An edge's evidence can also carry sibling keys alongside `occurrences` —
+`semantic_review` (below) and `candidate_count` (a `backed_by`-only,
+edge-level fact: how many (experiment, metric) pairs the claim matches in
+total) are both stored this way, overwritten wholesale to their latest
+value on every write, never accumulated like `occurrences` is. Folding
+either into an occurrence's own identity instead used to be a real bug —
+see connector 7's confidence discussion below for `candidate_count`'s
+history.
 
 `nodes.human_fields` and `edges.status` are the human-owned columns. The
 machine write path (`upsert_node` / `upsert_edge`) structurally cannot set
@@ -124,7 +144,15 @@ evidence carries `candidate_count`, the count of (experiment, metric) pairs
 that claim matched — not the count of distinct experiments, since one
 experiment can contribute more than one matching metric to the same claim
 — so a reviewer sees "3 candidates" rather than inferring it from a
-confidence of `0.33`.
+confidence of `0.33`. `candidate_count` is a sibling of `occurrences`
+(`evidence.candidate_count`, not nested inside any one occurrence) and is
+overwritten to the latest total on every re-ingest, never accumulated: it
+describes the whole claim across every experiment, not the one occurrence
+just written, and folding it into an occurrence's own identity instead
+used to be a real bug — incrementally adding new matching experiments
+changed the count on every re-ingest, which made an *already-existing*
+edge's unchanged occurrence look "new" each time and grew a single edge's
+occurrence list without bound.
 
 `supports` still has no extractor and exists in the schema only; it belongs
 to a future extension of the semantic layer described in section 7.
@@ -162,6 +190,15 @@ guess" exists to prevent. Concretely, this is enforced two ways:
    a name that is not literally present is discarded as a hallucination,
    logged, and never written (`related`/`reason` are kept regardless — one
    field failing verification does not discard the whole review).
+3. **Trim the response, never the judgement.** `reason` is meant to be one
+   sentence; a model that instead writes several is not treated as a
+   validation failure. `reason` is capped at 300 characters — truncated to
+   that length with a trailing `" ..."` marker and the truncation logged
+   (never silent) — while `related` and a verified `better_match` are still
+   validated and stored normally. Discarding the whole response over a
+   wordier-than-asked-for `reason` would throw away the one thing a human
+   reviewer actually wants (the model's `related`/`better_match` verdict)
+   over nothing worse than a run-on sentence.
 
 The result reads like a second opinion, not a verdict: "this candidate is
 probably a numeric coincidence, and `quantization` on this same run looks
@@ -260,10 +297,18 @@ and **local by default, not local by construction**: `rce.semantic.backend`
 talks to whatever OpenAI-compatible server `RCE_LLM_BASE_URL` (or the
 `base_url` constructor argument) names, and that is a plain configuration
 value, not something the code structurally confines to this machine. The
-default points at a local server, and every `rce judge` run that resolves
-to a non-localhost/`*.local` host prints a prominent warning before sending
-that run's experiment params and metric names anywhere, so pointing the
-semantic layer at a remote endpoint is possible but never silent.
+default points at a local server, and every `rce judge` run whose base URL's
+hostname is not `localhost`/a loopback address/`*.local` prints a prominent
+warning before sending that run's experiment params and metric names
+anywhere, so pointing the semantic layer at a remote endpoint is possible
+but never silent. This is a hostname-*shape* check (string comparison
+against a short allow-list), not DNS resolution or a network reachability
+probe — RCE never resolves or contacts the address to decide whether to
+warn. **Known limitation:** the `*.local` exemption trusts the suffix by
+name only; a hostname that merely ends in `.local` (whether or not it is
+actually mDNS/LAN-only) is treated as local and warned about the same as
+`localhost`, since a hostname-shape check has no way to verify what a name
+actually resolves to or where it's reachable from.
 
 **Later.** A local read-only web view over the same graph, and periodic
 digests of what changed, what went stale, and what is waiting for review.
