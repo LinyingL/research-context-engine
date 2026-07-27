@@ -389,11 +389,21 @@ def cmd_judge(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_edge(edge: dict, other_side: str, direction: str) -> None:
+def _print_edge(edge: dict, other_side: str, direction: str, conn=None) -> None:
     evidence = json.dumps(edge["evidence"], sort_keys=True)
+    # A claim's line lives on the claim node, not in the edge evidence, so resolve
+    # it here the same way `status --pending` and `trace` do -- otherwise this is
+    # the one consumer that cannot tell the reader where in the paper to look.
+    location = ""
+    if conn is not None and edge["type"] == "backed_by":
+        loc = query.claim_source_location(conn, edge["src"]) or query.claim_source_location(
+            conn, edge["dst"]
+        )
+        if loc and loc.get("line") is not None:
+            location = f" source_location={loc.get('file')}:{loc['line']}"
     print(
         f"  {direction} {edge[other_side]} [{edge['type']}] extractor={edge['extractor']} "
-        f"confidence={edge['confidence']:.2f} status={edge['status']} evidence={evidence}"
+        f"confidence={edge['confidence']:.2f} status={edge['status']} evidence={evidence}{location}"
     )
 
 
@@ -417,12 +427,12 @@ def cmd_query(args: argparse.Namespace) -> int:
         incoming = db.query_edges(conn, dst=args.node_id)
         print(f"Outgoing edges ({len(outgoing)}):")
         for edge in outgoing:
-            _print_edge(edge, "dst", "->")
+            _print_edge(edge, "dst", "->", conn)
         if not outgoing:
             print("  (none)")
         print(f"Incoming edges ({len(incoming)}):")
         for edge in incoming:
-            _print_edge(edge, "src", "<-")
+            _print_edge(edge, "src", "<-", conn)
         if not incoming:
             print("  (none)")
     finally:

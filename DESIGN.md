@@ -192,7 +192,7 @@ guess" exists to prevent. Concretely, this is enforced two ways:
    field failing verification does not discard the whole review).
 3. **Trim the response, never the judgement.** `reason` is meant to be one
    sentence; a model that instead writes several is not treated as a
-   validation failure. `reason` is capped at 300 characters — truncated to
+   validation failure. `reason` is truncated at 300 characters (plus a 4-character marker, so a stored value can be 304) — truncated to
    that length with a trailing `" ..."` marker and the truncation logged
    (never silent) — while `related` and a verified `better_match` are still
    validated and stored normally. Discarding the whole response over a
@@ -206,15 +206,20 @@ like a better fit" is exactly the kind of note a human reviewer wants
 sitting next to a `pending` edge before they decide — and exactly the kind
 of note that must never quietly become the decision itself.
 
-**Known limitation.** A `backed_by` edge can carry more than one matched
-(experiment, metric) occurrence — `evidence.candidate_count > 1` — because
-`rce.ingest.claims` merges every metric that matches the same claim against
-the same experiment onto one edge (DESIGN.md section 4). `rce judge`
-reviews exactly one occurrence per edge (the most recently written one) and
-records which one it saw in `semantic_review.metric`/`.metric_value`; every
-other occurrence on that edge is logged as skipped, never itself sent to
-the model. A `candidate_count > 1` edge is therefore reviewed once, not
-once per matched pair.
+**Known limitation.** A `backed_by` edge carries one occurrence per distinct
+metric of *that* experiment matching the claim, so an edge has more than one
+occurrence only when a single experiment logs several metrics that all round
+to the claim's printed value. `rce judge` reviews exactly one occurrence per
+edge (the most recently written one) and records which one it saw in
+`semantic_review.metric`/`.metric_value`; any other occurrence on that edge
+is logged as skipped, never itself sent to the model.
+
+Note that `evidence.candidate_count` is *not* what triggers this. It is an
+edge-level, claim-global figure — how many (experiment, metric) pairs the
+claim matched across the whole graph — so the ordinary case of a claim
+matching twenty different experiments gives every one of those edges
+`candidate_count = 20` and exactly one occurrence, and each is reviewed in
+full. Only the several-metrics-on-one-experiment case is partially reviewed.
 
 ## Section 5 — Connection keys
 
@@ -298,7 +303,7 @@ talks to whatever OpenAI-compatible server `RCE_LLM_BASE_URL` (or the
 `base_url` constructor argument) names, and that is a plain configuration
 value, not something the code structurally confines to this machine. The
 default points at a local server, and every `rce judge` run whose base URL's
-hostname is not `localhost`/a loopback address/`*.local` prints a prominent
+hostname is not `localhost`/`127.0.0.1`/`::1`/`*.local` prints a prominent
 warning before sending that run's experiment params and metric names
 anywhere, so pointing the semantic layer at a remote endpoint is possible
 but never silent. This is a hostname-*shape* check (string comparison
@@ -306,8 +311,7 @@ against a short allow-list), not DNS resolution or a network reachability
 probe — RCE never resolves or contacts the address to decide whether to
 warn. **Known limitation:** the `*.local` exemption trusts the suffix by
 name only; a hostname that merely ends in `.local` (whether or not it is
-actually mDNS/LAN-only) is treated as local and warned about the same as
-`localhost`, since a hostname-shape check has no way to verify what a name
+actually mDNS/LAN-only) is treated as local and, like `localhost`, produces no warning at all, since a hostname-shape check has no way to verify what a name
 actually resolves to or where it's reachable from.
 
 **Later.** A local read-only web view over the same graph, and periodic

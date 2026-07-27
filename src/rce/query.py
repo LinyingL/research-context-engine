@@ -111,9 +111,14 @@ def trace(conn, node_id: str, max_hops: int = 4) -> dict[str, Any]:
                 if edge_key in recorded:
                     continue
                 recorded.add(edge_key)
-                source_location = claim_source_location(conn, edge["src"]) or claim_source_location(
-                    conn, edge["dst"]
-                )
+                # Only backed_by edges have a claim endpoint, so skip the two node
+                # lookups entirely for every other edge type -- on a wide graph this
+                # is the difference between two extra point reads per hop and none.
+                source_location = None
+                if edge["type"] == "backed_by":
+                    source_location = claim_source_location(
+                        conn, edge["src"]
+                    ) or claim_source_location(conn, edge["dst"])
                 hops.append({
                     "depth": depth,
                     **{k: edge[k] for k in
