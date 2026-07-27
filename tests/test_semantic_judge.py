@@ -175,20 +175,33 @@ def test_illegal_related_type_is_rejected_and_nothing_written(conn):
     assert edge["status"] == "pending"
 
 
-def test_oversized_reason_is_rejected_and_nothing_written(conn):
+def test_oversized_reason_is_truncated_not_discarded(conn, caplog):
+    """A model that gets `related`/`better_match` right but writes a
+    multi-sentence `reason` must not lose its whole judgement to
+    `[error]` -- only `reason` is trimmed; `related`/`better_match` are
+    validated and stored normally."""
     claim_id, experiment_id = _seed_pending_edge(conn)
+    long_reason = "x" * 1000
     backend = _FakeBackend(responses=[
-        {"related": True, "reason": "x" * 1000, "better_match": None},
+        {"related": True, "reason": long_reason, "better_match": None},
     ])
 
-    result = semantic_judge.review_pending_backed_by(conn, backend, dry_run=False, max_reason_chars=300)
+    with caplog.at_level(logging.WARNING):
+        result = semantic_judge.review_pending_backed_by(conn, backend, dry_run=False, max_reason_chars=300)
 
     outcome = result.reviewed[0]
-    assert outcome.written is False
-    assert "char" in outcome.error
+    assert outcome.written is True
+    assert outcome.error is None
+    assert outcome.related is True  # the model's actual judgement survives
+    assert outcome.reason.endswith(" ...")
+    assert len(outcome.reason) <= 300 + len(" ...")
+    assert outcome.reason != long_reason  # genuinely truncated, not passed through
+    assert "truncat" in caplog.text.lower()
 
     edge = _sole_edge(conn, claim_id, experiment_id)
-    assert "semantic_review" not in edge["evidence"]
+    review = edge["evidence"]["semantic_review"]
+    assert review["reason"] == outcome.reason
+    assert review["related"] is True
 
 
 def test_llm_error_on_one_edge_is_skipped_and_others_still_processed(conn):
@@ -339,6 +352,52 @@ def test_single_occurrence_edge_logs_nothing_about_skipped_metrics(conn, caplog)
     assert "skip" not in caplog.text.lower()
 
 
+def test_same_metric_occurrences_at_different_lines_log_no_self_contradictory_skip(conn, caplog):
+    """Regression (blocker fix): before this fix, `_log_skipped_occurrences`
+    compared occurrences by Python object identity, not by metric name. Two
+    occurrence dicts for the exact same (metric, value) match but recorded
+    at different source lines -- exactly what rce.ingest.claims used to
+    write when an unrelated edit shifted the claim's line (see the sibling
+    bug in rce.ingest.claims / tests/test_ingest_claims.py) -- are different
+    objects even though they name the same metric. The old identity check
+    therefore warned "reviewing only metric='accuracy' ... skipping
+    unreviewed metric(s) ['accuracy']": the exact same metric name reported
+    as both reviewed and skipped in the same sentence. Deduping by metric
+    name means this case must log nothing at all -- there is no metric that
+    was genuinely left unreviewed."""
+    claim_id = "claim:paper.tex#dupe"
+    experiment_id = "experiment:run_dupe"
+    db.upsert_node(
+        conn, claim_id, "claim", title="We reach 87.3.",
+        attrs={"sentence": "We reach 87.3.", "raw": "87.3", "printed_number": "87.3", "value": 87.3},
+    )
+    db.upsert_node(
+        conn, experiment_id, "experiment", title="run_dupe",
+        attrs={"run_id": "run_dupe", "params": {}, "metrics": {"accuracy": 87.3}},
+    )
+    # Same (metric, value) match recorded twice at different lines -- the
+    # shape rce.ingest.claims produced before its own line-shift fix.
+    for line in (2, 4):
+        db.upsert_edge(
+            conn, claim_id, experiment_id, "backed_by", extractor="claims",
+            evidence={
+                "file": "paper.tex", "line": line, "metric": "accuracy", "metric_value": 87.3,
+                "claim_raw": "87.3", "claim_value": 87.3, "candidate_count": 1,
+            },
+            confidence=1.0, status="pending",
+        )
+    edge = _sole_edge(conn, claim_id, experiment_id)
+    assert len(edge["evidence"]["occurrences"]) == 2  # sanity: still two distinct occurrence dicts
+
+    backend = _FakeBackend(responses=[{"related": True, "reason": "matches", "better_match": None}])
+
+    with caplog.at_level(logging.WARNING):
+        result = semantic_judge.review_pending_backed_by(conn, backend, dry_run=False)
+
+    assert result.reviewed[0].written is True
+    assert "skip" not in caplog.text.lower()  # no self-contradictory "skipped metric X" for X == reviewed
+
+
 def test_judge_never_calls_set_edge_status(conn, monkeypatch):
     """Constitutional gate: the machine write path structurally cannot move
     an edge to confirmed/rejected. This spies on db.set_edge_status itself
@@ -400,6 +459,10 @@ def test_cli_judge_writes_annotations_and_status_pending_surfaces_them(tmp_path,
     out = capsys.readouterr().out
     assert "semantic_review" in out
     assert "FLAGGED" in out  # related=False
+    # A pending edge can have several (experiment, metric) candidate pairs
+    # (see candidate_count); the display must say which metric this
+    # particular verdict is about, not just "some match was reviewed".
+    assert "metric='grad_norm_epoch'" in out
 
 
 def test_cli_judge_dry_run_flag_writes_nothing(tmp_path, monkeypatch, capsys):

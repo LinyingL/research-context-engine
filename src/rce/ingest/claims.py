@@ -506,6 +506,23 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
     `_cleanup_orphaned_claims` (F2). A path that fails to read (below) is
     excluded from that cleanup scope, not treated as evidence its claims are
     gone.
+
+    Each candidate's evidence occurrence deliberately omits `line` (bug fix,
+    same root cause F2 fixed for the claim node id itself -- DESIGN.md
+    section 4: a claim's id is content-addressed, never line-addressed,
+    precisely so an unrelated edit elsewhere in the file cannot change it).
+    Before this fix the occurrence dict *did* carry the claim's line number,
+    and db._merge_edge_evidence dedupes by whole-dict equality -- so any
+    edit that merely shifted later lines (e.g. inserting a comment above the
+    claim) produced a "new" occurrence every re-ingest even though the match
+    itself never changed, silently growing towards
+    db._MAX_EDGE_EVIDENCE_OCCURRENCES on a long-lived paper with no new
+    information gained. The occurrence's identity is now exactly
+    (file, metric, metric_value, claim_raw, claim_value, candidate_count) --
+    stable across line shifts, still specific to this exact match. The
+    claim's *current* line is not lost: it lives on the claim node's own
+    `attrs["line"]` (kept current by `upsert_node` every re-ingest), which
+    is what `rce.cli` reads for `status`/`trace` display instead.
     """
     counts = {"claims": 0, "candidates": 0}
     metrics = _collect_experiment_metrics(conn)
@@ -549,9 +566,15 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
             for exp_id, metric_name, metric_value in matches:
                 db.upsert_edge(
                     conn, claim.id, exp_id, "backed_by", extractor="claims",
+                    # No "line" here (bug fix) -- see this function's
+                    # docstring: the claim's line shifts with unrelated
+                    # edits, but this evidence dict's whole-dict identity is
+                    # what db._merge_edge_evidence dedupes on, so a variable
+                    # line kept minting "new" occurrences for the same
+                    # match. The claim's current line lives on the claim
+                    # node's own attrs (set a few lines above), not here.
                     evidence={
                         "file": claim.tex_path,
-                        "line": claim.line,
                         "metric": metric_name,
                         "metric_value": metric_value,
                         "claim_raw": claim.raw,

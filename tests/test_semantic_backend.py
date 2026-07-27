@@ -4,6 +4,7 @@ made, so the suite stays closed and reproducible in CI with no LM Studio
 (or any other server) running."""
 
 import json
+import logging
 import urllib.error
 
 import pytest
@@ -169,3 +170,44 @@ def test_authorization_header_reflects_api_key(monkeypatch, api_key, expect_head
     client.probe()
 
     assert requests_log[0].get_header("Authorization") == expect_header
+
+
+# -- Privacy: DESIGN.md section 7 says "local by default", not "local by
+# construction" -- RCE_LLM_BASE_URL is user-configurable, so a non-local
+# value must warn loudly and every time, never silently ship data offline. --
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:1234/v1",
+        "http://127.0.0.1:1234/v1",
+        "http://[::1]:1234/v1",
+        "http://my-desktop.local:1234/v1",
+        backend.DEFAULT_BASE_URL,
+    ],
+)
+def test_local_base_urls_do_not_warn(base_url, caplog):
+    with caplog.at_level(logging.WARNING):
+        backend.LlmBackend(base_url=base_url)
+
+    assert caplog.text == ""
+
+
+def test_remote_base_url_warns_every_construction(caplog):
+    with caplog.at_level(logging.WARNING):
+        backend.LlmBackend(base_url="http://example.com:8000/v1")
+        backend.LlmBackend(base_url="http://example.com:8000/v1")  # second construction, second warning
+
+    assert caplog.text.count("NON-LOCAL") == 2
+    assert "example.com" in caplog.text
+
+
+def test_remote_base_url_from_env_var_also_warns(monkeypatch, caplog):
+    monkeypatch.setenv("RCE_LLM_BASE_URL", "https://api.remote-inference.example/v1")
+
+    with caplog.at_level(logging.WARNING):
+        backend.LlmBackend()
+
+    assert "NON-LOCAL" in caplog.text
+    assert "api.remote-inference.example" in caplog.text

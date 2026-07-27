@@ -132,7 +132,17 @@ def _format_semantic_review_suffix(evidence: dict[str, Any]) -> str:
     without opening `rce query` on each one. `[FLAGGED]` on `related=False`
     is the "see this one first" signal the task asked for; it is purely
     display -- the edge's `status` is untouched by judge and stays whatever
-    it already was (pending, per the constitution)."""
+    it already was (pending, per the constitution).
+
+    Includes `metric=` (bug fix): a `backed_by` edge can carry several
+    (experiment, metric) candidate pairs (see `candidate_count`), but
+    `rce.semantic.judge` only ever reviews one occurrence per edge and
+    records which one in `semantic_review["metric"]`/`["metric_value"]`
+    (see rce.semantic.judge.review_pending_backed_by). Without printing it
+    here, a human reading this line had no way to tell which of possibly
+    several matched metrics the model's `related`/`reason` verdict was
+    actually about.
+    """
     review = evidence.get("semantic_review") if isinstance(evidence, dict) else None
     if not isinstance(review, dict):
         return ""
@@ -140,16 +150,35 @@ def _format_semantic_review_suffix(evidence: dict[str, Any]) -> str:
     better = review.get("better_match")
     better_note = f" better_match={better!r}" if better else ""
     return (
-        f"\n      semantic_review: {flag}related={review.get('related')!r} "
-        f"reason={review.get('reason')!r}{better_note} (model={review.get('model')!r})"
+        f"\n      semantic_review: {flag}metric={review.get('metric')!r} "
+        f"related={review.get('related')!r} reason={review.get('reason')!r}"
+        f"{better_note} (model={review.get('model')!r})"
     )
 
 
-def _format_pending_line(index: int, edge: dict) -> str:
+def _current_claim_line(conn: Connection, edge: dict) -> int | None:
+    """The claim node's *current* line number for a `backed_by` edge, for
+    display only (bug fix companion to rce.ingest.claims no longer writing
+    a `line` into each occurrence -- see that module's docstring for why:
+    the line shifts with any unrelated edit above the claim, and evidence
+    is deduped by whole-dict equality, so a stable per-occurrence identity
+    requires dropping it there). The claim node's own `attrs["line"]` is
+    always kept current by `upsert_node` on every re-ingest, so this is the
+    single place display code reads it from instead."""
+    if edge["type"] != "backed_by":
+        return None
+    claim_node = db.get_node(conn, edge["src"])
+    if claim_node is None:
+        return None
+    line = claim_node["attrs"].get("line")
+    return line if isinstance(line, int) else None
+
+
+def _format_pending_line(index: int, edge: dict, conn: Connection) -> str:
     return (
         f"  [{index}] {edge['src']} --{edge['type']}--> {edge['dst']} "
         f"extractor={edge['extractor']} confidence={edge['confidence']:.2f} "
-        f"evidence={_format_evidence_summary(edge['evidence'])}"
+        f"evidence={_format_evidence_summary(edge['evidence'], display_line=_current_claim_line(conn, edge))}"
         f"{_format_semantic_review_suffix(edge['evidence'])}"
     )
 
@@ -165,7 +194,7 @@ def _print_pending_queue(conn: Connection, limit: int | None) -> None:
         return
     shown = queue if limit is None else queue[:limit]
     for i, edge in enumerate(shown, start=1):
-        print(_format_pending_line(i, edge))
+        print(_format_pending_line(i, edge, conn))
     if limit is not None and len(queue) > limit:
         print(
             f"  ... truncated: showing {limit} of {len(queue)} pending edge(s) -- pass a larger "
@@ -408,7 +437,7 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
-def _format_occurrence(occurrence: dict[str, Any]) -> str:
+def _format_occurrence(occurrence: dict[str, Any], display_line: int | None = None) -> str:
     """Render one evidence occurrence dict as a readable string.
 
     Special-cases the common {"file": ..., "line": ...} shape (latex/pyfig
@@ -416,8 +445,17 @@ def _format_occurrence(occurrence: dict[str, Any]) -> str:
     callee, ...) falls back to sorted "key=value" pairs. This only reformats
     keys that are actually present -- it never invents fields an extractor
     didn't record.
+
+    `display_line` fills in a missing "line" for display only (never
+    written back to the occurrence dict in the database) -- `backed_by`
+    occurrences from rce.ingest.claims no longer carry one (see
+    rce.cli._current_claim_line), so the caller passes the claim node's
+    current line here to keep the "file:line" rendering instead of falling
+    back to a bare "file=...".
     """
     remaining = dict(occurrence)
+    if display_line is not None and "file" in remaining and "line" not in remaining:
+        remaining["line"] = display_line
     parts: list[str] = []
     if "file" in remaining and "line" in remaining:
         parts.append(f"{remaining.pop('file')}:{remaining.pop('line')}")
@@ -425,17 +463,21 @@ def _format_occurrence(occurrence: dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "(no detail)"
 
 
-def _format_evidence_summary(evidence: dict[str, Any]) -> str:
+def _format_evidence_summary(evidence: dict[str, Any], display_line: int | None = None) -> str:
     """Expand an edge's evidence into a readable summary.
 
     db.upsert_edge stores evidence as {"occurrences": [dict, ...]} (T10); a
     pre-T10 bare-evidence dict (see db._merge_edge_evidence's docstring) is
     treated as its own single occurrence rather than requiring a migration.
+
+    `display_line` (see `_format_occurrence`) is passed through to every
+    occurrence -- harmless for occurrence shapes that already carry their
+    own "line" (it is only ever used to fill a *missing* one).
     """
     occurrences = evidence.get("occurrences")
     if not isinstance(occurrences, list):
         occurrences = [evidence]
-    return "; ".join(_format_occurrence(occ) for occ in occurrences)
+    return "; ".join(_format_occurrence(occ, display_line) for occ in occurrences)
 
 
 def _format_trace_human(node_id: str, max_hops: int, result: dict[str, Any]) -> str:

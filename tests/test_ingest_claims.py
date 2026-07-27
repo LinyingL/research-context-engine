@@ -486,6 +486,47 @@ def test_repeated_unrelated_edits_do_not_accumulate_orphaned_claim_nodes(tmp_pat
     assert len(db.query_edges(conn, type="backed_by")) == 1
 
 
+def test_repeated_line_shifting_edits_do_not_grow_edge_occurrences(tmp_path):
+    """Regression (sibling bug to the F2 line-shift fix above, same root
+    cause): before this fix, each backed_by occurrence carried the claim's
+    *line* number, and db._merge_edge_evidence dedupes by whole-dict
+    equality -- so an edit that shifts the claim's line without touching its
+    sentence or printed number (a comment inserted above it, say) minted a
+    "new" occurrence on every re-ingest even though nothing about the match
+    itself changed. Real-world repro: inserting two comment lines above a
+    claim and re-ingesting once turned 1 occurrence into 2 with the OLD
+    code. The edge row count staying at 1 (asserted by the sibling test
+    above) is not enough on its own -- this asserts the occurrence count
+    *inside* that one edge, which is where the old bug actually grew, and
+    uses a different number of prefix lines on every iteration so the
+    claim genuinely lands on a different line each time (the case the old
+    code got wrong).
+    """
+    repo = _repo(tmp_path, TEX_87_3_PCT)
+    conn = _seeded_conn(run_a={"accuracy": 0.87312})
+
+    claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    edge = db.query_edges(conn, type="backed_by")[0]
+    assert len(edge["evidence"]["occurrences"]) == 1
+    lines_seen = {db.get_nodes_by_type(conn, "claim")[0]["attrs"]["line"]}
+
+    for i in range(1, 6):
+        prefix = "".join(f"% note {i}-{j}\n" for j in range(i))
+        (tmp_path / "paper.tex").write_text(prefix + TEX_87_3_PCT)
+        claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+        lines_seen.add(db.get_nodes_by_type(conn, "claim")[0]["attrs"]["line"])
+
+    assert len(lines_seen) == 6  # sanity: the claim really did land on a different line every time
+    edge = db.query_edges(conn, type="backed_by")[0]
+    assert len(edge["evidence"]["occurrences"]) == 1  # occurrence count must not grow from line churn alone
+    assert "line" not in edge["evidence"]["occurrences"][0]
+
+    # The claim's *current* line is not lost -- it is tracked on the claim
+    # node's own attrs, which rce.cli reads from for display (see
+    # rce.cli._current_claim_line) now that the occurrence no longer has it.
+    assert db.get_nodes_by_type(conn, "claim")[0]["attrs"]["line"] == max(lines_seen)
+
+
 def test_orphaned_pending_claim_is_removed_once_its_sentence_disappears(tmp_path):
     repo = _repo(tmp_path, TEX_87_3_PCT)
     conn = _seeded_conn(run_a={"accuracy": 0.87312})

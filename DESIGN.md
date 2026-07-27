@@ -145,7 +145,8 @@ guess" exists to prevent. Concretely, this is enforced two ways:
 
 1. **A narrow write path.** `db.set_edge_semantic_review` is the only
    function `rce.semantic.judge` calls to persist anything. It writes
-   `evidence.semantic_review` (`related`, `reason`, `better_match`, plus
+   `evidence.semantic_review` (`related`, `reason`, `better_match`, the
+   `metric`/`metric_value` of the one occurrence actually reviewed, plus
    `model`/`reviewed_at`/`run_id` for traceability) and nothing else on the
    row — not `status`, not `confidence`. It does not call `upsert_edge` or
    `set_edge_status` itself, so there is no code path by which a judge run
@@ -167,6 +168,16 @@ probably a numeric coincidence, and `quantization` on this same run looks
 like a better fit" is exactly the kind of note a human reviewer wants
 sitting next to a `pending` edge before they decide — and exactly the kind
 of note that must never quietly become the decision itself.
+
+**Known limitation.** A `backed_by` edge can carry more than one matched
+(experiment, metric) occurrence — `evidence.candidate_count > 1` — because
+`rce.ingest.claims` merges every metric that matches the same claim against
+the same experiment onto one edge (DESIGN.md section 4). `rce judge`
+reviews exactly one occurrence per edge (the most recently written one) and
+records which one it saw in `semantic_review.metric`/`.metric_value`; every
+other occurrence on that edge is logged as skipped, never itself sent to
+the model. A `candidate_count > 1` edge is therefore reviewed once, not
+once per matched pair.
 
 ## Section 5 — Connection keys
 
@@ -245,8 +256,14 @@ vs. human judgement" below.
 **Next.** Proposing `supports` edges (a figure substantiates an argument)
 with confidence scores, every proposal verified against the graph before it
 is stored and queued for human confirmation when uncertain. Still optional
-and local by construction — the point is that your unpublished results never
-need to leave the machine.
+and **local by default, not local by construction**: `rce.semantic.backend`
+talks to whatever OpenAI-compatible server `RCE_LLM_BASE_URL` (or the
+`base_url` constructor argument) names, and that is a plain configuration
+value, not something the code structurally confines to this machine. The
+default points at a local server, and every `rce judge` run that resolves
+to a non-localhost/`*.local` host prints a prominent warning before sending
+that run's experiment params and metric names anywhere, so pointing the
+semantic layer at a remote endpoint is possible but never silent.
 
 **Later.** A local read-only web view over the same graph, and periodic
 digests of what changed, what went stale, and what is waiting for review.

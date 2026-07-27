@@ -185,18 +185,34 @@ def _log_skipped_occurrences(edge: dict[str, Any], reviewed_occurrence: dict[str
     rule 4: reviewing every occurrence would mean one model call per
     occurrence instead of one per edge, a larger behavior change than this
     bug fix calls for) -- it only makes the omission visible.
+
+    Deduped by metric NAME, not by occurrence identity (bug fix): two
+    occurrence dicts for the same (metric, value) match but recorded at
+    different source lines (rce.ingest.claims writes the claim's *current*
+    line into each occurrence -- see that module) are a different Python
+    object from `reviewed_occurrence` even though they describe the exact
+    same metric that was just reviewed. Comparing by `is not` therefore used
+    to list the reviewed metric itself as "skipped, never judged" -- a
+    self-contradictory warning fired on the single most common case (an
+    edit above the claim that does not change the match at all). Comparing
+    metric *names* instead means a genuinely different, never-reviewed
+    metric is the only thing that can appear here; if the set difference is
+    empty (every occurrence names the same metric that was reviewed),
+    nothing is logged at all.
     """
     occurrences = edge["evidence"].get("occurrences")
     if not isinstance(occurrences, list) or len(occurrences) <= 1:
         return
-    skipped_metrics = [o.get("metric") for o in occurrences if o is not reviewed_occurrence]
+    reviewed_metric = reviewed_occurrence.get("metric")
+    all_metrics = {o.get("metric") for o in occurrences}
+    skipped_metrics = sorted(all_metrics - {reviewed_metric}, key=lambda m: (m is None, m))
     if not skipped_metrics:
         return
     logger.warning(
         "judge: edge %s --backed_by--> %s has %d matched occurrences from this claim/"
         "experiment pair; reviewing only metric=%r and skipping unreviewed metric(s) %s "
         "-- their support for this claim was never judged",
-        edge["src"], edge["dst"], len(occurrences), reviewed_occurrence.get("metric"), skipped_metrics,
+        edge["src"], edge["dst"], len(occurrences), reviewed_metric, skipped_metrics,
     )
 
 
@@ -274,6 +290,9 @@ def _build_prompt(
     )
 
 
+_TRUNCATION_MARKER = " ..."
+
+
 def _validate_and_sanitize(
     instance: dict[str, Any], valid_names: set[str], max_reason_chars: int
 ) -> tuple[bool, str, str | None, bool]:
@@ -284,7 +303,19 @@ def _validate_and_sanitize(
     specific to the experiment being reviewed, not part of the static
     schema. Returns (related, reason, better_match, hallucination_dropped);
     raises _InvalidJudgeResponse if `related`/`reason` themselves don't pass
-    sanity checks, in which case nothing about this response is trusted.
+    sanity checks (missing, wrong type, or empty), in which case nothing
+    about this response is trusted.
+
+    An overlong `reason` is NOT one of those disqualifying cases (bug fix):
+    it used to raise here too, discarding the model's entire judgement --
+    `related` and a verified `better_match` along with it -- over nothing
+    worse than a wordier-than-asked-for sentence. The model's actual
+    judgement is exactly what a human reviewing `rce status --pending`
+    wants to see; losing it to `[error]` because the model wrote two
+    sentences instead of one is a worse outcome than showing a trimmed
+    reason. `reason` is now truncated to `max_reason_chars` with a trailing
+    `" ..."` marker and the truncation is logged (never silent), while
+    `related`/`better_match` are validated and returned normally.
     """
     related = instance.get("related")
     if not isinstance(related, bool):
@@ -295,9 +326,13 @@ def _validate_and_sanitize(
         raise _InvalidJudgeResponse(f"'reason' is not a non-empty string: {reason!r}")
     reason = reason.strip()
     if len(reason) > max_reason_chars:
-        raise _InvalidJudgeResponse(
-            f"'reason' is {len(reason)} chars, over the {max_reason_chars}-char sanity cap for "
-            "a one-sentence annotation"
+        original_len = len(reason)
+        reason = reason[:max_reason_chars].rstrip() + _TRUNCATION_MARKER
+        logger.warning(
+            "judge: 'reason' was %d chars, over the %d-char sanity cap for a one-sentence "
+            "annotation -- truncating to %d chars plus %r rather than discarding the whole "
+            "response (related/better_match are kept)",
+            original_len, max_reason_chars, max_reason_chars, _TRUNCATION_MARKER,
         )
 
     better_match = instance.get("better_match")
