@@ -383,6 +383,82 @@ def test_upsert_edge_caps_occurrences_and_drops_oldest_with_warning(conn, caplog
     assert any("exceeded cap" in r.message for r in caplog.records)
 
 
+# -- set_edge_semantic_review (S2): sibling key beside occurrences --------
+#
+# rce.semantic.judge's only write path. Lives beside `occurrences` inside
+# the same evidence JSON, and must survive a subsequent machine re-ingest
+# (upsert_edge/_merge_edge_evidence) without either side clobbering the
+# other -- see _merge_edge_evidence's own docstring for why it now passes
+# through any sibling key it finds.
+
+
+def test_set_edge_semantic_review_adds_sibling_key_beside_occurrences(conn):
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim")
+    db.upsert_node(conn, "experiment:run_a", "experiment")
+    db.upsert_edge(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", "claims",
+        {"metric": "grad_norm_epoch", "metric_value": 1.5786}, 1.0, status="pending",
+    )
+
+    db.set_edge_semantic_review(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", "claims",
+        {"related": False, "reason": "coincidental rounding", "better_match": "quantization"},
+    )
+
+    edge = db.query_edges(conn, src="claim:paper.tex#abc", dst="experiment:run_a")[0]
+    assert edge["evidence"] == {
+        "occurrences": [{"metric": "grad_norm_epoch", "metric_value": 1.5786}],
+        "semantic_review": {
+            "related": False, "reason": "coincidental rounding", "better_match": "quantization",
+        },
+    }
+    assert edge["status"] == "pending"  # untouched -- this is not a status write path
+
+
+def test_set_edge_semantic_review_is_a_noop_on_unknown_edge(conn):
+    # Matches set_human_fields/set_edge_status's behavior for an unknown target.
+    db.set_edge_semantic_review(
+        conn, "claim:nope#0", "experiment:nope", "backed_by", "claims", {"related": True, "reason": "x"},
+    )
+    assert db.query_edges(conn) == []
+
+
+def test_upsert_edge_reingest_preserves_semantic_review_sibling_key(conn):
+    # A routine re-ingest by the deterministic extractor (upsert_edge) must
+    # never silently erase a semantic-layer annotation living beside
+    # `occurrences` in the same evidence blob.
+    db.upsert_node(conn, "claim:paper.tex#abc", "claim")
+    db.upsert_node(conn, "experiment:run_a", "experiment")
+    db.upsert_edge(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", "claims",
+        {"metric": "grad_norm_epoch", "metric_value": 1.5786}, 1.0, status="pending",
+    )
+    db.set_edge_semantic_review(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", "claims",
+        {"related": False, "reason": "coincidental rounding", "better_match": "quantization"},
+    )
+
+    # Re-ingest: same evidence content (idempotent) plus a second, distinct
+    # occurrence (e.g. the claim also appears on another line).
+    db.upsert_edge(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", "claims",
+        {"metric": "grad_norm_epoch", "metric_value": 1.5786}, 1.0, status="pending",
+    )
+    db.upsert_edge(
+        conn, "claim:paper.tex#abc", "experiment:run_a", "backed_by", "claims",
+        {"metric": "grad_norm_epoch", "metric_value": 1.5786, "line": 9}, 1.0, status="pending",
+    )
+
+    edge = db.query_edges(conn, src="claim:paper.tex#abc", dst="experiment:run_a")[0]
+    assert edge["evidence"]["semantic_review"] == {
+        "related": False, "reason": "coincidental rounding", "better_match": "quantization",
+    }
+    assert edge["evidence"]["occurrences"] == [
+        {"metric": "grad_norm_epoch", "metric_value": 1.5786},
+        {"metric": "grad_norm_epoch", "metric_value": 1.5786, "line": 9},
+    ]
+
+
 # -- human_fields invariant -----------------------------------------------
 
 

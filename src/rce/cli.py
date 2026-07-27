@@ -1,5 +1,5 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query` /
-`trace` / `confirm` (F3).
+`trace` / `confirm` (F3) / `judge` (S2, optional semantic layer).
 
 stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
@@ -45,6 +45,14 @@ from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
 from rce.ingest import pyfig as pyfig_ingest
 from rce.ingest import wandb as wandb_ingest
+# S2: `rce judge`, the optional semantic layer. Unlike rce.mcp_server
+# (behind a lazy import because it needs the third-party 'mcp' extra),
+# rce.semantic.{backend,judge} use only stdlib urllib -- importing them
+# here eagerly costs zero-dependency installs nothing, so `judge` gets a
+# normal top-level subparser like every other subcommand, not the `mcp`
+# subcommand's pass-through special case.
+from rce.semantic import backend as semantic_backend
+from rce.semantic import judge as semantic_judge
 
 RCE_DIRNAME = ".rce"
 DB_FILENAME = "graph.db"
@@ -117,11 +125,32 @@ def _ordered_edges(edges: list[dict]) -> list[dict]:
     return sorted(edges, key=lambda e: (e["src"], e["dst"], e["type"], e["extractor"]))
 
 
+def _format_semantic_review_suffix(evidence: dict[str, Any]) -> str:
+    """Second line for a pending edge that already carries a `semantic_review`
+    annotation (written by `rce judge`, S2) -- lets a human skim the queue
+    and see which candidates a model already flagged as likely coincidental,
+    without opening `rce query` on each one. `[FLAGGED]` on `related=False`
+    is the "see this one first" signal the task asked for; it is purely
+    display -- the edge's `status` is untouched by judge and stays whatever
+    it already was (pending, per the constitution)."""
+    review = evidence.get("semantic_review") if isinstance(evidence, dict) else None
+    if not isinstance(review, dict):
+        return ""
+    flag = "[FLAGGED: model says likely unrelated] " if review.get("related") is False else ""
+    better = review.get("better_match")
+    better_note = f" better_match={better!r}" if better else ""
+    return (
+        f"\n      semantic_review: {flag}related={review.get('related')!r} "
+        f"reason={review.get('reason')!r}{better_note} (model={review.get('model')!r})"
+    )
+
+
 def _format_pending_line(index: int, edge: dict) -> str:
     return (
         f"  [{index}] {edge['src']} --{edge['type']}--> {edge['dst']} "
         f"extractor={edge['extractor']} confidence={edge['confidence']:.2f} "
         f"evidence={_format_evidence_summary(edge['evidence'])}"
+        f"{_format_semantic_review_suffix(edge['evidence'])}"
     )
 
 
@@ -284,6 +313,55 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         old_status = matches[0]["status"]
         db.set_edge_status(conn, src, dst, edge_type, extractor, args.status)
         print(f"Edge {src} --{edge_type}--> {dst} (extractor={extractor}): {old_status} -> {args.status}")
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_judge(args: argparse.Namespace) -> int:
+    """`rce judge` (S2): the optional semantic layer. Reviews every pending
+    `backed_by` candidate and annotates it with a model's opinion --
+    written to `evidence.semantic_review` via `db.set_edge_semantic_review`
+    only (see rce.semantic.judge's module docstring for why: the machine
+    write path may only ever produce `status` in {auto, pending}, so this
+    command never calls `db.set_edge_status`/`db.upsert_edge` and cannot
+    move an edge to confirmed/rejected no matter what the model says).
+
+    Zero-dependency baseline (task requirement 6): a backend that is not
+    reachable fails this one command clearly and exits non-zero -- it never
+    touches ingest/status/query/trace/confirm, none of which import
+    anything from rce.semantic to begin with.
+    """
+    project_root = _resolve_project_root(args.path)
+    conn = db.connect(_require_db(project_root))
+    try:
+        llm = semantic_backend.LlmBackend()
+        try:
+            llm.probe()
+        except semantic_backend.LlmError as exc:
+            raise CliError(
+                f"semantic backend unavailable: {exc} -- 'rce judge' is the only affected "
+                "command; ingest/status/query/trace/confirm work with no model running at all"
+            ) from exc
+
+        result = semantic_judge.review_pending_backed_by(
+            conn, llm, limit=args.limit, dry_run=args.dry_run,
+        )
+        mode = "dry run -- no writes" if args.dry_run else "writing semantic_review annotations"
+        print(f"Judging pending backed_by candidates ({mode}), backend model={llm.model!r}:")
+        print(f"  pending backed_by edges total: {result.total_pending}")
+        for outcome in result.reviewed:
+            if outcome.error:
+                print(f"  [error] {outcome.src} --backed_by--> {outcome.dst}: {outcome.error}")
+                continue
+            flag = " [hallucinated better_match dropped]" if outcome.hallucination_dropped else ""
+            print(
+                f"  {outcome.src} --backed_by--> {outcome.dst}: related={outcome.related} "
+                f"better_match={outcome.better_match!r}{flag} reason={outcome.reason!r}"
+            )
+        errors = sum(1 for o in result.reviewed if o.error)
+        written = sum(1 for o in result.reviewed if o.written)
+        print(f"  reviewed={len(result.reviewed)} written={written} errors={errors}")
     finally:
         conn.close()
     return 0
@@ -520,6 +598,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--path", default=".", help="project root (default: '.')")
     p.set_defaults(func=cmd_confirm)
+
+    p = sub.add_parser(
+        "judge",
+        help=(
+            "optional semantic layer: annotate pending backed_by candidates via a local "
+            "model (writes evidence.semantic_review only, status stays pending -- see "
+            "rce.semantic.judge)"
+        ),
+    )
+    p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="review at most N pending backed_by edges, in 'status --pending' order (default: all)",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="call the model and print what would be annotated, but write nothing to the database",
+    )
+    p.set_defaults(func=cmd_judge)
 
     # `mcp`'s own args (--path etc.) are parsed by rce.mcp_server.main itself,
     # not by this parser -- see the argv[0] == "mcp" interception in main()

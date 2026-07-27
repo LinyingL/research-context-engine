@@ -41,13 +41,19 @@ Three layers, only the first of which is mandatory:
 ```
   deterministic parsing   always on, no model, no network
            |
-  semantic enhancement    optional, local model, off by default
+  semantic enhancement    optional, local model, off by default (implemented: annotation-only)
            |
   human confirmation      always available, never required
 ```
 
 The engine is fully usable with the first layer alone. That is the default
 install and the intended baseline, not a degraded mode.
+
+The semantic layer is implemented as `rce judge` (S2): it reviews pending
+`backed_by` candidates and writes a model's opinion into each edge's
+`evidence.semantic_review`, but it never writes `status` — see "Machine
+annotation vs. human judgement" below for why that split is load-bearing,
+not incidental.
 
 Storage is a single SQLite file at `.rce/graph.db` inside the project,
 alongside `.git` rather than inside it. Two tables — `nodes` and `edges` —
@@ -114,12 +120,53 @@ judgement call, and judgement belongs to the semantic layer or a human, never
 the extractor; diluting confidence to `1/N` across `N` candidates used to
 smuggle a guess about "which one" into a decimal that looked precise but
 wasn't. Instead, ambiguity is recorded plainly: every candidate edge's
-evidence carries `candidate_count`, the total number of experiments that
-claim matched, so a reviewer sees "3 candidates" rather than inferring it
-from a confidence of `0.33`.
+evidence carries `candidate_count`, the count of (experiment, metric) pairs
+that claim matched — not the count of distinct experiments, since one
+experiment can contribute more than one matching metric to the same claim
+— so a reviewer sees "3 candidates" rather than inferring it from a
+confidence of `0.33`.
 
 `supports` still has no extractor and exists in the schema only; it belongs
-to the optional local-model layer described in section 7.
+to a future extension of the semantic layer described in section 7.
+`backed_by` candidates, meanwhile, are reviewable today: `rce judge` (S2)
+attaches a model's opinion to each pending candidate as
+`evidence.semantic_review` — see "Machine annotation vs. human judgement"
+below. This is annotation on top of the existing `backed_by` edge, not a
+new edge type, so it needed no change to the table above.
+
+### Machine annotation vs. human judgement
+
+`rce judge` (`rce.semantic.judge`) is a second machine that looks at the
+graph, not a shortcut around "humans own judgement." Section 0's rule does
+not carve out an exception for a model just because its guess is often
+better than the deterministic rounding-coincidence match it is reviewing —
+a wrong guess dressed up as fluent prose is exactly the failure mode "never
+guess" exists to prevent. Concretely, this is enforced two ways:
+
+1. **A narrow write path.** `db.set_edge_semantic_review` is the only
+   function `rce.semantic.judge` calls to persist anything. It writes
+   `evidence.semantic_review` (`related`, `reason`, `better_match`, plus
+   `model`/`reviewed_at`/`run_id` for traceability) and nothing else on the
+   row — not `status`, not `confidence`. It does not call `upsert_edge` or
+   `set_edge_status` itself, so there is no code path by which a judge run
+   could move an edge to `confirmed` or `rejected`, however confident the
+   model's own `related: true` sounds. A `pending` candidate reviewed by
+   the judge is still `pending` afterward; a human decides via `rce
+   confirm`, same as any other candidate.
+2. **A verifier the model cannot talk its way past.** `better_match` names a
+   param or metric the model claims exists on the *same* experiment run —
+   information only available at review time, so no static JSON-Schema can
+   check it. `rce.semantic.judge`'s own verifier checks `better_match`
+   against that run's actual param/metric names before anything is stored;
+   a name that is not literally present is discarded as a hallucination,
+   logged, and never written (`related`/`reason` are kept regardless — one
+   field failing verification does not discard the whole review).
+
+The result reads like a second opinion, not a verdict: "this candidate is
+probably a numeric coincidence, and `quantization` on this same run looks
+like a better fit" is exactly the kind of note a human reviewer wants
+sitting next to a `pending` edge before they decide — and exactly the kind
+of note that must never quietly become the decision itself.
 
 ## Section 5 — Connection keys
 
@@ -183,12 +230,21 @@ broken extractor.
 analysis, MLflow's local store, and W&B's public API; deterministic
 `claim --backed_by--> experiment` candidate generation from numbers in prose
 (pending status, no model); a command line that ingests and traces
-provenance; an optional MCP server.
+provenance; an optional MCP server. The semantic layer's first slice
+(`rce judge`, S2): a local, vendor-neutral OpenAI-compatible client
+(`rce.semantic.backend`, off by default, no third-party dependency to
+install) reviews pending `backed_by` candidates and writes its opinion into
+`evidence.semantic_review` — related or not, a one-sentence reason, and an
+optional `better_match` naming a param or metric on that *same* experiment
+run the deterministic matcher never considered. Every `better_match` is
+verified against the run's actual param/metric names before being stored; a
+name that doesn't exist there is discarded as a hallucination, logged, and
+never written. `status` is untouched either way — see "Machine annotation
+vs. human judgement" below.
 
-**Next.** The semantic layer: a local model that reviews the deterministic
-`backed_by` candidates and additionally proposes `supports` edges with
-confidence scores, every proposal verified against the graph before it is
-stored and queued for human confirmation when uncertain. It stays optional
+**Next.** Proposing `supports` edges (a figure substantiates an argument)
+with confidence scores, every proposal verified against the graph before it
+is stored and queued for human confirmation when uncertain. Still optional
 and local by construction — the point is that your unpublished results never
 need to leave the machine.
 
@@ -198,7 +254,10 @@ digests of what changed, what went stale, and what is waiting for review.
 ## Interfaces
 
 The command line is complete on its own: ingest, inspect, and trace
-provenance with no assistant involved.
+provenance with no assistant involved. `rce judge` is the one subcommand
+that talks to a model, and only when invoked — every other subcommand
+(`init`/`ingest`/`status`/`query`/`trace`/`confirm`) works identically
+whether or not a local model server exists.
 
 An optional MCP server exposes the same graph to any MCP-capable client,
 including open-source clients and ones backed by local models. MCP is a

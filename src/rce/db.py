@@ -256,13 +256,27 @@ def _merge_edge_evidence(existing_evidence_json: str | None, new_evidence: dict[
     not grow the list. Caps at `_MAX_EDGE_EVIDENCE_OCCURRENCES`, dropping the
     oldest occurrences and logging a warning when the cap is exceeded --
     never silently, and never unbounded.
+
+    Sibling keys other than "occurrences" -- currently only `semantic_review`,
+    written by `set_edge_semantic_review` for the S2 semantic judge -- are
+    carried forward unchanged whenever present on the existing row. This
+    function only ever touches `occurrences`; any other top-level key is
+    passed through as-is so a routine re-ingest (the only caller of
+    upsert_edge, hence of this function) can never silently erase a
+    semantic-layer annotation living beside it. This is why the semantic
+    layer's own writes go through `set_edge_semantic_review` instead of
+    reusing this function directly -- that function updates only the
+    `semantic_review` key and leaves `occurrences` (and any other sibling)
+    exactly as this function last left them.
     """
+    extra: dict[str, Any] = {}
     if existing_evidence_json is None:
         occurrences: list[Any] = []
     else:
         existing = json.loads(existing_evidence_json)
         if isinstance(existing, dict) and isinstance(existing.get("occurrences"), list):
             occurrences = list(existing["occurrences"])
+            extra = {k: v for k, v in existing.items() if k != "occurrences"}
         else:
             occurrences = [existing]  # legacy bare-evidence row, pre-T10
 
@@ -277,7 +291,7 @@ def _merge_edge_evidence(existing_evidence_json: str | None, new_evidence: dict[
             _MAX_EDGE_EVIDENCE_OCCURRENCES, dropped, "y" if dropped == 1 else "ies",
         )
 
-    return json.dumps({"occurrences": occurrences})
+    return json.dumps({"occurrences": occurrences, **extra})
 
 
 def upsert_edge(
@@ -430,6 +444,58 @@ def set_edge_status(
         WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
         """,
         (status, _now(), src, dst, type, extractor),
+    )
+    conn.commit()
+
+
+def set_edge_semantic_review(
+    conn: sqlite3.Connection,
+    src: str,
+    dst: str,
+    type: str,
+    extractor: str,
+    semantic_review: dict[str, Any],
+) -> None:
+    """Machine-annotation write path for the optional semantic layer (S2,
+    DESIGN.md section 7): attaches `semantic_review` as a sibling key next
+    to `occurrences` inside an edge's evidence JSON.
+
+    Constitutional note (DESIGN.md section 2/4, "humans own judgement"): this
+    function is the ONLY way `rce.semantic.judge` is allowed to record a
+    model's opinion. It updates `evidence` alone -- it never touches
+    `status` or `confidence`, and it does not call `upsert_edge` or
+    `set_edge_status`. A model's output is therefore structurally
+    annotation, never a verdict: an edge this function is called on stays
+    exactly whatever status it already had (in practice always 'pending',
+    since that is all the judge ever reviews) -- confirming or rejecting an
+    edge remains solely `set_edge_status`'s job, and nothing here can reach
+    it even by mistake.
+
+    Overwrites any previous `semantic_review` on this edge (a re-run
+    judgement supersedes the old one) but never touches `occurrences` --
+    read via the same "existing dict, minus occurrences, carried forward"
+    logic `_merge_edge_evidence` uses for its own sibling-key passthrough,
+    so a judge re-run and a routine re-ingest can never clobber each other's
+    half of the evidence.
+
+    No-op if the (src, dst, type, extractor) row does not exist, matching
+    `set_human_fields`/`set_edge_status`'s behavior for an unknown target.
+    """
+    row = conn.execute(
+        "SELECT evidence FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+        (src, dst, type, extractor),
+    ).fetchone()
+    if row is None:
+        return
+    existing = json.loads(row["evidence"])
+    if isinstance(existing, dict) and isinstance(existing.get("occurrences"), list):
+        evidence = {k: v for k, v in existing.items()}
+    else:
+        evidence = {"occurrences": [existing] if existing else []}  # legacy bare-evidence row
+    evidence["semantic_review"] = semantic_review
+    conn.execute(
+        "UPDATE edges SET evidence = ?, updated_at = ? WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+        (json.dumps(evidence), _now(), src, dst, type, extractor),
     )
     conn.commit()
 
