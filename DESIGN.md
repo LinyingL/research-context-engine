@@ -150,7 +150,14 @@ to change on re-parse like any other node's `attrs`.
 via `.rce/attempts.toml` (file/heading/`[columns]` name mapping, optional
 `steps_dir`) -- with no config present, `rce attempts` prints a
 copy-pasteable template and exits 1 rather than guessing which table in the
-project is the attempt timeline. `verdict`/`result` go to `human_fields` via
+project is the attempt timeline. The same clean-message-and-exit-1 handling
+also covers a configured `[columns]` name no longer present in the table's
+actual header (e.g. a renamed column) and a heading/table that can no
+longer be located at all (see "Attempt orphans" below); both raise
+`AttemptsConfigError` -- the latter via its `AttemptsTableNotFoundError`
+subclass -- from inside `ingest_attempts_repo`, not only from `load_config`,
+and `rce.cli.cmd_attempts` catches both around the same call so neither
+surfaces as a raw traceback. `verdict`/`result` go to `human_fields` via
 `set_human_fields` on *every* parse, resynced to whatever the row currently
 says in the source file -- see "Attempt human_fields: resync from source,
 not write-once" below for why this is not an exception to "humans own
@@ -234,9 +241,22 @@ itself rewrite the source file -- rather than left for whoever adds it to
 discover by losing an edit. This precondition used to be enforced by
 nothing but this paragraph; `tests/test_ingest_attempts.py::
 test_set_human_fields_has_exactly_one_caller_in_src` now asserts the
-call-site count directly (via `ast`, so a mention of the name in a
-docstring or comment is not mistaken for a call), so a second caller turns
-this from a stale comment into a failing test the moment it is added.
+call-site count directly via `ast` -- a mention of the name in a docstring
+or comment is not mistaken for a call, and (fixed after a reviewer probe
+found the gap) neither is an aliased import evading detection: `from
+rce.db import set_human_fields as _write_hf` followed by a real call
+through `_write_hf(...)` used to pass this test undetected, since that
+call's own `func.id` is the alias, never the literal string
+`"set_human_fields"`. The scan now also flags any `ImportFrom` of the name
+as a site in its own right, aliased or not, regardless of whether the
+alias is ever subsequently called. This makes the test a best-effort
+static tripwire for the common ways a second caller gets added -- an
+ordinary call, an attribute access, or an aliased import -- not a proof
+that no second caller can ever exist undetected: a sufficiently indirect
+reference (`getattr(db, "set_human_fields")`, constructing the call from a
+string) is still outside what a syntactic `ast` scan can see. It closes the
+concrete gap a reviewer found, not every gap that could theoretically be
+constructed.
 
 **Staleness window: only `rce attempts` refreshes these nodes.** `attempt`
 nodes are written and resynced exclusively by `rce.ingest.attempts`
@@ -257,8 +277,57 @@ before listing or `--check`ing (above).
 
 ### Attempt orphans: deletion resyncs from source too, not just verdicts
 
+**Observation failure is not evidence of absence.** Everything else in this
+section governs *which* previously-ingested nodes `_cleanup_orphans`
+deletes once it runs -- but it must first be established that this run
+actually observed the timeline at all, and "parsed zero rows" is not one
+condition. `parse_attempts_table` can come back with either (a) the
+heading and its table were both located, and the table's data section
+genuinely has no rows (every row really was deleted, or this is a fresh,
+empty timeline) -- a real, legitimate observation -- or (b) the configured
+`heading`, or a table underneath it, could not be *located* in the source
+file at all: an unrelated Markdown edit inserted a heading between the
+tracked one and its table, the heading text drifted out of sync with
+`.rce/attempts.toml`, or the table lost its separator row. These two used
+to come back identically, as a bare `[]` with only a logged warning
+(Blocker 1, found against the real 23-row project map this extractor was
+built against): inserting one ordinary prose sub-heading (`### 说明:...`)
+between `## 二、尝试途径总年表` and its table made `parse_attempts_table`
+return `[]`; `ingest_attempts_repo`'s `seen_ids` therefore came back empty,
+and `_cleanup_orphans` read that exactly the way it reads a genuinely
+emptied table -- "none of these 23 attempts exist anymore." `rce attempts`
+printed `attempts=0 created=0 updated=0 orphans_removed=23` and deleted
+every node; `rce attempts --check` then printed `OK: no attempts to check`
+and exited 0 -- an ordinary heading edit silently erased the graph's entire
+attempt history and reported success on the way out. This is Section 0's
+"never guess" principle again, pointed at a failure mode the OSError
+read-failure path just above already defends against (that section's own
+docstring: "not evidence the attempts are gone") but which had not yet been
+extended to a *located-file, unlocatable-table* failure: not having
+observed the table's rows is not evidence they don't exist, and reading
+"not found" as "empty" is exactly as much a guess as fabricating a number
+would be.
+
+The fix keeps the two outcomes from ever being conflated in the first
+place, structurally rather than by convention: `parse_attempts_table` now
+raises `AttemptsTableNotFoundError` (a subclass of `AttemptsConfigError`)
+when the heading or its table cannot be located, and returns a plain `[]`
+-- unambiguous now -- only when the table *was* located and its data
+section is genuinely empty. `ingest_attempts_repo` lets that exception
+propagate rather than swallowing it (after logging which file/heading it
+was looking for and noting explicitly that every existing node for this
+file is left untouched): the row loop that would build `seen_ids` never
+runs, so `_cleanup_orphans` is skipped structurally, not by a conditional
+that could itself have the same bug. `rce.cli.cmd_attempts` catches it
+alongside every other `AttemptsConfigError` (above) and exits 1 with a
+clean message -- deliberately not the OSError path's silent all-zero-counts
+return, because unlike a transient read failure this means the run's own
+request (this heading, in this file) could not be satisfied, and the
+operator should be told, not shown a quiet success line.
+
 The resync above covers a row that still exists but whose verdict changed.
-A row *deleted* (or renumbered) out of the table entirely used to be
+A row *deleted* (or renumbered) out of the table entirely -- once the
+table has actually been located and parsed, per the above -- used to be
 handled differently, and inconsistently with the principle that same
 section just established: `rce.ingest.attempts._cleanup_orphans` preserved
 any orphaned `attempt` node that still carried `human_fields`, deleting
@@ -266,56 +335,83 @@ only one with none -- modeled on `rce.ingest.claims`'s own orphan cleanup,
 which preserves a claim node whose `backed_by` edge carries a
 confirmed/rejected `edges.status`.
 
-That model does not transfer. Testing against a real 23-row map confirmed
-it concretely: deleting row 15 from the source file and re-ingesting left
-`rce attempts`' listing still printing 23 rows including `#15`, `rce
-attempts --check` still reporting a finding about a row that no longer
-existed anywhere in the project, and exit code 1 -- with no way to clear
-either short of dropping the whole database. Worse, the guard behind this
-was never actually reachable in practice: this same extractor's resync
-(above) writes `human_fields` on *every* node's first parse, even a row
-whose verdict/result are both blank, since `{"verdict": "", "result": ""}`
-is still a truthy dict -- so `if node["human_fields"]:` was true for every
-attempt node this extractor has ever produced, and the delete branch
-beneath it was dead code outside a hand-built test.
+That model does not transfer as a `human_fields` check. Testing against a
+real 23-row map confirmed it concretely: deleting row 15 from the source
+file and re-ingesting left `rce attempts`' listing still printing 23 rows
+including `#15`, `rce attempts --check` still reporting a finding about a
+row that no longer existed anywhere in the project, and exit code 1 -- with
+no way to clear either short of dropping the whole database. Worse, the
+guard behind this was never actually reachable in practice: this same
+extractor's resync (above) writes `human_fields` on *every* node's first
+parse, even a row whose verdict/result are both blank, since
+`{"verdict": "", "result": ""}` is still a truthy dict -- so
+`if node["human_fields"]:` was true for every attempt node this extractor
+has ever produced, and the delete branch beneath it was dead code outside a
+hand-built test. `human_fields` looking truthy is not evidence of a
+decision *in the graph* the way a confirmed/rejected `edges.status` is --
+it is simply the last mirrored copy of whatever the row's verdict cell
+said, and the row no longer exists to mirror. Checking it, as that version
+of `_cleanup_orphans` did, was applying claims's guard to the wrong
+authority: an attempt's verdict/result decision is recorded in the
+researcher's own source file, never in an edge, and the graph only mirrors
+it (see "resync from source" above); `human_fields` is simply not where a
+human decision about *this node* lives.
 
-The underlying reason claims's preserve-on-orphan is *correct* is exactly
-why attempts' copy of it was wrong. A claim's `backed_by` edge is
-machine-generated, and `rce confirm` writing `status` onto it in the graph
-is the *only* place that confirm/reject decision is ever recorded --
-delete the claim node and that decision is gone, unrecoverable from
-anywhere else, so claims must check for it and refuse to delete when
-present. An attempt node has no edge of that kind. Its human decision --
-verdict/result -- is recorded in the researcher's own source file and only
-mirrored into `human_fields`, never recorded *in the graph* the way
-`edges.status` is; a truthy `human_fields` on an attempt node is not
-evidence of an in-graph decision, only evidence that this extractor's
-resync ran at least once. There is nothing an orphaned attempt node is
-protecting by continuing to exist. And the source file itself is
-ordinarily under git, so the deleted row's history is not lost by deleting
-the mirror's copy of it either.
+Removing that wrong check does not mean no check is needed at all, though
+-- and the fix that first replaced it went one step too far by concluding
+exactly that. That version deleted an orphaned node -- and every edge
+touching it, in either direction, from any extractor -- unconditionally,
+reasoning that an attempt node's only edge type, `uses`
+(`attempt --uses--> commit`, written by `rce.consistency` below, tagged
+`extractor="attempts_consistency"`), is "a deterministic, always-`auto`
+fact that no human ever confirms or rejects." That assumption was never
+actually *enforced* anywhere in the codebase, and a real end-to-end run
+against the project map disproved it directly (Blocker 2): `rce confirm`
+carries no allowlist restricting which edge types a human may judge --
+`rce confirm --status confirmed <attempt-node> <commit> uses
+attempts_consistency` succeeds today exactly like confirming a `backed_by`
+edge would. Once that `uses` edge was confirmed, deleting the row it
+belonged to and re-ingesting silently destroyed both the edge and the node
+carrying the confirmed decision -- no log line, no count, nothing to
+distinguish it from an ordinary, harmless cleanup.
 
-The fix: `_cleanup_orphans` now deletes an orphaned attempt node --
-and every edge touching it -- unconditionally, with no preserve branch and
-no `human_fields` check. "Every edge touching it," not just edges this
-extractor itself produced, is the other deliberate departure from claims's
-pattern: `rce.consistency` (below) writes `attempt --uses--> commit` edges
-tagged `extractor="attempts_consistency"`, and `nodes.id` is a foreign key
-`edges.src`/`dst` reference with no cascade, so a `uses` edge left over
-from an earlier `--check` run would make the node delete itself raise
-`sqlite3.IntegrityError`. Dropping that edge too costs nothing: `uses` is
-a deterministic, always-`auto` fact that no human ever confirms or
-rejects, and it is regenerated the next time `--check` runs against a
-still-existing node.
+The corrected fix restores a preserve check, keyed on the same signal
+claims already uses -- `edges.status` in `('confirmed', 'rejected')` -- not
+on `human_fields`, which was the wrong signal for the reasons just given.
+Before deleting an orphaned attempt node, `_cleanup_orphans` now inspects
+every edge touching it, `src` or `dst`, from any extractor; if any carries
+that status, the node and all of its edges are left exactly as they are,
+logged (which node, which file, how many edges carry a decision), and
+counted under a new `orphans_preserved_with_human_decision` key, visible in
+`rce attempts`'s own summary line rather than only in the log. Only when
+none of a node's edges are confirmed or rejected does the delete proceed as
+before: every edge touching the node is removed first (counted under a new
+`orphan_edges_removed` key, mirroring claims's `backed_by_edges_removed`),
+then the node itself.
 
-`edges.status` (claims) and `attempt` orphans (this section) therefore
-behave oppositely on purpose, the same way the verdict resync above does:
-a claim orphan must be preserved when a human decision lives on its edge,
-because the graph is the only record of that decision; an attempt orphan
-must always be deleted because the source file, not the graph, is the
-only record of whether the row still exists at all, and a graph that kept
-a deleted row around would be lying about what the file currently says --
-exactly the failure this section's opening principle exists to prevent.
+`edges.status` (claims) and `attempt` orphans (this section) now agree on
+*when* to preserve a node: both refuse to delete once a confirmed/rejected
+edge is present, because in both cases the graph's own `edges.status` is
+somewhere a human decision can genuinely be recorded, and `rce confirm`
+does not care which node type or extractor an edge belongs to. What still
+differs, deliberately, is *scope*: claims's own check and delete are both
+scoped to edges its own extractor produced (`extractor="claims"`), so a
+hypothetical second claims-like extractor's candidates would not interfere
+with each other's bookkeeping; attempts' check and delete both span every
+extractor touching the node, because `nodes.id` is a foreign key
+`edges.src`/`dst` reference with no cascade (`db.delete_node`'s own
+docstring) -- an unconfirmed `uses` edge left in place by an earlier
+`--check` run would otherwise make the node's own delete raise
+`sqlite3.IntegrityError`, and there is no reason to scope the
+*human-decision protection* narrowly just because claims happens to scope
+its own extractor-local bookkeeping that way. `human_fields` resync
+(above) still behaves oppositely from `edges.status` on purpose, unaffected
+by either fix: an attempt's `human_fields` must always be resynced from the
+source file, because the file, not the graph, is the sole record of a
+verdict; an edge's `status`, and now an attempt node carrying a
+confirmed/rejected edge, must never be overwritten or deleted by
+re-ingestion, because the graph is the sole record of *that* decision,
+wherever in the graph it happens to be attached.
 
 Edge types, grouped by the layer that produces them:
 

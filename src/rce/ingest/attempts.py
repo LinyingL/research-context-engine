@@ -45,11 +45,23 @@ divergence and refuse to overwrite, or have the in-graph edit rewrite the
 source file) rather than discover it by losing an edit.
 
 The same "source file is the sole authority" reasoning applies to a row's
-*existence*, not just its verdict/result: a row deleted (or renumbered)
-out of the table has its `attempt` node, and every edge touching it,
-deleted on the next parse, unconditionally -- the mirror-image opposite of
-`rce.ingest.claims`'s own orphan cleanup, on purpose, not a discrepancy to
-reconcile. See `_cleanup_orphans` below for why.
+*existence*, not just its verdict/result: a row deleted (or renumbered) out
+of the table has its `attempt` node, and every edge touching it, deleted on
+the next parse -- unless a human has confirmed or rejected one of those
+edges in the graph itself (e.g. via `rce confirm` on a `uses` edge
+`rce.consistency` wrote), in which case the node and its edges are left
+alone and logged instead, the same `edges.status` signal
+`rce.ingest.claims`'s own orphan cleanup already checks for. This still
+differs from claims in scope (which edges count, not whether the check
+happens at all) -- see `_cleanup_orphans` below for the full rule and why
+an earlier version of this function got that scope question wrong.
+
+Separately, and upstream of all of the above: a row's existence must never
+be inferred from a *failed attempt* to even locate the table -- if the
+configured heading or the table beneath it cannot be found in the source
+file at all, that is an observation failure, not evidence every row is
+gone, and `_cleanup_orphans` must not run at all in that case. See
+`AttemptsTableNotFoundError` and `parse_attempts_table` below.
 
 A description differing from what's already stored under an id is *not* a
 collision -- it is the ordinary case of a human editing that cell (the
@@ -145,6 +157,32 @@ verdict = "判决"
 class AttemptsConfigError(Exception):
     """Missing/unusable .rce/attempts.toml; message already includes
     SAMPLE_CONFIG so the caller can print it as-is."""
+
+
+class AttemptsTableNotFoundError(AttemptsConfigError):
+    """The configured `heading` or the table beneath it could not be located
+    in the source file *this run* -- distinct from "the table was located
+    and its data section is genuinely empty," which is a legitimate result
+    and returns a plain `[]` from `parse_attempts_table`, not this error.
+
+    A subclass of `AttemptsConfigError` (not a separate exception hierarchy)
+    on purpose: whichever of the two is true -- the heading text drifted
+    out of sync with `.rce/attempts.toml`, or the source file changed shape
+    (an inserted sub-heading, a dropped separator row) -- from `rce
+    attempts`'s point of view this is the same class of problem as a
+    misconfigured column name: something `.rce/attempts.toml` points at no
+    longer matches what is actually in the project, and `rce.cli.cmd_attempts`
+    should give one clean message and exit 1, not guess and not crash with a
+    raw traceback.
+
+    Conflating this with "table found, zero rows" into a bare `[]` was
+    Blocker 1 (DESIGN.md, "Attempt orphans"): a caller reading an empty
+    return as "this file now has zero attempts" and feeding it to orphan
+    cleanup deletes every node ever ingested for that file the moment the
+    table merely becomes unlocatable -- an editing accident, not evidence
+    the rows are gone. See `parse_attempts_table` and `ingest_attempts_repo`
+    for how this is kept from reaching `_cleanup_orphans` at all.
+    """
 
 
 @dataclass(frozen=True)
@@ -278,14 +316,33 @@ class AttemptRow:
 
 def parse_attempts_table(md_text: str, heading: str, columns: dict[str, str]) -> list[AttemptRow]:
     """Rows of the first table under `heading`, mapped by column *name*, not
-    position. Raises AttemptsConfigError if a configured column name isn't
-    among the table's actual headers; returns [] with a logged warning if
-    the heading or a table under it isn't present at all."""
+    position.
+
+    Raises `AttemptsConfigError` if a configured column name isn't among
+    the table's actual headers. Raises `AttemptsTableNotFoundError` (a
+    subclass of `AttemptsConfigError`) if the heading or a table under it
+    can't be located at all -- callers must not treat this the same as a
+    plain `[]` return. A plain `[]` is reserved for the *other* empty
+    outcome: the heading and its table both were located, but the table's
+    data section genuinely has no rows (every row really was deleted, or
+    the timeline is a fresh, empty one) -- a real, legitimate state, not a
+    failed observation. Collapsing these two outcomes into one bare `[]`
+    was Blocker 1 (see `AttemptsTableNotFoundError`'s docstring and
+    DESIGN.md's "Attempt orphans" section): a caller cannot tell "we looked
+    and there is nothing" from "we could not look" from the return value
+    alone, and treating the latter as the former is exactly the guess
+    DESIGN.md section 0 rules out.
+    """
     lines = md_text.splitlines()
     located = _find_table(lines, heading)
     if located is None:
-        logger.warning("heading %r or a table under it not found", heading)
-        return []
+        raise AttemptsTableNotFoundError(
+            f"heading {heading!r} or a table under it not found in the source file -- "
+            f".rce/attempts.toml currently configures heading={heading!r}; check that this "
+            f"text still matches a heading in the file, and that a table (a header row "
+            f"followed by a |---|---| separator row, prose in between is fine) still follows "
+            f"it before the next heading"
+        )
     header_idx, data_idx = located
     header_cells = [_clean_cell(c) for c in _split_row(lines[header_idx])]
 
@@ -416,69 +473,117 @@ def _node_id(file: str, number: str) -> str:
 def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[str, int]:
     """Attempt nodes from `file` produced on an earlier run but not this one
     (the row was deleted, or its `#` was renumbered out from under it):
-    delete the node, and every edge touching it, unconditionally.
+    delete the node, and every edge touching it -- unless a human has
+    confirmed or rejected one of those edges in the graph, in which case
+    the node (and all its edges) are preserved instead.
 
     This is the deletion-direction half of "resync from source, not
     write-once" (module docstring above, DESIGN.md section 4): the source
     Markdown file is the sole authority for whether an attempt row exists
     at all, exactly as it is the sole authority for that row's
     verdict/result. A researcher deleting a row from their own map *is*
-    the human decision; there is nothing left in the graph worth
-    protecting by keeping the node around once the row is gone. And if the
-    source file itself lives in git -- the ordinary case -- its history
-    still has the deleted row, so the graph does not have to be the
-    archive of record.
+    the human decision, ordinarily; there is ordinarily nothing left in the
+    graph worth protecting by keeping the node around once the row is
+    gone. And if the source file itself lives in git -- the ordinary case
+    -- its history still has the deleted row, so the graph does not have
+    to be the archive of record.
 
     Do NOT read this as "the old preserve-if-judged behavior was a bug, so
     rce.ingest.claims's `_cleanup_orphaned_claims` must have the same bug":
     that one preserves an orphaned claim node whose `backed_by` edge
     carries a confirmed/rejected `edges.status`, and that is correct and
-    stays correct. The difference is *where* the human decision for each
-    node type is recorded. A claim's `backed_by` edge is machine-generated,
-    and `rce confirm` writing `status` onto it in the graph is the one and
-    only place that confirm/reject decision is ever recorded anywhere --
-    delete the node and the decision is gone for good, unrecoverable from
-    any other source, so claims must check for it and refuse to delete
-    when it is present. An attempt's decision is recorded in the
-    researcher's own source file, next to the row, never in an edge; the
-    graph only mirrors it (see module docstring). `human_fields` looking
-    truthy is not evidence of a decision *in the graph* the way a
-    confirmed/rejected `backed_by` edge is -- it is simply the last
-    mirrored copy of whatever the row's verdict cell said, and the row no
-    longer exists to mirror. Checking it here, as the previous version of
-    this function did, was applying claims's guard to the wrong authority:
-    every node this extractor ever writes gets human_fields on its very
-    first parse (even an empty verdict/result becomes the truthy
-    `{"verdict": "", "result": ""}`), so that guard was true for every
-    attempt node in practice and the delete branch beneath it was dead
-    code -- reachable only via a hand-built test node that never went
-    through `set_human_fields` at all, never in real use.
+    stays correct. `human_fields` looking truthy is not evidence of a
+    decision *in the graph* the way a confirmed/rejected edge is -- it is
+    simply the last mirrored copy of whatever the row's verdict cell said,
+    and the row no longer exists to mirror. Checking `human_fields` here,
+    as an earlier version of this function did, was applying claims's
+    guard to the wrong authority: every node this extractor ever writes
+    gets human_fields on its very first parse (even an empty
+    verdict/result becomes the truthy `{"verdict": "", "result": ""}`), so
+    that guard was true for every attempt node in practice and the delete
+    branch beneath it was dead code -- reachable only via a hand-built
+    test node that never went through `set_human_fields` at all, never in
+    real use.
 
-    Also unlike claims, this delete is not scoped to edges this extractor
-    (`attempts`) itself produced: every edge referencing the node is
-    removed, including a `uses` edge `rce.consistency` may have written in
-    an earlier `--check` run (extractor `attempts_consistency`). Two
-    reasons, not one: first, `uses` is a deterministic, always-`auto` fact
-    ("this script's last commit was X") that is never confirmed/rejected
-    by a human and is trivially regenerated the next time `--check` runs
-    against a still-existing node, so nothing worth protecting is lost by
-    dropping it. Second, `nodes.id` is a foreign key `edges.src`/`dst`
-    reference with no cascade (db.delete_node's own docstring) -- leaving
-    that `uses` edge in place would make `delete_node` below raise
-    `sqlite3.IntegrityError` on exactly the real-world case this fix is
-    for (a project with steps_dir configured and `--check` already run at
-    least once before the row was deleted).
+    Removing that wrong check does not mean there is *no* right check,
+    though, and an earlier version of this fix went one correction too
+    far by concluding exactly that: it reasoned that an attempt node's
+    only possible edge, `uses`, is "a deterministic, always-auto fact that
+    no human ever confirms or rejects," and deleted unconditionally on
+    that basis. That assumption was never actually enforced anywhere
+    (Blocker 2, a real end-to-end run against the project map): `rce
+    confirm` accepts *any* `(src, dst, type, extractor)` edge, with no
+    allowlist restricting it to `backed_by`. `rce confirm --status
+    confirmed <attempt-node> <commit> uses attempts_consistency` succeeds
+    today and moves that edge's `status` to `"confirmed"` -- and the
+    unconditional-delete version of this function then destroyed that
+    edge and its node the next time the row was removed from the source
+    and re-ingested, silently: no log line, no count, nothing to indicate
+    a human judgement had just been erased.
+
+    The right check, restored here, is the same signal claims already
+    uses: `edges.status` in `('confirmed', 'rejected')`, not
+    `human_fields`. Every edge touching an orphaned node -- `src` or `dst`,
+    any extractor -- is inspected; if any of them carries that status, the
+    node and every one of its edges are left exactly as they are, and this
+    is logged (which node, which file it vanished from, how many edges
+    carry a decision) and counted under `orphans_preserved_with_human_
+    decision` so it surfaces in `rce attempts`'s own summary line, not
+    only in the log. Only when none of a node's edges are confirmed or
+    rejected does the delete proceed, exactly as before: every edge
+    touching the node is removed (counted under `orphan_edges_removed`,
+    mirroring claims's `backed_by_edges_removed`), then the node itself.
+
+    This still differs from claims in one respect, unchanged from before:
+    the edge check and the eventual delete are not scoped to edges this
+    extractor (`attempts`) itself produced -- a `uses` edge written by
+    `rce.consistency` (extractor `attempts_consistency`) is inspected and,
+    if unconfirmed, deleted right alongside the node. Two reasons: first,
+    a human-confirmed `uses` edge deserves the same protection as a
+    human-confirmed `backed_by` edge regardless of which extractor wrote
+    it -- there is no reason to scope the *protection* narrowly just
+    because claims happens to scope its own extractor-local bookkeeping
+    that way. Second, when no such protection applies, `nodes.id` is a
+    foreign key `edges.src`/`dst` reference with no cascade
+    (db.delete_node's own docstring) -- leaving an unconfirmed `uses` edge
+    in place would make `delete_node` below raise `sqlite3.IntegrityError`
+    on exactly the real-world case this fix is for (a project with
+    steps_dir configured and `--check` already run at least once before
+    the row was deleted).
     """
     removed = 0
+    edges_removed = 0
+    preserved = 0
     prefix = f"attempt:{file}#"
     for node in db.get_nodes_by_type(conn, "attempt"):
-        if node["id"] in seen_ids or not node["id"].startswith(prefix):
+        node_id = node["id"]
+        if node_id in seen_ids or not node_id.startswith(prefix):
             continue
-        db.delete_edges_for_node(conn, node["id"])
-        db.delete_node(conn, node["id"])
+        # Both directions, deduped by the edges table's own integer `id`:
+        # an attempt is `src` of every edge this codebase currently writes
+        # (`uses`), but nothing here assumes that stays true forever.
+        touching = {e["id"]: e for e in db.query_edges(conn, src=node_id)}
+        touching.update({e["id"]: e for e in db.query_edges(conn, dst=node_id)})
+        human_judged = [e for e in touching.values() if e["status"] in ("confirmed", "rejected")]
+        if human_judged:
+            preserved += 1
+            logger.warning(
+                "%s no longer present in %s, but %d of its edge(s) carry a human confirm/reject "
+                "decision (via rce confirm) -- preserving the node instead of deleting it, "
+                "since deleting it would destroy that decision with no record anywhere else; "
+                "resolve manually",
+                node_id, file, len(human_judged),
+            )
+            continue
+        edges_removed += db.delete_edges_for_node(conn, node_id)
+        db.delete_node(conn, node_id)
         removed += 1
-        logger.info("%s no longer present in %s -- deleted (source file is sole authority on whether it exists)", node["id"], file)
-    return {"orphans_removed": removed}
+        logger.info("%s no longer present in %s -- deleted (source file is sole authority on whether it exists)", node_id, file)
+    return {
+        "orphans_removed": removed,
+        "orphan_edges_removed": edges_removed,
+        "orphans_preserved_with_human_decision": preserved,
+    }
 
 
 def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: AttemptsConfig) -> dict[str, int]:
@@ -487,24 +592,46 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
     always refreshes `attrs` (description/date/variables/step_refs/
     step_files/source_line) to the row's current text, and resyncs an
     existing node's `human_fields` (verdict/result) to the row's current
-    values every time -- writing only when they actually differ from what
-    is already stored, so an unchanged row is a no-op (see module
-    docstring for why this differs from `edges.status`). A row whose `#`
-    repeats one already seen *in this same parse* is a collision -- skipped
-    and logged, never merged onto the first (see module docstring). A row
-    no longer present this parse (deleted, or renumbered away) is an
-    orphan: its node, and every edge touching it, is deleted -- see
-    `_cleanup_orphans` for why this direction is an unconditional delete
-    rather than the confirmed/rejected-aware preserve `rce.ingest.claims`
-    uses for its own orphans. A read failure on the source file is logged
-    and returns all-zero counts rather than raising -- not evidence the
-    attempts are gone (and, not having parsed a single row this run,
-    orphan cleanup does not run at all in that case -- every existing node
-    for `config.file` would otherwise look orphaned)."""
+    values every time -- the `set_human_fields` *write* is skipped when the
+    freshly parsed verdict/result already match what is stored, so an
+    unchanged row causes no gratuitous write and no log noise (see module
+    docstring for why this differs from `edges.status`). This no-op only
+    covers that one write: `db.upsert_node` above it still runs, and still
+    refreshes `attrs`/`updated_at`, for every row on every parse regardless
+    of whether anything in the row actually changed -- `upsert_node` has no
+    equality check of its own, unlike the `human_fields` write here, so an
+    unchanged row is not a no-op end to end, only its human_fields half is.
+
+    A row whose `#` repeats one already seen *in this same parse* is a
+    collision -- skipped and logged, never merged onto the first (see
+    module docstring). A row no longer present this parse (deleted, or
+    renumbered away) is an orphan: its node, and every edge touching it, is
+    deleted -- unless a human has confirmed or rejected one of those edges,
+    in which case the node is preserved instead; see `_cleanup_orphans` for
+    the full rule and its one remaining scope difference from
+    `rce.ingest.claims`'s own orphan handling.
+
+    Two distinct failures short-circuit before any of the above runs, and
+    are handled differently on purpose (DESIGN.md section 0, "never
+    guess" -- neither is evidence the attempts are gone, but only one of
+    them is left silent): a read failure on the source file itself
+    (`OSError`) is logged and this function returns all-zero counts rather
+    than raising -- orphan cleanup does not run in that case either (every
+    existing node for `config.file` would otherwise look orphaned). A
+    *table location* failure -- the configured heading or the table under
+    it cannot be found at all, `parse_attempts_table` raising
+    `AttemptsTableNotFoundError` -- is logged with the same "cleanup
+    skipped, existing nodes untouched" framing but is then re-raised rather
+    than swallowed: the caller (`rce.cli.cmd_attempts`) treats it as a
+    config-shaped error and exits 1, because unlike a transient read
+    failure this means the run's own request could not be satisfied at all
+    and the operator should notice, not see a quiet zero-count success
+    line."""
     project_root = Path(project_root)
     counts = {
         "attempts": 0, "created": 0, "updated": 0, "collisions_skipped": 0,
-        "orphans_removed": 0,
+        "orphans_removed": 0, "orphan_edges_removed": 0,
+        "orphans_preserved_with_human_decision": 0,
     }
     source_path = project_root / config.file
     try:
@@ -516,7 +643,18 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
     steps_dir = (project_root / config.steps_dir) if config.steps_dir else None
     seen_ids: set[str] = set()
 
-    for row in parse_attempts_table(text, config.heading, config.columns):
+    try:
+        rows = parse_attempts_table(text, config.heading, config.columns)
+    except AttemptsTableNotFoundError:
+        logger.error(
+            "%s: could not locate this run's attempt table -- orphan cleanup skipped entirely "
+            "(not treated as \"zero attempts, everything else orphaned\"); every existing "
+            "attempt node for %r is left exactly as it was",
+            source_path, config.file,
+        )
+        raise
+
+    for row in rows:
         node_id = _node_id(config.file, row.number)
         if node_id in seen_ids:
             counts["collisions_skipped"] += 1

@@ -398,7 +398,17 @@ def cmd_attempts(args: argparse.Namespace) -> int:
     current source file. Config-gated on purpose (DESIGN.md section 0,
     "never guess") -- with no .rce/attempts.toml this prints a
     copy-pasteable template and exits 1 instead of guessing which table in
-    the project is the attempt timeline.
+    the project is the attempt timeline. The same clean-message-plus-exit-1
+    handling also covers every other way `.rce/attempts.toml` can drift out
+    of sync with the project: a configured `[columns]` name no longer
+    present in the table's actual header (e.g. a renamed column), or the
+    configured heading/table no longer locatable at all
+    (`attempts_ingest.AttemptsTableNotFoundError`, DESIGN.md's "Attempt
+    orphans" section) -- both are raised as `AttemptsConfigError` (the
+    latter via that subclass) from inside `ingest_attempts_repo`, not just
+    from `load_config`, so both must be caught here too; letting either
+    propagate out of this function would print a raw Python traceback
+    instead of the clean message this docstring promises.
 
     Without `--check`: a plain listing of what is registered (rce.consistency
     .attempts_for_file), no judgement involved. With `--check`: the three
@@ -413,10 +423,10 @@ def cmd_attempts(args: argparse.Namespace) -> int:
     try:
         try:
             config = attempts_ingest.load_config(project_root)
+            counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
         except attempts_ingest.AttemptsConfigError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
         print(f"Attempts ({config.file}): {_format_counts(counts)}")
 
         if args.check:

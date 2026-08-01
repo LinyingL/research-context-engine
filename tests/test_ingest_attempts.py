@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from rce import db
+from rce import cli, db
 from rce.ingest import attempts
 
 COLUMNS = {
@@ -170,11 +170,18 @@ def test_ragged_row_skipped_with_warning(tmp_path, caplog):
     assert "expected 6" in caplog.text
 
 
-def test_heading_not_found_returns_empty(tmp_path, caplog):
-    with caplog.at_level("WARNING"):
-        rows = attempts.parse_attempts_table("# nothing here\n", HEADING, COLUMNS)
-    assert rows == []
-    assert "not found" in caplog.text
+def test_heading_not_found_raises_table_not_found_error():
+    """Blocker 1: a heading/table that can't be located must not come back
+    as a bare `[]` -- that used to be indistinguishable from "the table was
+    found and genuinely has zero rows," and a caller (ingest_attempts_repo)
+    reading it that way fed an empty seen_ids into orphan cleanup and wiped
+    every previously-ingested node for the file. AttemptsTableNotFoundError
+    is a subclass of AttemptsConfigError so rce.cli.cmd_attempts's existing
+    config-error handling covers it with no separate except clause."""
+    with pytest.raises(attempts.AttemptsTableNotFoundError) as excinfo:
+        attempts.parse_attempts_table("# nothing here\n", HEADING, COLUMNS)
+    assert isinstance(excinfo.value, attempts.AttemptsConfigError)
+    assert HEADING in str(excinfo.value)
 
 
 def test_unmapped_column_name_raises_config_error(tmp_path):
@@ -368,7 +375,7 @@ def test_row_removed_from_table_is_deleted_with_its_node(conn, tmp_path):
     (tmp_path / "map.md").write_text(trimmed_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
     assert counts["orphans_removed"] == 1
-    assert "orphans_preserved" not in counts
+    assert counts["orphans_preserved_with_human_decision"] == 0
     assert db.get_node(conn, "attempt:map.md#16") is None
 
 
@@ -424,14 +431,152 @@ def test_deleted_row_orphan_cleanup_also_removes_edges_from_other_extractors(con
     (tmp_path / "map.md").write_text(trimmed_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)  # must not raise
     assert counts["orphans_removed"] == 1
+    assert counts["orphan_edges_removed"] == 1
+    assert counts["orphans_preserved_with_human_decision"] == 0
     assert db.get_node(conn, node_id) is None
     assert db.query_edges(conn, src=node_id, type="uses") == []
+
+
+def test_orphan_with_confirmed_edge_is_preserved_not_deleted(conn, tmp_path):
+    """Blocker 2 regression: the previous unconditional-delete `_cleanup_
+    orphans` assumed a `uses` edge is "a fact no human ever confirms or
+    rejects" -- but `rce confirm` (db.set_edge_status) accepts any edge,
+    with no allowlist. Confirming a `uses` edge end-to-end (as a human
+    could do via `rce confirm ... uses attempts_consistency`) and then
+    deleting the row it belongs to must preserve the node and that
+    decision, exactly as rce.ingest.claims already preserves a claim whose
+    backed_by edge is confirmed/rejected."""
+    node_id = "attempt:map.md#1"
+    config = _config(tmp_path, TABLE_MD)
+    attempts.ingest_attempts_repo(conn, tmp_path, config)
+    commit_node_id = "commit:deadbeef"
+    db.upsert_node(conn, commit_node_id, "commit", attrs={})
+    db.upsert_edge(
+        conn, node_id, commit_node_id, "uses", extractor="attempts_consistency",
+        confidence=1.0, status="auto", evidence={"occurrences": [{"script": "steps/1-a.py"}]},
+    )
+    db.set_edge_status(conn, node_id, commit_node_id, "uses", "attempts_consistency", "confirmed")
+
+    trimmed_md = "\n".join(line for line in TABLE_MD.splitlines() if "| 1 |" not in line)
+    (tmp_path / "map.md").write_text(trimmed_md)
+    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
+
+    assert counts["orphans_removed"] == 0
+    assert counts["orphans_preserved_with_human_decision"] == 1
+    assert db.get_node(conn, node_id) is not None  # node preserved
+    edge = db.query_edges(conn, src=node_id, dst=commit_node_id, type="uses")[0]
+    assert edge["status"] == "confirmed"  # decision untouched, edge not deleted either
+
+
+def test_orphan_with_only_rejected_edge_is_also_preserved(conn, tmp_path):
+    """Same as the confirmed case, but for "rejected" -- both are human
+    decisions, only "auto"/"pending" are machine-owned and safe to drop."""
+    node_id = "attempt:map.md#1"
+    config = _config(tmp_path, TABLE_MD)
+    attempts.ingest_attempts_repo(conn, tmp_path, config)
+    commit_node_id = "commit:deadbeef"
+    db.upsert_node(conn, commit_node_id, "commit", attrs={})
+    db.upsert_edge(
+        conn, node_id, commit_node_id, "uses", extractor="attempts_consistency",
+        confidence=1.0, status="auto", evidence={"occurrences": [{"script": "steps/1-a.py"}]},
+    )
+    db.set_edge_status(conn, node_id, commit_node_id, "uses", "attempts_consistency", "rejected")
+
+    trimmed_md = "\n".join(line for line in TABLE_MD.splitlines() if "| 1 |" not in line)
+    (tmp_path / "map.md").write_text(trimmed_md)
+    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
+
+    assert counts["orphans_removed"] == 0
+    assert counts["orphans_preserved_with_human_decision"] == 1
+    assert db.get_node(conn, node_id) is not None
+
+
+def test_table_location_failure_does_not_wipe_existing_nodes(conn, tmp_path, caplog):
+    """Blocker 1 end-to-end regression (the exact real-world trigger a
+    reviewer used against a real 23-row project map): inserting one
+    ordinary prose sub-heading between the tracked heading and its table
+    makes `_find_table` hit that sub-heading before it ever finds the
+    table, so the table can no longer be located at all. This must raise
+    AttemptsTableNotFoundError, skip orphan cleanup entirely, and leave
+    every previously-ingested node exactly as it was -- not read as "zero
+    attempts this run" and delete all of them."""
+    config = _config(tmp_path, TABLE_MD)
+    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
+    assert counts["attempts"] == 3
+    assert db.get_node(conn, "attempt:map.md#16") is not None
+
+    broken_md = TABLE_MD.replace(
+        f"## {HEADING} (22 rows)\n\n| # |",
+        f"## {HEADING} (22 rows)\n\n### An unrelated sub-heading\n\n| # |",
+    )
+    (tmp_path / "map.md").write_text(broken_md)
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(attempts.AttemptsTableNotFoundError):
+            attempts.ingest_attempts_repo(conn, tmp_path, config)
+    assert "untouched" in caplog.text or "left exactly as it was" in caplog.text
+
+    # every previously-ingested node for this file must survive, untouched
+    assert db.get_node(conn, "attempt:map.md#1") is not None
+    assert db.get_node(conn, "attempt:map.md#14a") is not None
+    assert db.get_node(conn, "attempt:map.md#16") is not None
 
 
 def test_unreadable_source_file_returns_zero_counts(conn, tmp_path):
     config = attempts.AttemptsConfig(file="does-not-exist.md", heading=HEADING, columns=COLUMNS)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
     assert counts["attempts"] == 0
+
+
+# -- CLI: config-shaped errors must give a clean message, never a traceback --
+
+
+def test_cli_renamed_column_gives_clean_error_not_raw_traceback(tmp_path, capsys):
+    """Warning 3: `parse_attempts_table` raising `AttemptsConfigError` for a
+    configured column name that no longer matches the table's actual header
+    (e.g. a renamed column) used to propagate straight out of
+    `rce.cli.cmd_attempts` uncaught -- only `load_config`'s own errors were
+    caught -- even though the command's own docstring promises a clean
+    config-error message. `cli.main` must catch it the same way and return
+    1, not raise."""
+    project = tmp_path / "project"
+    project.mkdir()
+    assert cli.main(["init", str(project)]) == 0
+    (project / "map.md").write_text(TABLE_MD)
+    (project / ".rce" / "attempts.toml").write_text(
+        f'file = "map.md"\nheading = "{HEADING}"\n'
+        '[columns]\nid = "#"\ndate = "Date"\ndescription = "Path"\n'
+        'variables = "Variables"\nresult = "Result"\nverdict = "Renamed Column"\n'
+    )
+
+    exit_code = cli.main(["attempts", str(project)])
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "Renamed Column" in captured.err  # clean message naming the mismatch
+    assert "Traceback" not in captured.err  # not a raw, uncaught exception
+
+
+def test_cli_table_location_failure_gives_clean_error_and_exit_1(tmp_path, capsys):
+    """Blocker 1's CLI-facing half: a table-location failure must exit 1
+    with a clear message via the same path as any other config error, not
+    silently succeed the way a source-file read failure does."""
+    project = tmp_path / "project"
+    project.mkdir()
+    assert cli.main(["init", str(project)]) == 0
+    (project / "map.md").write_text(f"# {HEADING}\n\nno table here at all\n")
+    (project / ".rce" / "attempts.toml").write_text(
+        f'file = "map.md"\nheading = "{HEADING}"\n'
+        '[columns]\nid = "#"\ndate = "Date"\ndescription = "Path"\n'
+        'variables = "Variables"\nresult = "Result"\nverdict = "Verdict"\n'
+    )
+
+    exit_code = cli.main(["attempts", str(project)])
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert HEADING in captured.err
+    assert "Traceback" not in captured.err
 
 
 # -- guardrail: the resync architecture's single-caller precondition --------
@@ -442,11 +587,28 @@ def _set_human_fields_call_sites(src_root: Path) -> list[tuple[Path, int]]:
     `src_root`, found via `ast` (not a text grep) so a docstring or comment
     merely *mentioning* the name -- there are several, including in this
     very module's own docstring -- is never mistaken for a call site, and
-    `db.py`'s own `def set_human_fields` is never mistaken for one either."""
+    `db.py`'s own `def set_human_fields` is never mistaken for one either.
+
+    Also flags an aliased import of the name on its own --
+    `from rce.db import set_human_fields as _write_hf` -- as a site,
+    whether or not the alias is ever actually called in the same file: a
+    reviewer probe showed a call written through such an alias
+    (`_write_hf(...)`) was invisible to a plain ast.Call name/attribute
+    match, since that call's own `func.id` is the alias `"_write_hf"`, not
+    `"set_human_fields"`. Counting the import itself, rather than also
+    tracing every alias forward to its call sites, keeps this a static,
+    best-effort tripwire rather than a full data-flow analysis -- see
+    `test_set_human_fields_has_exactly_one_caller_in_src`'s docstring for
+    what this still does not catch."""
     sites: list[tuple[Path, int]] = []
     for path in sorted(src_root.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "set_human_fields":
+                        sites.append((path, node.lineno))
+                continue
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -456,14 +618,46 @@ def _set_human_fields_call_sites(src_root: Path) -> list[tuple[Path, int]]:
     return sites
 
 
+def test_call_site_detector_catches_aliased_import(tmp_path):
+    """Warning 4 regression, exercised against a synthetic src tree (not the
+    real one, so this test doesn't itself trip the guardrail it verifies):
+    `from rce.db import set_human_fields as _write_hf` plus a real call
+    through that alias used to pass the guardrail test undetected -- the
+    call's own `func.id` is `"_write_hf"`, never the literal string
+    `"set_human_fields"`. The import binding itself must now be counted."""
+    fake_src = tmp_path / "fake_src" / "pkg"
+    fake_src.mkdir(parents=True)
+    (fake_src / "__init__.py").write_text("")
+    (fake_src / "sneaky.py").write_text(
+        "from rce.db import set_human_fields as _write_hf\n"
+        "\n"
+        "def do_it(conn, node_id, fields):\n"
+        "    _write_hf(conn, node_id, fields)\n"
+    )
+    sites = _set_human_fields_call_sites(tmp_path / "fake_src")
+    assert len(sites) == 1
+    assert sites[0][0].name == "sneaky.py"
+
+
 def test_set_human_fields_has_exactly_one_caller_in_src():
     """Tripwire for the precondition the resync-from-source architecture
     rests on (module docstring's "This assumes the source Markdown file is
     currently the *only* place an attempt's verdict is ever recorded"):
     today `db.set_human_fields` has exactly one caller anywhere in `src/`,
     this extractor's own resync call. Was previously only a claim in a
-    comment; now goes red the moment a second caller appears, instead of
-    the two authorities silently disagreeing."""
+    comment; now goes red for a second caller written as an ordinary call
+    (`db.set_human_fields(...)`, or a bare name after `from rce.db import
+    set_human_fields`) or an aliased import of the name (`... import
+    set_human_fields as _write_hf`, counted the moment it is imported,
+    whether or not the alias is ever called -- see
+    `_set_human_fields_call_sites`'s docstring; a reviewer probe showed the
+    unaliased version of this check missed exactly that form). This is a
+    best-effort static tripwire, not a proof of the precondition: it is an
+    `ast`-based syntactic scan, not real data-flow analysis, so a
+    sufficiently indirect reference -- `getattr(db, "set_human_fields")`,
+    building the call from a string, or reassigning the name at runtime --
+    would still not be caught. It closes the concrete gap that was found,
+    not every gap that could theoretically exist."""
     src_root = Path(__file__).resolve().parent.parent / "src"
     sites = _set_human_fields_call_sites(src_root)
     assert len(sites) == 1, (
