@@ -44,6 +44,13 @@ whoever adds one must resolve that conflict explicitly (e.g. detect
 divergence and refuse to overwrite, or have the in-graph edit rewrite the
 source file) rather than discover it by losing an edit.
 
+The same "source file is the sole authority" reasoning applies to a row's
+*existence*, not just its verdict/result: a row deleted (or renumbered)
+out of the table has its `attempt` node, and every edge touching it,
+deleted on the next parse, unconditionally -- the mirror-image opposite of
+`rce.ingest.claims`'s own orphan cleanup, on purpose, not a discrepancy to
+reconcile. See `_cleanup_orphans` below for why.
+
 A description differing from what's already stored under an id is *not* a
 collision -- it is the ordinary case of a human editing that cell (the
 `途径`/description column is everyday table maintenance), and `attrs`
@@ -408,23 +415,70 @@ def _node_id(file: str, number: str) -> str:
 
 def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[str, int]:
     """Attempt nodes from `file` produced on an earlier run but not this one
-    (row deleted/renumbered) -- mirrors rce.ingest.claims's orphan cleanup.
-    A node still carrying human_fields (true of every attempt node this
-    extractor writes) is preserved and logged, never deleted -- it records a
-    real judgement call, not something a re-ingest gets to erase."""
-    removed = preserved = 0
+    (the row was deleted, or its `#` was renumbered out from under it):
+    delete the node, and every edge touching it, unconditionally.
+
+    This is the deletion-direction half of "resync from source, not
+    write-once" (module docstring above, DESIGN.md section 4): the source
+    Markdown file is the sole authority for whether an attempt row exists
+    at all, exactly as it is the sole authority for that row's
+    verdict/result. A researcher deleting a row from their own map *is*
+    the human decision; there is nothing left in the graph worth
+    protecting by keeping the node around once the row is gone. And if the
+    source file itself lives in git -- the ordinary case -- its history
+    still has the deleted row, so the graph does not have to be the
+    archive of record.
+
+    Do NOT read this as "the old preserve-if-judged behavior was a bug, so
+    rce.ingest.claims's `_cleanup_orphaned_claims` must have the same bug":
+    that one preserves an orphaned claim node whose `backed_by` edge
+    carries a confirmed/rejected `edges.status`, and that is correct and
+    stays correct. The difference is *where* the human decision for each
+    node type is recorded. A claim's `backed_by` edge is machine-generated,
+    and `rce confirm` writing `status` onto it in the graph is the one and
+    only place that confirm/reject decision is ever recorded anywhere --
+    delete the node and the decision is gone for good, unrecoverable from
+    any other source, so claims must check for it and refuse to delete
+    when it is present. An attempt's decision is recorded in the
+    researcher's own source file, next to the row, never in an edge; the
+    graph only mirrors it (see module docstring). `human_fields` looking
+    truthy is not evidence of a decision *in the graph* the way a
+    confirmed/rejected `backed_by` edge is -- it is simply the last
+    mirrored copy of whatever the row's verdict cell said, and the row no
+    longer exists to mirror. Checking it here, as the previous version of
+    this function did, was applying claims's guard to the wrong authority:
+    every node this extractor ever writes gets human_fields on its very
+    first parse (even an empty verdict/result becomes the truthy
+    `{"verdict": "", "result": ""}`), so that guard was true for every
+    attempt node in practice and the delete branch beneath it was dead
+    code -- reachable only via a hand-built test node that never went
+    through `set_human_fields` at all, never in real use.
+
+    Also unlike claims, this delete is not scoped to edges this extractor
+    (`attempts`) itself produced: every edge referencing the node is
+    removed, including a `uses` edge `rce.consistency` may have written in
+    an earlier `--check` run (extractor `attempts_consistency`). Two
+    reasons, not one: first, `uses` is a deterministic, always-`auto` fact
+    ("this script's last commit was X") that is never confirmed/rejected
+    by a human and is trivially regenerated the next time `--check` runs
+    against a still-existing node, so nothing worth protecting is lost by
+    dropping it. Second, `nodes.id` is a foreign key `edges.src`/`dst`
+    reference with no cascade (db.delete_node's own docstring) -- leaving
+    that `uses` edge in place would make `delete_node` below raise
+    `sqlite3.IntegrityError` on exactly the real-world case this fix is
+    for (a project with steps_dir configured and `--check` already run at
+    least once before the row was deleted).
+    """
+    removed = 0
     prefix = f"attempt:{file}#"
     for node in db.get_nodes_by_type(conn, "attempt"):
         if node["id"] in seen_ids or not node["id"].startswith(prefix):
             continue
-        if node["human_fields"]:
-            preserved += 1
-            logger.info("%s no longer present in %s -- preserved (has human_fields)", node["id"], file)
-            continue
-        db.delete_edges_for_node(conn, node["id"], extractor="attempts")
+        db.delete_edges_for_node(conn, node["id"])
         db.delete_node(conn, node["id"])
         removed += 1
-    return {"orphans_removed": removed, "orphans_preserved": preserved}
+        logger.info("%s no longer present in %s -- deleted (source file is sole authority on whether it exists)", node["id"], file)
+    return {"orphans_removed": removed}
 
 
 def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: AttemptsConfig) -> dict[str, int]:
@@ -437,13 +491,20 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
     is already stored, so an unchanged row is a no-op (see module
     docstring for why this differs from `edges.status`). A row whose `#`
     repeats one already seen *in this same parse* is a collision -- skipped
-    and logged, never merged onto the first (see module docstring). A read
-    failure on the source file is logged and returns all-zero counts rather
-    than raising -- not evidence the attempts are gone."""
+    and logged, never merged onto the first (see module docstring). A row
+    no longer present this parse (deleted, or renumbered away) is an
+    orphan: its node, and every edge touching it, is deleted -- see
+    `_cleanup_orphans` for why this direction is an unconditional delete
+    rather than the confirmed/rejected-aware preserve `rce.ingest.claims`
+    uses for its own orphans. A read failure on the source file is logged
+    and returns all-zero counts rather than raising -- not evidence the
+    attempts are gone (and, not having parsed a single row this run,
+    orphan cleanup does not run at all in that case -- every existing node
+    for `config.file` would otherwise look orphaned)."""
     project_root = Path(project_root)
     counts = {
         "attempts": 0, "created": 0, "updated": 0, "collisions_skipped": 0,
-        "orphans_removed": 0, "orphans_preserved": 0,
+        "orphans_removed": 0,
     }
     source_path = project_root / config.file
     try:

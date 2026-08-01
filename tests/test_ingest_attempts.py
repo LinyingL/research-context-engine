@@ -1,6 +1,7 @@
 """Tests for rce.ingest.attempts (task A2): config-driven parsing of a
 hand-maintained attempt timeline into `attempt` nodes."""
 
+import ast
 import sqlite3
 from pathlib import Path
 
@@ -350,29 +351,125 @@ def test_duplicate_id_within_one_parse_is_a_collision(conn, tmp_path):
     assert node["attrs"]["description"] == "first row with id 1"  # first row wins
 
 
-def test_row_removed_from_table_is_preserved_with_human_fields(conn, tmp_path):
+def test_row_removed_from_table_is_deleted_with_its_node(conn, tmp_path):
+    """Architecture fix (this task, deletion direction): the source file is
+    the sole authority for whether an attempt row exists at all, exactly as
+    it already is for verdict/result (see module docstring). A row deleted
+    from the table must not leave a stale node behind for `rce attempts`'
+    listing or `--check` to keep reporting on -- the previous "preserve any
+    node with human_fields" guard was always true in practice (every node
+    gets human_fields on first parse, even an empty one) and so never
+    actually protected anything; it just made a deleted row un-deletable."""
     config = _config(tmp_path, TABLE_MD)
     attempts.ingest_attempts_repo(conn, tmp_path, config)
+    assert db.get_node(conn, "attempt:map.md#16") is not None
 
     trimmed_md = "\n".join(line for line in TABLE_MD.splitlines() if "| 16 |" not in line)
     (tmp_path / "map.md").write_text(trimmed_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
-    assert counts["orphans_preserved"] == 1
-    assert counts["orphans_removed"] == 0
-    assert db.get_node(conn, "attempt:map.md#16") is not None  # never deleted
+    assert counts["orphans_removed"] == 1
+    assert "orphans_preserved" not in counts
+    assert db.get_node(conn, "attempt:map.md#16") is None
 
 
-def test_orphan_without_human_fields_is_removed(conn, tmp_path):
-    # A node of this type/file with no human_fields (e.g. from a bug or a
-    # future extractor) is the one case cleanup actually deletes.
-    db.upsert_node(conn, "attempt:map.md#99", "attempt", attrs={"description": "stray"})
-    config = _config(tmp_path, TABLE_MD)
+def test_row_with_empty_verdict_and_result_is_still_deleted_when_removed(conn, tmp_path):
+    """The guard this replaced (`if node["human_fields"]:`) was truthy even
+    for a row whose verdict/result cells are both empty strings -- a
+    non-empty dict `{"verdict": "", "result": ""}` is still truthy in
+    Python -- so an empty-judgement row was exactly as stuck as a
+    judged one. Confirms the fix covers that case too, not just a row that
+    happens to carry non-empty verdict/result."""
+    md = f"""## {HEADING}
+
+| # | Date | Path | Variables | Result | Verdict |
+|---|---|---|---|---|---|
+| 1 | 07-07 | keep me | x | y | ok |
+| 2 | 07-08 | never judged yet | x | | |
+"""
+    config = _config(tmp_path, md)
+    attempts.ingest_attempts_repo(conn, tmp_path, config)
+    node = db.get_node(conn, "attempt:map.md#2")
+    assert node["human_fields"] == {"verdict": "", "result": ""}  # truthy dict, empty values
+
+    trimmed_md = "\n".join(line for line in md.splitlines() if "| 2 |" not in line)
+    (tmp_path / "map.md").write_text(trimmed_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
     assert counts["orphans_removed"] == 1
-    assert db.get_node(conn, "attempt:map.md#99") is None
+    assert db.get_node(conn, "attempt:map.md#2") is None
+    assert db.get_node(conn, "attempt:map.md#1") is not None  # untouched
+
+
+def test_deleted_row_orphan_cleanup_also_removes_edges_from_other_extractors(conn, tmp_path):
+    """rce.consistency writes `attempt --uses--> commit` edges tagged
+    extractor="attempts_consistency", not "attempts". Unlike
+    rce.ingest.claims's orphan cleanup (extractor-scoped, on purpose --
+    see _cleanup_orphans docstring), this one must not scope the edge
+    delete to its own extractor: a leftover `uses` edge from an earlier
+    `--check` run still references the node, and nodes.id is a foreign key
+    with no cascade, so leaving it in place would make delete_node raise
+    sqlite3.IntegrityError -- exactly the real-world case (steps_dir
+    configured, `--check` already run once) this test reproduces."""
+    node_id = "attempt:map.md#1"
+    config = _config(tmp_path, TABLE_MD)
+    attempts.ingest_attempts_repo(conn, tmp_path, config)
+    commit_node_id = "commit:deadbeef"
+    db.upsert_node(conn, commit_node_id, "commit", attrs={})
+    db.upsert_edge(
+        conn, node_id, commit_node_id, "uses", extractor="attempts_consistency",
+        confidence=1.0, status="auto", evidence={"occurrences": [{"script": "steps/1-a.py"}]},
+    )
+    assert db.query_edges(conn, src=node_id, type="uses")
+
+    trimmed_md = "\n".join(line for line in TABLE_MD.splitlines() if "| 1 |" not in line)
+    (tmp_path / "map.md").write_text(trimmed_md)
+    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)  # must not raise
+    assert counts["orphans_removed"] == 1
+    assert db.get_node(conn, node_id) is None
+    assert db.query_edges(conn, src=node_id, type="uses") == []
 
 
 def test_unreadable_source_file_returns_zero_counts(conn, tmp_path):
     config = attempts.AttemptsConfig(file="does-not-exist.md", heading=HEADING, columns=COLUMNS)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
     assert counts["attempts"] == 0
+
+
+# -- guardrail: the resync architecture's single-caller precondition --------
+
+
+def _set_human_fields_call_sites(src_root: Path) -> list[tuple[Path, int]]:
+    """Every syntactic call to `set_human_fields`/`db.set_human_fields` in
+    `src_root`, found via `ast` (not a text grep) so a docstring or comment
+    merely *mentioning* the name -- there are several, including in this
+    very module's own docstring -- is never mistaken for a call site, and
+    `db.py`'s own `def set_human_fields` is never mistaken for one either."""
+    sites: list[tuple[Path, int]] = []
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else None
+            if name == "set_human_fields":
+                sites.append((path, node.lineno))
+    return sites
+
+
+def test_set_human_fields_has_exactly_one_caller_in_src():
+    """Tripwire for the precondition the resync-from-source architecture
+    rests on (module docstring's "This assumes the source Markdown file is
+    currently the *only* place an attempt's verdict is ever recorded"):
+    today `db.set_human_fields` has exactly one caller anywhere in `src/`,
+    this extractor's own resync call. Was previously only a claim in a
+    comment; now goes red the moment a second caller appears, instead of
+    the two authorities silently disagreeing."""
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    sites = _set_human_fields_call_sites(src_root)
+    assert len(sites) == 1, (
+        f"expected exactly one src/ call site for db.set_human_fields, found {len(sites)}: "
+        f"{sites} -- if you just added a second caller, read rce.ingest.attempts's module "
+        f"docstring (the 'two authorities that can disagree' paragraph) before proceeding, "
+        f"this precondition no longer holds and must be resolved explicitly"
+    )
+    assert sites[0][0].name == "attempts.py"

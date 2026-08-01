@@ -202,7 +202,9 @@ competes with it. Freezing `human_fields` on first sight did not defend
 that decision; it defended a stale copy against the original, which is
 backwards -- the researcher editing their own map file *is* them making
 the judgement, and an engine that keeps mirroring the file faithfully is
-not overriding anything.
+not overriding anything. ("Keeps mirroring" describes what happens *when
+this extractor runs*, not a standing live guarantee -- see "Staleness
+window" below.)
 
 The fix: `verdict`/`result` are resynced from the source file on every
 parse (`rce.ingest.attempts.ingest_attempts_repo`), written via
@@ -229,7 +231,91 @@ silently discard the in-graph edit on the very next `rce attempts` run.
 That case must be resolved explicitly when such a path is added -- e.g.
 detect divergence and refuse to overwrite, or have the in-graph edit
 itself rewrite the source file -- rather than left for whoever adds it to
-discover by losing an edit.
+discover by losing an edit. This precondition used to be enforced by
+nothing but this paragraph; `tests/test_ingest_attempts.py::
+test_set_human_fields_has_exactly_one_caller_in_src` now asserts the
+call-site count directly (via `ast`, so a mention of the name in a
+docstring or comment is not mistaken for a call), so a second caller turns
+this from a stale comment into a failing test the moment it is added.
+
+**Staleness window: only `rce attempts` refreshes these nodes.** `attempt`
+nodes are written and resynced exclusively by `rce.ingest.attempts`
+(above), which runs when the `rce attempts` subcommand runs -- `rce
+ingest` (the deterministic pass over commits/figures/claims/etc., section
+2) never touches them. So between one `rce attempts` run and the next, an
+attempt's `human_fields`/`attrs` read via `rce query` or the MCP server can
+be stale relative to whatever the researcher has since edited into the
+source file -- the mirror is refreshed on demand, not continuously, and
+nothing currently re-runs `rce attempts` as a side effect of `rce ingest`
+or a query. This is a reasonable division of labor (a hand-maintained
+Markdown table is not a thing to re-parse on every unrelated `rce ingest`
+of commits and figures), not an oversight, but it means "the graph
+reflects the file" is only true as of the last `rce attempts` invocation,
+and a project relying on fresh attempt data before a query should run `rce
+attempts` first, the same way `cmd_attempts` itself always re-ingests
+before listing or `--check`ing (above).
+
+### Attempt orphans: deletion resyncs from source too, not just verdicts
+
+The resync above covers a row that still exists but whose verdict changed.
+A row *deleted* (or renumbered) out of the table entirely used to be
+handled differently, and inconsistently with the principle that same
+section just established: `rce.ingest.attempts._cleanup_orphans` preserved
+any orphaned `attempt` node that still carried `human_fields`, deleting
+only one with none -- modeled on `rce.ingest.claims`'s own orphan cleanup,
+which preserves a claim node whose `backed_by` edge carries a
+confirmed/rejected `edges.status`.
+
+That model does not transfer. Testing against a real 23-row map confirmed
+it concretely: deleting row 15 from the source file and re-ingesting left
+`rce attempts`' listing still printing 23 rows including `#15`, `rce
+attempts --check` still reporting a finding about a row that no longer
+existed anywhere in the project, and exit code 1 -- with no way to clear
+either short of dropping the whole database. Worse, the guard behind this
+was never actually reachable in practice: this same extractor's resync
+(above) writes `human_fields` on *every* node's first parse, even a row
+whose verdict/result are both blank, since `{"verdict": "", "result": ""}`
+is still a truthy dict -- so `if node["human_fields"]:` was true for every
+attempt node this extractor has ever produced, and the delete branch
+beneath it was dead code outside a hand-built test.
+
+The underlying reason claims's preserve-on-orphan is *correct* is exactly
+why attempts' copy of it was wrong. A claim's `backed_by` edge is
+machine-generated, and `rce confirm` writing `status` onto it in the graph
+is the *only* place that confirm/reject decision is ever recorded --
+delete the claim node and that decision is gone, unrecoverable from
+anywhere else, so claims must check for it and refuse to delete when
+present. An attempt node has no edge of that kind. Its human decision --
+verdict/result -- is recorded in the researcher's own source file and only
+mirrored into `human_fields`, never recorded *in the graph* the way
+`edges.status` is; a truthy `human_fields` on an attempt node is not
+evidence of an in-graph decision, only evidence that this extractor's
+resync ran at least once. There is nothing an orphaned attempt node is
+protecting by continuing to exist. And the source file itself is
+ordinarily under git, so the deleted row's history is not lost by deleting
+the mirror's copy of it either.
+
+The fix: `_cleanup_orphans` now deletes an orphaned attempt node --
+and every edge touching it -- unconditionally, with no preserve branch and
+no `human_fields` check. "Every edge touching it," not just edges this
+extractor itself produced, is the other deliberate departure from claims's
+pattern: `rce.consistency` (below) writes `attempt --uses--> commit` edges
+tagged `extractor="attempts_consistency"`, and `nodes.id` is a foreign key
+`edges.src`/`dst` reference with no cascade, so a `uses` edge left over
+from an earlier `--check` run would make the node delete itself raise
+`sqlite3.IntegrityError`. Dropping that edge too costs nothing: `uses` is
+a deterministic, always-`auto` fact that no human ever confirms or
+rejects, and it is regenerated the next time `--check` runs against a
+still-existing node.
+
+`edges.status` (claims) and `attempt` orphans (this section) therefore
+behave oppositely on purpose, the same way the verdict resync above does:
+a claim orphan must be preserved when a human decision lives on its edge,
+because the graph is the only record of that decision; an attempt orphan
+must always be deleted because the source file, not the graph, is the
+only record of whether the row still exists at all, and a graph that kept
+a deleted row around would be lying about what the file currently says --
+exactly the failure this section's opening principle exists to prevent.
 
 Edge types, grouped by the layer that produces them:
 
