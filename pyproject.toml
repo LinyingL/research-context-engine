@@ -28,10 +28,15 @@ dependencies = []
 # `rce mcp` (constitution section 0, Occam rule 1 -- official SDK over a
 # hand-rolled stdio/JSON-RPC protocol); every other subcommand works without
 # it. Install with: pip install "rce[mcp]"
-mcp = ["mcp>=1.0"]
+# Upper bound is deliberate, not laziness: mcp 2.0.0 (released 2026-08)
+# removed `mcp.server.fastmcp`, which rce.mcp_server is built on -- an
+# unbounded `mcp>=1.0` silently broke CI the day 2.0 shipped. Supporting the
+# 2.0 server API is a separate, testable piece of work; until then this pins
+# the range the code is actually verified against.
+mcp = ["mcp>=1.0,<2"]
 # dev pulls in mcp too, so tests/test_mcp_server.py keeps running under the
 # full test suite.
-dev = ["pytest>=8", "mcp>=1.0"]
+dev = ["pytest>=8", "mcp>=1.0,<2"]
 
 [project.scripts]
 rce = "rce.cli:main"
