@@ -5,21 +5,56 @@ Config-driven, never guessed (DESIGN.md section 0): which file, heading,
 and column maps to which field come only from `.rce/attempts.toml`
 (SAMPLE_CONFIG is both the doc and the missing-config error's template).
 
-`verdict`/`result` are the human's judgement in the row's own prose --
-written to `human_fields` via `set_human_fields` once, on first sight of an
-id, and never again: a later re-parse refreshes `attrs` (machine-parsed
-facts) but leaves `human_fields` exactly as it is, so a correction made any
-other way is never silently reset by a routine re-ingest.
+`verdict`/`result` are the human's judgement, but the researcher writes
+that judgement in the row's own prose in the *source* Markdown file, not
+in this graph. Every parse therefore writes them to `human_fields` via
+`set_human_fields` again -- resynced to whatever the source row currently
+says -- not just on first sight of an id. A write is skipped when the
+freshly parsed verdict/result already match what is stored, so an
+unchanged row produces no gratuitous write and no log noise; a changed
+row always propagates on the next `rce attempts` run, however it changed.
+
+This is the mirror image of `edges.status` (`confirm`/`reject`, DESIGN.md
+section 0/2), not an exception to "humans own judgement": for an edge,
+the candidate is machine-generated and the human's decision is made *in
+the graph itself* via `rce confirm` -- the graph is the only place that
+decision is ever recorded, so re-ingestion touching `status` would erase
+it outright. For an attempt, the decision is made in the researcher's
+*own source file* next to the row -- the graph only mirrors it. Freezing
+`human_fields` on first sight (this extractor's original design) did not
+protect that decision; it froze a copy against a source that kept moving,
+which let the mirror silently go stale. A real audit against a 23-row
+project map caught this concretely: a row's verdict changed from a dead
+marker to an active one in the source file, and the freshly re-ingested
+graph -- and `revived_dead_variables` reading it -- still reported no
+findings, purely because the old write-once rule had locked that node's
+`human_fields` on an earlier parse. The rule "never overwrite the one
+place a human decision lives" did not change; resyncing on every parse is
+what actually applies it here, because the source file, not the graph, is
+that place.
+
+This assumes the source Markdown file is currently the *only* place an
+attempt's verdict is ever recorded. If a future write path lets someone
+edit an attempt's verdict directly in the graph (mirroring `rce confirm`
+for edges), that edit and the source file become two authorities that can
+disagree, and this resync would silently discard the in-graph edit on the
+next `rce attempts` run. No such path exists today -- `set_human_fields`
+has exactly one caller in the whole `src` tree, this extractor -- but
+whoever adds one must resolve that conflict explicitly (e.g. detect
+divergence and refuse to overwrite, or have the in-graph edit rewrite the
+source file) rather than discover it by losing an edit.
 
 A description differing from what's already stored under an id is *not* a
 collision -- it is the ordinary case of a human editing that cell (the
 `途径`/description column is everyday table maintenance), and `attrs`
 (description/date/variables/step_refs/step_files/source_line -- every
 machine-parsed field) is refreshed on every re-parse just like any other
-node's `attrs`, `human_fields` untouched either way. The actual collision
-DESIGN.md section 4 warns about is a `#` value used by *two different rows
-in the same parse* (a duplicate id within one table): the second row is
-skipped and logged, never merged onto the first.
+node's `attrs`; `human_fields` resyncs to the row's current verdict/result
+same as always, which in this scenario is simply unchanged, since only the
+description cell moved. The actual collision DESIGN.md section 4 warns
+about is a `#` value used by *two different rows in the same parse* (a
+duplicate id within one table): the second row is skipped and logged,
+never merged onto the first.
 
 `.rce/attempts.toml` also carries two optional top-level lists consumed by
 `rce.consistency`'s revived-dead-variable check (task A3), not by ingest
@@ -396,8 +431,11 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
     """Parse the configured attempt timeline and mirror it into `attempt`
     nodes. Idempotent on (file, id): re-running never duplicates a node,
     always refreshes `attrs` (description/date/variables/step_refs/
-    step_files/source_line) to the row's current text, and never touches an
-    existing node's `human_fields` (see module docstring). A row whose `#`
+    step_files/source_line) to the row's current text, and resyncs an
+    existing node's `human_fields` (verdict/result) to the row's current
+    values every time -- writing only when they actually differ from what
+    is already stored, so an unchanged row is a no-op (see module
+    docstring for why this differs from `edges.status`). A row whose `#`
     repeats one already seen *in this same parse* is a collision -- skipped
     and logged, never merged onto the first (see module docstring). A read
     failure on the source file is logged and returns all-zero counts rather
@@ -445,8 +483,15 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
         is_new = existing is None
         db.upsert_node(conn, node_id, "attempt", title=row.description, attrs=attrs)
         counts["created" if is_new else "updated"] += 1
-        if is_new or not existing["human_fields"]:
-            db.set_human_fields(conn, node_id, {"verdict": row.verdict, "result": row.result})
+
+        # Resync every parse (module docstring): the source file is the
+        # sole authority for verdict/result, so a changed row must always
+        # propagate. The equality check below is only to skip a
+        # no-op write on an unchanged row -- it is not a write-once guard.
+        new_human_fields = {"verdict": row.verdict, "result": row.result}
+        current_human_fields = None if is_new else existing["human_fields"]
+        if current_human_fields != new_human_fields:
+            db.set_human_fields(conn, node_id, new_human_fields)
 
     counts.update(_cleanup_orphans(conn, config.file, seen_ids))
     return counts

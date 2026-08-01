@@ -31,7 +31,11 @@ missing edge is a normal outcome. A fabricated one is a defect.
 
 **Humans own judgment.** Machine ingestion can write `auto` and `pending`
 edges only. Confirming or rejecting an edge goes through a separate write
-path, and re-ingestion never overwrites a human decision.
+path, and re-ingestion never overwrites a human decision. (This is about
+protecting the one place a decision is actually recorded, not a blanket
+"never touch human_fields" rule -- an `attempt` node's `human_fields` is
+the one documented exception, and section 4 explains why it is not really
+an exception at all.)
 
 **Simplest thing that works.** Prefer an existing library over new code,
 deterministic code over a model, a smaller model over a larger one, a single
@@ -147,10 +151,12 @@ via `.rce/attempts.toml` (file/heading/`[columns]` name mapping, optional
 `steps_dir`) -- with no config present, `rce attempts` prints a
 copy-pasteable template and exits 1 rather than guessing which table in the
 project is the attempt timeline. `verdict`/`result` go to `human_fields` via
-`set_human_fields` once, on first sight of an id, and never again on a later
-re-parse -- so a correction made any other way is never silently reset. A
-description referencing a step-number range (e.g. `(16-18)`) resolves, when
-`steps_dir` is configured, by exact numeric filename prefix into
+`set_human_fields` on *every* parse, resynced to whatever the row currently
+says in the source file -- see "Attempt human_fields: resync from source,
+not write-once" below for why this is not an exception to "humans own
+judgement" (section 0) but the same rule pointed at a different authority.
+A description referencing a step-number range (e.g. `(16-18)`) resolves,
+when `steps_dir` is configured, by exact numeric filename prefix into
 `attrs.step_files`; a number with no matching file is recorded in
 `attrs.step_files_broken` for a future consistency check (A3), never fuzzy-matched.
 
@@ -160,12 +166,70 @@ the row's text, and a re-parse may refresh them like any other node's
 `attrs`. `verdict` and `result` are the human's judgement call recorded in
 prose next to the row (what the attempt showed, whether it stands) and
 must be written to `human_fields` only, through `set_human_fields`, never
-through the machine `upsert_node` path -- the same "humans own judgement"
-split (section 0/2) that already governs every other node and edge, not a
-special case invented for this type. `db.upsert_node` enforces this
-structurally: its `UPDATE` column list has no `human_fields` entry, so
+through the machine `upsert_node` path -- not because the value is frozen
+once written (it is not; see below), but because `db.upsert_node` enforces
+this structurally: its `UPDATE` column list has no `human_fields` entry, so
 even a future extractor that carelessly puts `verdict`/`result` in its
-`attrs` dict cannot make them land there.
+`attrs` dict cannot make them land there instead.
+
+### Attempt human_fields: resync from source, not write-once
+
+The first implementation of task A2 wrote `verdict`/`result` to
+`human_fields` once, on first sight of an id, and never again -- modeled
+directly on `edges.status`, where re-ingestion must never touch a
+confirmed or rejected edge. Testing against a real 23-row attempt timeline
+exposed this as a mistake, not a stricter safeguard: a row's verdict was
+changed from `☠️ 伪协整` to `🕒 决定复活重做` in the source file, the
+project was re-ingested, and the graph did not move -- `rce attempts
+--check` kept printing `[revived_dead_variables] OK: no issues found
+(23/23 attempts checked)`, while the same map ingested fresh into an empty
+database correctly reported the revival. `rce.consistency.
+check_revived_dead_variables`'s logic was never wrong; the input it read
+had been frozen.
+
+The mistake was applying "humans own judgement" to the wrong authority.
+That rule protects the one place a human decision is actually recorded
+from being silently overwritten by a machine re-ingest. For
+`edges.status`, that place is the graph itself: a `backed_by` candidate is
+machine-generated, and `rce confirm` writing `status` in the graph is the
+*only* place a human ever records confirm/reject -- so re-ingestion
+touching `status` would erase the one record of that decision that exists
+anywhere. For an attempt's `verdict`/`result`, the decision is instead
+recorded by the researcher in their *own source Markdown file*, in prose
+next to the row -- the timeline is declared the project's single source of
+truth, and the graph is a queryable mirror of it, not a second copy that
+competes with it. Freezing `human_fields` on first sight did not defend
+that decision; it defended a stale copy against the original, which is
+backwards -- the researcher editing their own map file *is* them making
+the judgement, and an engine that keeps mirroring the file faithfully is
+not overriding anything.
+
+The fix: `verdict`/`result` are resynced from the source file on every
+parse (`rce.ingest.attempts.ingest_attempts_repo`), written via
+`set_human_fields` whenever the freshly parsed value differs from what is
+stored, and skipped otherwise so an unchanged row produces neither a
+gratuitous write nor log noise. This is not an exception to "machine
+ingestion never overwrites a human decision" -- it is that same rule,
+pointed at the place the decision actually lives. `edges.status` and
+attempt `human_fields` therefore behave oppositely on purpose:
+`edges.status` must never be touched by re-ingestion because the graph is
+the sole record of that decision; attempt `human_fields` must always be
+resynced by re-ingestion because the source file is the sole record and
+the graph must not be allowed to go stale and start lying about what that
+file currently says.
+
+**Precondition this rests on.** There is currently exactly one place an
+attempt's verdict is ever recorded: the source Markdown file --
+`db.set_human_fields` has exactly one caller in the whole `src` tree, this
+extractor. If a future feature lets someone edit an attempt's verdict
+directly in the graph (mirroring how `rce confirm` edits `edges.status`
+directly, rather than editing a source file), that edit and the source
+file become two authorities that can disagree, and this resync would
+silently discard the in-graph edit on the very next `rce attempts` run.
+That case must be resolved explicitly when such a path is added -- e.g.
+detect divergence and refuse to overwrite, or have the in-graph edit
+itself rewrite the source file -- rather than left for whoever adds it to
+discover by losing an edit.
 
 Edge types, grouped by the layer that produces them:
 

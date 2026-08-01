@@ -407,6 +407,33 @@ def test_revived_dead_variable_not_flagged_for_inactive_verdict(conn, tmp_path):
     assert result.findings == []
 
 
+def test_revived_dead_variable_check_sees_verdict_change_after_resync(conn, tmp_path):
+    """Reproduces the real-map regression the write-once human_fields design
+    caused: a row's verdict changes from a dead marker to an active one in
+    the source file, and re-ingesting must make that visible to this check
+    without dropping and recreating the database. Under the old write-once
+    rule this second `check_revived_dead_variables` call kept reporting
+    `findings == []` no matter how the source changed, because ingest never
+    wrote the new verdict into human_fields after the row's first parse."""
+    table_dead = f"""## {HEADING}
+
+| # | Date | Path | Variables | Result | Verdict |
+|---|---|---|---|---|---|
+| 15 | 2026-07-20 | reuses 信息熵 again | x | y | ☠️ dead |
+"""
+    config = _config(dead_variables=["信息熵"], active_verdicts=["✅", "🕒"])
+    _ingest(conn, tmp_path, table_dead, config)
+    result = consistency.check_revived_dead_variables(conn, config)
+    assert result.findings == []  # still dead -- not yet a finding
+
+    table_revived = table_dead.replace("☠️ dead", "🕒 decided to revive")
+    _ingest(conn, tmp_path, table_revived, config)
+    result = consistency.check_revived_dead_variables(conn, config)
+    assert len(result.findings) == 1
+    assert result.findings[0]["attempt"] == "attempt:map.md#15"
+    assert result.findings[0]["dead_variable"] == "信息熵"
+
+
 def test_revived_dead_variable_case_insensitive_substring_match(conn, tmp_path):
     table = f"""## {HEADING}
 

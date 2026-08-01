@@ -250,31 +250,70 @@ def test_ingest_creates_nodes_and_sets_human_fields(conn, tmp_path):
     assert node["human_fields"] == {"verdict": "✅ current", "result": "t=2.91"}
 
 
-def test_reingest_is_idempotent_and_preserves_edited_human_fields(conn, tmp_path):
+def test_reingest_is_idempotent_when_source_is_unchanged(conn, tmp_path, monkeypatch):
+    """No source-file change -> no human_fields write at all, not merely an
+    unchanged value: re-ingest must not call set_human_fields a second time
+    for a row whose verdict/result didn't move (no gratuitous write, no log
+    noise -- see module docstring)."""
     config = _config(tmp_path, TABLE_MD)
     attempts.ingest_attempts_repo(conn, tmp_path, config)
 
-    # A human corrects the stored verdict through some other write path.
-    db.set_human_fields(conn, "attempt:map.md#16", {"verdict": "manually corrected", "result": "t=2.91"})
+    calls: list[str] = []
+    original = db.set_human_fields
+
+    def spy(conn_, node_id, human_fields):
+        calls.append(node_id)
+        return original(conn_, node_id, human_fields)
+
+    monkeypatch.setattr(db, "set_human_fields", spy)
 
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
     assert counts["attempts"] == 3
     assert counts["created"] == 0
     assert counts["updated"] == 3
+    assert calls == []  # nothing in the source changed -- no write, no noise
     node = db.get_node(conn, "attempt:map.md#16")
-    assert node["human_fields"]["verdict"] == "manually corrected"  # never clobbered
+    assert node["human_fields"] == {"verdict": "✅ current", "result": "t=2.91"}
 
 
-def test_edited_description_refreshes_attrs_and_keeps_human_fields(conn, tmp_path):
-    """B4 regression: editing the description ("途径") cell is everyday
-    table maintenance, not an id collision -- attrs must refresh to the new
-    text on re-ingest, human_fields (verdict/result) must stay exactly as
-    first recorded, and this must never be counted as a collision."""
+def test_reingest_resyncs_human_fields_when_source_verdict_changes(conn, tmp_path):
+    """Architecture fix (this task): verdict/result are the researcher's
+    judgement, but they live in the source Markdown file, not in this
+    graph -- so a re-ingest must resync them, mirroring a real audit where
+    a row's verdict changed from a dead marker to a revived one in the
+    source and the graph needed to pick that up on the next `rce attempts`
+    run, not stay frozen on the first parse."""
+    config = _config(tmp_path, TABLE_MD)
+    attempts.ingest_attempts_repo(conn, tmp_path, config)
+    node = db.get_node(conn, "attempt:map.md#16")
+    assert node["human_fields"] == {"verdict": "✅ current", "result": "t=2.91"}
+
+    revived_md = TABLE_MD.replace(
+        "| 16 | 07-26 | **TopicShift->volatility (16-18)** | TopicShift->RV (monthly) | t=2.91 | ✅ **current** |",
+        "| 16 | 07-26 | **TopicShift->volatility (16-18)** | TopicShift->RV (monthly) | t=2.91 | 🕒 decided to revive |",
+    )
+    (tmp_path / "map.md").write_text(revived_md)
+    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
+    assert counts["created"] == 0
+    assert counts["updated"] == 3
+    node = db.get_node(conn, "attempt:map.md#16")
+    assert node["human_fields"] == {"verdict": "🕒 decided to revive", "result": "t=2.91"}
+
+
+def test_edited_description_refreshes_attrs_and_resyncs_human_fields(conn, tmp_path):
+    """B4 regression (attrs refresh) plus the architecture fix (human_fields
+    resync): editing the description ("途径") cell is everyday table
+    maintenance, not an id collision -- attrs must refresh to the new text
+    on re-ingest, and this must never be counted as a collision. A verdict
+    written through some other path than the source file (simulated here;
+    not an actual write path this codebase offers -- see module docstring's
+    "two authorities" caveat) does not survive a re-ingest: the source file
+    is the sole authority for verdict/result, so it resyncs back to what
+    the source currently says (here: unchanged, since only the description
+    cell moved) rather than preserving the out-of-band edit."""
     config = _config(tmp_path, TABLE_MD)
     attempts.ingest_attempts_repo(conn, tmp_path, config)
 
-    # A human corrects the verdict through some other write path, same as
-    # test_reingest_is_idempotent_and_preserves_edited_human_fields.
     db.set_human_fields(conn, "attempt:map.md#1", {"verdict": "manually corrected", "result": "z"})
 
     reworded_md = TABLE_MD.replace(
@@ -287,7 +326,9 @@ def test_edited_description_refreshes_attrs_and_keeps_human_fields(conn, tmp_pat
     node = db.get_node(conn, "attempt:map.md#1")
     assert node["attrs"]["description"] == "reworded description"  # attrs refreshed
     assert node["title"] == "reworded description"
-    assert node["human_fields"]["verdict"] == "manually corrected"  # never clobbered
+    # Resynced from the source file, not the out-of-band "manually
+    # corrected" value -- the source, not the graph, is authoritative here.
+    assert node["human_fields"] == {"verdict": "dead end", "result": "\"significant\""}
 
 
 def test_duplicate_id_within_one_parse_is_a_collision(conn, tmp_path):
