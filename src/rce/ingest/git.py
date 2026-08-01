@@ -15,6 +15,27 @@ introduced that line (DESIGN.md section 4 erratum: "src=生成代码所在
 commit"), not whichever commit happens to be HEAD at ingestion time.
 Unparseable git output is skipped and logged, never guessed at (section 5's
 savefig rule: "拼不出来就放弃，不猜").
+
+Non-ASCII path bug fix (real repro: a Chinese-filename research repo): git's
+default `core.quotepath=true` escapes any non-ASCII byte in a path into a
+backslash-octal-escaped, double-quoted string (e.g. `"\\346\\226\\207.py"`) for
+any *human-oriented* (newline-separated) porcelain output --
+`git ls-files` and `git log --name-only` both do this. `list_source_files`
+and `read_commits` used to read exactly that human-oriented form, so a
+tracked file whose name contained non-ASCII bytes (Chinese/Japanese/German
+umlaut/French accent/Cyrillic, or a plain filename picked up by
+quotepath's own non-ASCII detection) came back as an escaped, quoted string
+that never matched any real path on disk -- silently invisible to every
+downstream extractor, no warning at all. Both now pass `-z`, which git
+documents as unconditionally disabling this quoting (independent of
+`core.quotepath`) and NUL-terminating each path instead of newline --
+verified via a dedicated regression test with `core.quotepath` explicitly
+set to `true`. `_run_git` also now decodes git's output as UTF-8 with
+`errors="surrogateescape"` rather than relying on the locale's preferred
+encoding, and `_has_undecodable_bytes` flags the rare path that still
+didn't survive that decode (e.g. a non-UTF-8 filesystem encoding) so that
+one path is skipped + logged individually -- never silently dropped, and
+never taking the rest of the listing/commit down with it.
 """
 
 from __future__ import annotations
@@ -57,9 +78,25 @@ class GitIngestError(RuntimeError):
     missing git binary, permission error, etc.)."""
 
 def _run_git(repo_path: Path, args: list[str]) -> str:
+    """Run `git <args>` and return stdout, decoded as UTF-8.
+
+    `encoding="utf-8", errors="surrogateescape"` (rather than `text=True`,
+    which would decode using the locale's preferred encoding -- not
+    necessarily UTF-8, and not necessarily the same on every machine this
+    runs on) makes the decode itself deterministic and never-raising: a
+    byte that isn't valid UTF-8 becomes a lone surrogate codepoint instead
+    of raising UnicodeDecodeError. That keeps a single bad byte from
+    crashing the whole `git` call; callers that split this into individual
+    path entries (list_source_files, read_commits) use
+    `_has_undecodable_bytes` to detect -- and skip + log, never silently
+    keep -- the one entry that round-trip actually failed on.
+    """
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_path), *args], capture_output=True, text=True
+            ["git", "-C", str(repo_path), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="surrogateescape",
         )
     except FileNotFoundError as exc:
         raise GitIngestError(f"git executable not found: {exc}") from exc
@@ -69,15 +106,37 @@ def _run_git(repo_path: Path, args: list[str]) -> str:
         )
     return result.stdout
 
+
+def _has_undecodable_bytes(path: str) -> bool:
+    """True if `path` contains a lone surrogate codepoint (U+DC80-U+DCFF) --
+    i.e. `_run_git`'s `errors="surrogateescape"` decode had to paper over a
+    byte sequence that was not valid UTF-8 (a path recorded under a
+    non-UTF-8 filesystem encoding). Detection only; callers decide the
+    reaction -- always skip + log that one path, never silently keep a
+    mangled string and never guess at its real bytes."""
+    return any(0xDC80 <= ord(ch) <= 0xDCFF for ch in path)
+
 def read_commits(repo_path: str | Path) -> list[GitCommit]:
     """Read full commit history via `git log`, oldest first. An unborn repo
     (no commits yet) returns [] rather than raising -- that is expected
     state, not a failure. Any other git failure raises GitIngestError.
+
+    `-z` (alongside `--name-only`) is what keeps a non-ASCII changed-file
+    name intact: without it, git's default `core.quotepath=true` escapes
+    any non-ASCII byte into an octal-quoted `"..."` string in this
+    newline-separated form, which then never matches a real path on disk.
+    `-z` NUL-terminates the file list unconditionally regardless of
+    `core.quotepath` (see module docstring). Per commit, git emits the
+    `--format` text (ending in `_FIELD_SEP`), then a single NUL where the
+    blank-line separator would otherwise be, then each changed file
+    NUL-terminated -- `.split("\x00")` + per-entry `.strip()` below absorbs
+    that leading artifact the same way `.strip()` already absorbed the old
+    leading/trailing newlines.
     """
     repo_path = Path(repo_path)
     try:
         raw = _run_git(
-            repo_path, ["log", "--reverse", "--name-only", f"--format={_LOG_FORMAT}"]
+            repo_path, ["log", "--reverse", "-z", "--name-only", f"--format={_LOG_FORMAT}"]
         )
     except GitIngestError as exc:
         if "does not have any commits yet" in str(exc):
@@ -100,12 +159,22 @@ def read_commits(repo_path: str | Path) -> list[GitCommit]:
             logger.warning("skipping git log record with empty sha")
             continue
         message, _, file_blob = rest.partition(_FIELD_SEP)
-        files = tuple(
-            line.strip() for line in file_blob.strip("\n").splitlines() if line.strip()
-        )
+        files: list[str] = []
+        for entry in file_blob.split("\x00"):
+            path = entry.strip()
+            if not path:
+                continue
+            if _has_undecodable_bytes(path):
+                logger.warning(
+                    "commit %s: skipping changed-file entry with bytes that are "
+                    "not valid UTF-8 (cannot resolve the real filename, not "
+                    "guessing): %r", sha.strip(), path,
+                )
+                continue
+            files.append(path)
         commits.append(GitCommit(
             sha=sha.strip(), author_name=author_name, author_email=author_email,
-            authored_at=authored_at, message=message.rstrip("\n"), files=files,
+            authored_at=authored_at, message=message.rstrip("\n"), files=tuple(files),
         ))
     return commits
 
@@ -161,13 +230,28 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
     Uses `git ls-files` (tracked files only, .gitignore respected for free)
     instead of a filesystem walk -- no ignore-matching logic to maintain.
     Creates no graph nodes.
+
+    `-z` NUL-terminates each path and unconditionally disables git's
+    quoting of non-ASCII paths (independent of `core.quotepath` -- see
+    module docstring): without it, any git-tracked file whose name
+    contains non-ASCII bytes comes back as an escaped `"\\NNN..."` string
+    that matches no real path on disk and silently vanishes from every
+    category below -- the actual bug this fixes. A path entry that still
+    doesn't decode cleanly as UTF-8 (`_has_undecodable_bytes`) is skipped
+    and logged individually rather than guessed at or silently dropped.
     """
     repo_path = Path(repo_path)
-    output = _run_git(repo_path, ["ls-files"])
+    output = _run_git(repo_path, ["ls-files", "-z"])
     inventory: dict[str, list[str]] = {"tex": [], "bib": [], "image": [], "py": []}
-    for line in output.splitlines():
-        path = line.strip()
+    for entry in output.split("\x00"):
+        path = entry.strip()
         if not path:
+            continue
+        if _has_undecodable_bytes(path):
+            logger.warning(
+                "skipping git-tracked path with bytes that are not valid UTF-8 "
+                "(cannot resolve the real filename, not guessing): %r", path,
+            )
             continue
         suffix = Path(path).suffix.lower()
         if suffix == ".tex":

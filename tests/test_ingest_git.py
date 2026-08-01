@@ -123,3 +123,80 @@ def test_list_source_files_groups_tracked_files_and_writes_no_nodes(repo, conn):
     assert inventory["image"] == ["fig1.png"]
     assert "notes.md" not in (inventory["tex"] + inventory["bib"] + inventory["image"])
     assert conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 0
+
+
+# -- non-ASCII path bug fix ----------------------------------------------------
+# Real repro: git's default core.quotepath=true octal-escapes and
+# double-quotes any path containing non-ASCII bytes for `git ls-files` /
+# `git log --name-only`'s ordinary (non -z) output, e.g. a Chinese filename
+# comes back as '"2-\344\277\241...\346\240\207\347\255\276\347\272\247.py"'
+# -- a string that matches no real path on disk. Every test below explicitly
+# sets core.quotepath=true (rather than relying on git's default, which a
+# machine's global gitconfig could already override) so this is a genuine
+# regression guard, not an accidental pass.
+
+def test_list_source_files_recognizes_non_ascii_paths_with_quotepath_true(repo, conn):
+    _git(repo, "config", "core.quotepath", "true")
+    (repo / "图表").mkdir()
+    (repo / "图表" / "结果图.png").write_bytes(b"\x89PNG")
+    (repo / "another space 图.png").write_bytes(b"\x89PNG")
+    (repo / "论文.tex").write_text(r"\section{Intro}")
+    (repo / "2-信息熵_标签级.py").write_text("print('hi')\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "中文提交")
+
+    inventory = git_ingest.list_source_files(repo)
+    assert inventory["tex"] == ["论文.tex"]
+    assert sorted(inventory["image"]) == sorted(["图表/结果图.png", "another space 图.png"])
+    assert inventory["py"] == ["2-信息熵_标签级.py"]
+    # never the octal-escaped, double-quoted string quotepath=true produces
+    for paths in inventory.values():
+        assert not any(p.startswith('"') for p in paths)
+
+
+def test_read_commits_preserves_non_ascii_filenames_with_quotepath_true(repo):
+    _git(repo, "config", "core.quotepath", "true")
+    sha = _commit(repo, "图-1.py", "print('x')\n", "中文提交信息", "作者", "author@example.com")
+    [commit] = git_ingest.read_commits(repo)
+    assert commit.sha == sha
+    assert commit.files == ("图-1.py",)
+    assert commit.message == "中文提交信息"
+
+
+def test_has_undecodable_bytes_detects_only_surrogate_escapes():
+    assert git_ingest._has_undecodable_bytes("图表/结果图.png") is False
+    assert git_ingest._has_undecodable_bytes("plain_ascii.py") is False
+    assert git_ingest._has_undecodable_bytes("bad\udcff.py") is True
+
+
+def test_list_source_files_skips_and_logs_undecodable_path(monkeypatch, tmp_path, caplog):
+    """A path byte sequence that isn't valid UTF-8 (surrogateescape-decoded
+    by _run_git into a lone surrogate) must be skipped + logged individually
+    -- never silently dropped with no trace, and never allowed to take the
+    rest of the listing down with it."""
+    good = "ascii.png"
+    bad = "bad\udcff.py"  # simulates a non-UTF-8-decodable path byte sequence
+    monkeypatch.setattr(
+        git_ingest, "_run_git", lambda repo_path, args: f"{good}\x00{bad}\x00"
+    )
+    with caplog.at_level("WARNING", logger="rce.ingest.git"):
+        inventory = git_ingest.list_source_files(tmp_path)
+    assert inventory["image"] == ["ascii.png"]
+    assert inventory["py"] == []
+    assert any("not valid UTF-8" in r.message for r in caplog.records)
+
+
+def test_read_commits_skips_and_logs_undecodable_changed_file(monkeypatch, tmp_path, caplog):
+    good = "ascii.py"
+    bad = "bad\udcff.py"
+    fake_record = (
+        git_ingest._RECORD_SEP
+        + git_ingest._FIELD_SEP.join(["a" * 40, "Name", "e@example.com", "2026-01-01T00:00:00+00:00"])
+        + git_ingest._FIELD_SEP + "msg\n" + git_ingest._FIELD_SEP
+        + f"\x00{good}\x00{bad}\x00"
+    )
+    monkeypatch.setattr(git_ingest, "_run_git", lambda repo_path, args: fake_record)
+    with caplog.at_level("WARNING", logger="rce.ingest.git"):
+        [commit] = git_ingest.read_commits(tmp_path)
+    assert commit.files == (good,)
+    assert any("not valid UTF-8" in r.message for r in caplog.records)
