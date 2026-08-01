@@ -16,6 +16,18 @@ enforced by this layer -- see DESIGN.md section 4):
     experiment:<run_id>         figure:<repo-relative path>
     section:<tex file>#<slug>   claim:<file>#<hash>
     ref:<lowercase bibkey>      contributor:<lowercase email>
+    attempt:<source md file, repo-relative path>#<# column value>
+
+Constitutional note on `attempt` nodes (DESIGN.md section 4, migration
+0002): an attempt's `#`/time/variable-description/referenced-step-number/
+source-file-and-line fields are machine-parsed facts about the row and
+belong in `attrs`. `verdict` and `result` are a human's judgement call
+recorded in prose (e.g. "☠️ 伪"/"✅ 现行") -- they must go in
+`human_fields`, set only via `set_human_fields`, never in `attrs`. A
+machine re-parse of the same Markdown row can suggest an updated `attrs`
+every time; it must never carry an opinion about `verdict`/`result`
+alongside it, for the same reason `upsert_node` structurally cannot write
+`human_fields` at all (see `upsert_node` below).
 """
 
 from __future__ import annotations
@@ -60,6 +72,10 @@ NODE_TYPES = frozenset(
         "claim",
         "reference",
         "contributor",
+        # Added in migration 0002 (DESIGN.md section 4): one row of a
+        # researcher's manually-maintained attempt timeline. See the
+        # attrs/human_fields boundary note in this module's docstring above.
+        "attempt",
     }
 )
 
@@ -73,6 +89,10 @@ EDGE_TYPES = frozenset(
         "authored_by",
         "backed_by",
         "supports",
+        # Added in migration 0002 (DESIGN.md section 4): `attempt --uses-->
+        # commit`, the last commit to touch a script file the attempt
+        # depends on -- deterministic, used for verdict-staleness checks.
+        "uses",
     }
 )
 
@@ -138,6 +158,18 @@ def migrate(conn: sqlite3.Connection, migrations_dir: str | Path | None = None) 
     clean pre-migration state instead of hitting "table already exists".
     Returns the list of version numbers newly applied (empty if the schema
     was already current -- safe to call on every startup).
+
+    Each file's transaction is bracketed with `PRAGMA foreign_keys = OFF` /
+    `= ON` (migration 0002: the standard SQLite 12-step table rebuild used to
+    widen a `CHECK` constraint needs to `DROP TABLE nodes` while `edges`
+    still holds a live foreign key to it by name -- see
+    migrations/0002_attempt.sql). The pragma is toggled *outside* the
+    transaction on both ends -- "no-op within a transaction" is documented
+    SQLite behaviour, so flipping it after `BEGIN` would silently fail to
+    take effect. `PRAGMA foreign_key_check` runs just before the
+    schema_migrations row is inserted, so a rebuild that left a dangling
+    reference fails loudly and rolls back like any other statement failure,
+    rather than silently shipping a corrupt foreign key.
     """
     directory = Path(migrations_dir) if migrations_dir else DEFAULT_MIGRATIONS_DIR
     conn.execute(
@@ -156,15 +188,26 @@ def migrate(conn: sqlite3.Connection, migrations_dir: str | Path | None = None) 
         if version in applied:
             continue
         statements = _split_migration_script(path.read_text())
+        conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("BEGIN")
         try:
             for statement in statements:
                 conn.execute(statement)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"migration {version} left dangling foreign keys: {violations!r}"
+                )
             conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
         except Exception:
             conn.rollback()
+            # Restored after rollback, not in a `finally` before it: toggling
+            # while the (now-aborted) transaction was still open would be
+            # the same no-op this whole comment is about.
+            conn.execute("PRAGMA foreign_keys = ON")
             raise
         conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
         newly_applied.append(version)
     return newly_applied
 

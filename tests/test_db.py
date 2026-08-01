@@ -72,6 +72,77 @@ def test_migrate_rolls_back_and_self_heals_on_mid_script_failure(tmp_path):
         conn.close()
 
 
+# -- migration 0002: attempt/uses ontology extension -----------------------
+
+
+def test_0002_migration_preserves_data_from_0001_only_db(tmp_path):
+    """The real-world upgrade path: a project whose .rce/graph.db already
+    ran 0001 (and has real nodes/edges in it) picks up 0002 later, once this
+    package ships it. Simulated by applying only a copy of 0001 first, then
+    re-migrating with the real migrations directory (0001 already recorded,
+    so only 0002 newly applies) -- must not lose a single row.
+    """
+    db_path = tmp_path / "graph.db"
+    only_0001_dir = tmp_path / "only_0001"
+    only_0001_dir.mkdir()
+    (only_0001_dir / "0001_init.sql").write_text(
+        (db.DEFAULT_MIGRATIONS_DIR / "0001_init.sql").read_text()
+    )
+
+    conn = db.connect(db_path)
+    try:
+        assert db.migrate(conn, only_0001_dir) == [1]
+
+        db.upsert_node(conn, "project:demo", "project", title="Demo")
+        db.upsert_node(conn, "commit:abc123", "commit")
+        db.upsert_node(conn, "figure:fig1.png", "figure")
+        db.set_human_fields(conn, "figure:fig1.png", {"caption_ok": True})
+        db.upsert_edge(
+            conn, "commit:abc123", "figure:fig1.png", "generates",
+            "test-extractor", {"file": "plot.py", "line": 10}, 1.0,
+        )
+        db.set_edge_status(conn, "commit:abc123", "figure:fig1.png", "generates", "test-extractor", "confirmed")
+
+        nodes_before = {n["id"]: n for n in (
+            db.get_node(conn, "project:demo"),
+            db.get_node(conn, "commit:abc123"),
+            db.get_node(conn, "figure:fig1.png"),
+        )}
+        edges_before = db.query_edges(conn)
+
+        # Now upgrade with the package's real migrations dir: 0001 is already
+        # recorded, so this applies exactly [2].
+        assert db.migrate(conn) == [2]
+
+        for node_id, before in nodes_before.items():
+            assert db.get_node(conn, node_id) == before
+        assert db.query_edges(conn) == edges_before
+
+        # And the widened CHECK constraints are now live.
+        db.upsert_node(conn, "attempt:map.md#1", "attempt", title="attempt 1")
+        db.upsert_edge(
+            conn, "attempt:map.md#1", "commit:abc123", "uses",
+            "test-extractor", {"file": "map.md", "line": 30}, 1.0,
+        )
+    finally:
+        conn.close()
+
+
+def test_0002_migration_applies_cleanly_on_a_fresh_empty_db(tmp_path):
+    conn = db.connect(tmp_path / "fresh.db")
+    try:
+        assert db.migrate(conn) == [1, 2]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {"nodes", "edges", "schema_migrations"} <= tables
+    finally:
+        conn.close()
+
+
 # -- node type CHECK -----------------------------------------------------
 
 
@@ -88,6 +159,18 @@ def test_illegal_node_type_rejected_at_db_level(conn):
             "INSERT INTO nodes (id, type, attrs, human_fields) VALUES (?, ?, '{}', '{}')",
             ("meeting:standup", "meeting"),
         )
+
+
+def test_attempt_node_type_accepted(conn):
+    # Migration 0002: the 9th node type, widened into the CHECK constraint.
+    db.upsert_node(
+        conn, "attempt:map.md#16", "attempt", title="TopicShift->volatility+adoption",
+        attrs={"number": "16", "date": "07-26", "variable": "TopicShift -> RV/NetBuyRate"},
+    )
+    node = db.get_node(conn, "attempt:map.md#16")
+    assert node["type"] == "attempt"
+    assert node["attrs"]["number"] == "16"
+    assert node["human_fields"] == {}  # verdict/result never land here
 
 
 # -- edge type / status CHECK --------------------------------------------
@@ -141,6 +224,21 @@ def test_upsert_edge_rejects_confirmed_or_rejected_status_in_python(conn):
                 1.0,
                 status=illegal_status,
             )
+
+
+def test_uses_edge_type_accepted(conn):
+    # Migration 0002: `attempt --uses--> commit`, deterministic and
+    # machine-written like any other upsert_edge call.
+    db.upsert_node(conn, "attempt:map.md#16", "attempt")
+    db.upsert_node(conn, "commit:abc123", "commit")
+    db.upsert_edge(
+        conn, "attempt:map.md#16", "commit:abc123", "uses",
+        "test-extractor", {"file": "16-叙事更替_TopicShift.py", "line": 1}, 1.0,
+    )
+    [edge] = db.query_edges(conn, type="uses")
+    assert edge["src"] == "attempt:map.md#16"
+    assert edge["dst"] == "commit:abc123"
+    assert edge["status"] == "auto"
 
 
 # -- confidence range CHECK ------------------------------------------------
@@ -560,6 +658,37 @@ def test_new_node_has_empty_human_fields(conn):
     db.upsert_node(conn, "project:demo", "project")
     node = db.get_node(conn, "project:demo")
     assert node["human_fields"] == {}
+
+
+def test_attempt_verdict_and_result_survive_reingest_untouched(conn):
+    """Constitutional boundary for `attempt` nodes (DESIGN.md section 4): a
+    machine re-parse of the attempt timeline may refresh `attrs` (number,
+    date, variable description, referenced step, source file/line) but must
+    never move `verdict`/`result` -- those are a human's call and live only
+    in `human_fields`, written solely through `set_human_fields`.
+    """
+    db.upsert_node(
+        conn, "attempt:map.md#16", "attempt", title="attempt 16",
+        attrs={"number": "16", "date": "07-26"},
+    )
+    db.set_human_fields(
+        conn, "attempt:map.md#16",
+        {"verdict": "✅ 现行", "result": "t=2.91, placebo p=0.0149"},
+    )
+
+    # A later machine re-ingest -- e.g. the map.md row's source line moved,
+    # or the referenced step number was corrected -- must not touch verdict/result,
+    # even though it rewrites attrs wholesale.
+    db.upsert_node(
+        conn, "attempt:map.md#16", "attempt", title="attempt 16 (re-ingested)",
+        attrs={"number": "16", "date": "07-26", "source_line": 47},
+    )
+
+    node = db.get_node(conn, "attempt:map.md#16")
+    assert node["human_fields"] == {
+        "verdict": "✅ 现行", "result": "t=2.91, placebo p=0.0149",
+    }
+    assert node["attrs"] == {"number": "16", "date": "07-26", "source_line": 47}
 
 
 # -- confirmation queue -----------------------------------------------------

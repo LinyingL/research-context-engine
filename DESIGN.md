@@ -92,8 +92,8 @@ confirmed and rejected edges alone.
 
 ## Section 4 — Object model
 
-Eight node types: `project`, `experiment`, `commit`, `figure`, `section`,
-`claim`, `reference`, `contributor`.
+Nine node types: `project`, `experiment`, `commit`, `figure`, `section`,
+`claim`, `reference`, `contributor`, `attempt`.
 
 Node ids are deterministic, so repeated ingestion converges instead of
 duplicating: `commit:<sha>`, `figure:<repo-relative-path>`,
@@ -111,6 +111,45 @@ earlier confirm/reject on the old claim genuinely no longer applies. A
 line-anchored id would instead let an unrelated edit shift a claim onto
 another claim's former id, silently inheriting that claim's human verdict.
 
+**`attempt` (migration 0002).** A researcher's project often has a
+hand-maintained Markdown table logging every research path tried -- an
+attempt timeline, one row per attempt, with a stable `#` column, a
+date, a path/variable description, and a human-written result and verdict
+(e.g. "confirmed", "dead end", "direction rejected"). RCE never asks the
+researcher to change this habit; an `attempt` node is a machine-parsed
+mirror of one such row, kept queryable and linkable to the rest of the
+graph rather than left as inert prose.
+
+Id convention: `attempt:<source-file-relative-path>#<# column value>` --
+e.g. `attempt:00-项目地图_唯一真相.md#16`, or `#14a` for a row the author
+split into sub-attempts (`14a`/`14b`) without renumbering the rows after
+it. This assumes the `#` column is a stable manually-assigned label rather
+than a position: checked against a real 22-row attempt timeline, the
+column runs 1-22 with no reused number, and several rows are *not* in
+chronological order relative to their neighbors (e.g. rows dated
+2026-07-09 appear after rows dated 2026-07-22 because they were folded in
+from a separate parallel review) -- exactly the pattern of a label the
+author assigns once and keeps, not a row index that shifts when the table
+is resorted or edited. This id convention holds only under that
+assumption: a project whose own timeline reuses or renumbers `#` values on
+edit would have re-ingestion quietly merge two different attempts onto one
+node, so an ingest extractor for this format must inherit the same "skip
+and log, never guess" discipline as every other connector (section 5) if a
+row's `#` value collides with a different row's already-stored title/attrs.
+
+Only `#`/date/variable-description/referenced-step-number/source-file-
+and-line are machine-parsed and live in `attrs` -- they are facts about
+the row's text, and a re-parse may refresh them like any other node's
+`attrs`. `verdict` and `result` are the human's judgement call recorded in
+prose next to the row (what the attempt showed, whether it stands) and
+must be written to `human_fields` only, through `set_human_fields`, never
+through the machine `upsert_node` path -- the same "humans own judgement"
+split (section 0/2) that already governs every other node and edge, not a
+special case invented for this type. `db.upsert_node` enforces this
+structurally: its `UPDATE` column list has no `human_fields` entry, so
+even a future extractor that carelessly puts `verdict`/`result` in its
+`attrs` dict cannot make them land there.
+
 Edge types, grouped by the layer that produces them:
 
 | Edge | Meaning | Layer |
@@ -122,6 +161,7 @@ Edge types, grouped by the layer that produces them:
 | `section --cites--> reference` | `\cite` and its natbib/biblatex variants | deterministic |
 | `* --authored_by--> contributor` | git author, run owner | deterministic |
 | `claim --backed_by--> experiment` | a number in the prose matches a run metric | deterministic candidate, pending judgement |
+| `attempt --uses--> commit` | the last commit to touch a script file the attempt depends on | deterministic |
 | `figure --supports--> section` | a figure substantiates an argument | semantic, planned |
 
 `backed_by` candidates are generated deterministically by `rce.ingest.claims`
