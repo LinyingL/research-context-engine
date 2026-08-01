@@ -137,6 +137,18 @@ node, so an ingest extractor for this format must inherit the same "skip
 and log, never guess" discipline as every other connector (section 5) if a
 row's `#` value collides with a different row's already-stored title/attrs.
 
+**`rce.ingest.attempts` (task A2)** is this extractor: config-driven only,
+via `.rce/attempts.toml` (file/heading/`[columns]` name mapping, optional
+`steps_dir`) -- with no config present, `rce attempts` prints a
+copy-pasteable template and exits 1 rather than guessing which table in the
+project is the attempt timeline. `verdict`/`result` go to `human_fields` via
+`set_human_fields` once, on first sight of an id, and never again on a later
+re-parse -- so a correction made any other way is never silently reset. A
+description referencing a step-number range (e.g. `(16-18)`) resolves, when
+`steps_dir` is configured, by exact numeric filename prefix into
+`attrs.step_files`; a number with no matching file is recorded in
+`attrs.step_files_broken` for a future consistency check (A3), never fuzzy-matched.
+
 Only `#`/date/variable-description/referenced-step-number/source-file-
 and-line are machine-parsed and live in `attrs` -- they are facts about
 the row's text, and a re-parse may refresh them like any other node's

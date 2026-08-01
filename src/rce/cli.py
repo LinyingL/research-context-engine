@@ -39,6 +39,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db, query
+from rce.ingest import attempts as attempts_ingest
 from rce.ingest import claims as claims_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
@@ -294,6 +295,28 @@ def cmd_status(args: argparse.Namespace) -> int:
         _print_graph_counts(conn)
         if args.pending:  # purely additive -- omitting it reproduces the prior output exactly
             _print_pending_queue(conn, args.limit)
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_attempts(args: argparse.Namespace) -> int:
+    """`rce attempts` (task A2): config-driven ingest of a hand-maintained
+    attempt timeline (see rce.ingest.attempts). Config-gated on purpose
+    (DESIGN.md section 0, "never guess") -- with no .rce/attempts.toml this
+    prints a copy-pasteable template and exits 1 instead of guessing which
+    table in the project is the attempt timeline.
+    """
+    project_root = _resolve_project_root(args.path)
+    conn = db.connect(_require_db(project_root))
+    try:
+        try:
+            config = attempts_ingest.load_config(project_root)
+        except attempts_ingest.AttemptsConfigError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
+        print(f"Attempts ({config.file}): {_format_counts(counts)}")
     finally:
         conn.close()
     return 0
@@ -627,6 +650,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="output structured JSON instead of human-readable text"
     )
     p.set_defaults(func=cmd_trace)
+
+    p = sub.add_parser(
+        "attempts",
+        help="Ingest a hand-maintained attempt timeline via .rce/attempts.toml (config-gated, never guessed)",
+    )
+    p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_attempts)
 
     p = sub.add_parser(
         "confirm",
