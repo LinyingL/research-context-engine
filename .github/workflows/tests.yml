@@ -72,6 +72,45 @@ jobs:
           rce status
           rce query "$project_id"
           rce trace "$project_id"
+      - name: rce attempts (the only command that reads a TOML config) on a minimal fixture table
+        run: |
+          set -euo pipefail
+          workdir=$(mktemp -d)
+          trap 'rm -rf "$workdir"' EXIT
+          cd "$workdir"
+          git init -q
+          git config user.email "ci@example.com"
+          git config user.name "RCE CI"
+          cat > map.md <<'EOF'
+          ## Attempt timeline
+
+          | # | Date | Path | Variables | Result | Verdict |
+          |---|---|---|---|---|---|
+          | 1 | 2026-07-01 | first pass | x | y | done |
+          EOF
+          git add map.md
+          git commit -q -m "init"
+          mkdir -p .rce
+          cat > .rce/attempts.toml <<'EOF'
+          file = "map.md"
+          heading = "Attempt timeline"
+
+          [columns]
+          id = "#"
+          date = "Date"
+          description = "Path"
+          variables = "Variables"
+          result = "Result"
+          verdict = "Verdict"
+          EOF
+          rce init .
+          # Positional path (item 10), same as init/ingest.
+          listing=$(rce attempts .)
+          echo "$listing"
+          echo "$listing" | grep -q "#1"
+          check_output=$(rce attempts . --check)
+          echo "$check_output"
+          echo "$check_output" | grep -q "skipped"
       - name: rce mcp must fail clearly (exit 1) without the optional 'mcp' extra
         run: |
           set +e

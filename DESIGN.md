@@ -124,18 +124,23 @@ Id convention: `attempt:<source-file-relative-path>#<# column value>` --
 e.g. `attempt:00-项目地图_唯一真相.md#16`, or `#14a` for a row the author
 split into sub-attempts (`14a`/`14b`) without renumbering the rows after
 it. This assumes the `#` column is a stable manually-assigned label rather
-than a position: checked against a real 22-row attempt timeline, the
-column runs 1-22 with no reused number, and several rows are *not* in
-chronological order relative to their neighbors (e.g. rows dated
-2026-07-09 appear after rows dated 2026-07-22 because they were folded in
-from a separate parallel review) -- exactly the pattern of a label the
-author assigns once and keeps, not a row index that shifts when the table
-is resorted or edited. This id convention holds only under that
-assumption: a project whose own timeline reuses or renumbers `#` values on
-edit would have re-ingestion quietly merge two different attempts onto one
-node, so an ingest extractor for this format must inherit the same "skip
-and log, never guess" discipline as every other connector (section 5) if a
-row's `#` value collides with a different row's already-stored title/attrs.
+than a position: checked against a real 23-row attempt timeline (row 14
+was split into `14a`/`14b` without renumbering the rows after it, so the
+column runs 1-13, `14a`, `14b`, 15-22 -- 23 physical rows, 22 distinct
+labels, no label reused), several rows are *not* in chronological order
+relative to their neighbors (e.g. rows dated 2026-07-09 appear after rows
+dated 2026-07-22 because they were folded in from a separate parallel
+review) -- exactly the pattern of a label the author assigns once and
+keeps, not a row index that shifts when the table is resorted or edited.
+This id convention holds only under that assumption: a project whose own
+timeline reuses a `#` value on a *different* row without renumbering would
+have re-ingestion quietly merge two different attempts onto one node, so
+an ingest extractor for this format must inherit the same "skip and log,
+never guess" discipline as every other connector (section 5) when a
+row's `#` value repeats a different row's `#` value within the same parse
+of the table -- editing a row's own description/date/variables text is
+not this case; those are ordinary machine-parsed `attrs` and are expected
+to change on re-parse like any other node's `attrs`.
 
 **`rce.ingest.attempts` (task A2)** is this extractor: config-driven only,
 via `.rce/attempts.toml` (file/heading/`[columns]` name mapping, optional
@@ -310,14 +315,32 @@ rule as every other extractor. Each reads `attempt` nodes already written by
    whether that particular script triggered a finding. A mtime fallback has
    no commit to point at, so no edge is written for that case.
 
-   **Known limitation.** The comparison needs the attempt's own date column
-   to parse as a plain `YYYY-MM-DD` date. A real hand-written timeline's
-   dates are rarely that clean — a range ("07-08~09"), an upper bound
-   ("≤07-07"), a bare month-day with no year. Inferring the missing year or
-   picking a bound of a range would be exactly the fabrication section 0
-   forbids, so an attempt whose date does not parse this strictly is
-   skipped from this one check individually (logged, never counted as
-   "not stale") rather than guessed at.
+   **Date parsing.** The comparison needs the attempt's own date column
+   parsed into a definite date. A real hand-written timeline's dates are
+   rarely a plain `YYYY-MM-DD` — a range ("07-08~09"), an upper bound
+   ("≤07-07"), a bare month-day with no year ("07-26"), a trailing
+   annotation ("07-10 冻结"). Inferring the missing year or picking a bound
+   of a range would be exactly the fabrication section 0 forbids, so none
+   of these parse *unless* the human declares `date_year` in
+   `.rce/attempts.toml` (below) — a human stating "this table's dates are
+   all in year Y", never rce inferring it. Once `date_year` is declared,
+   `rce.consistency._parse_attempt_date` accepts, in addition to a full
+   `YYYY-MM-DD`:
+     - `MM-DD` (e.g. `"07-26"`) — combined with `date_year`.
+     - `<=MM-DD` / `≤MM-DD` (e.g. `"≤07-07"`) — the prefix is stripped and
+       the date after it used as-is; it marks the true date as possibly
+       earlier, but does not change which date this check takes.
+     - `MM-DD~DD` or `MM-DD~MM-DD` (e.g. `"07-08~09"`, a range spanning a
+       month boundary) — the LATER end is taken, because a verdict is only
+       safely dated once the attempt is actually finished, i.e. the end of
+       the range, never its start.
+     - Trailing free text after the date (e.g. `"07-10 冻结"`) is ignored.
+
+   An attempt whose date still does not parse (bare `MM-DD` with no
+   `date_year` configured, or genuinely unparseable text) is skipped from
+   this one check individually, logged, and counted in the check's own
+   coverage figures — never guessed at, and never silently folded into "0
+   findings" (see "Honest coverage reporting" below).
 3. **Revived dead variable.** A *living* attempt (its verdict contains one
    of the configured `active_verdicts` markers) whose description or
    variable list mentions one of the configured `dead_variables` entries.
@@ -329,20 +352,44 @@ rule as every other extractor. Each reads `attempt` nodes already written by
 Each check is independently gated on its own config prerequisite, and a
 missing prerequisite is reported as *skipped*, never silently folded into
 "no findings" — the two look identical in a bug but must never look
-identical in this tool's output. Checks 1 and 2 need `steps_dir`; check 3
-needs both `dead_variables` and `active_verdicts` declared. All three are
-optional top-level keys in the same `.rce/attempts.toml` task A2 already
-introduced — no second config file:
+identical in this tool's output. Checks 1 and 2 need `steps_dir`; check 2
+also optionally reads `date_year` (above); check 3 needs both
+`dead_variables` and `active_verdicts` declared. All of these are optional
+top-level keys in the same `.rce/attempts.toml` task A2 already introduced
+— no second config file. They **must** appear before the `[columns]` table
+in the file: TOML nests any bare key written after a `[table]` header into
+that table, so a list or int written after `[columns]` is silently read as
+e.g. `columns.dead_variables` instead and never seen by `load_config` at
+all — a real bug this project's own `SAMPLE_CONFIG` template shipped with
+until it was caught against a real 23-row timeline (see `rce.ingest.
+attempts` for the fix and its regression test).
 
 ```toml
 steps_dir = "复现包_分步"                    # optional; gates checks 1 and 2
 dead_variables = ["信息熵", "lnRate 配置比例"]  # optional; gates check 3, paired with:
 active_verdicts = ["✅", "🕒"]                # which verdict markers count as "alive"
+date_year = 2026                             # optional; gates check 2's looser date forms above
 ```
 
 `dead_variables`/`active_verdicts` default to unset (not `[]`) when absent,
 so an explicitly declared empty list (a valid, if pointless, configuration)
-is never confused with "never declared, skip and say why."
+is never confused with "never declared, skip and say why." `date_year`
+similarly defaults to unset, in which case check 2 only ever accepts a
+plain `YYYY-MM-DD`, exactly as before this key existed.
+
+**Honest coverage reporting.** `CheckResult` records not just findings but
+`total`/`checked`: how many attempts the check considered, and how many it
+actually evaluated (the rest skipped per-item, per above — currently only
+check 2 has a per-item skip; checks 1 and 3 always have `checked == total`
+since neither has a comparable "this one item is unparseable" case). A
+check where `checked` is far below `total` — in the extreme, `checked ==
+0` — must never render as "OK, no issues found": a real 23-row timeline
+with no `date_year` configured has every single date fail to parse, and
+printing that as a clean bill of health hides that the check ran and
+verified nothing at all. `rce attempts --check`'s report always states the
+coverage figure (`rce.cli._print_consistency_report`), and explicitly flags
+zero coverage as not a clean result, rather than only ever printing
+`findings`.
 
 `rce attempts` with no `--check` lists what is registered — `#`, date,
 verdict, and how many step files a row resolved to — the same non-judging

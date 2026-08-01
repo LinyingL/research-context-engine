@@ -90,6 +90,48 @@ def test_config_loads_real_shaped_toml(tmp_path):
     assert config.columns["verdict"] == "判决"
 
 
+def test_sample_config_dead_variables_and_active_verdicts_actually_load(tmp_path):
+    """B1 regression: SAMPLE_CONFIG is both the module's own documentation
+    and the exact template printed to a user with no config file yet -- if
+    its own `dead_variables`/`active_verdicts` keys land inside `[columns]`
+    (a TOML ordering bug: any bare key written after a [table] header nests
+    into that table), every user who copy-pastes it gets a silently-None
+    config and the revived-dead-variables check always reports "skipped"
+    with no indication anything is wrong."""
+    (tmp_path / ".rce").mkdir()
+    (tmp_path / ".rce" / "attempts.toml").write_text(attempts.SAMPLE_CONFIG)
+    config = attempts.load_config(tmp_path)
+    assert config.dead_variables is not None
+    assert config.active_verdicts is not None
+    assert "信息熵" in config.dead_variables
+    assert "✅" in config.active_verdicts
+    # Also confirm they did NOT get nested under columns (the actual bug shape).
+    assert "dead_variables" not in config.columns
+    assert "active_verdicts" not in config.columns
+
+
+def test_config_reads_date_year(tmp_path):
+    (tmp_path / ".rce").mkdir()
+    (tmp_path / ".rce" / "attempts.toml").write_text(
+        'file = "map.md"\nheading = "X"\ndate_year = 2026\n'
+        '[columns]\nid = "#"\ndate = "d"\ndescription = "p"\n'
+        'variables = "v"\nresult = "r"\nverdict = "j"\n'
+    )
+    config = attempts.load_config(tmp_path)
+    assert config.date_year == 2026
+
+
+def test_config_date_year_must_be_int(tmp_path):
+    (tmp_path / ".rce").mkdir()
+    (tmp_path / ".rce" / "attempts.toml").write_text(
+        'file = "map.md"\nheading = "X"\ndate_year = "2026"\n'
+        '[columns]\nid = "#"\ndate = "d"\ndescription = "p"\n'
+        'variables = "v"\nresult = "r"\nverdict = "j"\n'
+    )
+    with pytest.raises(attempts.AttemptsConfigError, match="date_year"):
+        attempts.load_config(tmp_path)
+
+
 # -- table parsing: real-world cell shapes -----------------------------------
 
 
@@ -156,6 +198,23 @@ def test_extract_step_refs(description, expected_refs):
     assert attempts._extract_step_refs(description) == expected_refs
 
 
+def test_extract_step_refs_ignores_year_range(caplog):
+    """Regression: a 4-digit year range copied into the description (e.g.
+    from the project map's own narrative text) must never be mistaken for a
+    13-step phantom range."""
+    with caplog.at_level("WARNING"):
+        refs = attempts._extract_step_refs("background (2014-2026) and steps (16-18)")
+    assert refs == ["16-18"]
+    assert "2014" not in "".join(refs)
+
+
+def test_extract_step_refs_drops_overly_wide_range(caplog):
+    with caplog.at_level("WARNING"):
+        refs = attempts._extract_step_refs("typo'd range (1-500)")
+    assert refs == []
+    assert "wider than" in caplog.text
+
+
 def test_resolve_step_files_matches_prefix_and_reports_broken(tmp_path):
     steps = tmp_path / "steps"
     steps.mkdir()
@@ -206,19 +265,48 @@ def test_reingest_is_idempotent_and_preserves_edited_human_fields(conn, tmp_path
     assert node["human_fields"]["verdict"] == "manually corrected"  # never clobbered
 
 
-def test_id_collision_with_different_description_is_skipped(conn, tmp_path):
+def test_edited_description_refreshes_attrs_and_keeps_human_fields(conn, tmp_path):
+    """B4 regression: editing the description ("途径") cell is everyday
+    table maintenance, not an id collision -- attrs must refresh to the new
+    text on re-ingest, human_fields (verdict/result) must stay exactly as
+    first recorded, and this must never be counted as a collision."""
     config = _config(tmp_path, TABLE_MD)
     attempts.ingest_attempts_repo(conn, tmp_path, config)
 
-    colliding_md = TABLE_MD.replace(
+    # A human corrects the verdict through some other write path, same as
+    # test_reingest_is_idempotent_and_preserves_edited_human_fields.
+    db.set_human_fields(conn, "attempt:map.md#1", {"verdict": "manually corrected", "result": "z"})
+
+    reworded_md = TABLE_MD.replace(
         "| 1 | 07-07 | original draft | entropy->rate (monthly) | \"significant\" | dead end |",
-        "| 1 | 07-07 | a totally different attempt | z | z | z |",
+        "| 1 | 07-07 | reworded description | entropy->rate (monthly) | \"significant\" | dead end |",
     )
-    (tmp_path / "map.md").write_text(colliding_md)
+    (tmp_path / "map.md").write_text(reworded_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
+    assert counts["collisions_skipped"] == 0
+    node = db.get_node(conn, "attempt:map.md#1")
+    assert node["attrs"]["description"] == "reworded description"  # attrs refreshed
+    assert node["title"] == "reworded description"
+    assert node["human_fields"]["verdict"] == "manually corrected"  # never clobbered
+
+
+def test_duplicate_id_within_one_parse_is_a_collision(conn, tmp_path):
+    """The real collision DESIGN.md section 4 means: the same `#` used by
+    two different rows in the same table (a duplicate, unrenumbered id),
+    not a merely-reworded description."""
+    md = f"""## {HEADING}
+
+| # | Date | Path | Variables | Result | Verdict |
+|---|---|---|---|---|---|
+| 1 | 07-07 | first row with id 1 | x | y | ok |
+| 1 | 07-08 | second, different row also claiming id 1 | x | y | ok |
+"""
+    config = _config(tmp_path, md)
+    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
+    assert counts["attempts"] == 1
     assert counts["collisions_skipped"] == 1
     node = db.get_node(conn, "attempt:map.md#1")
-    assert node["attrs"]["description"] == "original draft"  # untouched by the collision
+    assert node["attrs"]["description"] == "first row with id 1"  # first row wins
 
 
 def test_row_removed_from_table_is_preserved_with_human_fields(conn, tmp_path):

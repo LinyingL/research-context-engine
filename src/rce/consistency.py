@@ -38,6 +38,14 @@ from rce.ingest import git as git_ingest
 logger = logging.getLogger(__name__)
 
 _ISO_DATE_RE = re_compile(r"^\d{4}-\d{2}-\d{2}$")
+# "MM-DD", optionally followed by "~DD" (same-month range) or "~MM-DD"
+# (cross-month range); trailing free text (a Chinese annotation like
+# " 冻结") is allowed and ignored, hence the lookahead instead of a full
+# end-of-string anchor. Any "<=" / "≤" upper-bound prefix is stripped by
+# the caller before this pattern is tried -- it is not part of this regex.
+_MONTH_DAY_RANGE_RE = re_compile(
+    r"^(?P<m1>\d{1,2})-(?P<d1>\d{1,2})(?:~(?:(?P<m2>\d{1,2})-)?(?P<d2>\d{1,2}))?(?=\s|$)"
+)
 
 # extractor tag for the one edge this module writes (attempt --uses--> commit).
 _EXTRACTOR = "attempts_consistency"
@@ -47,40 +55,115 @@ _EXTRACTOR = "attempts_consistency"
 class CheckResult:
     """One check's outcome: either `skipped` with a reason, or a (possibly
     empty) list of finding dicts. An empty `findings` on a non-skipped check
-    is a real "checked, nothing wrong" -- never conflated with `skipped`."""
+    is a real "checked, nothing wrong" -- never conflated with `skipped`.
+
+    `total`/`checked` are the check's own coverage: how many `attempt`
+    nodes it considered, and how many of those it actually evaluated (the
+    rest skipped for a per-item reason -- currently only
+    `check_stale_verdicts`, whose date column may not parse; the other two
+    checks always have `checked == total`). Coverage below 100% -- and
+    especially `checked == 0` -- must never be allowed to look like "OK, no
+    issues found": zero attempts actually examined is not a clean bill of
+    health, it is an unmeasured one, and the CLI report (`rce.cli.
+    _print_consistency_report`) is required to say so explicitly rather
+    than only printing `findings`."""
 
     name: str
     findings: list[dict[str, Any]] = field(default_factory=list)
     skipped: bool = False
     skip_reason: str | None = None
+    total: int = 0
+    checked: int = 0
+    items_skipped_reason: str | None = None
 
 
 def attempts_for_file(conn: Connection, source_file: str) -> list[dict[str, Any]]:
     """`attempt` nodes ingested from one source Markdown file, in the id
-    convention `attempt:<source_file>#<number>` (DESIGN.md section 4).
-    Shared by all three checks below and by `rce attempts`'s plain listing
-    (rce.cli), so both read the same set of nodes."""
+    convention `attempt:<source_file>#<number>` (DESIGN.md section 4),
+    sorted by `attempts_ingest.attempt_sort_key` (the same natural "#"
+    order `rce attempts`'s plain listing uses). Shared by all three checks
+    below and by that listing, so both a project's findings and its listing
+    always walk attempts in the same stable order -- required for `--check`
+    to be diffable in CI/pre-commit rather than following raw database read
+    order."""
     prefix = f"attempt:{source_file}#"
-    return [n for n in db.get_nodes_by_type(conn, "attempt") if n["id"].startswith(prefix)]
+    nodes = [n for n in db.get_nodes_by_type(conn, "attempt") if n["id"].startswith(prefix)]
+    return sorted(nodes, key=lambda n: attempts_ingest.attempt_sort_key(n["attrs"].get("number", "")))
 
 
 def _iso_date(raw: str) -> date | None:
-    """Strict `YYYY-MM-DD` only -- `None` for anything else (a date range
-    like "07-08~09", a bare "07-07" with no year, a "≤07-07" upper bound).
-
-    Known limitation (mirrors DESIGN.md section 5's connector-7 callouts):
-    a real hand-written attempt timeline's date column is rarely this
-    clean. Inferring the missing year, or picking a bound of a range, would
-    be exactly the fabrication DESIGN.md section 0 forbids -- so an
-    attempt whose date does not parse this strictly is skipped from the
-    stale-verdict check individually (logged, never counted as "not
-    stale"), rather than guessed at.
-    """
+    """Strict `YYYY-MM-DD` only -- `None` for anything else. Used for
+    machine-recorded dates (a git commit's `authored_at`, a file's mtime)
+    that are always already in this exact form; see `_parse_attempt_date`
+    for the attempt timeline's own, much messier date column."""
     raw = raw.strip()
     if not _ISO_DATE_RE.match(raw):
         return None
     try:
         return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _parse_attempt_date(raw: str, date_year: int | None) -> date | None:
+    """Parse one attempt's own date cell into a definite `date`, or `None`
+    if it cannot be parsed without guessing (DESIGN.md section 0).
+
+    Accepted forms, in order:
+
+    1. A full `YYYY-MM-DD` (`date.fromisoformat`) -- always accepted,
+       regardless of `date_year`.
+    2. Only when `.rce/attempts.toml` declares `date_year` (a human stating
+       "this table's dates are all in year Y" -- rce never infers this):
+         - `MM-DD`, e.g. `"07-26"` -- combined with `date_year`.
+         - `<=MM-DD` / `≤MM-DD`, e.g. `"≤07-07"` -- an upper-bound
+           prefix. The prefix is stripped and the date after it parsed
+           as-is; it does not change *which* date is taken, only that the
+           true date might be earlier than what's written. The
+           stale-verdict check this feeds wants the latest date that is
+           still guaranteed truthful, and an upper bound's own written
+           value already is that.
+         - `MM-DD~DD`, e.g. `"07-08~09"` -- a same-month day range. The
+           LATER day is taken: this check asks "was the verdict made stale
+           by a later edit", and a verdict is only safely dated once the
+           attempt is actually finished, i.e. the end of the range, never
+           its start.
+         - `MM-DD~MM-DD`, e.g. a range spanning a month boundary -- same
+           rule, the later end (both month and day) is taken.
+         - Trailing free text after the date, e.g. `"07-10 冻结"`
+           (a Chinese annotation), is ignored -- it is the researcher's own
+           note, not part of the date.
+    3. Anything else -- a bare `MM-DD` with `date_year` unset, unparseable
+       junk, an unrecognized separator -- returns `None`. The caller
+       (`check_stale_verdicts`) skips that one attempt for this check and
+       counts it in the check's coverage figures (`CheckResult.total` vs.
+       `.checked`); it is never guessed at, and a fully-skipped check must
+       never be allowed to look like "OK, no issues found" (see
+       `CheckResult`'s own docstring and `rce.cli._print_consistency_report`).
+    """
+    raw = raw.strip()
+    if _ISO_DATE_RE.match(raw):
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+    if date_year is None:
+        return None
+    body = raw
+    if body.startswith("≤"):
+        body = body[1:].strip()
+    elif body.startswith("<="):
+        body = body[2:].strip()
+    m = _MONTH_DAY_RANGE_RE.match(body)
+    if not m:
+        return None
+    month, day = int(m.group("m1")), int(m.group("d1"))
+    if m.group("d2"):
+        if m.group("m2"):
+            month = int(m.group("m2"))
+        day = int(m.group("d2"))
+    try:
+        return date(date_year, month, day)
     except ValueError:
         return None
 
@@ -107,14 +190,17 @@ def check_broken_references(
         )
     available = attempts_ingest.available_step_numbers(Path(project_root) / config.steps_dir)
     findings: list[dict[str, Any]] = []
-    for node in attempts_for_file(conn, config.file):
+    nodes = attempts_for_file(conn, config.file)
+    for node in nodes:
         for missing in node["attrs"].get("step_files_broken") or []:
             findings.append({
                 "attempt": node["id"],
                 "missing_step": missing,
                 "neighbors": _nearest_neighbors(missing, available),
             })
-    return CheckResult("broken_references", findings=findings)
+    # No per-item skip in this check -- every attempt's step_files_broken is
+    # examined, so checked always equals total.
+    return CheckResult("broken_references", findings=findings, total=len(nodes), checked=len(nodes))
 
 
 def _ensure_commit_node(conn: Connection, commit: git_ingest.GitCommit) -> str:
@@ -176,15 +262,23 @@ def check_stale_verdicts(
             last_touch[touched] = commit
 
     findings: list[dict[str, Any]] = []
-    for node in attempts_for_file(conn, config.file):
+    nodes = attempts_for_file(conn, config.file)
+    checked = 0
+    for node in nodes:
         raw_date = node["attrs"].get("date", "")
-        attempt_date = _iso_date(raw_date)
+        attempt_date = _parse_attempt_date(raw_date, config.date_year)
         if attempt_date is None:
+            reason = (
+                "not a plain YYYY-MM-DD date and no date_year configured to try looser forms"
+                if config.date_year is None
+                else "unparseable even with date_year configured"
+            )
             logger.info(
-                "%s: date %r is not a plain YYYY-MM-DD date -- skipping the stale-verdict check "
-                "for this attempt rather than guessing at a range or a missing year", node["id"], raw_date,
+                "%s: date %r is not parseable (%s) -- skipping the stale-verdict check for this "
+                "attempt rather than guessing", node["id"], raw_date, reason,
             )
             continue
+        checked += 1
         for filename in node["attrs"].get("step_files") or []:
             rel_path = f"{config.steps_dir}/{filename}"
             commit = last_touch.get(rel_path)
@@ -210,7 +304,11 @@ def check_stale_verdicts(
                     "attempt": node["id"], "script": rel_path, "attempt_date": raw_date,
                     "script_last_touched": script_date.isoformat(), "basis": basis,
                 })
-    return CheckResult("stale_verdicts", findings=findings)
+    skipped_count = len(nodes) - checked
+    return CheckResult(
+        "stale_verdicts", findings=findings, total=len(nodes), checked=checked,
+        items_skipped_reason="unparseable date" if skipped_count else None,
+    )
 
 
 def check_revived_dead_variables(
@@ -234,7 +332,8 @@ def check_revived_dead_variables(
             skip_reason="active_verdicts not declared in .rce/attempts.toml",
         )
     findings: list[dict[str, Any]] = []
-    for node in attempts_for_file(conn, config.file):
+    nodes = attempts_for_file(conn, config.file)
+    for node in nodes:
         verdict = node["human_fields"].get("verdict") or ""
         if not any(marker in verdict for marker in config.active_verdicts):
             continue
@@ -247,7 +346,11 @@ def check_revived_dead_variables(
                         "attempt": node["id"], "dead_variable": dead,
                         "field": field_name, "excerpt": text,
                     })
-    return CheckResult("revived_dead_variables", findings=findings)
+    # No per-item skip in this check -- every attempt is evaluated (an
+    # inactive verdict is a non-match, not a skip), so checked == total.
+    return CheckResult(
+        "revived_dead_variables", findings=findings, total=len(nodes), checked=len(nodes),
+    )
 
 
 def run_checks(

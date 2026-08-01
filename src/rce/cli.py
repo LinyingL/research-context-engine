@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -301,26 +300,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-_ATTEMPT_NUMBER_RE = re.compile(r"^(\d+)(.*)$")
-
-
-def _attempt_sort_key(number: str) -> tuple[float, str]:
-    """Natural order for attempt `#` labels: "14a" sorts right after "14",
-    ahead of "15" -- a plain string sort would put "14a" after "2". A label
-    with no leading digits (should not happen in practice) sorts last."""
-    m = _ATTEMPT_NUMBER_RE.match(number)
-    if not m:
-        return (float("inf"), number)
-    return (int(m.group(1)), m.group(2))
-
-
 def _print_attempts_listing(conn: Connection, config: attempts_ingest.AttemptsConfig) -> None:
     """`rce attempts` with no --check: what's registered, not a judgement --
-    editor/date/verdict/link count, in the attempt's own `#` order."""
-    nodes = sorted(
-        consistency.attempts_for_file(conn, config.file),
-        key=lambda n: _attempt_sort_key(n["attrs"].get("number", "")),
-    )
+    editor/date/verdict/link count, in the attempt's own `#` order
+    (`rce.consistency.attempts_for_file` already sorts by
+    `rce.ingest.attempts.attempt_sort_key`, the same order `--check`'s
+    findings now use, so both walk a project's attempts identically)."""
+    nodes = consistency.attempts_for_file(conn, config.file)
     print(f"Registered attempts in {config.file} ({len(nodes)}):")
     for node in nodes:
         number = node["attrs"].get("number", "?")
@@ -352,18 +338,57 @@ def _format_finding(check_name: str, finding: dict[str, Any]) -> str:
     return str(finding)  # defensive only -- every real check name is handled above
 
 
+def _format_coverage(result: consistency.CheckResult) -> str:
+    """`N/M attempts checked` plus, when some were skipped, why -- shared by
+    every non-skipped branch of `_print_consistency_report` so the coverage
+    figure is never left out of a clean-looking report (B3: a check that
+    examined zero attempts must never read the same as a check that
+    examined all of them and found nothing)."""
+    note = f"{result.checked}/{result.total} attempts checked"
+    skipped_count = result.total - result.checked
+    if skipped_count:
+        note += f" ({skipped_count} skipped: {result.items_skipped_reason})"
+    return note
+
+
 def _print_consistency_report(results: list[consistency.CheckResult]) -> None:
     print("Consistency checks:")
     for result in results:
         if result.skipped:
             print(f"  [{result.name}] skipped: {result.skip_reason}")
             continue
-        if not result.findings:
-            print(f"  [{result.name}] OK: no issues found")
+        if result.total == 0:
+            # Nothing to check at all (e.g. an empty attempt timeline) --
+            # a genuinely different case from "checked some/none of N and
+            # found nothing", so this is the one case still allowed to say
+            # a plain OK.
+            print(f"  [{result.name}] OK: no attempts to check")
             continue
-        print(f"  [{result.name}] {len(result.findings)} issue(s):")
+        coverage = _format_coverage(result)
+        if not result.findings:
+            if result.checked == 0:
+                print(f"  [{result.name}] {coverage} -- coverage is zero, this is NOT a clean bill of health")
+            elif result.checked < result.total:
+                print(f"  [{result.name}] {coverage}, no issues found among those checked")
+            else:
+                print(f"  [{result.name}] OK: no issues found ({coverage})")
+            continue
+        print(f"  [{result.name}] {coverage}, {len(result.findings)} issue(s):")
         for finding in result.findings:
             print(f"    - {_format_finding(result.name, finding)}")
+
+
+def _resolve_attempts_path(args: argparse.Namespace) -> str:
+    """`rce attempts` accepts the project root either positionally (like
+    `init`/`ingest`) or via `--path` (its own original convention, kept for
+    compatibility) -- but not both at once."""
+    if args.path is not None and args.path_flag is not None:
+        raise CliError("give the project root either positionally or via --path, not both")
+    if args.path_flag is not None:
+        return args.path_flag
+    if args.path is not None:
+        return args.path
+    return "."
 
 
 def cmd_attempts(args: argparse.Namespace) -> int:
@@ -383,7 +408,7 @@ def cmd_attempts(args: argparse.Namespace) -> int:
     itself "a problem found"), so this composes into a caller's own CI/
     pre-commit pipeline.
     """
-    project_root = _resolve_project_root(args.path)
+    project_root = _resolve_project_root(_resolve_attempts_path(args))
     conn = db.connect(_require_db(project_root))
     try:
         try:
@@ -675,6 +700,15 @@ def _positive_hops(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rce", description="Research Context Engine CLI.")
+    # Global, precedes the subcommand (e.g. `rce -v attempts --check`): every
+    # extractor logs its skip/orphan/fallback reasons at INFO via the
+    # standard `logging` module, but main() never called `basicConfig`, so
+    # none of that was ever visible in normal use -- only this flag turns it
+    # on, and only for this one invocation.
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="enable INFO-level diagnostic logging (skip reasons, orphan preservation, etc.)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="Initialize an RCE project (.rce/graph.db) at a path")
@@ -740,7 +774,14 @@ def build_parser() -> argparse.ArgumentParser:
             "never guessed); lists registered attempts, or runs consistency checks with --check"
         ),
     )
-    p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "path", nargs="?", default=None,
+        help="project root (default: '.'); consistent with 'init'/'ingest' -- --path below also accepted",
+    )
+    p.add_argument(
+        "--path", dest="path_flag", default=None,
+        help="project root, equivalent to the positional argument above (this subcommand's original form)",
+    )
     p.add_argument(
         "--check", action="store_true",
         help=(
@@ -834,6 +875,8 @@ def main(argv: list[str] | None = None) -> int:
         # rather than re-declaring the same options in this parser.
         return mcp_server.main(argv[1:])
     args = build_parser().parse_args(argv)
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
     try:
         return args.func(args)
     except CliError as exc:

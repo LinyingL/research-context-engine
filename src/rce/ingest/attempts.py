@@ -11,9 +11,15 @@ id, and never again: a later re-parse refreshes `attrs` (machine-parsed
 facts) but leaves `human_fields` exactly as it is, so a correction made any
 other way is never silently reset by a routine re-ingest.
 
-An id reused by a row whose description no longer matches what's already
-stored under it is a collision (DESIGN.md section 4): skipped and logged,
-never merged onto the existing node.
+A description differing from what's already stored under an id is *not* a
+collision -- it is the ordinary case of a human editing that cell (the
+`途径`/description column is everyday table maintenance), and `attrs`
+(description/date/variables/step_refs/step_files/source_line -- every
+machine-parsed field) is refreshed on every re-parse just like any other
+node's `attrs`, `human_fields` untouched either way. The actual collision
+DESIGN.md section 4 warns about is a `#` value used by *two different rows
+in the same parse* (a duplicate id within one table): the second row is
+skipped and logged, never merged onto the first.
 
 `.rce/attempts.toml` also carries two optional top-level lists consumed by
 `rce.consistency`'s revived-dead-variable check (task A3), not by ingest
@@ -25,6 +31,21 @@ Both default to `None` (not `[]`) when absent from the TOML, so
 apart from "declared empty -- run it, it just matches nothing".
 `available_step_numbers` below is also consumed by that module, for its
 broken-reference check's "nearest existing neighbor" hint.
+
+A third optional top-level key, `date_year` (an int), is consumed by
+`rce.consistency`'s stale-verdict check to parse a hand-written date column
+that is rarely a clean `YYYY-MM-DD` -- see that module for the exact accepted
+forms. It also defaults to `None` (not declared), in which case that check's
+date parsing is unchanged: only a full `YYYY-MM-DD` is accepted.
+
+All three of these top-level keys -- along with `steps_dir` -- must appear
+*before* the `[columns]` table in the TOML file. TOML nests any bare key
+written after a `[table]` header into that table, so a list written after
+`[columns]` silently becomes `columns.dead_variables` and `load_config`
+never sees it; this was a real bug in this very module's own `SAMPLE_CONFIG`
+template (task A3.1) and is why the ordering is called out here and enforced
+by `test_config_loads_real_shaped_toml` feeding `SAMPLE_CONFIG` itself
+through `load_config`.
 """
 
 from __future__ import annotations
@@ -47,9 +68,27 @@ _REQUIRED_COLUMNS = ("id", "date", "description", "variables", "result", "verdic
 SAMPLE_CONFIG = """\
 # .rce/attempts.toml -- tells `rce attempts` which file/heading/table holds
 # your hand-maintained attempt timeline. RCE never guesses this.
+#
+# All top-level keys (this section) MUST come before the [columns] table
+# below -- TOML nests any key written after a [table] header into that
+# table, so a list like `dead_variables` placed after [columns] silently
+# becomes `columns.dead_variables` and is never seen here again.
 file = "00-项目地图_唯一真相.md"      # markdown file, relative to the project root
 heading = "二、尝试途径总年表"          # heading right above the table (prefix match is enough)
 steps_dir = "复现包_分步"              # optional: numbered step scripts dir, for step-ref linking
+
+# Both optional (task A3, rce.consistency's revived-dead-variable check).
+# Leave either unset to skip that one check -- rce never assumes an empty
+# list means "declared, nothing dead" when you just never wrote the key.
+dead_variables = ["信息熵", "lnRate 配置比例", "8 立场框架", "维基叙事度量"]
+active_verdicts = ["✅", "🕒"]           # verdict markers that count as "alive"
+
+# Optional (task A3, rce.consistency's stale-verdict check): the year your
+# whole timeline's date column belongs to. You declare it -- rce never
+# infers it. Once set, a bare "MM-DD", a "<=MM-DD"/"≤MM-DD" upper bound, or
+# an "MM-DD~DD"/"MM-DD~MM-DD" range is also accepted (see rce.consistency
+# for the exact rules); leave unset and only a full "YYYY-MM-DD" parses.
+# date_year = 2026
 
 [columns]                              # markdown header text for each field, as YOU wrote it
 id = "#"
@@ -58,12 +97,6 @@ description = "途径"
 variables = "变量→因变量(频率)"
 result = "结果"
 verdict = "判决"
-
-# Both optional (task A3, rce.consistency's revived-dead-variable check).
-# Leave either unset to skip that one check -- rce never assumes an empty
-# list means "declared, nothing dead" when you just never wrote the key.
-dead_variables = ["信息熵", "lnRate 配置比例", "8 立场框架", "维基叙事度量"]
-active_verdicts = ["✅", "🕒"]           # verdict markers that count as "alive"
 """
 
 
@@ -83,6 +116,11 @@ class AttemptsConfig:
     # why), distinct from an explicit `[]` (declared, matches nothing).
     dead_variables: list[str] | None = None
     active_verdicts: list[str] | None = None
+    # Task A3 (rce.consistency's stale-verdict check), not read by anything
+    # in this module: `None` means "not declared" -- only a strict
+    # YYYY-MM-DD date parses. A declared value is the year the researcher
+    # states the whole date column belongs to (never inferred by rce).
+    date_year: int | None = None
 
 
 def load_config(project_root: Path) -> AttemptsConfig:
@@ -106,12 +144,18 @@ def load_config(project_root: Path) -> AttemptsConfig:
         raise AttemptsConfigError(
             f"{path}'s [columns] missing required key(s) {missing_cols}\n\nTemplate:\n{SAMPLE_CONFIG}"
         )
+    date_year = data.get("date_year")
+    if date_year is not None and not isinstance(date_year, int):
+        raise AttemptsConfigError(
+            f"{path}'s date_year must be a plain integer year (e.g. 2026), got {date_year!r}"
+        )
     return AttemptsConfig(
         file=data["file"], heading=data["heading"], columns=dict(columns), steps_dir=data.get("steps_dir"),
         # .get (not .get(..., [])): a missing key must stay None, never
         # silently become "[] -- declared, nothing dead" (see module
         # docstring and rce.consistency).
         dead_variables=data.get("dead_variables"), active_verdicts=data.get("active_verdicts"),
+        date_year=date_year,
     )
 
 
@@ -122,7 +166,15 @@ _BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _CODE_RE = re.compile(r"`([^`]*)`")
 _BOLD_RE = re.compile(r"\*\*([^*]*)\*\*")
-_STEP_REF_RE = re.compile(r"\((\d+)(?:-(\d+))?\)")
+_STEP_REF_RE = re.compile(r"\((\d{1,3})(?:-(\d{1,3}))?\)")
+# A conservative pair of guards, never a guess at which range is "real"
+# (DESIGN.md section 0): the {1,3} digit cap means a 4+-digit number (a
+# year, e.g. the "(2014-2026)" range that appears elsewhere in a real
+# project map) never matches as a step reference at all -- a repro-package
+# steps directory does not run into four digits. `_MAX_STEP_REF_WIDTH` is a
+# second, independent guard against an implausibly wide *range* of
+# otherwise-valid-looking 1-3-digit numbers (e.g. a typo'd "(1-500)").
+_MAX_STEP_REF_WIDTH = 50
 
 
 def _clean_cell(raw: str) -> str:
@@ -232,8 +284,26 @@ def parse_attempts_table(md_text: str, heading: str, columns: dict[str, str]) ->
 
 def _extract_step_refs(description: str) -> list[str]:
     """Parenthesized step-number refs, e.g. "(16-18)" or "(5)" -- raw
-    matched text, no fuzzy matching."""
-    return [f"{a}-{b}" if b else a for a, b in _STEP_REF_RE.findall(description)]
+    matched text, no fuzzy matching. A range wider than
+    `_MAX_STEP_REF_WIDTH` is dropped and logged rather than treated as a
+    step reference (see the constant's own comment; the 4+-digit case,
+    e.g. a year range, is already excluded by `_STEP_REF_RE` itself and
+    never reaches this function at all)."""
+    refs = []
+    for a, b in _STEP_REF_RE.findall(description):
+        if not b:
+            refs.append(a)
+            continue
+        width = int(b) - int(a)
+        if width < 0 or width > _MAX_STEP_REF_WIDTH:
+            logger.warning(
+                "description %r: parenthesized range (%s-%s) is wider than %d -- not treated "
+                "as a step-number reference (DESIGN.md section 0, conservative guard)",
+                description, a, b, _MAX_STEP_REF_WIDTH,
+            )
+            continue
+        refs.append(f"{a}-{b}")
+    return refs
 
 
 def _resolve_step_files(steps_dir: Path, refs: list[str]) -> tuple[list[str], list[int]]:
@@ -278,6 +348,24 @@ def available_step_numbers(steps_dir: Path) -> list[int]:
 
 # -- Graph ingest -------------------------------------------------------------
 
+_ATTEMPT_NUMBER_RE = re.compile(r"^(\d+)(.*)$")
+
+
+def attempt_sort_key(number: str) -> tuple[float, str]:
+    """Natural order for attempt `#` labels: "14a" sorts right after "14",
+    ahead of "15" -- a plain string sort would put "14a" after "2". A label
+    with no leading digits (should not happen in practice) sorts last.
+
+    Shared by `rce.cli`'s plain listing and every `rce.consistency` check
+    (via `rce.consistency.attempts_for_file`), so a project's findings and
+    its listing always walk attempts in the same order -- this used to be
+    defined separately in `rce.cli` alone, which meant `--check`'s findings
+    came out in raw database-read order instead of `#` order."""
+    m = _ATTEMPT_NUMBER_RE.match(number)
+    if not m:
+        return (float("inf"), number)
+    return (int(m.group(1)), m.group(2))
+
 
 def _node_id(file: str, number: str) -> str:
     return f"attempt:{file}#{number}"
@@ -306,10 +394,14 @@ def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[st
 
 def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: AttemptsConfig) -> dict[str, int]:
     """Parse the configured attempt timeline and mirror it into `attempt`
-    nodes. Idempotent on (file, id): re-running never duplicates a node and
-    never touches an existing node's `human_fields` (see module docstring).
-    A read failure on the source file is logged and returns all-zero counts
-    rather than raising -- not evidence the attempts are gone."""
+    nodes. Idempotent on (file, id): re-running never duplicates a node,
+    always refreshes `attrs` (description/date/variables/step_refs/
+    step_files/source_line) to the row's current text, and never touches an
+    existing node's `human_fields` (see module docstring). A row whose `#`
+    repeats one already seen *in this same parse* is a collision -- skipped
+    and logged, never merged onto the first (see module docstring). A read
+    failure on the source file is logged and returns all-zero counts rather
+    than raising -- not evidence the attempts are gone."""
     project_root = Path(project_root)
     counts = {
         "attempts": 0, "created": 0, "updated": 0, "collisions_skipped": 0,
@@ -327,17 +419,17 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
 
     for row in parse_attempts_table(text, config.heading, config.columns):
         node_id = _node_id(config.file, row.number)
-        existing = db.get_node(conn, node_id)
-        if existing is not None and existing["attrs"].get("description") != row.description:
+        if node_id in seen_ids:
             counts["collisions_skipped"] += 1
             logger.warning(
-                "%s: id %r already holds a different attempt (%r) -- new row %r skipped, never "
-                "merged onto an existing id (DESIGN.md section 4)",
-                config.file, row.number, existing["attrs"].get("description"), row.description,
+                "%s: id %r appears on more than one row in this parse (duplicate #) -- second "
+                "and later occurrences skipped, never merged onto the first (DESIGN.md section 4)",
+                config.file, row.number,
             )
             continue
         seen_ids.add(node_id)
         counts["attempts"] += 1
+        existing = db.get_node(conn, node_id)
 
         attrs: dict[str, Any] = {
             "number": row.number, "date": row.date, "description": row.description,

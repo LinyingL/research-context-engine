@@ -40,10 +40,58 @@ its own from the command line.
   a local model reviews pending `backed_by` candidates and annotates each
   with its opinion (`evidence.semantic_review`). It never confirms or
   rejects anything — see "Design principles" below.
+- `rce attempts [<path>] [--path P] [--check] [-v]` — ingest a
+  hand-maintained attempt-timeline table (a Markdown table logging every
+  research path tried, one row per attempt) via `.rce/attempts.toml`, then
+  either list what is registered, or run three deterministic consistency
+  checks with `--check`: broken step references, stale verdicts, and
+  revived dead variables. Config-gated on purpose — with no
+  `.rce/attempts.toml` present it prints a copy-pasteable template and
+  exits 1 rather than guessing which table in the project is the attempt
+  timeline. See "`rce attempts` configuration" below for the file format.
 
-`--path` defaults to `.` for `query`/`trace`/`status`/`confirm`, so they
-also work by `cd`-ing into the project root first and dropping `--path`
-entirely.
+`--path` defaults to `.` for `query`/`trace`/`status`/`confirm`/`attempts`,
+so they also work by `cd`-ing into the project root first and dropping
+`--path` entirely; `attempts` (like `init`/`ingest`) also accepts the
+project root as a plain positional argument instead.
+
+A global `-v`/`--verbose` flag (placed before the subcommand, e.g. `rce -v
+attempts --check`) turns on INFO-level diagnostic logging — skip reasons,
+orphan-node preservation, and similar detail that every extractor already
+logs but which is otherwise invisible in normal use.
+
+### `rce attempts` configuration
+
+`rce attempts` never guesses which table in your project is the attempt
+timeline — create `.rce/attempts.toml` (relative to the project root):
+
+```toml
+# All top-level keys below MUST appear before the [columns] table -- TOML
+# nests any bare key written after a [table] header into that table.
+file = "00-project-map.md"      # markdown file, relative to the project root
+heading = "Attempt timeline"    # heading right above the table (prefix match is enough)
+steps_dir = "repro/steps"       # optional: numbered step-script dir, for step-ref linking
+
+# Optional, gates the "revived dead variable" check:
+dead_variables = ["entropy weighting", "lnRate config ratio"]
+active_verdicts = ["✅", "🕒"]   # verdict markers that count as "alive"
+
+# Optional, gates the "stale verdict" check's looser date parsing (a bare
+# "MM-DD", a "<=MM-DD"/"≤MM-DD" upper bound, or an "MM-DD~DD" range) --
+# leave unset and only a full "YYYY-MM-DD" date parses.
+date_year = 2026
+
+[columns]                       # markdown header text for each field, as YOU wrote it
+id = "#"
+date = "Date"
+description = "Path"
+variables = "Variables"
+result = "Result"
+verdict = "Verdict"
+```
+
+Running `rce attempts` with no config prints this exact template (see
+`rce.ingest.attempts.SAMPLE_CONFIG`) and exits 1.
 
 ## Optional: MCP
 
