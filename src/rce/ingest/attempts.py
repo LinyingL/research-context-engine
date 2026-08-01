@@ -14,6 +14,17 @@ other way is never silently reset by a routine re-ingest.
 An id reused by a row whose description no longer matches what's already
 stored under it is a collision (DESIGN.md section 4): skipped and logged,
 never merged onto the existing node.
+
+`.rce/attempts.toml` also carries two optional top-level lists consumed by
+`rce.consistency`'s revived-dead-variable check (task A3), not by ingest
+itself: `dead_variables` (substrings from the project map's own "red line"
+section that must never resurface in a live attempt) and `active_verdicts`
+(which verdict markers, as the researcher writes them, count as "alive").
+Both default to `None` (not `[]`) when absent from the TOML, so
+`rce.consistency` can tell "not declared -- skip this check and say why"
+apart from "declared empty -- run it, it just matches nothing".
+`available_step_numbers` below is also consumed by that module, for its
+broken-reference check's "nearest existing neighbor" hint.
 """
 
 from __future__ import annotations
@@ -47,6 +58,12 @@ description = "途径"
 variables = "变量→因变量(频率)"
 result = "结果"
 verdict = "判决"
+
+# Both optional (task A3, rce.consistency's revived-dead-variable check).
+# Leave either unset to skip that one check -- rce never assumes an empty
+# list means "declared, nothing dead" when you just never wrote the key.
+dead_variables = ["信息熵", "lnRate 配置比例", "8 立场框架", "维基叙事度量"]
+active_verdicts = ["✅", "🕒"]           # verdict markers that count as "alive"
 """
 
 
@@ -61,6 +78,11 @@ class AttemptsConfig:
     heading: str
     columns: dict[str, str]
     steps_dir: str | None = None
+    # Task A3 (rce.consistency), not read by anything in this module: `None`
+    # means "not declared in .rce/attempts.toml" (skip that check and say
+    # why), distinct from an explicit `[]` (declared, matches nothing).
+    dead_variables: list[str] | None = None
+    active_verdicts: list[str] | None = None
 
 
 def load_config(project_root: Path) -> AttemptsConfig:
@@ -86,6 +108,10 @@ def load_config(project_root: Path) -> AttemptsConfig:
         )
     return AttemptsConfig(
         file=data["file"], heading=data["heading"], columns=dict(columns), steps_dir=data.get("steps_dir"),
+        # .get (not .get(..., [])): a missing key must stay None, never
+        # silently become "[] -- declared, nothing dead" (see module
+        # docstring and rce.consistency).
+        dead_variables=data.get("dead_variables"), active_verdicts=data.get("active_verdicts"),
     )
 
 
@@ -230,6 +256,24 @@ def _resolve_step_files(steps_dir: Path, refs: list[str]) -> tuple[list[str], li
     files = sorted({name for names in by_number.values() for name in names})
     broken = sorted(n for n, names in by_number.items() if not names)
     return files, broken
+
+
+def available_step_numbers(steps_dir: Path) -> list[int]:
+    """Every step number actually present as a file prefix in `steps_dir`,
+    sorted ascending -- the same "name starts with 'N-'" rule as
+    `_resolve_step_files` (never guessed, DESIGN.md section 0). A missing
+    directory returns [] rather than raising. Used by `rce.consistency`'s
+    broken-reference check (task A3) to report the nearest step numbers
+    that DO exist, so a human can spot a rename or deletion.
+    """
+    if not steps_dir.is_dir():
+        return []
+    numbers: set[int] = set()
+    for entry in steps_dir.iterdir():
+        m = re.match(r"(\d+)-", entry.name)
+        if entry.is_file() and m:
+            numbers.add(int(m.group(1)))
+    return sorted(numbers)
 
 
 # -- Graph ingest -------------------------------------------------------------

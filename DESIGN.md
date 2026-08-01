@@ -273,6 +273,84 @@ matching twenty different experiments gives every one of those edges
 `candidate_count = 20` and exactly one occurrence, and each is reviewed in
 full. Only the several-metrics-on-one-experiment case is partially reviewed.
 
+### Attempt consistency checks (task A3)
+
+The attempt timeline (above) is not a place RCE hands a judgement back to
+the researcher. The researcher already wrote the judgement — `verdict` and
+`result`, in their own words, next to the row. What the researcher cannot
+easily do by hand is notice that a row's step reference no longer resolves
+to a file, that a script a row depends on was edited after the verdict was
+recorded, or that a dead variable's name has quietly resurfaced in a row
+that is still marked alive. `rce.consistency` (`rce attempts --check`) is
+three narrow, fully deterministic checks for exactly that — no model
+anywhere in this module, same "code beats models wherever code suffices"
+rule as every other extractor. Each reads `attempt` nodes already written by
+`rce.ingest.attempts` rather than re-parsing the source Markdown itself, so
+`rce attempts --check` always re-ingests first.
+
+1. **Broken reference.** An attempt's step reference (`attrs.step_refs`,
+   resolved into `attrs.step_files`/`attrs.step_files_broken` at ingest
+   time — see the `attempt` node description above) that matched no file
+   under `steps_dir`. The finding also reports the nearest step numbers
+   that DO exist in the directory, on either side of the missing one, so a
+   human can tell a rename from an actual deletion at a glance instead of
+   opening the folder.
+2. **Stale verdict.** An attempt whose recorded date is earlier than the
+   last time one of its resolved dependency scripts was touched — the
+   verdict was written, then the code changed again. The script's
+   last-touch time comes from `rce.ingest.git.read_commits` (reused, not
+   reimplemented): the most recent commit whose changed-file list includes
+   that script. A script the check cannot find in git history at all —
+   untracked, or the project has no git repository — falls back to the
+   file's own mtime, and the finding says so explicitly (`basis="git"` vs.
+   `basis="mtime"`) rather than presenting both as equally reliable. Every
+   script resolved via git also gets an `attempt --uses--> commit` edge
+   (the edge type migration 0002 added), evidence `{"script",
+   "commit_time"}` — a deterministic fact worth keeping regardless of
+   whether that particular script triggered a finding. A mtime fallback has
+   no commit to point at, so no edge is written for that case.
+
+   **Known limitation.** The comparison needs the attempt's own date column
+   to parse as a plain `YYYY-MM-DD` date. A real hand-written timeline's
+   dates are rarely that clean — a range ("07-08~09"), an upper bound
+   ("≤07-07"), a bare month-day with no year. Inferring the missing year or
+   picking a bound of a range would be exactly the fabrication section 0
+   forbids, so an attempt whose date does not parse this strictly is
+   skipped from this one check individually (logged, never counted as
+   "not stale") rather than guessed at.
+3. **Revived dead variable.** A *living* attempt (its verdict contains one
+   of the configured `active_verdicts` markers) whose description or
+   variable list mentions one of the configured `dead_variables` entries.
+   Matching is a case-insensitive substring test, deliberately
+   conservative, and every finding carries the actual matched field text
+   verbatim so a human judges it themselves — this check only ever reports
+   a hit, it never files, dismisses, or otherwise disposes of one.
+
+Each check is independently gated on its own config prerequisite, and a
+missing prerequisite is reported as *skipped*, never silently folded into
+"no findings" — the two look identical in a bug but must never look
+identical in this tool's output. Checks 1 and 2 need `steps_dir`; check 3
+needs both `dead_variables` and `active_verdicts` declared. All three are
+optional top-level keys in the same `.rce/attempts.toml` task A2 already
+introduced — no second config file:
+
+```toml
+steps_dir = "复现包_分步"                    # optional; gates checks 1 and 2
+dead_variables = ["信息熵", "lnRate 配置比例"]  # optional; gates check 3, paired with:
+active_verdicts = ["✅", "🕒"]                # which verdict markers count as "alive"
+```
+
+`dead_variables`/`active_verdicts` default to unset (not `[]`) when absent,
+so an explicitly declared empty list (a valid, if pointless, configuration)
+is never confused with "never declared, skip and say why."
+
+`rce attempts` with no `--check` lists what is registered — `#`, date,
+verdict, and how many step files a row resolved to — the same non-judging
+posture as the rest of this section. `--check` runs all three and exits
+non-zero if any of them reports a finding; a skipped check never affects
+the exit code, since a missing config declaration is a configuration gap,
+not itself "a problem found" in the project.
+
 ## Section 5 — Connection keys
 
 The deterministic layer joins objects on evidence that already exists in the

@@ -32,13 +32,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import db, query
+from rce import consistency, db, query
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import claims as claims_ingest
 from rce.ingest import git as git_ingest
@@ -300,12 +301,87 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+_ATTEMPT_NUMBER_RE = re.compile(r"^(\d+)(.*)$")
+
+
+def _attempt_sort_key(number: str) -> tuple[float, str]:
+    """Natural order for attempt `#` labels: "14a" sorts right after "14",
+    ahead of "15" -- a plain string sort would put "14a" after "2". A label
+    with no leading digits (should not happen in practice) sorts last."""
+    m = _ATTEMPT_NUMBER_RE.match(number)
+    if not m:
+        return (float("inf"), number)
+    return (int(m.group(1)), m.group(2))
+
+
+def _print_attempts_listing(conn: Connection, config: attempts_ingest.AttemptsConfig) -> None:
+    """`rce attempts` with no --check: what's registered, not a judgement --
+    editor/date/verdict/link count, in the attempt's own `#` order."""
+    nodes = sorted(
+        consistency.attempts_for_file(conn, config.file),
+        key=lambda n: _attempt_sort_key(n["attrs"].get("number", "")),
+    )
+    print(f"Registered attempts in {config.file} ({len(nodes)}):")
+    for node in nodes:
+        number = node["attrs"].get("number", "?")
+        raw_date = node["attrs"].get("date", "")
+        verdict = node["human_fields"].get("verdict", "")
+        step_files = len(node["attrs"].get("step_files") or [])
+        print(f"  #{number:<5} {raw_date:<14} {verdict:<24} linked_step_files={step_files}")
+
+
+def _format_finding(check_name: str, finding: dict[str, Any]) -> str:
+    """One finding line per check type (task A3) -- each check's dict shape
+    is its own, so this is a dispatch, not a generic key=value dump."""
+    if check_name == "broken_references":
+        neighbors = finding["neighbors"]
+        return (
+            f"{finding['attempt']}: references step {finding['missing_step']}, no matching file -- "
+            f"nearest existing steps: prev={neighbors['prev_available']} next={neighbors['next_available']}"
+        )
+    if check_name == "stale_verdicts":
+        return (
+            f"{finding['attempt']}: verdict dated {finding['attempt_date']!r} but {finding['script']} "
+            f"last touched {finding['script_last_touched']} (basis={finding['basis']})"
+        )
+    if check_name == "revived_dead_variables":
+        return (
+            f"{finding['attempt']}: dead variable {finding['dead_variable']!r} found in "
+            f"{finding['field']}: {finding['excerpt']!r}"
+        )
+    return str(finding)  # defensive only -- every real check name is handled above
+
+
+def _print_consistency_report(results: list[consistency.CheckResult]) -> None:
+    print("Consistency checks:")
+    for result in results:
+        if result.skipped:
+            print(f"  [{result.name}] skipped: {result.skip_reason}")
+            continue
+        if not result.findings:
+            print(f"  [{result.name}] OK: no issues found")
+            continue
+        print(f"  [{result.name}] {len(result.findings)} issue(s):")
+        for finding in result.findings:
+            print(f"    - {_format_finding(result.name, finding)}")
+
+
 def cmd_attempts(args: argparse.Namespace) -> int:
-    """`rce attempts` (task A2): config-driven ingest of a hand-maintained
-    attempt timeline (see rce.ingest.attempts). Config-gated on purpose
-    (DESIGN.md section 0, "never guess") -- with no .rce/attempts.toml this
-    prints a copy-pasteable template and exits 1 instead of guessing which
-    table in the project is the attempt timeline.
+    """`rce attempts` (task A2 ingest, task A3 listing/`--check`):
+    config-driven ingest of a hand-maintained attempt timeline (see
+    rce.ingest.attempts), always run first so what follows reflects the
+    current source file. Config-gated on purpose (DESIGN.md section 0,
+    "never guess") -- with no .rce/attempts.toml this prints a
+    copy-pasteable template and exits 1 instead of guessing which table in
+    the project is the attempt timeline.
+
+    Without `--check`: a plain listing of what is registered (rce.consistency
+    .attempts_for_file), no judgement involved. With `--check`: the three
+    deterministic consistency checks (rce.consistency.run_checks), grouped
+    in a report; exits 1 if any check reports a finding (skipped checks
+    never affect the exit code -- a missing config declaration is not
+    itself "a problem found"), so this composes into a caller's own CI/
+    pre-commit pipeline.
     """
     project_root = _resolve_project_root(args.path)
     conn = db.connect(_require_db(project_root))
@@ -317,6 +393,12 @@ def cmd_attempts(args: argparse.Namespace) -> int:
             return 1
         counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
         print(f"Attempts ({config.file}): {_format_counts(counts)}")
+
+        if args.check:
+            results = consistency.run_checks(conn, project_root, config)
+            _print_consistency_report(results)
+            return 1 if any(r.findings for r in results) else 0
+        _print_attempts_listing(conn, config)
     finally:
         conn.close()
     return 0
@@ -653,9 +735,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "attempts",
-        help="Ingest a hand-maintained attempt timeline via .rce/attempts.toml (config-gated, never guessed)",
+        help=(
+            "Ingest a hand-maintained attempt timeline via .rce/attempts.toml (config-gated, "
+            "never guessed); lists registered attempts, or runs consistency checks with --check"
+        ),
     )
     p.add_argument("--path", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--check", action="store_true",
+        help=(
+            "run the three deterministic consistency checks (broken step references, stale "
+            "verdicts, revived dead variables) instead of listing -- exits 1 if any check "
+            "reports a finding"
+        ),
+    )
     p.set_defaults(func=cmd_attempts)
 
     p = sub.add_parser(
