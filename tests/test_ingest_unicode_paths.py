@@ -134,3 +134,50 @@ def test_full_ingest_pipeline_resolves_non_ascii_paths_end_to_end(unicode_repo, 
     src = generates_edges[0]["src"]
     assert src.startswith("commit:")
     assert len(src) == len("commit:") + 40  # a real 40-hex sha, not an escaped string
+
+
+def test_leading_and_trailing_space_filenames_survive_verbatim(tmp_path):
+    """A leading/trailing space is a legal part of a filename, and `-z` hands it
+    over byte-exact. Trimming it silently drops the real file *and* mints a ghost
+    node for the trimmed name (DESIGN.md section 0: evidence or nothing)."""
+    repo = tmp_path / "spaces"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / " fig.png").write_bytes(b"\x89PNG")
+    (repo / "fig .png").write_bytes(b"\x89PNG")
+    (repo / "plot.py").write_text(
+        "import matplotlib.pyplot as plt\nplt.savefig('fig.png')\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t.dev",
+         "commit", "-qm", "files whose names carry edge whitespace")
+
+    inventory = git_ingest.list_source_files(repo)
+    assert " fig.png" in inventory["image"]
+    assert "fig .png" in inventory["image"]
+    assert "fig.png" not in inventory["image"]
+
+    commits = git_ingest.read_commits(repo)
+    assert " fig.png" in commits[0].files
+    assert "fig .png" in commits[0].files
+
+
+def test_savefig_to_a_trimmed_name_is_not_resolved_to_a_space_padded_file(tmp_path):
+    """`savefig('fig.png')` must not silently resolve to the tracked ' fig.png'."""
+    repo = tmp_path / "ghost"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / " fig.png").write_bytes(b"\x89PNG")
+    (repo / "plot.py").write_text(
+        "import matplotlib.pyplot as plt\nplt.savefig('fig.png')\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t.dev",
+         "commit", "-qm", "savefig target differs from the tracked name")
+
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    inventory = git_ingest.list_source_files(repo)
+    counts = pyfig_ingest.ingest_pyfig_repo(conn, repo, inventory["py"], inventory["image"])
+    assert counts["generates"] == 0
+    assert db.get_nodes_by_type(conn, "figure") == []

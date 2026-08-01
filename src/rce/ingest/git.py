@@ -159,9 +159,13 @@ def read_commits(repo_path: str | Path) -> list[GitCommit]:
             logger.warning("skipping git log record with empty sha")
             continue
         message, _, file_blob = rest.partition(_FIELD_SEP)
+        # `git log -z --name-only` emits NUL then a literal newline before the
+        # first changed file. Strip that artifact once, on the blob -- never
+        # per entry: with -z each entry is a byte-exact path, and a leading or
+        # trailing space is a legal part of a filename, not whitespace to trim.
+        file_blob = file_blob.removeprefix("\x00").removeprefix("\n")
         files: list[str] = []
-        for entry in file_blob.split("\x00"):
-            path = entry.strip()
+        for path in file_blob.split("\x00"):
             if not path:
                 continue
             if _has_undecodable_bytes(path):
@@ -243,8 +247,9 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
     repo_path = Path(repo_path)
     output = _run_git(repo_path, ["ls-files", "-z"])
     inventory: dict[str, list[str]] = {"tex": [], "bib": [], "image": [], "py": []}
-    for entry in output.split("\x00"):
-        path = entry.strip()
+    for path in output.split("\x00"):
+        # No .strip(): `ls-files -z` entries are byte-exact, and leading or
+        # trailing whitespace is a legal part of a filename.
         if not path:
             continue
         if _has_undecodable_bytes(path):
