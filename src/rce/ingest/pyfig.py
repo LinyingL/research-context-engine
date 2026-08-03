@@ -457,9 +457,12 @@ def ingest_pyfig_repo(
     Each edge's src is resolved per call site via `git blame` (batch3-fix,
     see module docstring) -- the commit that last touched that exact
     savefig(...) line, not the repo's current HEAD. A repo with no HEAD
-    commit yet (unborn repo) skips the whole scan rather than inventing a
-    placeholder commit; a savefig line that is only a local, uncommitted
-    edit skips just that one call site (both logged, never guessed at).
+    commit yet (unborn repo), or no git repository at all (W1 -- a plain
+    filesystem-scanned project, see rce.ingest.files), skips the whole scan
+    rather than inventing a placeholder commit -- a `generates` edge's src
+    is a real Commit node, and neither case has one to offer. A savefig
+    line that is only a local, uncommitted edit skips just that one call
+    site (all three logged, never guessed at).
 
     `image_paths` is the exact set of git-tracked image files (e.g. from
     rce.ingest.git.list_source_files()["image"]) a resolved literal must
@@ -470,7 +473,22 @@ def ingest_pyfig_repo(
     db.upsert_node/upsert_edge plus the stable blame-resolved src.
     """
     counts = {"generates": 0}
-    if git_ingest.read_head_sha(repo_root) is None:
+    try:
+        head_sha = git_ingest.read_head_sha(repo_root)
+    except git_ingest.GitIngestError as exc:
+        # W1: no git repository here at all (or some other git failure) --
+        # either way there is no commit history to resolve a `generates`
+        # edge's src node from, so the whole scan is skipped rather than
+        # inventing a placeholder commit. Caught as the GitIngestError base
+        # (not just NotAGitRepositoryError): every cause reduces to the same
+        # "no commit source node available" outcome for this extractor.
+        logger.warning(
+            "no usable git history at %s (%s); a generates edge needs a real commit "
+            "source node, which requires git -- skipping the savefig scan entirely",
+            repo_root, exc,
+        )
+        return counts
+    if head_sha is None:
         logger.warning("repo has no HEAD commit yet (unborn repo); skipping savefig scan")
         return counts
 

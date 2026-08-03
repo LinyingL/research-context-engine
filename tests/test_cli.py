@@ -101,14 +101,67 @@ def test_commands_without_init_report_clear_error(tmp_path, monkeypatch, capsys,
     assert "Error" in err and "rce init" in err
 
 
-def test_ingest_on_non_git_repo_reports_clear_error(tmp_path, capsys):
+def test_ingest_on_non_git_repo_degrades_gracefully(tmp_path, capsys):
+    """W1: a project root that is not a git repository at all must not abort
+    ingest. Real background: a researcher's project root is routinely never
+    `git init`ed. `rce ingest` prints one clear explanatory line, skips
+    commit/contributor nodes (no history to read), and every other
+    extractor still runs -- here against a filesystem-scanned inventory
+    (rce.ingest.files) instead of `git ls-files`. pyfig additionally has no
+    commit source node to attach a `generates` edge to, so it degrades
+    separately (see rce.ingest.pyfig.ingest_pyfig_repo) and reports
+    generates=0 rather than crashing or fabricating a commit."""
     project = tmp_path / "proj"
-    project.mkdir()
+    project.mkdir()  # deliberately never `git init`ed
+    (project / "overview.png").write_bytes(b"\x89PNG")
+    (project / "refs.bib").write_text(
+        "@article{smith2020,\n title={A Paper},\n author={Smith},\n year={2020},\n}\n"
+    )
+    (project / "paper.tex").write_text(
+        "\\section{Intro}\n\\includegraphics{overview.png}\nAs shown in \\citep{smith2020}.\n"
+    )
+    (project / "plot.py").write_text(
+        "import matplotlib.pyplot as plt\nplt.savefig('overview.png')\n"
+    )
     cli.main(["init", str(project)])
     capsys.readouterr()
 
-    assert cli.main(["ingest", str(project)]) == 1
-    assert "git ingestion failed" in capsys.readouterr().err
+    assert cli.main(["ingest", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert (
+        "no git repository -- commit/contributor nodes unavailable; "
+        "using filesystem scan for the file inventory" in out
+    )
+    assert all(s in out for s in ("sections=1", "figures=1", "cites=1"))
+    # pyfig cannot resolve a commit source node without git -- no generates edge.
+    assert "generates=0" in out
+
+    conn = db.connect(project / ".rce" / "graph.db")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='commit'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='contributor'").fetchone()[0] == 0
+        assert db.get_node(conn, "figure:overview.png") is not None
+        assert db.get_node(conn, "ref:smith2020") is not None
+        assert db.query_edges(conn, type="generates") == []
+    finally:
+        conn.close()
+
+
+def test_ingest_on_non_git_repo_skips_noise_directories(tmp_path, capsys):
+    """W1: the filesystem-scan fallback must not pull in noise directories
+    (build caches, dependency trees) that a git-tracked inventory would
+    never have surfaced either."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "__pycache__").mkdir()
+    (project / "__pycache__" / "ghost.py").write_text("print('should not be scanned')\n")
+    (project / "real.py").write_text("import matplotlib.pyplot as plt\n")
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["ingest", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "pyfig: 1 .py scanned" in out
 
 
 # -- T5.5 review item 5: `rce init` gitignore tip --

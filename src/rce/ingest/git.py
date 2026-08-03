@@ -16,6 +16,23 @@ commit"), not whichever commit happens to be HEAD at ingestion time.
 Unparseable git output is skipped and logged, never guessed at (section 5's
 savefig rule: "拼不出来就放弃，不猜").
 
+W1: a project root that is not a git repository at all (the common case for
+a researcher's working directory that was never `git init`ed) is a normal,
+supported state, not a fatal one. `_run_git` raises the narrower
+`NotAGitRepositoryError` (a `GitIngestError` subclass) specifically for
+git's own "not a git repository (or any of the parent directories)" message
+-- distinct from every other `GitIngestError` cause (missing git binary,
+permission error, a corrupt repo) that a caller still very much wants to
+surface as fatal. `rce.cli.cmd_ingest` catches only this narrower type to
+print one explanatory line and fall back to `rce.ingest.files.
+list_source_files` (a filesystem walk) for the file inventory, then
+continues running every other extractor; `rce.ingest.pyfig.
+ingest_pyfig_repo` catches it (via the same `GitIngestError` base -- no
+commit source node is resolvable either way) around its own
+`read_head_sha` call and skips its scan the same way it already does for an
+unborn repo, since a `generates` edge needs a real commit node to attach to
+and neither case has one.
+
 Non-ASCII path bug fix (real repro: a Chinese-filename research repo): git's
 default `core.quotepath=true` escapes any non-ASCII byte in a path into a
 backslash-octal-escaped, double-quoted string (e.g. `"\\346\\226\\207.py"`) for
@@ -60,6 +77,12 @@ IMAGE_EXTENSIONS = frozenset(
     {".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".gif", ".tiff", ".tif"}
 )
 
+# W1: tabular/data-file extensions a research project commonly carries
+# alongside its code/paper -- shared with rce.ingest.files (the non-git
+# filesystem-walk counterpart) so both inventories categorize identically,
+# one source of truth rather than two extension lists that could drift.
+DATA_EXTENSIONS = frozenset({".csv", ".xlsx", ".parquet", ".rds", ".dta", ".json"})
+
 @dataclass(frozen=True)
 class GitCommit:
     """One parsed `git log` record, raw as git reported it -- email case is
@@ -76,6 +99,19 @@ class GitCommit:
 class GitIngestError(RuntimeError):
     """`git` failed for a reason other than "no commits yet" (not a repo,
     missing git binary, permission error, etc.)."""
+
+
+class NotAGitRepositoryError(GitIngestError):
+    """`repo_path` is not inside a git repository at all -- git's own "not a
+    git repository (or any of the parent directories)" message, raised for
+    every git subcommand identically regardless of which one was run. A
+    narrower, catchable condition than `GitIngestError` in general (W1):
+    callers that want to degrade gracefully for "there is simply no git
+    here" (rce.cli.cmd_ingest, rce.ingest.pyfig.ingest_pyfig_repo) catch
+    this specifically, while every other git failure (missing git binary,
+    permission error, a corrupt repo) still surfaces as a fatal
+    `GitIngestError` to them."""
+
 
 def _run_git(repo_path: Path, args: list[str]) -> str:
     """Run `git <args>` and return stdout, decoded as UTF-8.
@@ -101,9 +137,10 @@ def _run_git(repo_path: Path, args: list[str]) -> str:
     except FileNotFoundError as exc:
         raise GitIngestError(f"git executable not found: {exc}") from exc
     if result.returncode != 0:
-        raise GitIngestError(
-            f"git {' '.join(args)} failed in {repo_path}: {result.stderr.strip()}"
-        )
+        message = f"git {' '.join(args)} failed in {repo_path}: {result.stderr.strip()}"
+        if "not a git repository" in result.stderr:
+            raise NotAGitRepositoryError(message)
+        raise GitIngestError(message)
     return result.stdout
 
 
@@ -229,7 +266,8 @@ def ingest_git_repo(conn: Connection, repo_path: str | Path) -> int:
     return ingested
 
 def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
-    """Inventory git-tracked .tex/.bib/image/.py files, grouped by category.
+    """Inventory git-tracked .tex/.bib/image/.py/.md/.r/.rmd/data files,
+    grouped by category.
 
     Uses `git ls-files` (tracked files only, .gitignore respected for free)
     instead of a filesystem walk -- no ignore-matching logic to maintain.
@@ -243,10 +281,19 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
     category below -- the actual bug this fixes. A path entry that still
     doesn't decode cleanly as UTF-8 (`_has_undecodable_bytes`) is skipped
     and logged individually rather than guessed at or silently dropped.
+
+    W1: md/r/rmd/data categories were added alongside the non-git
+    filesystem-walk counterpart (`rce.ingest.files.list_source_files`) so a
+    git-tracked and a filesystem-scanned inventory carry the same shape --
+    same category keys, same extension-to-category rules (`DATA_EXTENSIONS`
+    is the one shared source of truth for the "data" category, see its
+    definition above).
     """
     repo_path = Path(repo_path)
     output = _run_git(repo_path, ["ls-files", "-z"])
-    inventory: dict[str, list[str]] = {"tex": [], "bib": [], "image": [], "py": []}
+    inventory: dict[str, list[str]] = {
+        "tex": [], "bib": [], "image": [], "py": [], "md": [], "r": [], "rmd": [], "data": [],
+    }
     for path in output.split("\x00"):
         # No .strip(): `ls-files -z` entries are byte-exact, and leading or
         # trailing whitespace is a legal part of a filename.
@@ -267,6 +314,14 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
             inventory["image"].append(path)
         elif suffix == ".py":
             inventory["py"].append(path)
+        elif suffix == ".md":
+            inventory["md"].append(path)
+        elif suffix == ".r":
+            inventory["r"].append(path)
+        elif suffix == ".rmd":
+            inventory["rmd"].append(path)
+        elif suffix in DATA_EXTENSIONS:
+            inventory["data"].append(path)
     return inventory
 
 

@@ -195,6 +195,30 @@ def test_unborn_repo_skips_entire_scan(tmp_path, caplog):
         conn.close()
 
 
+def test_non_git_repo_skips_entire_scan_gracefully(tmp_path, caplog):
+    """W1: a project root with no git repository at all (never `git init`ed)
+    has no commit history to resolve a `generates` edge's src node from --
+    the whole scan must be skipped, logged, and must not raise, exactly like
+    the unborn-repo case above."""
+    project = tmp_path / "not_a_repo"
+    project.mkdir()  # deliberately never `git init`ed
+    (project / "plot.png").write_bytes(b"\x89PNG")
+    (project / "plot.py").write_text("plt.savefig('plot.png')\n")
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    try:
+        with caplog.at_level("WARNING", logger="rce.ingest.pyfig"):
+            counts = pyfig.ingest_pyfig_repo(conn, project, ["plot.py"], ["plot.png"])
+        assert counts == {"generates": 0}
+        assert db.query_edges(conn, type="generates") == []
+        assert any(
+            "no usable git history" in r.message and "skipping the savefig scan entirely" in r.message
+            for r in caplog.records
+        )
+    finally:
+        conn.close()
+
+
 # --- T9: same-file module constant folding -----------------------------------
 
 

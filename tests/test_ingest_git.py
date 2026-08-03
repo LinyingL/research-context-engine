@@ -125,6 +125,23 @@ def test_list_source_files_groups_tracked_files_and_writes_no_nodes(repo, conn):
     assert conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 0
 
 
+# -- W1: md/r/rmd/data categories (added alongside rce.ingest.files) ----------
+def test_list_source_files_categorizes_md_r_rmd_and_data(repo, conn):
+    (repo / "notes.md").write_text("# Notes\n")
+    (repo / "analysis.R").write_text("x <- 1\n")
+    (repo / "report.Rmd").write_text("---\ntitle: x\n---\n")
+    (repo / "data.csv").write_text("a,b\n1,2\n")
+    (repo / "data.json").write_text("{}")
+    _git(repo, "add", "notes.md", "analysis.R", "report.Rmd", "data.csv", "data.json")
+    _git(repo, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "add sources")
+
+    inventory = git_ingest.list_source_files(repo)
+    assert inventory["md"] == ["notes.md"]
+    assert inventory["r"] == ["analysis.R"]
+    assert inventory["rmd"] == ["report.Rmd"]
+    assert sorted(inventory["data"]) == ["data.csv", "data.json"]
+
+
 # -- non-ASCII path bug fix ----------------------------------------------------
 # Real repro: git's default core.quotepath=true octal-escapes and
 # double-quotes any path containing non-ASCII bytes for `git ls-files` /

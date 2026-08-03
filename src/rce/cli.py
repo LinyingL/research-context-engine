@@ -5,6 +5,18 @@ stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
 (section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow -> wandb);
 writes only via db.upsert_node/upsert_edge, no new graph mutation logic here.
+
+W1: `cmd_ingest` catches `git_ingest.NotAGitRepositoryError` specifically
+(a project root that is not a git repository at all -- the common case for
+a researcher's working directory that was never `git init`ed) and degrades
+rather than aborting: it prints one explanatory line, skips commit/
+contributor ingestion (nothing to read), and gets the file inventory from
+`rce.ingest.files.list_source_files` (a plain filesystem walk) instead of
+`git_ingest.list_source_files`. Every other extractor still runs. A git
+repository's behavior is unchanged -- this only branches on the specific
+"not a repository" failure, not `GitIngestError` in general, which still
+aborts the whole ingest as before (missing git binary, permission error,
+a corrupt repo, ...).
 `trace` reuses rce.query.trace() directly -- multi-hop traversal logic lives
 in exactly one place.
 
@@ -41,6 +53,7 @@ from typing import Any
 from rce import consistency, db, query
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import claims as claims_ingest
+from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
 from rce.ingest import mlflow as mlflow_ingest
@@ -228,10 +241,30 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             print(f"Ingesting {project_root}")
             try:
                 commits = git_ingest.ingest_git_repo(conn, project_root)
-                inventory = git_ingest.list_source_files(project_root)
+            except git_ingest.NotAGitRepositoryError:
+                # W1: a project root with no git repository at all is a
+                # normal, supported case, not a fatal one -- commit/
+                # contributor nodes are simply unavailable (there is no
+                # commit history to read), so the file inventory falls back
+                # to a plain filesystem walk (rce.ingest.files, no
+                # .gitignore to consult) and every other extractor still
+                # runs against it. pyfig degrades its own `generates` edges
+                # separately (see rce.ingest.pyfig.ingest_pyfig_repo) since
+                # it additionally needs a commit source node per call site.
+                print(
+                    "  git: no git repository -- commit/contributor nodes unavailable; "
+                    "using filesystem scan for the file inventory"
+                )
+                commits = 0
+                inventory = files_ingest.list_source_files(project_root)
             except git_ingest.GitIngestError as exc:
                 raise CliError(f"git ingestion failed: {exc}") from exc
-            print(f"  git: {commits} commit(s) ingested")
+            else:
+                try:
+                    inventory = git_ingest.list_source_files(project_root)
+                except git_ingest.GitIngestError as exc:
+                    raise CliError(f"git ingestion failed: {exc}") from exc
+                print(f"  git: {commits} commit(s) ingested")
             # inventory["image"] lets the latex ingester reject "ghost figures"
             # (\includegraphics targets not actually tracked in the repo, T5.5
             # review item 2) -- this cli entry point always passes it; the
