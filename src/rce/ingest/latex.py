@@ -92,6 +92,23 @@ def _strip_comment(line: str) -> str:
 def _slugify(title: str) -> str:
     return _SLUG_INVALID_RE.sub("-", title.strip().lower()).strip("-") or "section"
 
+def _dedupe_slug(title: str, slug_counts: dict[str, int]) -> str:
+    """Slugify `title` (see _slugify) and disambiguate a repeated slug within
+    one file by appending -2, -3, ... in encounter order, mutating
+    `slug_counts` as it goes.
+
+    Extracted (task W3) so this exact numbering convention is shared
+    verbatim by `parse_tex_file` below (LaTeX \\section/\\subsection) and
+    `rce.ingest.mdpaper.parse_md_file` (Markdown ATX headings) -- a project
+    mixing both source formats must see identical collision-numbering
+    behavior for a repeated section title, not two subtly different
+    implementations that could drift apart.
+    """
+    base_slug = _slugify(title)
+    seen = slug_counts.get(base_slug, 0)
+    slug_counts[base_slug] = seen + 1
+    return base_slug if seen == 0 else f"{base_slug}-{seen + 1}"
+
 def _resolve_figure_path(tex_rel_path: str, graphics_dir: str | None, raw_path: str) -> str | None:
     """Resolve relative to the .tex file, with basic \\graphicspath support
     (first declared directory only -- v0 simplification, see deviations).
@@ -218,10 +235,7 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
         sec_match = _SECTION_RE.search(line)
         if sec_match:
             level, title = sec_match.group(1), sec_match.group(2).strip()
-            base_slug = _slugify(title)
-            seen = slug_counts.get(base_slug, 0)
-            slug = base_slug if seen == 0 else f"{base_slug}-{seen + 1}"
-            slug_counts[base_slug] = seen + 1
+            slug = _dedupe_slug(title, slug_counts)
             current_id = f"section:{tex_rel_path}#{slug}"
             sections.append(ParsedSection(current_id, title, level, lineno))
             section_attrs[current_id] = {"labels": [], "refs": []}

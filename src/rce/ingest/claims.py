@@ -68,7 +68,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
-from rce.ingest.latex import _strip_comment, parse_tex_file
+from rce.ingest.latex import ParsedSection, _strip_comment, parse_tex_file
 
 logger = logging.getLogger(__name__)
 
@@ -179,9 +179,24 @@ _NUM = r"\d+(?:\.\d+)?"
 # Alternation order is significant: SI/percent forms are tried before the
 # generic "plain" form so e.g. "87.3\%"'s digits are claimed by the percent
 # branch, not partially matched as a bare "87.3" with a stray "\%" left over.
+#
+# `\\?%` (task W3, Markdown support): the backslash is now OPTIONAL, not
+# required. This is a deliberately shared regex (rce.ingest.mdpaper.
+# parse_md_claims runs it too, via _scan_claims_in_lines below), and the two
+# formats spell a literal percent sign differently -- LaTeX always escapes
+# it ("87.3\%"; an *unescaped* "%" in .tex source is a comment marker, and
+# _strip_comment above has already dropped it and everything after it on
+# that line by the time this regex ever runs, so a bare "%" can never reach
+# here from real .tex input) while Markdown never escapes it ("87.3%", no
+# comment-marker meaning at all). Making the backslash optional is provably
+# a no-op for existing LaTeX behavior (there is no way for an unescaped "%"
+# to survive _strip_comment and reach this regex) and is what lets a
+# Markdown "92.1%" register as a percent claim (value 0.921) instead of
+# silently falling through to the generic "plain" branch as a bare 92.1 --
+# which would never match a real experiment metric normalized to [0, 1].
 _CLAIM_RE = re.compile(
     rf"\\SI\{{(?P<si>{_NUM})\}}\{{\\percent\}}"
-    rf"|(?P<pct>{_NUM})\\%"
+    rf"|(?P<pct>{_NUM})\\?%"
     rf"|(?<!\\)\$\s*(?P<math>\d+\.\d+)\s*\$"
     rf"|(?<![\w.\\])(?P<plain>\d+\.\d+)(?!\.\d)(?!\w)"
 )
@@ -339,24 +354,26 @@ class ParsedClaim:
     precision_decimals: int  # rounding precision derived from `raw`
 
 
-def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedClaim]:
-    """Scan one .tex file for quantitative prose claims. Reuses
-    `latex.parse_tex_file`'s already-computed section list purely to look up
-    which section a claim's line falls under -- no section-parsing logic is
-    duplicated here."""
-    repo_root = Path(repo_root)
-    text = (repo_root / tex_rel_path).read_text(errors="replace")
-    raw_lines = text.splitlines()
-    stripped = [_strip_comment(line) for line in raw_lines]
-    no_command_args = [_blank_command_args(line) for line in stripped]
-    blanked = _blank_skip_regions(no_command_args)
+def _scan_claims_in_lines(
+    rel_path: str, lines: list[str], sections: list[ParsedSection]
+) -> list[ParsedClaim]:
+    """Shared number-matching core (DESIGN.md section 5 connector 7): given
+    lines already blanked of every non-prose span, plus an ascending-by-line
+    section list, scan for quantitative claims -- recognised forms, the
+    compound-modifier skip, sentence extraction, and content-addressed id
+    construction.
 
-    sections = parse_tex_file(repo_root, tex_rel_path).sections  # ascending by line
-
+    Extracted (task W3) so this exact logic is shared verbatim by
+    `parse_tex_claims` below (LaTeX -- blanks \\-commands/table/equation
+    environments upstream) and `rce.ingest.mdpaper.parse_md_claims`
+    (Markdown -- blanks fenced code blocks/table rows upstream instead).
+    Only the blanking differs per format; the number-recognition, skip, and
+    id rules must never be duplicated between the two.
+    """
     claims: list[ParsedClaim] = []
     sec_idx = 0
     current_section_id: str | None = None
-    for lineno, line in enumerate(blanked, start=1):
+    for lineno, line in enumerate(lines, start=1):
         while sec_idx < len(sections) and sections[sec_idx].line <= lineno:
             current_section_id = sections[sec_idx].id
             sec_idx += 1
@@ -368,7 +385,7 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
                     "%s:%d: skipping %r -- number immediately followed by a "
                     "hyphenated word (compound modifier, e.g. \"1.58-bit\"), "
                     "not a prose claim",
-                    tex_rel_path, lineno, m.group(0),
+                    rel_path, lineno, m.group(0),
                 )
                 continue
             if m.group("si") is not None:
@@ -386,8 +403,8 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
             sentence = _extract_sentence(line, m.start(), m.end())
             claims.append(
                 ParsedClaim(
-                    id=_content_id(tex_rel_path, current_section_id, sentence, m.group(0), seq_in_sentence),
-                    tex_path=tex_rel_path,
+                    id=_content_id(rel_path, current_section_id, sentence, m.group(0), seq_in_sentence),
+                    tex_path=rel_path,
                     line=lineno,
                     section_id=current_section_id,
                     sentence=sentence,
@@ -399,6 +416,23 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
                 )
             )
     return claims
+
+
+def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedClaim]:
+    """Scan one .tex file for quantitative prose claims. Reuses
+    `latex.parse_tex_file`'s already-computed section list purely to look up
+    which section a claim's line falls under -- no section-parsing logic is
+    duplicated here. The actual number-matching happens in
+    `_scan_claims_in_lines`, shared with the Markdown extractor (see there)."""
+    repo_root = Path(repo_root)
+    text = (repo_root / tex_rel_path).read_text(errors="replace")
+    raw_lines = text.splitlines()
+    stripped = [_strip_comment(line) for line in raw_lines]
+    no_command_args = [_blank_command_args(line) for line in stripped]
+    blanked = _blank_skip_regions(no_command_args)
+
+    sections = parse_tex_file(repo_root, tex_rel_path).sections  # ascending by line
+    return _scan_claims_in_lines(tex_rel_path, blanked, sections)
 
 
 def _collect_experiment_metrics(conn: Connection) -> list[tuple[str, str, float]]:
@@ -477,12 +511,33 @@ def _cleanup_orphaned_claims(
     }
 
 
-def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[str]) -> dict[str, int]:
-    """Ingest claim nodes and candidate (pending) backed_by edges.
+def ingest_parsed_claims(
+    conn: Connection, parsed_by_path: dict[str, list[ParsedClaim]],
+) -> dict[str, int]:
+    """Write claim nodes + candidate (pending) backed_by edges for an
+    already-parsed set of claims, one list per source file, then clean up
+    orphans scoped to exactly those files (F2, see `_cleanup_orphaned_claims`).
 
-    Must run after experiment nodes exist (mlflow/wandb) -- with none yet in
-    the graph, every claim would trivially get zero candidates. Idempotent
-    via db.upsert_node/upsert_edge.
+    Extracted (task W3) so this one write path is shared by
+    `ingest_claims_repo` (LaTeX, below) and `rce.ingest.mdpaper.ingest_md_repo`
+    (Markdown) -- both do their own format-specific parsing (blanking
+    commands/environments here, code fences/tables there -- see
+    `_scan_claims_in_lines`) and hand the resulting `ParsedClaim` lists to
+    this one function, so the node/edge-writing, candidate-matching, and
+    orphan-cleanup logic is never duplicated between the two formats.
+    `extractor="claims"` is written for every backed_by edge below
+    regardless of source format: it names the matching *algorithm*
+    (deterministic rounding-precision comparison), not the file type, and
+    both formats share that exact algorithm via this one function.
+
+    `parsed_by_path`'s keys double as the orphan-cleanup scope (this
+    function's own `scanned_tex_paths` argument to `_cleanup_orphaned_claims`):
+    a caller must include an entry (even an empty list) for every source file
+    it *successfully* parsed this run, and omit a file it failed to read
+    entirely -- see `ingest_claims_repo`'s OSError handling below for why a
+    read failure must never be treated as evidence a file's claims are gone.
+
+    Idempotent via db.upsert_node/upsert_edge.
 
     confidence is always 1.0, whether a claim has one candidate or several
     (Owner decision, P2). Precision-matching itself is deterministic and
@@ -499,13 +554,6 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
     `evidence["candidate_count"]`, and every candidate is still written
     `status="pending"` regardless of count -- ambiguity is visible in the
     evidence, not laundered into the confidence number.
-
-    After (re-)ingesting every successfully-read tex path, orphaned claim
-    nodes from those same paths -- ones this extractor produced before but
-    did not produce again this run -- are cleaned up; see
-    `_cleanup_orphaned_claims` (F2). A path that fails to read (below) is
-    excluded from that cleanup scope, not treated as evidence its claims are
-    gone.
 
     Three separate layers of identity are load-bearing here (DESIGN.md
     section 4, architecture ruling 2026-07-27) -- conflating any two of them
@@ -547,20 +595,23 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
         --pending`, `rce trace`/`--json`, `rce query`, and the MCP
         `rce_trace` tool) gets one consistent number from, instead of each
         display path growing its own copy.
+
+    `attrs["tex_path"]`/`evidence["file"]` below use the literal key name
+    `tex_path` even for a claim parsed from Markdown by
+    `rce.ingest.mdpaper` -- this is a deliberate, documented reuse, not an
+    oversight: `rce.query.claim_source_location` (the single place a
+    claim's source file is ever resolved for `status --pending`/`trace`/the
+    MCP server) reads `attrs["tex_path"]` by that literal name, so keeping
+    it means Markdown claims get working source-location resolution for
+    free through this one shared function; renaming it to something
+    format-neutral would require touching `rce.query` and every existing
+    consumer for a purely cosmetic gain, which is out of scope here.
     """
     counts = {"claims": 0, "candidates": 0}
     metrics = _collect_experiment_metrics(conn)
     seen_ids: set[str] = set()
-    scanned_paths: set[str] = set()
 
-    for tex_rel_path in tex_paths:
-        try:
-            claims = parse_tex_claims(repo_root, tex_rel_path)
-        except OSError as exc:
-            logger.warning("cannot read tex file %s: %s", tex_rel_path, exc)
-            continue
-        scanned_paths.add(tex_rel_path)
-
+    for claims in parsed_by_path.values():
         for claim in claims:
             seen_ids.add(claim.id)
             attrs: dict[str, Any] = {
@@ -584,7 +635,7 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
             if candidate_count > 1:
                 logger.info(
                     "%s:%d: claim %r has %d backed_by candidates: %s",
-                    tex_rel_path, claim.line, claim.raw, candidate_count,
+                    claim.tex_path, claim.line, claim.raw, candidate_count,
                     ", ".join(f"{eid}:{name}" for eid, name, _ in matches),
                 )
             for exp_id, metric_name, metric_value in matches:
@@ -621,5 +672,30 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
                 )
                 counts["candidates"] += 1
 
-    counts.update(_cleanup_orphaned_claims(conn, scanned_paths, seen_ids))
+    counts.update(_cleanup_orphaned_claims(conn, set(parsed_by_path.keys()), seen_ids))
     return counts
+
+
+def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[str]) -> dict[str, int]:
+    """Ingest claim nodes and candidate (pending) backed_by edges from LaTeX
+    sources: parses every path with `parse_tex_claims`, then hands the
+    result to `ingest_parsed_claims` (the write path shared with Markdown,
+    see there for the full node/edge/orphan-cleanup contract).
+
+    Must run after experiment nodes exist (mlflow/wandb) -- with none yet in
+    the graph, every claim would trivially get zero candidates.
+
+    A tex path that fails to read is logged and excluded from
+    `parsed_by_path` entirely, which in turn excludes it from
+    `ingest_parsed_claims`'s orphan-cleanup scope -- a transient read
+    failure must never be treated as evidence that file's claims are gone
+    (DESIGN.md section 0, "never guess"; see `_cleanup_orphaned_claims`).
+    """
+    parsed_by_path: dict[str, list[ParsedClaim]] = {}
+    for tex_rel_path in tex_paths:
+        try:
+            parsed_by_path[tex_rel_path] = parse_tex_claims(repo_root, tex_rel_path)
+        except OSError as exc:
+            logger.warning("cannot read tex file %s: %s", tex_rel_path, exc)
+            continue
+    return ingest_parsed_claims(conn, parsed_by_path)

@@ -2,10 +2,15 @@
 `trace` / `confirm` (F3) / `judge` (S2, optional semantic layer).
 
 stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
-the existing extractors (rce.ingest.git/latex/dataflow/pyfig/mlflow/wandb)
-and rce.db (section 7 Phase A order: git -> latex/.bib -> dataflow (task W2,
-data lineage) -> pyfig -> mlflow -> wandb); writes only via
-db.upsert_node/upsert_edge, no new graph mutation logic here.
+the existing extractors (rce.ingest.git/latex/dataflow/pyfig/mlflow/wandb/
+mdpaper/claims) and rce.db (section 7 Phase A order: git -> latex/.bib ->
+dataflow (task W2, data lineage) -> pyfig -> mlflow -> wandb -> mdpaper
+(task W3, Markdown paper support) -> claims); writes only via
+db.upsert_node/upsert_edge, no new graph mutation logic here. mdpaper runs
+after mlflow/wandb (same experiment-nodes-must-exist-first requirement the
+tex claims step has) and before the tex claims step, since both need
+section/experiment state already in place before generating their own
+backed_by candidates.
 
 W1: `cmd_ingest` catches `git_ingest.NotAGitRepositoryError` specifically
 (a project root that is not a git repository at all -- the common case for
@@ -58,6 +63,7 @@ from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
+from rce.ingest import mdpaper as mdpaper_ingest
 from rce.ingest import mlflow as mlflow_ingest
 from rce.ingest import pyfig as pyfig_ingest
 from rce.ingest import wandb as wandb_ingest
@@ -317,6 +323,21 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 print(f"  wandb: {args.wandb} -> {_format_counts(wandb_counts)}")
             else:
                 print("  wandb: skipped (no --wandb given)")
+            # Task W3: Markdown paper support (headings/figures/claims for
+            # .md sources -- a research project is often 88 .md files, not
+            # LaTeX). Runs after mlflow/wandb for the same reason the tex
+            # claims step just below must: it generates its own backed_by
+            # candidates against experiment metrics internally, so those
+            # nodes need to already exist or every markdown claim would
+            # trivially get zero candidates (see rce.ingest.mdpaper).
+            md_counts = mdpaper_ingest.ingest_md_repo(
+                conn, project_root, inventory["md"], image_paths=inventory["image"],
+            )
+            print(
+                f"  mdpaper: {len(inventory['md'])} .md scanned "
+                f"({md_counts['md_skipped_non_paper']} skipped as README/CHANGELOG/LICENSE) "
+                f"-> {_format_counts(md_counts)}"
+            )
             # Phase B (task B1): claim extraction + deterministic backed_by
             # candidate generation. Must run last -- it matches claim
             # numbers against experiment nodes' metrics, so mlflow/wandb

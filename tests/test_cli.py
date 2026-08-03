@@ -200,6 +200,42 @@ def test_ingest_reports_dataflow_summary_and_creates_lineage_nodes(tmp_path, cap
         conn.close()
 
 
+# -- task W3: rce.ingest.mdpaper wired into `rce ingest`, after wandb/before claims --
+
+
+def test_ingest_reports_mdpaper_summary_and_creates_claim_backed_by_edge(tmp_path, capsys):
+    """W3: cli.py orchestrates rce.ingest.mdpaper -- a .md paper's heading
+    becomes a section, and its quantitative claim gets a pending backed_by
+    edge once a matching MLflow metric exists, exactly like a .tex claim
+    would (same shared write path, see rce.ingest.claims.ingest_parsed_claims).
+    A README.md alongside it must be counted as skipped, not ingested."""
+    project = tmp_path / "proj"
+    project.mkdir()  # deliberately never `git init`ed, like W1/W2's own tests above
+    (project / "paper.md").write_text("# Results\n\nOur model achieves 87.3% accuracy.\n")
+    (project / "README.md").write_text("# Not a paper\n\nJust a readme.\n")
+    run_dir = project / "mlruns" / "0" / "run_a"
+    (run_dir / "metrics").mkdir(parents=True)
+    (run_dir / "meta.yaml").write_text("experiment_id: '0'\nrun_id: run_a\nstatus: FINISHED\n")
+    (run_dir / "metrics" / "accuracy").write_text("0 0.873 0\n")
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["ingest", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "mdpaper: 2 .md scanned (1 skipped as README/CHANGELOG/LICENSE)" in out
+    assert all(s in out for s in ("sections=1", "figures=0", "claims=1", "candidates=1"))
+
+    conn = db.connect(project / ".rce" / "graph.db")
+    try:
+        assert db.get_node(conn, "section:paper.md#results")["type"] == "section"
+        assert db.get_node(conn, "section:README.md#not-a-paper") is None  # README never ingested
+        edges = db.query_edges(conn, type="backed_by")
+        assert len(edges) == 1
+        assert edges[0]["dst"] == "experiment:run_a" and edges[0]["status"] == "pending"
+    finally:
+        conn.close()
+
+
 # -- T5.5 review item 5: `rce init` gitignore tip --
 
 
