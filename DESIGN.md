@@ -718,6 +718,41 @@ name that doesn't exist there is discarded as a hallucination, logged, and
 never written. `status` is untouched either way — see "Machine annotation
 vs. human judgement" below.
 
+Also now, though it predates this roadmap section's own last update: the W2
+data-lineage extractor (`rce.ingest.dataflow`) statically scans `.py`/`.R`/
+`.Rmd` sources for recognized read/write calls (`pd.read_csv`/`to_csv`,
+`open()`, `read.csv`/`write.csv`, `ggsave`, ...) into
+`script --reads/writes--> dataset|figure` edges — no model, no git required
+(unlike `rce.ingest.pyfig`'s `generates` edge, whose src is resolved via
+`git blame`). `rce lineage` (W4) is the read-only report surface over that
+graph, and the one new user-facing exit this round: it writes nothing and
+re-parses no source file, only querying edges `rce ingest` already wrote.
+Four blocks, each scoped precisely rather than uniformly: **orphan inputs**
+(a `dataset` read by a script but written by none — "where did this input
+data actually come from", scoped to `dataset` only, since a `figure` is
+normally an output, never an input a script reads back) and **duplicate
+copies** (a read `dataset` whose basename also exists at other paths in the
+project — "which of the N copies did the script actually read", again
+`dataset`-only for the same reason) sit next to **lineage chains** (a
+`dataset` *or* `figure` with both a writer and a reader — a produced-and-
+consumed plot is exactly as traceable a chain link as a produced-and-
+consumed dataset, so `figure` is included here) and **broken links** (any
+`reads`/`writes` occurrence whose evidence carries `missing: true`,
+regardless of node type — a script pointing at a file that genuinely isn't
+on disk is the same finding whether that file would have been a dataset or
+a figure). `--orphans` narrows the report to the first block alone; `--json`
+gives the same four blocks as structured output. The command exits 1 if
+either orphan inputs or broken links were found (the two blocks that
+represent an actual gap) and 0 otherwise — chains and duplicates are
+informational and never affect the exit code. An empty block is simply
+omitted; only when every block is genuinely empty does the report say so
+explicitly, stating what was scanned (script/edge/target counts) and that
+none of it matched any of the four patterns — never a bare success line
+with no content behind it, the same "a missing finding is a normal outcome,
+but it must be stated, not indistinguishable from nothing having run"
+posture Section 0 already asks of every other check in this document (see
+e.g. `rce attempts --check`'s own coverage reporting above).
+
 **Next.** Proposing `supports` edges (a figure substantiates an argument)
 with confidence scores, every proposal verified against the graph before it
 is stored and queued for human confirmation when uncertain. Still optional

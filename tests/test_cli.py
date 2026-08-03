@@ -89,7 +89,9 @@ def test_init_creates_db_and_project_node_idempotently(tmp_path, capsys):
     assert "Initialized RCE project" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("argv", [["ingest", "PROJECT"], ["status"], ["query", "commit:deadbeef"]])
+@pytest.mark.parametrize(
+    "argv", [["ingest", "PROJECT"], ["status"], ["query", "commit:deadbeef"], ["lineage"]]
+)
 def test_commands_without_init_report_clear_error(tmp_path, monkeypatch, capsys, argv):
     project = tmp_path / "proj"
     project.mkdir()
@@ -614,3 +616,189 @@ def test_confirm_then_reingest_never_overwrites_human_judgement(claim_repo, caps
         assert updated["status"] == "confirmed"
     finally:
         conn.close()
+
+
+# -- task W4: `rce lineage` -- read-only four-block report over W2's dataflow graph --
+
+
+@pytest.fixture
+def lineage_project(tmp_path: Path) -> Path:
+    """A project exercising all four `rce lineage` blocks at once:
+
+    - `data/orphan_input.csv`: read by gen.py, written by nothing -- orphan.
+    - `data/topicshift_monthly.csv`: written by gen.py, read by analysis.Rmd,
+      and pre-created on disk so *both* occurrences are missing=False --
+      a clean chain, deliberately kept free of the broken-link finding
+      below so block 2 has one unambiguous, non-overlapping example. It
+      also has a same-named copy under archive/, for block 4.
+    - `data/gone_missing.csv`: read by gen.py but never created on disk and
+      never written by anything -- both an orphan (block 1) AND a broken
+      link (block 3) at once, a deliberately realistic overlap (a script
+      reading a file nobody regenerates) rather than an artifact to avoid.
+
+    Deliberately never `git init`ed (like the W1/W2 CLI tests above) --
+    dataflow needs no git repository, and this keeps the fixture minimal.
+    """
+    project = tmp_path / "proj"
+    _write(project, {
+        "gen.py": (
+            "import pandas as pd\n"
+            "raw = pd.read_csv('data/orphan_input.csv')\n"  # orphan: no writer anywhere
+            "raw.to_csv('data/topicshift_monthly.csv')\n"  # chain writer (target pre-exists below)
+            "missing_df = pd.read_csv('data/gone_missing.csv')\n"  # orphan + broken: never created
+        ),
+        "analysis.Rmd": (
+            "```{r}\n"
+            "d <- read_csv(\"data/topicshift_monthly.csv\")\n"  # chain reader
+            "```\n"
+        ),
+    })
+    (project / "data").mkdir()
+    (project / "data" / "orphan_input.csv").write_text("a,b\n1,2\n")
+    (project / "data" / "topicshift_monthly.csv").write_text("a,b\n3,4\n")
+    (project / "archive").mkdir()
+    (project / "archive" / "topicshift_monthly.csv").write_text("dup\n")  # duplicate-named copy
+    return project
+
+
+def test_lineage_reports_all_four_blocks_and_exits_1(lineage_project, capsys):
+    cli.main(["init", str(lineage_project)])
+    cli.main(["ingest", str(lineage_project)])
+    capsys.readouterr()
+
+    assert cli.main(["lineage", str(lineage_project)]) == 1
+    out = capsys.readouterr().out
+
+    assert (
+        "scanned 2 script node(s) -> 3 reads edge(s), 1 writes edge(s) "
+        "across 3 dataset/figure target(s)" in out
+    )
+
+    assert "Orphan inputs -- read but never written (2):" in out
+    assert "data/orphan_input.csv" in out
+    assert "data/gone_missing.csv" in out
+    assert "<- read by gen.py:2 (pd.read_csv)" in out
+    assert "<- read by gen.py:4 (pd.read_csv)" in out
+
+    assert "Lineage chains (1):" in out
+    assert "data/topicshift_monthly.csv" in out
+    assert "<- written by gen.py:3 (raw.to_csv)" in out
+    assert "-> read by analysis.Rmd:2 (read_csv)" in out
+
+    assert "Broken links -- evidence.missing=true (1):" in out
+    assert "gen.py:4 reads data/gone_missing.csv (not found on disk)" in out
+
+    assert "Duplicate copies (1):" in out
+    assert "data/topicshift_monthly.csv (this is the copy actually read)" in out
+    assert "also exists at: archive/topicshift_monthly.csv" in out
+
+
+def test_lineage_orphans_flag_prints_only_block_one(lineage_project, capsys):
+    cli.main(["init", str(lineage_project)])
+    cli.main(["ingest", str(lineage_project)])
+    capsys.readouterr()
+
+    assert cli.main(["lineage", str(lineage_project), "--orphans"]) == 1
+    out = capsys.readouterr().out
+
+    assert "Orphan inputs -- read but never written (2):" in out
+    assert "data/orphan_input.csv" in out
+    assert "data/gone_missing.csv" in out
+    for absent in ("Lineage chains", "Broken links", "Duplicate copies"):
+        assert absent not in out
+
+
+def test_lineage_json_output_matches_all_four_blocks(lineage_project, capsys):
+    cli.main(["init", str(lineage_project)])
+    cli.main(["ingest", str(lineage_project)])
+    capsys.readouterr()
+
+    assert cli.main(["lineage", str(lineage_project), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["scanned"] == {
+        "scripts": 2, "reads_edges": 3, "writes_edges": 1, "targets": 3,
+    }
+    assert [o["path"] for o in payload["orphans"]] == [
+        "data/gone_missing.csv", "data/orphan_input.csv",
+    ]
+    assert [c["path"] for c in payload["chains"]] == ["data/topicshift_monthly.csv"]
+    assert payload["broken_links"] == [{
+        "script": "gen.py", "line": 4, "callee": "pd.read_csv",
+        "kind": "reads", "target": "data/gone_missing.csv",
+    }]
+    assert payload["duplicates"] == [{
+        "target": "dataset:data/topicshift_monthly.csv",
+        "path": "data/topicshift_monthly.csv",
+        "other_copies": ["archive/topicshift_monthly.csv"],
+    }]
+
+
+def test_lineage_json_orphans_flag_narrows_payload(lineage_project, capsys):
+    cli.main(["init", str(lineage_project)])
+    cli.main(["ingest", str(lineage_project)])
+    capsys.readouterr()
+
+    cli.main(["lineage", str(lineage_project), "--orphans", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"scanned", "orphans"}
+
+
+def test_lineage_empty_project_explains_scan_scope_instead_of_bare_ok(tmp_path, capsys):
+    """The product red line this task exists to enforce: an empty result
+    must never print as a bare status line -- it must say what was scanned
+    and why nothing came of it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.main(["init", str(project)])
+    cli.main(["ingest", str(project)])  # no .py/.R/.Rmd at all -- dataflow finds nothing
+    capsys.readouterr()
+
+    assert cli.main(["lineage", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "scanned 0 script node(s) -> 0 reads edge(s), 0 writes edge(s)" in out
+    assert "Nothing to report" in out
+    assert out.strip() != "OK"
+
+
+def test_lineage_orphans_flag_empty_also_explains_scope(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.main(["init", str(project)])
+    cli.main(["ingest", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["lineage", str(project), "--orphans"]) == 0
+    out = capsys.readouterr().out
+    assert "No orphan inputs found" in out
+    assert "scanned 0 script node(s)" in out
+
+
+def test_lineage_clean_chain_with_no_orphans_or_broken_links_exits_0(tmp_path, capsys):
+    """A project with a real, fully-resolved chain and nothing else wrong
+    exits 0 -- duplicates/chains are informational, only orphans and broken
+    links represent an actual gap (per the task's own exit-code rule).
+    `clean.csv` is synthesized (no read call at all), not read from another
+    tracked file, and pre-created on disk before ingest -- so the only
+    dataset in this graph has a writer and a reader and nothing else."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "data").mkdir()
+    (project / "data" / "clean.csv").write_text("a\n1\n2\n")
+    (project / "gen.py").write_text(
+        "import pandas as pd\n"
+        "df = pd.DataFrame({'a': [1, 2]})\n"
+        "df.to_csv('data/clean.csv')\n"
+    )
+    (project / "report.py").write_text("import pandas as pd\npd.read_csv('data/clean.csv')\n")
+    cli.main(["init", str(project)])
+    cli.main(["ingest", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["lineage", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Lineage chains (1):" in out
+    assert "data/clean.csv" in out
+    assert "Nothing to report" not in out
+    assert "Orphan inputs" not in out
+    assert "Broken links" not in out

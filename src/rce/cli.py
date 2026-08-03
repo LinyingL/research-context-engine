@@ -1,5 +1,6 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query` /
-`trace` / `confirm` (F3) / `judge` (S2, optional semantic layer).
+`trace` / `confirm` (F3) / `judge` (S2, optional semantic layer) / `lineage`
+(W4, read-only four-block report over task W2's dataflow graph).
 
 stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/dataflow/pyfig/mlflow/wandb/
@@ -24,7 +25,10 @@ repository's behavior is unchanged -- this only branches on the specific
 aborts the whole ingest as before (missing git binary, permission error,
 a corrupt repo, ...).
 `trace` reuses rce.query.trace() directly -- multi-hop traversal logic lives
-in exactly one place.
+in exactly one place. `lineage` (W4) reuses rce.lineage.build_lineage_report()
+the same way -- it is a pure read over edges `rce ingest` already wrote (task
+W2's dataflow extractor), never a re-parse of source files and never a write
+path; see rce.lineage's own module docstring for the four blocks it reports.
 
 A project is "initialized" once `<root>/.rce/graph.db` exists (`rce init`);
 every other command requires that file and errors clearly if absent (no
@@ -56,7 +60,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import consistency, db, query
+from rce import consistency, db, lineage, query
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import claims as claims_ingest
 from rce.ingest import dataflow as dataflow_ingest
@@ -737,6 +741,111 @@ def cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_lineage_entry(entry: dict[str, Any]) -> str:
+    return f"{entry['script']}:{entry['line']} ({entry['callee']})"
+
+
+def _format_lineage_human(report: dict[str, Any], orphans_only: bool) -> str:
+    """Human-readable rendering of `rce.lineage.build_lineage_report`'s four
+    blocks. Per-block rule: a block is only headed and listed when it
+    actually has content -- an empty block is not padded out with a "none
+    found" line of its own, matching the task's own spec ("每块有内容才打").
+    The one exception is when there is truly nothing to say at all (every
+    block empty, or -- in --orphans mode -- the one block being shown is
+    empty): that case is never left silent or rendered as a bare "OK". It
+    states what was actually scanned and why the result is empty instead
+    (DESIGN.md section 0: a missing finding is a normal outcome, but it must
+    still be stated, never indistinguishable from "nothing was checked").
+    """
+    scanned = report["scanned"]
+    scan_note = (
+        f"scanned {scanned['scripts']} script node(s) -> {scanned['reads_edges']} reads "
+        f"edge(s), {scanned['writes_edges']} writes edge(s) across {scanned['targets']} "
+        f"dataset/figure target(s)"
+    )
+    lines = [f"Lineage report ({scan_note}):"]
+
+    orphans = report["orphans"]
+    if orphans:
+        lines.append(f"\nOrphan inputs -- read but never written ({len(orphans)}):")
+        for o in orphans:
+            lines.append(f"  {o['path']}")
+            for r in o["readers"]:
+                lines.append(f"    <- read by {_format_lineage_entry(r)}")
+    elif orphans_only:
+        lines.append(
+            f"\nNo orphan inputs found ({scan_note}): every dataset read here has at "
+            "least one writer, or nothing here reads a dataset at all."
+        )
+
+    if orphans_only:
+        return "\n".join(lines)
+
+    chains = report["chains"]
+    if chains:
+        lines.append(f"\nLineage chains ({len(chains)}):")
+        for c in chains:
+            lines.append(f"  {c['path']}")
+            for w in c["writers"]:
+                lines.append(f"    <- written by {_format_lineage_entry(w)}")
+            for r in c["readers"]:
+                lines.append(f"    -> read by {_format_lineage_entry(r)}")
+
+    broken = report["broken_links"]
+    if broken:
+        lines.append(f"\nBroken links -- evidence.missing=true ({len(broken)}):")
+        for b in broken:
+            lines.append(f"  {b['script']}:{b['line']} {b['kind']} {b['target']} (not found on disk)")
+
+    duplicates = report["duplicates"]
+    if duplicates:
+        lines.append(f"\nDuplicate copies ({len(duplicates)}):")
+        for d in duplicates:
+            lines.append(f"  {d['path']} (this is the copy actually read)")
+            for other in d["other_copies"]:
+                lines.append(f"    also exists at: {other}")
+
+    if not (orphans or chains or broken or duplicates):
+        lines.append(
+            f"\nNothing to report: {scan_note}, and none of it matched an orphan-input, "
+            "lineage-chain, broken-link, or duplicate-copy pattern."
+        )
+    return "\n".join(lines)
+
+
+def cmd_lineage(args: argparse.Namespace) -> int:
+    """`rce lineage` (task W4): the one new user-facing exit this round --
+    a read-only, four-block report over task W2's dataflow graph
+    (`script --reads/writes--> dataset|figure`). Requires `rce ingest` to
+    have already run, exactly like `query`/`trace`/`status` -- this command
+    writes nothing and re-parses no source file (see rce.lineage's module
+    docstring for the four blocks and their scoping rules).
+
+    `--orphans` narrows the human/`--json` output to block 1 alone. The
+    exit code rule is the same either way: 1 if orphan inputs or broken
+    links were found (the two blocks that represent an actual gap, not
+    merely a fact worth knowing), 0 otherwise -- computed from the full
+    report regardless of which blocks `--orphans` chooses to print, so the
+    exit code never depends on which flag was used to ask.
+    """
+    project_root = _resolve_project_root(args.path)
+    conn = db.connect(_require_db(project_root))
+    try:
+        report = lineage.build_lineage_report(conn, project_root)
+    finally:
+        conn.close()
+
+    if args.json:
+        payload = report if not args.orphans else {
+            "scanned": report["scanned"], "orphans": report["orphans"],
+        }
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(_format_lineage_human(report, args.orphans))
+
+    return 1 if (report["orphans"] or report["broken_links"]) else 0
+
+
 def _import_mcp_server():
     """Lazy import for the optional 'mcp' extra (positioning ruling
     2026-07-22): rce.mcp_server does `from mcp.server.fastmcp import
@@ -843,6 +952,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="output structured JSON instead of human-readable text"
     )
     p.set_defaults(func=cmd_trace)
+
+    p = sub.add_parser(
+        "lineage",
+        help=(
+            "Read-only four-block report over the W2 dataflow graph: orphan inputs, "
+            "lineage chains, broken (missing-on-disk) links, and duplicate-named copies"
+        ),
+    )
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--orphans", action="store_true",
+        help="print only block 1 (data files read by a script but written by none)",
+    )
+    p.add_argument(
+        "--json", action="store_true", help="output structured JSON instead of human-readable text"
+    )
+    p.set_defaults(func=cmd_lineage)
 
     p = sub.add_parser(
         "attempts",

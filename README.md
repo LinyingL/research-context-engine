@@ -28,6 +28,19 @@ its own from the command line.
 - `rce trace <node-id> [--path P] [--hops N] [--json]` — walk the multi-hop
   provenance chain outward from a node (default 4 hops, must be >= 1);
   `--json` for scripting.
+- `rce lineage [<path>] [--orphans] [--json]` — read-only report over the
+  data-lineage graph (`script --reads/writes--> dataset|figure`, built by
+  `rce ingest`): **orphan inputs** (a data file read by a script but written
+  by none — "where did this come from?"), **lineage chains** (a file with
+  both a writer and a reader, shown as `written by file:line` /
+  `read by file:line`), **broken links** (a script reads/writes a file that
+  isn't actually on disk), and **duplicate copies** (a file a script reads
+  has other same-named copies elsewhere in the project — which one did it
+  actually read?). Every block prints only when it has something to say; an
+  entirely empty result states what was scanned and why, never a bare `OK`.
+  `--orphans` narrows the report to the first block alone. Exits 1 if any
+  orphan input or broken link was found, 0 otherwise (duplicates/chains are
+  informational and never affect the exit code).
 - `rce status [--path P] [--pending] [--limit N]` — whole-graph node/edge
   counts and the pending confirmation queue's size; `--pending` also lists
   each pending edge (src/dst/type/extractor/confidence/evidence), so it can
@@ -53,7 +66,9 @@ its own from the command line.
 `--path` defaults to `.` for `query`/`trace`/`status`/`confirm`/`attempts`,
 so they also work by `cd`-ing into the project root first and dropping
 `--path` entirely; `attempts` (like `init`/`ingest`) also accepts the
-project root as a plain positional argument instead.
+project root as a plain positional argument instead. `lineage` follows the
+`init`/`ingest` convention directly: a plain positional `path` (default `.`),
+no separate `--path` flag.
 
 A global `-v`/`--verbose` flag (placed before the subcommand, e.g. `rce -v
 attempts --check`) turns on INFO-level diagnostic logging — skip reasons,
