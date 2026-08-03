@@ -111,8 +111,9 @@ def test_0002_migration_preserves_data_from_0001_only_db(tmp_path):
         edges_before = db.query_edges(conn)
 
         # Now upgrade with the package's real migrations dir: 0001 is already
-        # recorded, so this applies exactly [2].
-        assert db.migrate(conn) == [2]
+        # recorded, so this applies [2, 3] (migration 0003 -- task W2 -- now
+        # also ships in DEFAULT_MIGRATIONS_DIR).
+        assert db.migrate(conn) == [2, 3]
 
         for node_id, before in nodes_before.items():
             assert db.get_node(conn, node_id) == before
@@ -131,7 +132,8 @@ def test_0002_migration_preserves_data_from_0001_only_db(tmp_path):
 def test_0002_migration_applies_cleanly_on_a_fresh_empty_db(tmp_path):
     conn = db.connect(tmp_path / "fresh.db")
     try:
-        assert db.migrate(conn) == [1, 2]
+        # Migration 0003 (task W2) now also ships in DEFAULT_MIGRATIONS_DIR.
+        assert db.migrate(conn) == [1, 2, 3]
         tables = {
             row[0]
             for row in conn.execute(
@@ -141,6 +143,98 @@ def test_0002_migration_applies_cleanly_on_a_fresh_empty_db(tmp_path):
         assert {"nodes", "edges", "schema_migrations"} <= tables
     finally:
         conn.close()
+
+
+# -- migration 0003: dataflow ontology extension (task W2) -----------------
+
+
+def test_0003_migration_preserves_data_from_0001_0002_db(tmp_path):
+    """Same upgrade-path guarantee as 0002's own test, one version later: a
+    project whose .rce/graph.db already ran 0001+0002 (with real rows,
+    including an attempt/uses row exercising 0002's own widened types)
+    picks up 0003 later -- must not lose a single row, and the newly widened
+    CHECK constraints (script/dataset nodes, reads/writes edges) must be
+    live afterward.
+    """
+    db_path = tmp_path / "graph.db"
+    only_0001_0002_dir = tmp_path / "only_0001_0002"
+    only_0001_0002_dir.mkdir()
+    (only_0001_0002_dir / "0001_init.sql").write_text(
+        (db.DEFAULT_MIGRATIONS_DIR / "0001_init.sql").read_text()
+    )
+    (only_0001_0002_dir / "0002_attempt.sql").write_text(
+        (db.DEFAULT_MIGRATIONS_DIR / "0002_attempt.sql").read_text()
+    )
+
+    conn = db.connect(db_path)
+    try:
+        assert db.migrate(conn, only_0001_0002_dir) == [1, 2]
+
+        db.upsert_node(conn, "project:demo", "project", title="Demo")
+        db.upsert_node(conn, "commit:abc123", "commit")
+        db.upsert_node(conn, "figure:fig1.png", "figure")
+        db.upsert_node(conn, "attempt:map.md#1", "attempt", title="attempt 1")
+        db.upsert_edge(
+            conn, "commit:abc123", "figure:fig1.png", "generates",
+            "test-extractor", {"file": "plot.py", "line": 10}, 1.0,
+        )
+        db.upsert_edge(
+            conn, "attempt:map.md#1", "commit:abc123", "uses",
+            "test-extractor", {"file": "map.md", "line": 30}, 1.0,
+        )
+        db.set_edge_status(conn, "commit:abc123", "figure:fig1.png", "generates", "test-extractor", "confirmed")
+
+        nodes_before = {n["id"]: n for n in (
+            db.get_node(conn, "project:demo"),
+            db.get_node(conn, "commit:abc123"),
+            db.get_node(conn, "figure:fig1.png"),
+            db.get_node(conn, "attempt:map.md#1"),
+        )}
+        edges_before = db.query_edges(conn)
+
+        # Upgrade with the package's real migrations dir: 0001/0002 already
+        # recorded, so this applies exactly [3].
+        assert db.migrate(conn) == [3]
+
+        for node_id, before in nodes_before.items():
+            assert db.get_node(conn, node_id) == before
+        assert db.query_edges(conn) == edges_before
+
+        # And the widened CHECK constraints (task W2) are now live.
+        db.upsert_node(conn, "script:scripts/gen.py", "script", title="scripts/gen.py")
+        db.upsert_node(conn, "dataset:data/out.csv", "dataset", title="data/out.csv")
+        db.upsert_edge(
+            conn, "script:scripts/gen.py", "dataset:data/out.csv", "writes",
+            "test-extractor", {"file": "scripts/gen.py", "line": 5}, 1.0,
+        )
+        db.upsert_edge(
+            conn, "script:scripts/gen.py", "dataset:data/out.csv", "reads",
+            "test-extractor", {"file": "scripts/gen.py", "line": 1}, 1.0,
+        )
+    finally:
+        conn.close()
+
+
+def test_script_and_dataset_node_types_accepted(conn):
+    # Migration 0003 (task W2): the 10th/11th node types.
+    db.upsert_node(conn, "script:scripts/gen.py", "script", title="scripts/gen.py")
+    db.upsert_node(conn, "dataset:data/out.csv", "dataset", title="data/out.csv")
+    assert db.get_node(conn, "script:scripts/gen.py")["type"] == "script"
+    assert db.get_node(conn, "dataset:data/out.csv")["type"] == "dataset"
+
+
+def test_reads_writes_edge_types_accepted(conn):
+    # Migration 0003 (task W2): script --reads/writes--> dataset (or figure).
+    db.upsert_node(conn, "script:scripts/gen.py", "script")
+    db.upsert_node(conn, "dataset:data/out.csv", "dataset")
+    db.upsert_edge(
+        conn, "script:scripts/gen.py", "dataset:data/out.csv", "writes",
+        "test-extractor", {"file": "scripts/gen.py", "line": 5}, 1.0,
+    )
+    edges = db.query_edges(conn, type="writes")
+    assert len(edges) == 1
+    assert edges[0]["src"] == "script:scripts/gen.py"
+    assert edges[0]["dst"] == "dataset:data/out.csv"
 
 
 # -- node type CHECK -----------------------------------------------------

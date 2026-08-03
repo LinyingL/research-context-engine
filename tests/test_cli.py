@@ -164,6 +164,42 @@ def test_ingest_on_non_git_repo_skips_noise_directories(tmp_path, capsys):
     assert "pyfig: 1 .py scanned" in out
 
 
+# -- task W2: rce.ingest.dataflow wired into `rce ingest`, after latex --
+
+
+def test_ingest_reports_dataflow_summary_and_creates_lineage_nodes(tmp_path, capsys):
+    """W2: cli.py orchestrates rce.ingest.dataflow -- runs even with no git
+    repository at all (its edges never reference a Commit node, unlike
+    pyfig's), and both a read of an existing file and a write of a
+    not-yet-created one show up in the graph."""
+    project = tmp_path / "proj"
+    project.mkdir()  # deliberately never `git init`ed, like W1's own tests above
+    (project / "data").mkdir()
+    (project / "data" / "raw.csv").write_text("a,b\n1,2\n")
+    (project / "gen.py").write_text(
+        "import pandas as pd\n"
+        "df = pd.read_csv('data/raw.csv')\n"
+        "df.to_csv('data/out.csv')\n"
+    )
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["ingest", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "dataflow: 1 .py, 0 .R, 0 .Rmd scanned -> reads=1 writes=1" in out
+
+    conn = db.connect(project / ".rce" / "graph.db")
+    try:
+        assert db.get_node(conn, "script:gen.py")["type"] == "script"
+        assert db.get_node(conn, "dataset:data/raw.csv") is not None
+        assert db.get_node(conn, "dataset:data/out.csv") is not None
+        write_edges = db.query_edges(conn, type="writes")
+        assert len(write_edges) == 1
+        assert write_edges[0]["evidence"]["occurrences"][0]["missing"] is True
+    finally:
+        conn.close()
+
+
 # -- T5.5 review item 5: `rce init` gitignore tip --
 
 

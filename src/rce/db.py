@@ -17,6 +17,14 @@ enforced by this layer -- see DESIGN.md section 4):
     section:<tex file>#<slug>   claim:<file>#<hash>
     ref:<lowercase bibkey>      contributor:<lowercase email>
     attempt:<source md file, repo-relative path>#<# column value>
+    script:<repo-relative path> dataset:<repo-relative path>
+
+Migration 0003 (task W2, data lineage): `script` is any .py/.R/.Rmd source
+file rce.ingest.dataflow scanned; `dataset` is a tabular/data file one of its
+calls targets. An image-extension target reuses the existing `figure` node
+type instead of a third node type -- see rce.ingest.dataflow's module
+docstring. `reads`/`writes` are both `script -> dataset` (or `script ->
+figure` for an image write).
 
 Constitutional note on `attempt` nodes (DESIGN.md section 4, migration
 0002): an attempt's `#`/time/variable-description/referenced-step-number/
@@ -76,6 +84,11 @@ NODE_TYPES = frozenset(
         # researcher's manually-maintained attempt timeline. See the
         # attrs/human_fields boundary note in this module's docstring above.
         "attempt",
+        # Added in migration 0003 (DESIGN.md section 4, task W2): a source
+        # file (.py/.R/.Rmd) and a tabular/data file, for data-lineage
+        # `reads`/`writes` edges -- see rce.ingest.dataflow.
+        "script",
+        "dataset",
     }
 )
 
@@ -93,6 +106,12 @@ EDGE_TYPES = frozenset(
         # commit`, the last commit to touch a script file the attempt
         # depends on -- deterministic, used for verdict-staleness checks.
         "uses",
+        # Added in migration 0003 (DESIGN.md section 4, task W2):
+        # `script --reads--> dataset` and `script --writes--> dataset` (or
+        # `--writes--> figure` for an image target) -- data lineage, written
+        # by rce.ingest.dataflow.
+        "reads",
+        "writes",
     }
 )
 

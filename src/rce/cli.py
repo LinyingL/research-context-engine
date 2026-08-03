@@ -2,9 +2,10 @@
 `trace` / `confirm` (F3) / `judge` (S2, optional semantic layer).
 
 stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
-the existing extractors (rce.ingest.git/latex/pyfig/mlflow/wandb) and rce.db
-(section 7 Phase A order: git -> latex/.bib -> pyfig -> mlflow -> wandb);
-writes only via db.upsert_node/upsert_edge, no new graph mutation logic here.
+the existing extractors (rce.ingest.git/latex/dataflow/pyfig/mlflow/wandb)
+and rce.db (section 7 Phase A order: git -> latex/.bib -> dataflow (task W2,
+data lineage) -> pyfig -> mlflow -> wandb); writes only via
+db.upsert_node/upsert_edge, no new graph mutation logic here.
 
 W1: `cmd_ingest` catches `git_ingest.NotAGitRepositoryError` specifically
 (a project root that is not a git repository at all -- the common case for
@@ -53,6 +54,7 @@ from typing import Any
 from rce import consistency, db, query
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import claims as claims_ingest
+from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
@@ -276,6 +278,17 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             print(
                 f"  latex: {len(inventory['tex'])} .tex, {len(inventory['bib'])} .bib "
                 f"scanned -> {_format_counts(latex_counts)}"
+            )
+            # W2: data-lineage extractor (script --reads/writes--> dataset/
+            # figure). Needs no git at all -- see rce.ingest.dataflow's
+            # module docstring -- so it runs identically whether or not the
+            # branch above found a real git repository.
+            dataflow_counts = dataflow_ingest.ingest_dataflow_repo(
+                conn, project_root, inventory["py"], inventory["r"], inventory["rmd"],
+            )
+            print(
+                f"  dataflow: {len(inventory['py'])} .py, {len(inventory['r'])} .R, "
+                f"{len(inventory['rmd'])} .Rmd scanned -> {_format_counts(dataflow_counts)}"
             )
             # T6: static savefig() analysis; each edge's src commit is
             # resolved internally via git blame (batch3-fix), not HEAD.
