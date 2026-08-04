@@ -91,6 +91,54 @@ def test_unrelated_earlier_heading_insertion_does_not_change_a_later_chinese_sec
     assert after_id.split("#", 1)[1] == before_id.split("#", 1)[1]  # same slug despite the earlier insertion
 
 
+# -- Blocker (two review rounds), shared with rce.ingest.latex: mirrors
+# test_ingest_latex.py's own property tests, confirming the shared
+# `_compute_ordered_slugs` fix behaves identically for Markdown headings. --
+
+
+def _section_and_claim_ids_by_key(repo: Path, md_rel_path: str) -> tuple[dict[str, str], dict[str, str]]:
+    sections = mdpaper.parse_md_file(repo, md_rel_path).sections
+    parsed_claims = mdpaper.parse_md_claims(repo, md_rel_path)
+    return (
+        {s.title: s.id for s in sections},
+        {c.sentence: c.id for c in parsed_claims},
+    )
+
+
+def test_ascii_collision_ids_survive_an_unrelated_heading_inserted_earlier(tmp_path):
+    # Same file, edited in place -- a claim id embeds its owning path
+    # (claims._content_id), so comparing across two *different* filenames
+    # would conflate "different file" with "different content" and prove
+    # nothing about position-independence (see test_ingest_latex.py's
+    # mirror of this test for the same rationale).
+    body = "## H3 检验\n\n准确率达到 87.3%。\n\n## H3：检验结果\n\n误差低于 3.0%。\n"
+    repo = _repo(tmp_path, body, path="paper.md")
+    before_sections, before_claims = _section_and_claim_ids_by_key(repo, "paper.md")
+
+    _repo(tmp_path, "## 无关新段落\n\n不相关的内容。\n\n" + body, path="paper.md")
+    after_sections, after_claims = _section_and_claim_ids_by_key(repo, "paper.md")
+
+    assert before_claims and before_claims == after_claims  # sanity: claims were actually found
+    for title in ("H3 检验", "H3：检验结果"):
+        assert before_sections[title] == after_sections[title]
+
+
+def test_ascii_collision_ids_are_stable_when_the_two_colliding_headings_swap_order(tmp_path):
+    # Same file (see rationale above): reordering the two colliding
+    # headings in place must not change either one's own id.
+    first_body = "## H3 检验\n\n准确率达到 87.3%。\n\n## H3：检验结果\n\n误差低于 3.0%。\n"
+    second_body = "## H3：检验结果\n\n误差低于 3.0%。\n\n## H3 检验\n\n准确率达到 87.3%。\n"
+    repo = _repo(tmp_path, first_body, path="paper.md")
+    first_sections, first_claims = _section_and_claim_ids_by_key(repo, "paper.md")
+
+    _repo(tmp_path, second_body, path="paper.md")
+    second_sections, second_claims = _section_and_claim_ids_by_key(repo, "paper.md")
+
+    assert first_claims and first_claims == second_claims  # sanity: claims were actually found
+    for title in ("H3 检验", "H3：检验结果"):
+        assert first_sections[title] == second_sections[title]
+
+
 def test_only_h1_h2_h3_are_recognised_as_sections(tmp_path):
     repo = _repo(
         tmp_path,

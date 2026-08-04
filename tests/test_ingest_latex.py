@@ -5,6 +5,7 @@
 from pathlib import Path
 
 from rce import db
+from rce.ingest import claims as claims_ingest
 from rce.ingest import latex
 
 TEX_CONTENT = r"""% top-level comment line -- must be fully ignored
@@ -113,6 +114,87 @@ def test_unrelated_earlier_section_insertion_does_not_change_a_later_chinese_sec
     after_id = next(s.id for s in after_sections if s.title == "结果与讨论")
 
     assert after_id.split("#", 1)[1] == before_id.split("#", 1)[1]  # same slug despite the earlier insertion
+
+
+def test_compute_ordered_slugs_covers_all_three_disambiguation_rules():
+    # (a) no collision at all -- bare base slugs, exactly _dedupe_slug's old
+    # behavior. This is the hard regression requirement: an ordinary,
+    # non-colliding project's ids must not move because of this fix.
+    assert latex._compute_ordered_slugs([("Intro", "Intro"), ("Data", "Data")]) == ["intro", "data"]
+
+    # (b) the blocker itself -- two DIFFERENT titles land on the same base
+    # slug ("h3", from titles with few ASCII tokens) -- both hash-
+    # disambiguated, and the assignment does not depend on which one is
+    # listed (== encountered) first.
+    forward = latex._compute_ordered_slugs([("H3 检验", "H3 检验"), ("H3：检验结果", "H3：检验结果")])
+    backward = latex._compute_ordered_slugs([("H3：检验结果", "H3：检验结果"), ("H3 检验", "H3 检验")])
+    assert forward[0] != forward[1]  # distinct titles never collapse onto the same slug
+    assert forward[0].startswith("h3-") and forward[1].startswith("h3-")
+    assert forward[0] == backward[1] and forward[1] == backward[0]  # order-independent
+
+    # (c) genuinely identical title text repeated -- the one remaining
+    # position-dependent case, numbered in encounter order (same convention
+    # _dedupe_slug used).
+    assert latex._compute_ordered_slugs([("Intro", "Intro"), ("Intro", "Intro")]) == ["intro", "intro-2"]
+
+
+# -- Blocker (two review rounds): a base slug collision between two
+# DIFFERENT titles used to be numbered by encounter order (see
+# _compute_ordered_slugs). Property tests below are the acceptance test. --
+
+
+def _section_and_claim_ids_by_key(repo: Path, tex_rel_path: str) -> tuple[dict[str, str], dict[str, str]]:
+    sections = latex.parse_tex_file(repo, tex_rel_path).sections
+    parsed_claims = claims_ingest.parse_tex_claims(repo, tex_rel_path)
+    return (
+        {s.title: s.id for s in sections},
+        {c.sentence: c.id for c in parsed_claims},
+    )
+
+
+def test_ascii_collision_ids_survive_an_unrelated_heading_inserted_earlier(tmp_path):
+    # Same file, edited in place (the real-world shape of this bug: a
+    # researcher inserts one new heading and re-ingests) -- a claim id
+    # embeds its owning tex path (claims._content_id), so comparing across
+    # two *different* filenames would conflate "different file" with
+    # "different content" and prove nothing about position-independence.
+    body = (
+        "\\section{H3 检验}\n准确率达到 87.3\\%。\n\n"
+        "\\section{H3：检验结果}\n误差低于 3.0\\%。\n"
+    )
+    tex_path = tmp_path / "paper.tex"
+    tex_path.write_text(body)
+    before_sections, before_claims = _section_and_claim_ids_by_key(tmp_path, "paper.tex")
+
+    tex_path.write_text("\\section{无关新段落}\n不相关的内容。\n\n" + body)
+    after_sections, after_claims = _section_and_claim_ids_by_key(tmp_path, "paper.tex")
+
+    assert before_claims and before_claims == after_claims  # sanity: claims were actually found
+    for title in ("H3 检验", "H3：检验结果"):
+        assert before_sections[title] == after_sections[title]
+
+
+def test_ascii_collision_ids_are_stable_when_the_two_colliding_headings_swap_order(tmp_path):
+    # Same file (see rationale above): reordering the two colliding
+    # headings in place must not change either one's own id.
+    first = (
+        "\\section{H3 检验}\n准确率达到 87.3\\%。\n\n"
+        "\\section{H3：检验结果}\n误差低于 3.0\\%。\n"
+    )
+    second = (
+        "\\section{H3：检验结果}\n误差低于 3.0\\%。\n\n"
+        "\\section{H3 检验}\n准确率达到 87.3\\%。\n"
+    )
+    tex_path = tmp_path / "paper.tex"
+    tex_path.write_text(first)
+    first_sections, first_claims = _section_and_claim_ids_by_key(tmp_path, "paper.tex")
+
+    tex_path.write_text(second)
+    second_sections, second_claims = _section_and_claim_ids_by_key(tmp_path, "paper.tex")
+
+    assert first_claims and first_claims == second_claims  # sanity: claims were actually found
+    for title in ("H3 检验", "H3：检验结果"):
+        assert first_sections[title] == second_sections[title]
 
 
 def test_parse_bib_entries_handles_braced_quoted_and_bare_values():
@@ -269,6 +351,16 @@ def test_parse_tex_file_real_section_titled_preamble_does_not_collide_with_synth
     node's id, and the lazy synthetic-section block unconditionally
     overwrote the shared section_attrs entry -- discarding the real
     section's already-collected labels and mislabeling it synthetic=True.
+
+    Blocker fix (two review rounds) changed the disambiguation itself: the
+    old fix numbered the two by encounter order (`preamble`/`preamble-2`),
+    which is exactly the position-dependent numbering the later blocker
+    flagged as unstable elsewhere. The synthetic node and the real
+    `\\section{Preamble}` are now just two entries in the same
+    collision-detection pass (`latex._compute_ordered_slugs`), so *both*
+    get a hash-disambiguated slug -- `preamble-<hash>` on both sides,
+    computed from each one's own title text, independent of which comes
+    first in the file.
     """
     (tmp_path / "paper.tex").write_text(
         "\\documentclass{article}\n"
@@ -278,8 +370,15 @@ def test_parse_tex_file_real_section_titled_preamble_does_not_collide_with_synth
     )
     result = latex.parse_tex_file(tmp_path, "paper.tex")
 
-    synthetic_id = "section:paper.tex#preamble"
-    real_id = "section:paper.tex#preamble-2"  # numbered -- no longer collides
+    synthetic_id, real_id = (
+        f"section:paper.tex#{slug}"
+        for slug in latex._compute_ordered_slugs(
+            [(latex._PREAMBLE_SLUG, latex._PREAMBLE_TITLE), ("Preamble", "Preamble")]
+        )
+    )
+    assert synthetic_id != real_id  # still two distinct ids, just not numbered by order
+    assert synthetic_id.startswith("section:paper.tex#preamble-")
+    assert real_id.startswith("section:paper.tex#preamble-")
 
     assert [s.id for s in result.sections] == [synthetic_id, real_id]
 
@@ -296,11 +395,19 @@ def test_parse_tex_file_real_section_titled_preamble_does_not_collide_with_synth
 
 
 def test_ingest_latex_repo_preserves_real_section_when_it_collides_with_preamble_slug(tmp_path):
+    # Blocker fix: both ids are now hash-disambiguated (see
+    # test_parse_tex_file_real_section_titled_preamble_does_not_collide_
+    # with_synthetic above for why "preamble"/"preamble-2" was replaced),
+    # so this test looks up the actual ids via the same shared helper
+    # rather than hardcoding the old numbered literals.
     (tmp_path / "paper.tex").write_text(
         "\\citep{early2020}\n\\section{Preamble}\n\\label{sec:pre}\n"
     )
     (tmp_path / "refs.bib").write_text(
         "@article{early2020,\n  title = {Early},\n  year = {2020},\n}\n"
+    )
+    synthetic_slug, real_slug = latex._compute_ordered_slugs(
+        [(latex._PREAMBLE_SLUG, latex._PREAMBLE_TITLE), ("Preamble", "Preamble")]
     )
     conn = db.connect(":memory:")
     db.migrate(conn)
@@ -312,11 +419,12 @@ def test_ingest_latex_repo_preserves_real_section_when_it_collides_with_preamble
         assert counts == {"sections": 2, "figures": 0, "cites": 1}
         assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='section'").fetchone()[0] == 2
 
-        synthetic = db.get_node(conn, "section:paper.tex#preamble")
+        synthetic = db.get_node(conn, f"section:paper.tex#{synthetic_slug}")
+        assert synthetic is not None
         assert synthetic["attrs"]["synthetic"] is True
         assert synthetic["attrs"]["labels"] == []
 
-        real = db.get_node(conn, "section:paper.tex#preamble-2")
+        real = db.get_node(conn, f"section:paper.tex#{real_slug}")
         assert real is not None
         assert "synthetic" not in real["attrs"]
         assert real["attrs"]["labels"] == [{"name": "sec:pre", "line": 3}]

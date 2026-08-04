@@ -129,27 +129,75 @@ def _slugify(title: str) -> str:
     digest = hashlib.sha256(title.strip().encode("utf-8")).hexdigest()[:_SLUG_FALLBACK_HASH_HEX_LEN]
     return f"section-{digest}"
 
-def _dedupe_slug(title: str, slug_counts: dict[str, int]) -> str:
-    """Slugify `title` (see _slugify) and disambiguate a repeated slug within
-    one file by appending -2, -3, ... in encounter order, mutating
-    `slug_counts` as it goes.
+def _compute_ordered_slugs(entries: list[tuple[str, str]]) -> list[str]:
+    """Two-pass slug assignment shared by `parse_tex_file` below (LaTeX
+    \\section/\\subsection) and `rce.ingest.mdpaper.parse_md_file` (Markdown
+    ATX headings) -- extracted (task W3) so both formats agree on
+    collision-numbering, rewritten here (blocker, two review rounds) so
+    numbering no longer depends on encounter order.
 
-    Because `_slugify`'s fallback is itself content-derived (above), this
-    counter only ever fires for a genuine collision -- two sections whose
-    slugified (or fallback-hashed) text is actually the same -- never merely
-    because both happen to fall back to a shared literal constant.
+    Bug this replaces: when a title has few or no ASCII characters
+    (`_slugify` strips everything else), two genuinely *different* titles
+    routinely land on the same base slug -- e.g. "H3 检验" and another
+    differently-worded heading both slugify to "h3", or "A. 引言"/"A. 方法"
+    both slugify to "a". The old single-pass `_dedupe_slug` disambiguated
+    any repeated base slug purely by an encounter-order counter (`-2`,
+    `-3`, ...), with no regard for whether the colliding titles were
+    actually the same text. Because `claims._content_id` folds the owning
+    section's slug into every claim's content-addressed id (DESIGN.md
+    section 4), inserting/reordering an unrelated heading earlier in the
+    file could renumber every later colliding slug -- and every claim id
+    beneath it -- with no change to those headings' own text: the exact
+    position-dependence content-addressed ids exist to prevent, reintroduced
+    one level up.
 
-    Extracted (task W3) so this exact numbering convention is shared
-    verbatim by `parse_tex_file` below (LaTeX \\section/\\subsection) and
-    `rce.ingest.mdpaper.parse_md_file` (Markdown ATX headings) -- a project
-    mixing both source formats must see identical collision-numbering
-    behavior for a repeated section title, not two subtly different
-    implementations that could drift apart.
+    `entries` is `(base_slug_text, identity_text)` pairs in document order
+    -- the caller must gather every heading before calling this (hence each
+    caller below is itself two passes). One entry per heading, plus (LaTeX
+    only) a leading entry for the synthetic preamble node when needed, with
+    `base_slug_text=_PREAMBLE_SLUG` (occupies that reserved slug exactly
+    like a real heading slugifying to "preamble" would) and
+    `identity_text=_PREAMBLE_TITLE` (hash-disambiguates it as a distinct
+    "title" from a real `\\section{Preamble}` sharing that slug).
+
+    Fix, in two passes over the full `entries` list:
+
+    1. Compute `_slugify(base_slug_text)` per entry, group by that base.
+    2. A base touched by >= 2 *distinct* `identity_text` values is a real
+       collision: every entry sharing it gets
+       `<base>-<sha256(identity_text)[:_SLUG_FALLBACK_HASH_HEX_LEN]>` --
+       a function of the heading's own text, so inserting/reordering an
+       unrelated heading never moves it. A base touched by exactly one
+       distinct text is not a collision and keeps the bare base slug,
+       unchanged from before this fix -- a non-colliding project's ids do
+       not move at all.
+    3. The one remaining position-dependent case: `identity_text` repeated
+       verbatim (no textual difference left to key on). Repeats of
+       whichever slug step 2 produced are numbered `-2`, `-3`, ... in
+       encounter order -- `_dedupe_slug`'s old convention, now applied on
+       top of a collision-aware base.
     """
-    base_slug = _slugify(title)
-    seen = slug_counts.get(base_slug, 0)
-    slug_counts[base_slug] = seen + 1
-    return base_slug if seen == 0 else f"{base_slug}-{seen + 1}"
+    base_slugs = [_slugify(base_text) for base_text, _ in entries]
+
+    distinct_identities: dict[str, set[str]] = {}
+    for (_, identity), base in zip(entries, base_slugs):
+        distinct_identities.setdefault(base, set()).add(identity)
+
+    disambiguated: list[str] = []
+    for (_, identity), base in zip(entries, base_slugs):
+        if len(distinct_identities[base]) >= 2:
+            digest = hashlib.sha256(identity.strip().encode("utf-8")).hexdigest()[:_SLUG_FALLBACK_HASH_HEX_LEN]
+            disambiguated.append(f"{base}-{digest}")
+        else:
+            disambiguated.append(base)
+
+    seen_counts: dict[str, int] = {}
+    ordered: list[str] = []
+    for slug in disambiguated:
+        seen = seen_counts.get(slug, 0)
+        seen_counts[slug] = seen + 1
+        ordered.append(slug if seen == 0 else f"{slug}-{seen + 1}")
+    return ordered
 
 def _resolve_figure_path(tex_rel_path: str, graphics_dir: str | None, raw_path: str) -> str | None:
     """Resolve relative to the .tex file, with basic \\graphicspath support
@@ -240,33 +288,53 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
     lazily -- only emitted into `sections`/`section_attrs` (and so only ever
     upserted as a node) when at least one such citation is actually present.
 
-    T-blocker fix: `slug_counts` is seeded with an entry for the reserved
-    preamble slug before the main loop runs, so a real `\\section{Preamble}`
-    (or any title that slugifies to "preamble") is numbered `preamble-2`
-    instead of colliding with the synthetic node's id. Without this, the
-    real section's id and `preamble_id` were identical, and the lazy
-    synthetic-section block below unconditionally overwrote that shared
-    `section_attrs` entry -- silently discarding the real section's already-
-    collected labels/refs and mislabeling it `synthetic: True`. The
-    `setdefault`/dedup guards below are a second, defensive layer against
-    that same clobber for any collision this seeding doesn't anticipate.
+    T-blocker fix (two review rounds): every heading's slug -- including the
+    synthetic preamble node below, when needed -- is now computed in one
+    shot, up front, by `_compute_ordered_slugs` (full rationale there),
+    instead of a running per-line counter. A real `\\section{Preamble}` is
+    just one more entry in that same collision-detection pass as the
+    synthetic node, so a genuine collision now gets `preamble-<hash>` on
+    *both* sides rather than the old `preamble`/`preamble-2` numbered by
+    whichever the parser reached first -- more stable, not merely
+    different (see this module's test suite for the updated expectations).
+    The `setdefault`/dedup guards below remain a second, defensive layer
+    against the residual (astronomically unlikely) case of a hash collision.
     """
     text = (Path(repo_root) / tex_rel_path).read_text(errors="replace")
+    stripped_lines = [_strip_comment(raw_line) for raw_line in text.splitlines()]
+
+    # Pass 1 (lightweight): collect every heading's title in document order,
+    # and whether a synthetic preamble node will be needed (a \cite-family
+    # command appears before the first \section/\subsection) -- both must be
+    # known before any slug is assigned (_compute_ordered_slugs above).
+    heading_titles: list[str] = []
+    preamble_needed = False
+    seen_first_section = False
+    for line in stripped_lines:
+        sec_match = _SECTION_RE.search(line)
+        if sec_match:
+            heading_titles.append(sec_match.group(2).strip())
+            seen_first_section = True
+            continue
+        if not seen_first_section and _CITE_RE.search(line):
+            preamble_needed = True
+
+    slug_entries: list[tuple[str, str]] = []
+    if preamble_needed:
+        slug_entries.append((_PREAMBLE_SLUG, _PREAMBLE_TITLE))
+    slug_entries.extend((title, title) for title in heading_titles)
+    slug_iter = iter(_compute_ordered_slugs(slug_entries))
+
     sections: list[ParsedSection] = []
     section_attrs: dict[str, dict[str, Any]] = {}
     figure_links: list[Link] = []
     cite_links: list[Link] = []
-    # Seeded so a real \section whose title slugifies to "preamble" is
-    # numbered preamble-2 rather than colliding with preamble_id below.
-    slug_counts: dict[str, int] = {_PREAMBLE_SLUG: 1}
     current_id: str | None = None
     graphics_dir: str | None = None
-    preamble_id = f"section:{tex_rel_path}#{_PREAMBLE_SLUG}"
+    preamble_id = f"section:{tex_rel_path}#{next(slug_iter) if preamble_needed else _PREAMBLE_SLUG}"
     preamble_first_line: int | None = None
 
-    for lineno, raw_line in enumerate(text.splitlines(), start=1):
-        line = _strip_comment(raw_line)
-
+    for lineno, line in enumerate(stripped_lines, start=1):
         if graphics_dir is None:
             gp_match = _GRAPHICSPATH_RE.search(line)
             if gp_match:
@@ -277,7 +345,7 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
         sec_match = _SECTION_RE.search(line)
         if sec_match:
             level, title = sec_match.group(1), sec_match.group(2).strip()
-            slug = _dedupe_slug(title, slug_counts)
+            slug = next(slug_iter)
             current_id = f"section:{tex_rel_path}#{slug}"
             sections.append(ParsedSection(current_id, title, level, lineno))
             section_attrs[current_id] = {"labels": [], "refs": []}

@@ -10,14 +10,17 @@ that are already format-agnostic despite living in the LaTeX module --
 
   * `ParsedSection` / `Link` -- both dataclasses hold only (id, title, level,
     line) / (section_id, target, line), nothing LaTeX-specific.
-  * `_slugify` (via `_dedupe_slug`) -- the exact same slug + collision-
-    numbering rule LaTeX \section/\subsection titles get, so a project
-    mixing both formats never sees two different conventions. A title that
-    slugifies to nothing printable (e.g. an all-Chinese heading -- see
-    `_slugify`'s own fallback) gets a `section-<hash-of-the-raw-title>` slug
-    derived from that title's own text, the same way it already does for
-    LaTeX; this is not a new limitation introduced here, it is the existing
-    rule applied identically.
+  * `_slugify` (via `_compute_ordered_slugs`) -- the exact same slug +
+    collision-numbering rule LaTeX \section/\subsection titles get, so a
+    project mixing both formats never sees two different conventions. A
+    title that slugifies to nothing printable (e.g. an all-Chinese heading)
+    gets a `section-<hash-of-the-raw-title>` slug from that title's own
+    text, same as LaTeX. Two *different* headings colliding on the same
+    base slug (routine when a title has few or no ASCII characters, e.g.
+    "H3 检验" and "A. 引言" both reducing to a short ASCII fragment) are
+    likewise disambiguated by a hash of each title's own text, not by
+    encounter order -- see `_compute_ordered_slugs` for why order-based
+    numbering was a bug, not a simplification.
   * `_match_known_image` -- extension-aware match against the repo's
     tracked image inventory, for the ghost-figure check below.
 
@@ -65,7 +68,7 @@ from typing import Any
 
 from rce import db
 from rce.ingest import claims as claims_ingest
-from rce.ingest.latex import Link, ParsedSection, _dedupe_slug, _match_known_image
+from rce.ingest.latex import Link, ParsedSection, _compute_ordered_slugs, _match_known_image
 
 logger = logging.getLogger(__name__)
 
@@ -218,22 +221,37 @@ def parse_md_file(repo_root: str | Path, md_rel_path: str) -> MdParseResult:
     skipped + logged -- mirroring `rce.ingest.latex.parse_tex_file`'s
     identical treatment of `\\includegraphics` before any `\\section`; there
     is no document-level fallback node for either format.
+
+    T-blocker fix: every heading's slug is computed in one shot, up front,
+    by `_compute_ordered_slugs` (shared with `rce.ingest.latex.
+    parse_tex_file`), which requires collecting every heading's title
+    before any slug is assigned -- hence the lightweight first pass below,
+    mirroring `parse_tex_file`'s own two-pass structure.
     """
     text = (Path(repo_root) / md_rel_path).read_text(errors="replace")
     raw_lines = text.splitlines()
     fenced = _blank_code_fences(raw_lines)  # headings/images must not see fenced-code content
 
+    # Pass 1 (lightweight): collect every heading's title in document order
+    # so slug collisions are resolved without depending on encounter order
+    # (see _compute_ordered_slugs).
+    heading_titles: list[str] = []
+    for line in fenced:
+        heading_match = _MD_HEADING_RE.match(line)
+        if heading_match:
+            heading_titles.append(heading_match.group(2).strip())
+    slug_iter = iter(_compute_ordered_slugs([(title, title) for title in heading_titles]))
+
     sections: list[ParsedSection] = []
     section_attrs: dict[str, dict[str, Any]] = {}
     figure_links: list[Link] = []
-    slug_counts: dict[str, int] = {}
     current_id: str | None = None
 
     for lineno, line in enumerate(fenced, start=1):
         heading_match = _MD_HEADING_RE.match(line)
         if heading_match:
             hashes, title = heading_match.group(1), heading_match.group(2).strip()
-            slug = _dedupe_slug(title, slug_counts)
+            slug = next(slug_iter)
             current_id = f"section:{md_rel_path}#{slug}"
             sections.append(ParsedSection(current_id, title, f"h{len(hashes)}", lineno))
             section_attrs[current_id] = {}
