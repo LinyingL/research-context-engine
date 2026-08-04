@@ -64,7 +64,18 @@ def _touch_binding_target(target: ast.expr, touch: Callable[[str], None]) -> Non
 _TYPE_ALIAS_NODE_TYPE = getattr(ast, "TypeAlias", None)
 
 
-def _count_all_name_bindings(tree: ast.Module) -> dict[str, int]:
+def count_name_bindings(node: ast.AST) -> dict[str, int]:
+    """Public entry point for `_count_all_name_bindings`, usable on any AST
+    node -- a whole module, or a single function's own subtree.
+    `rce.ingest.dataflow`'s default-parameter folding reuses this exact
+    counting pass scoped to one function, to detect whether a parameter is
+    reassigned anywhere inside that function's own body (the parameter's own
+    declaration is itself one touch, so "reassigned" is touch count > 1,
+    same convention `collect_module_string_constants` uses below)."""
+    return _count_all_name_bindings(node)
+
+
+def _count_all_name_bindings(tree: ast.AST) -> dict[str, int]:
     """Count every name-binding touch anywhere in the whole file. Uses
     `ast.walk` over the entire tree, so a binding nested inside if/for/try/
     with/def at module level -- invisible to a `tree.body`-only scan -- is
@@ -204,11 +215,20 @@ def collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
     function's own D parameter shadows it at runtime).
 
     Pass 2 keeps only a name whose *sole* touch (count == 1) is a top-level
-    `NAME = "..."` Assign directly in `tree.body`, to a bare string literal.
-    Any name touched anywhere else in the file (conditionally, in a loop,
-    imported, deleted, declared global, used as a parameter or function/class
-    name, ...) is excluded regardless of how many times it looks foldable at
-    the top level -- DESIGN.md section 5: "拼不出来就放弃，不猜".
+    `NAME = ...` Assign directly in `tree.body`, RHS folded via `fold_expr`
+    against the names already collected *earlier* in `tree.body` -- so a bare
+    string literal folds as before, and so does a chain like `BASE = "..."`
+    followed by `DATA = BASE + "sub/"` followed by `RAW = DATA + "_raw/"`,
+    each resolved in the same top-to-bottom order Python itself would
+    execute them in, using only names already resolved by that point. A name
+    that references a *later* definition, or one excluded by the touch-count
+    check below, is simply not yet in `values` when its own turn comes and so
+    fails to fold -- exactly as if that reference had raised `NameError` at
+    runtime, not a guess in either direction. Any name touched anywhere else
+    in the file (conditionally, in a loop, imported, deleted, declared
+    global, used as a parameter or function/class name, ...) is excluded
+    regardless of how many times it looks foldable at the top level --
+    DESIGN.md section 5: "拼不出来就放弃，不猜".
 
     A `from x import *` anywhere disables folding for the whole file: the set
     of names it binds is only knowable by importing that module, so no
@@ -232,8 +252,9 @@ def collect_module_string_constants(tree: ast.Module) -> dict[str, str]:
         name = stmt.targets[0].id
         if touch_count.get(name, 0) != 1:
             continue  # touched elsewhere in the file -- ambiguous, don't fold
-        if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
-            values[name] = stmt.value.value
+        folded = fold_expr(stmt.value, values)
+        if folded is not None:
+            values[name] = folded
     return values
 
 

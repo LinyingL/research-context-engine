@@ -71,11 +71,56 @@ the same Figure nodes `rce.ingest.latex`/`rce.ingest.pyfig` already produce).
 Any other extension is neither, and is skipped and logged rather than
 guessed at.
 
+**R constant folding (this module's own counterpart to Python's T9).** A
+same-file/document name bound exactly once, via `name <- "literal"` or
+`name = "literal"` (a depth-0 `=` only -- a `=` inside a function call's
+parentheses is a keyword argument, never a binding), folds into a call's
+path argument the same way a Python module constant does. Recognized
+argument shapes: a bare literal, a bare foldable name, `paste0(a, b, ...)`
+(no separator -- paste0's own semantics; every argument itself required to
+be a literal or a foldable name, no further nesting), and `file.path(a, b,
+...)` (joined with `"/"`). Any other appearance of the same name anywhere in
+the scanned text -- a second `<-`/`=`, a right-assign `value -> name`, or an
+`assign("name", ...)` call -- disqualifies folding for that name, mirroring
+`pyconst`'s "touched more than once, don't guess" rule exactly. A `.Rmd`'s
+binding count spans every R chunk concatenated (the same
+`_extract_r_chunks`-masked text `_scan_r_calls` already scans for calls),
+since chunks in one document share one R environment -- a name bound in one
+chunk and used, or rebound, in another is still one document-wide scope.
+**Known limitation:** a conservative regex + depth scanner, not a real R
+parser, same as the rest of this module -- an assignment nested inside an
+unclosed call's own parentheses (e.g. inside a lambda passed to
+`sapply(...)`) is not counted toward that name's binding total.
+
+**Absolute-path remapping (Python and R alike).** A folded or literal path
+that turns out to be *absolute* is not an automatic skip: if it resolves
+(symlinks included, so macOS's `/private/tmp` vs `/tmp` never causes a false
+miss) under the project root's own resolved path, the root prefix is
+stripped and ingestion proceeds exactly as if the literal had been written
+relative all along -- `evidence.remapped_from_absolute = true` marks the
+occurrence. An absolute path that does not resolve under the project root is
+unchanged from before this feature existed: skipped and logged, never
+guessed at.
+
+**Python default-parameter folding.** `def f(out=DATA + "x.csv"): ...
+open(out, "w")` -- a call's own literal argument, `out`, is a parameter, not
+a module constant, so T9 alone never resolves it. When `out`'s default value
+folds to a literal under pyconst's existing rules, `out` is never reassigned
+anywhere in `f`'s own body, and every call to `f(...)` found in this same
+file consistently *omits* `out` (positional and keyword alike), that default
+value stands in for `out` inside `f`'s own body only -- scoped per function,
+never leaking to an unrelated function or module scope that happens to reuse
+the same parameter name. Any ambiguity -- the parameter reassigned in the
+body, a call that supplies it, calls that disagree with each other, or the
+function never called at all in this file -- makes that parameter
+ineligible, logged, never guessed at.
+
 Evidence on every edge: `{"file", "line", "callee"}`, plus `"folded_from"`
-(Python T9 folding only) and `"missing": true` when the target does not
-exist on disk. `extractor="dataflow"`, `confidence=1.0`, `status="auto"`
-(machine-owned, per `db.upsert_edge`). Idempotent via
-`db.upsert_node`/`db.upsert_edge`.
+(Python T9 / R constant folding only), `"missing": true` when the target
+does not exist on disk, and `"remapped_from_absolute": true` when the
+literal was an absolute path remapped under the project root (above).
+`extractor="dataflow"`, `confidence=1.0`, `status="auto"` (machine-owned,
+per `db.upsert_edge`). Idempotent via `db.upsert_node`/`db.upsert_edge`.
 """
 
 from __future__ import annotations
@@ -100,9 +145,9 @@ logger = logging.getLogger(__name__)
 class DataflowCall:
     """One read/write call site found by a Python or R/Rmd scan, before path
     resolution. `kind` is "read" or "write". `literal` is the resolved
-    argument string (verbatim, or T9-folded for Python). `folded_from` is
-    None for a plain literal, else the original expression's exact source
-    text (Python-only evidence trail; R has no equivalent folding)."""
+    argument string (verbatim, or folded -- T9/default-parameter folding for
+    Python, same-file constant folding for R). `folded_from` is None for a
+    plain literal, else the original expression's exact source text."""
 
     script_path: str
     line: int
@@ -207,6 +252,126 @@ def _resolve_path_arg(
     return None
 
 
+def _positional_default_pairs(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, ast.expr]:
+    """Every parameter of `func` that has a default value, mapped to that
+    default expression -- positional-or-keyword params (paired from the end
+    of `args.posonlyargs`/`args.args`, per Python's own default-alignment
+    rule) and keyword-only params (`args.kwonlyargs`, each with its own
+    possibly-None `kw_defaults` slot) alike."""
+    args = func.args
+    positional = [*args.posonlyargs, *args.args]
+    pairs: dict[str, ast.expr] = {}
+    offset = len(positional) - len(args.defaults)
+    for i, default in enumerate(args.defaults):
+        pairs[positional[offset + i].arg] = default
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None:
+            pairs[arg.arg] = default
+    return pairs
+
+
+def _call_provides_param(
+    call: ast.Call, param: str, positional: list[str], kwonly: set[str]
+) -> bool | None:
+    """Whether `call` supplies `param`, positionally or by keyword. None
+    when a `*args`/`**kwargs` splat makes this undecidable statically -- the
+    caller treats None as an ambiguity that disqualifies the parameter,
+    never guessing whether the splat happens to cover it."""
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        return None
+    if any(kw.arg is None for kw in call.keywords):  # a **kwargs splat
+        return None
+    if param not in kwonly:
+        index = positional.index(param)
+        if len(call.args) > index:
+            return True
+    return any(kw.arg == param for kw in call.keywords)
+
+
+def _eligible_default_param_folds(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    all_calls: list[ast.Call],
+    module_constants: dict[str, str],
+    py_rel_path: str,
+) -> dict[str, str]:
+    """Parameters of `func` whose *default value* safely stands in for that
+    parameter inside `func`'s own body -- see module docstring, "Python
+    default-parameter folding". Ambiguity for one parameter disqualifies
+    only that parameter (logged); other eligible parameters of the same
+    function are unaffected."""
+    candidates = {
+        name: folded
+        for name, expr in _positional_default_pairs(func).items()
+        if (folded := pyconst.fold_expr(expr, module_constants)) is not None
+    }
+    if not candidates:
+        return {}
+
+    calls_to_func = [
+        c for c in all_calls if isinstance(c.func, ast.Name) and c.func.id == func.name
+    ]
+    if not calls_to_func:
+        logger.warning(
+            "%s: %s(...) is never called in this file; skipping default-value "
+            "folding for its parameters, not guessing",
+            py_rel_path, func.name,
+        )
+        return {}
+
+    positional = [a.arg for a in (*func.args.posonlyargs, *func.args.args)]
+    kwonly = {a.arg for a in func.args.kwonlyargs}
+    touch_count = pyconst.count_name_bindings(func)
+
+    eligible: dict[str, str] = {}
+    for name, folded_value in candidates.items():
+        if touch_count.get(name, 0) != 1:
+            logger.warning(
+                "%s: %s(...)'s parameter %r is reassigned inside the function "
+                "body; skipping default-value folding for it, not guessing",
+                py_rel_path, func.name, name,
+            )
+            continue
+        provided = {_call_provides_param(c, name, positional, kwonly) for c in calls_to_func}
+        if provided == {False}:
+            eligible[name] = folded_value
+        else:
+            logger.warning(
+                "%s: %s(...)'s call sites do not consistently omit parameter "
+                "%r (some provide it, or a *args/**kwargs splat makes it "
+                "undecidable); skipping default-value folding for it, not guessing",
+                py_rel_path, func.name, name,
+            )
+    return eligible
+
+
+def _collect_default_param_overlays(
+    tree: ast.Module, module_constants: dict[str, str], py_rel_path: str
+) -> dict[int, dict[str, str]]:
+    """`{id(call_node): {param_name: folded_default_value}}` for every Call
+    lexically inside a top-level function whose default-parameter folding is
+    eligible (`_eligible_default_param_folds`) -- merged with
+    `module_constants` when that specific call's own path argument is
+    resolved, so a folded default value is only ever visible inside its own
+    function's body."""
+    overlays: dict[int, dict[str, str]] = {}
+    top_level_funcs = [
+        n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not top_level_funcs:
+        return overlays
+    all_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    for func in top_level_funcs:
+        local_folds = _eligible_default_param_folds(func, all_calls, module_constants, py_rel_path)
+        if not local_folds:
+            continue
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                overlays[id(node)] = local_folds
+    return overlays
+
+
 def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[DataflowCall]:
     """Scan one .py file for read/write call sites. A file that fails to
     parse (SyntaxError -- e.g. non-Python source under a .py extension) is
@@ -226,6 +391,7 @@ def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[DataflowCall]
         return []
 
     module_constants = pyconst.collect_module_string_constants(tree)
+    default_param_overlays = _collect_default_param_overlays(tree, module_constants, py_rel_path)
 
     calls: list[DataflowCall] = []
     for node in ast.walk(tree):
@@ -248,7 +414,9 @@ def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[DataflowCall]
                     py_rel_path, node.lineno,
                 )
             continue
-        resolved = _resolve_path_arg(node, module_constants)
+        local_overlay = default_param_overlays.get(id(node))
+        constants = {**module_constants, **local_overlay} if local_overlay else module_constants
+        resolved = _resolve_path_arg(node, constants)
         if resolved is None:
             logger.warning(
                 "%s:%d: %s(...) path argument is not a string literal (first "
@@ -399,23 +567,210 @@ def _unquote_r_literal(value: str) -> str | None:
     return None
 
 
-def _resolve_r_call_path(name: str, args_text: str) -> str | None:
-    """The call's path argument as a plain string, or None if it cannot be
-    determined as a bare literal. Checks a `file`/`path`/`filename` keyword
-    argument first (unambiguous regardless of the function -- and, if
-    present but not a bare literal, this is a definite skip, not a reason to
+# ---------------------------------------------------------------------------
+# R constant folding (this module's counterpart to Python's T9 -- see module
+# docstring, "R constant folding")
+# ---------------------------------------------------------------------------
+
+_R_LEFT_ASSIGN_RE = re.compile(r"<<-|<-")
+_R_RIGHT_ASSIGN_RE = re.compile(r"->>|->")
+# A statement-level `=` only: `==`/`<=`/`>=`/`!=` excluded by the
+# lookaround, but a call's own keyword-argument `=` (e.g. `file = "x"`) is
+# syntactically identical and can only be told apart by bracket depth --
+# see `_r_call_depth_at` below, checked by every caller of this regex.
+_R_BARE_EQ_RE = re.compile(r"(?<![=<>!])=(?!=)")
+_R_ASSIGN_CALL_RE = re.compile(r"\bassign\s*\(")
+_R_BARE_NAME_RE = re.compile(r"^[A-Za-z.][A-Za-z0-9_.]*$")
+_R_PASTE0_RE = re.compile(r"^paste0\s*\((.*)\)$", re.DOTALL)
+_R_FILE_PATH_RE = re.compile(r"^file\.path\s*\((.*)\)$", re.DOTALL)
+
+
+def _r_call_depth_at(text: str) -> list[int]:
+    """Bracket/paren depth (`(`/`)`/`[`/`]` only -- deliberately never
+    `{`/`}`, which don't introduce call-argument-keyword syntax in R)
+    immediately before each character offset in `text`, skipping quoted
+    string contents. The only use is telling a statement-level `=` (depth 0
+    -- an assignment) from a call's own keyword argument `=` (depth >= 1) --
+    `<-`/`<<-`/`->`/`->>` are never keyword-argument syntax in R, so they
+    need no depth check at all."""
+    n = len(text)
+    depths = [0] * (n + 1)
+    depth = 0
+    i = 0
+    while i < n:
+        depths[i] = depth
+        ch = text[i]
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                i += 2 if text[i] == "\\" and i + 1 < n else 1
+            i += 1
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        i += 1
+    depths[n] = depth
+    return depths
+
+
+def _extract_simple_target(prefix: str) -> str | None:
+    """The bare name `prefix` (all text before an assignment operator) ends
+    in, or None if `prefix` does not end in exactly a plain identifier --
+    `df$col`, `obj@slot`, and `names(x)` (a replacement-function call
+    target) all correctly return None, none of those being the plain "name"
+    shape this scan folds."""
+    prefix = prefix.rstrip()
+    match = re.search(r"[A-Za-z.][A-Za-z0-9_.]*$", prefix)
+    if not match:
+        return None
+    before = prefix[: match.start()].rstrip()
+    if before and before[-1] in "$@]":
+        return None
+    return match.group(0)
+
+
+def _extract_right_target(suffix: str) -> str | None:
+    """The bare name a right-assign (`value -> name`) targets, or None if
+    what immediately follows the operator is not exactly a plain identifier
+    (`-> df$col`, `-> x[i]`, ...)."""
+    suffix = suffix.lstrip()
+    match = re.match(r"[A-Za-z.][A-Za-z0-9_.]*", suffix)
+    if not match:
+        return None
+    after = suffix[match.end():].lstrip()
+    if after[:1] in "$@[(":
+        return None
+    return match.group(0)
+
+
+def _collect_r_constants(text: str) -> dict[str, str]:
+    """Every name in `text` (already comment-stripped; for a .Rmd this is
+    the whole document's chunk-masked text, so binding counts span every
+    chunk -- see module docstring) foldable into a call's path argument: a
+    name whose SOLE binding, anywhere in `text`, among `<-`/`<<-`/
+    `=`(statement-level only)/`->`/`->>`/`assign("name", ...)`, is a plain
+    `name <- "literal"` or `name = "literal"`. Mirrors `pyconst.
+    collect_module_string_constants`'s two-pass "count every touch, keep
+    only a sole literal touch" shape."""
+    touch_count: dict[str, int] = {}
+    literal_values: dict[str, str] = {}
+
+    def touch(name: str) -> None:
+        touch_count[name] = touch_count.get(name, 0) + 1
+
+    def record_left(match: re.Match[str]) -> None:
+        name = _extract_simple_target(text[: match.start()])
+        if name is None:
+            return
+        touch(name)
+        rhs = text[match.end():].split("\n", 1)[0].strip()
+        literal = _unquote_r_literal(rhs)
+        if literal is not None:
+            literal_values[name] = literal
+
+    for match in _R_LEFT_ASSIGN_RE.finditer(text):
+        record_left(match)
+
+    depths = _r_call_depth_at(text)
+    for match in _R_BARE_EQ_RE.finditer(text):
+        if depths[match.start()] != 0:
+            continue  # a call's keyword argument, not a statement-level assignment
+        record_left(match)
+
+    for match in _R_RIGHT_ASSIGN_RE.finditer(text):
+        name = _extract_right_target(text[match.end():])
+        if name is not None:
+            touch(name)  # never itself a fold source -- see module docstring
+
+    for match in _R_ASSIGN_CALL_RE.finditer(text):
+        close_idx = _find_matching_paren(text, match.end() - 1)
+        if close_idx is None:
+            continue
+        args = _split_top_level_args(text[match.end():close_idx])
+        if not args:
+            continue
+        name = _unquote_r_literal(args[0].strip())
+        if name is not None:  # a dynamic assign() target is not statically knowable
+            touch(name)
+
+    return {
+        name: value for name, value in literal_values.items() if touch_count.get(name) == 1
+    }
+
+
+def _fold_r_arg_atom(raw: str, constants: dict[str, str]) -> str | None:
+    """One `paste0(...)`/`file.path(...)` argument, folded to a string: a
+    bare literal, or a bare name found in `constants` -- no further nesting
+    (a nested `paste0(...)`/`file.path(...)` call as an argument is outside
+    the documented shape and is not folded)."""
+    raw = raw.strip()
+    literal = _unquote_r_literal(raw)
+    if literal is not None:
+        return literal
+    if _R_BARE_NAME_RE.match(raw):
+        return constants.get(raw)
+    return None
+
+
+def _fold_r_value(value: str, constants: dict[str, str]) -> tuple[str, bool] | None:
+    """`(literal, folded)` for a call argument's source text: a bare literal
+    (`folded=False`), or a same-scope name/`paste0(...)`/`file.path(...)`
+    folded via `constants` (`folded=True`). None if it folds to nothing --
+    skip and log, never guess at a partial path."""
+    value = value.strip()
+    literal = _unquote_r_literal(value)
+    if literal is not None:
+        return literal, False
+    if _R_BARE_NAME_RE.match(value):
+        folded = constants.get(value)
+        return (folded, True) if folded is not None else None
+    match = _R_PASTE0_RE.match(value)
+    if match:
+        parts = [_fold_r_arg_atom(a, constants) for a in _split_top_level_args(match.group(1))]
+        if parts and all(p is not None for p in parts):
+            return "".join(parts), True  # type: ignore[arg-type]
+        return None
+    match = _R_FILE_PATH_RE.match(value)
+    if match:
+        parts = [_fold_r_arg_atom(a, constants) for a in _split_top_level_args(match.group(1))]
+        if parts and all(p is not None for p in parts):
+            return "/".join(parts), True  # type: ignore[arg-type]
+        return None
+    return None
+
+
+def _resolve_r_call_path(
+    name: str, args_text: str, constants: dict[str, str]
+) -> tuple[str, str | None] | None:
+    """The call's path argument as `(literal, folded_from)` -- `folded_from`
+    is the argument's own raw source text when folding via `constants`
+    produced the literal, else None for a bare quoted literal -- or None if
+    it cannot be determined at all. Checks a `file`/`path`/`filename`
+    keyword argument first (unambiguous regardless of the function -- and,
+    if present but not resolvable, this is a definite skip, not a reason to
     fall back to guessing at a positional argument instead); only when no
     such keyword is given does it fall back to the function's own
     documented positional index (`_R_PATH_ARG_INDEX`, counting only the
     call's positional -- not keyword -- arguments)."""
+
+    def resolve(value: str) -> tuple[str, str | None] | None:
+        resolved = _fold_r_value(value, constants)
+        if resolved is None:
+            return None
+        literal, folded = resolved
+        return literal, (value.strip() if folded else None)
+
     parsed = [_parse_arg(raw) for raw in _split_top_level_args(args_text)]
     for keyword, value in parsed:
         if keyword in _R_PATH_KEYWORDS:
-            return _unquote_r_literal(value)
+            return resolve(value)
     positional_values = [value for keyword, value in parsed if keyword is None]
     index = _R_PATH_ARG_INDEX.get(name)
     if index is not None and index < len(positional_values):
-        return _unquote_r_literal(positional_values[index])
+        return resolve(positional_values[index])
     return None
 
 
@@ -485,6 +840,7 @@ def _scan_r_calls(text: str, script_rel_path: str) -> list[DataflowCall]:
     rules, for both source kinds."""
     calls: list[DataflowCall] = []
     scan_text = _strip_r_comments(text)
+    constants = _collect_r_constants(scan_text)
     for match in _R_CALL_RE.finditer(scan_text):
         pkg, name = match.group(1), match.group(2)
         label = f"{pkg}::{name}" if pkg else name
@@ -499,15 +855,17 @@ def _scan_r_calls(text: str, script_rel_path: str) -> list[DataflowCall]:
             )
             continue
         args_text = scan_text[open_paren_idx + 1:close_idx]
-        literal = _resolve_r_call_path(name, args_text)
-        if literal is None:
+        resolved = _resolve_r_call_path(name, args_text, constants)
+        if resolved is None:
             logger.warning(
-                "%s:%d: %s(...) path argument is not a plain quoted string literal "
-                "(a variable, file.path(...), or other expression); skipping, not guessing",
+                "%s:%d: %s(...) path argument is not a plain quoted string literal, "
+                "a foldable same-scope name, paste0(...), or file.path(...) of only "
+                "those (a variable, or other expression); skipping, not guessing",
                 script_rel_path, line, label,
             )
             continue
-        calls.append(DataflowCall(script_rel_path, line, label, kind, literal))
+        literal, folded_from = resolved
+        calls.append(DataflowCall(script_rel_path, line, label, kind, literal, folded_from))
     return calls
 
 
@@ -557,35 +915,69 @@ def _normalize_candidate(base_dir: str, raw_path: str) -> str | None:
     return normalized
 
 
-def _resolve_target(script_rel_path: str, literal: str, repo_root: Path) -> tuple[str, bool] | None:
-    """Resolve a read/write literal to a repo-relative path plus whether the
-    target currently exists on disk.
+def _remap_absolute_path(literal: str, repo_root: Path) -> str | None:
+    """An absolute `literal` that resolves under the project root's own
+    resolved filesystem path, remapped to a project-relative POSIX path (the
+    root prefix stripped) -- see module docstring, "Absolute-path
+    remapping". Both sides are resolved (symlinks included, so e.g. macOS's
+    `/private/tmp` vs `/tmp` is never a false miss) before comparing, so this
+    is a deterministic filesystem-prefix judgement, not a guess. None when
+    the literal does not resolve under the project root at all -- the caller
+    then treats it exactly as before this feature existed: skip and log."""
+    try:
+        resolved_literal = Path(literal).resolve()
+        resolved_root = repo_root.resolve()
+        relative = resolved_literal.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return None
+    return relative.as_posix()
 
-    Tries the literal relative to the project root first, then relative to
-    the script's own directory (both attempted, per the task spec; this
-    checking order matches the existing `rce.ingest.pyfig.
-    _resolve_figure_target` convention elsewhere in this codebase) --
-    whichever is an actually-existing file wins. When *neither* exists, the
-    root-relative candidate is still returned (same order, as a deterministic
-    default label -- not a claim that it is the "correct" one, just a
-    documented, consistent choice) with `missing=True` -- see the module
-    docstring for why this deliberately does not skip the way
-    `rce.ingest.pyfig` skips an unresolved savefig literal: a script
-    reading/writing a file that doesn't exist is the finding, not noise.
+
+def _resolve_target(
+    script_rel_path: str, literal: str, repo_root: Path
+) -> tuple[str, bool, bool] | None:
+    """Resolve a read/write literal to a repo-relative path plus whether the
+    target currently exists on disk, plus whether it was remapped from an
+    absolute path (below).
+
+    An absolute `literal` is not an automatic skip: `_remap_absolute_path`
+    first tries to remap it to a project-relative path; only when that fails
+    (the literal does not resolve under the project root) does this function
+    return None exactly as before this feature existed.
+
+    Once relative (as written, or after remapping), tries the literal
+    relative to the project root first, then relative to the script's own
+    directory (both attempted, per the task spec; this checking order
+    matches the existing `rce.ingest.pyfig._resolve_figure_target`
+    convention elsewhere in this codebase) -- whichever is an
+    actually-existing file wins. When *neither* exists, the root-relative
+    candidate is still returned (same order, as a deterministic default
+    label -- not a claim that it is the "correct" one, just a documented,
+    consistent choice) with `missing=True` -- see the module docstring for
+    why this deliberately does not skip the way `rce.ingest.pyfig` skips an
+    unresolved savefig literal: a script reading/writing a file that doesn't
+    exist is the finding, not noise.
 
     Returns None only when the literal cannot be safely mapped into the repo
-    at all (an absolute path, or a `..` escape) -- there is then no
-    repo-relative path to report even as "missing"."""
+    at all (an absolute path outside the project root, or a `..` escape) --
+    there is then no repo-relative path to report even as "missing"."""
+    remapped_from_absolute = False
+    if posixpath.isabs(literal):
+        remapped = _remap_absolute_path(literal, repo_root)
+        if remapped is None:
+            return None
+        literal = remapped
+        remapped_from_absolute = True
     root_candidate = _normalize_candidate(".", literal)
     script_dir = posixpath.dirname(script_rel_path) or "."
     script_candidate = _normalize_candidate(script_dir, literal)
     for candidate in (root_candidate, script_candidate):
         if candidate is not None and (repo_root / candidate).is_file():
-            return candidate, False
+            return candidate, False, remapped_from_absolute
     fallback = root_candidate if root_candidate is not None else script_candidate
     if fallback is None:
         return None
-    return fallback, True
+    return fallback, True, remapped_from_absolute
 
 
 def _node_type_for_extension(path: str) -> str | None:
@@ -633,7 +1025,7 @@ def ingest_dataflow_repo(
                 call.script_path, call.line, call.callee, call.literal,
             )
             continue
-        target_path, missing = resolved
+        target_path, missing, remapped_from_absolute = resolved
         node_type = _node_type_for_extension(target_path)
         if node_type is None:
             logger.warning(
@@ -649,9 +1041,11 @@ def ingest_dataflow_repo(
             "file": call.script_path, "line": call.line, "callee": call.callee,
         }
         if call.folded_from is not None:
-            evidence["folded_from"] = call.folded_from  # T9: folded argument only
+            evidence["folded_from"] = call.folded_from  # folded argument only
         if missing:
             evidence["missing"] = True
+        if remapped_from_absolute:
+            evidence["remapped_from_absolute"] = True
         db.upsert_node(conn, script_id, "script", title=call.script_path)
         db.upsert_node(conn, target_id, node_type, title=target_path)
         db.upsert_edge(
