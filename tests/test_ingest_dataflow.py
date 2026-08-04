@@ -5,6 +5,8 @@ tests build a plain fake repo tree under tmp_path, mirroring
 tests/test_ingest_latex.py's style.
 """
 
+import logging
+
 from rce import db
 from rce.ingest import dataflow
 
@@ -147,6 +149,51 @@ def test_parse_py_file_default_param_folds_when_every_call_omits_it(tmp_path):
     assert [(c.kind, c.literal, c.folded_from) for c in calls] == [
         ("write", "root/data/foreign_flows_ccdc.csv", "out"),
     ]
+
+
+def test_parse_py_file_default_param_shadowing_nested_def_disqualifies(tmp_path, caplog):
+    """Adversarial case from review: a genuinely dead top-level function must
+    not borrow call sites from a same-named nested def. Before the fix, the
+    bare-name call to helper's inner `build_x` counted as evidence the dead
+    top-level `build_x` runs, and its default got folded anyway."""
+    (tmp_path / "gen.py").write_text(
+        "DATA = 'root/'\n"
+        "\n"
+        "def build_x(out=DATA + 'x.csv'):\n"
+        "    with open(out, 'w') as f:\n"
+        "        f.write('x')\n"
+        "\n"
+        "def helper():\n"
+        "    def build_x():\n"
+        "        return None\n"
+        "    build_x()\n"
+        "\n"
+        "helper()\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        calls = dataflow.parse_py_file(tmp_path, "gen.py")
+    assert not any(c.folded_from == "out" for c in calls), (
+        "dead top-level build_x must not be folded via the nested def's call site"
+    )
+    assert any("bound more than once" in r.message for r in caplog.records)
+
+
+def test_parse_py_file_default_param_recursion_only_is_not_evidence_of_a_call(tmp_path, caplog):
+    """A function whose only bare-name call is its own recursive call has no
+    proof anything external ever invokes it -- treat as never-called."""
+    (tmp_path / "gen.py").write_text(
+        "DATA = 'root/'\n"
+        "\n"
+        "def build_x(out=DATA + 'x.csv', depth=0):\n"
+        "    if depth < 1:\n"
+        "        build_x(depth=depth + 1)\n"
+        "    with open(out, 'w') as f:\n"
+        "        f.write('x')\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        calls = dataflow.parse_py_file(tmp_path, "gen.py")
+    assert not any(c.folded_from == "out" for c in calls)
+    assert any("never called in this file" in r.message for r in caplog.records)
 
 
 def test_parse_py_file_default_param_reassigned_in_body_skips(tmp_path, caplog):

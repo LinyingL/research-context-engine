@@ -295,12 +295,24 @@ def _eligible_default_param_folds(
     all_calls: list[ast.Call],
     module_constants: dict[str, str],
     py_rel_path: str,
+    tree: ast.Module,
 ) -> dict[str, str]:
     """Parameters of `func` whose *default value* safely stands in for that
     parameter inside `func`'s own body -- see module docstring, "Python
     default-parameter folding". Ambiguity for one parameter disqualifies
     only that parameter (logged); other eligible parameters of the same
-    function are unaffected."""
+    function are unaffected.
+
+    A bare-name call is only trustworthy evidence that *this* def runs if
+    the name resolves to it everywhere in the file. Two guards make that
+    airtight rather than assumed: (1) if `func.name` is bound anywhere else
+    in the file -- a same-named nested def, a shadowing local, a module
+    rebinding -- every bare-name call site is ambiguous, so the whole
+    function is ineligible (a nested `def build_x` inside a helper used to
+    let a genuinely dead top-level `build_x` borrow the nested one's call
+    sites and get folded anyway); (2) calls lexically inside `func`'s own
+    body are recursion, not proof anything external ever invokes it, so
+    they don't count."""
     candidates = {
         name: folded
         for name, expr in _positional_default_pairs(func).items()
@@ -309,8 +321,23 @@ def _eligible_default_param_folds(
     if not candidates:
         return {}
 
+    if pyconst.count_name_bindings(tree).get(func.name, 0) != 1:
+        logger.warning(
+            "%s: the name %r is bound more than once in this file (shadowing "
+            "def, local variable, or module rebinding); bare-name calls cannot "
+            "be attributed to this def unambiguously -- skipping default-value "
+            "folding for it, not guessing",
+            py_rel_path, func.name,
+        )
+        return {}
+
+    recursion_sites = {id(c) for c in ast.walk(func) if isinstance(c, ast.Call)}
     calls_to_func = [
-        c for c in all_calls if isinstance(c.func, ast.Name) and c.func.id == func.name
+        c
+        for c in all_calls
+        if isinstance(c.func, ast.Name)
+        and c.func.id == func.name
+        and id(c) not in recursion_sites
     ]
     if not calls_to_func:
         logger.warning(
@@ -363,7 +390,9 @@ def _collect_default_param_overlays(
         return overlays
     all_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     for func in top_level_funcs:
-        local_folds = _eligible_default_param_folds(func, all_calls, module_constants, py_rel_path)
+        local_folds = _eligible_default_param_folds(
+            func, all_calls, module_constants, py_rel_path, tree
+        )
         if not local_folds:
             continue
         for node in ast.walk(func):
