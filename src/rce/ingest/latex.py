@@ -10,6 +10,7 @@ skipped and logged, never guessed (DESIGN.md section 5).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import posixpath
 import re
@@ -48,6 +49,13 @@ _CITE_RE = re.compile(
 _LABEL_RE = re.compile(r"\\label\{([^{}]*)\}")
 _REF_RE = re.compile(r"\\ref\{([^{}]*)\}")
 _SLUG_INVALID_RE = re.compile(r"[^a-z0-9]+")
+
+# Hex digits of a sha256 digest used only for _slugify's no-ASCII-survives
+# fallback below -- an id-length convention, not a match/scoring threshold,
+# same rationale as claims._ID_HASH_HEX_LEN (DESIGN.md section 0's "never
+# guess" governs match *decisions*, not how many hash characters make a
+# fallback slug practically collision-free within one file).
+_SLUG_FALLBACK_HASH_HEX_LEN = 8
 
 # T10 (candidate-2 testbed regression): a \cite in the abstract/introduction,
 # before the paper's first \section, used to be dropped outright -- real
@@ -90,12 +98,46 @@ def _strip_comment(line: str) -> str:
     return "".join(out)
 
 def _slugify(title: str) -> str:
-    return _SLUG_INVALID_RE.sub("-", title.strip().lower()).strip("-") or "section"
+    """Lowercase `title`, collapse every run of non a-z0-9 characters to a
+    single '-', and strip leading/trailing '-'.
+
+    A title with no ASCII letters/digits at all -- routine for a
+    Chinese-language heading, which is the overwhelming majority of real
+    headings in the audience task W3's Markdown support directly targets --
+    leaves nothing printable this way. That case used to fall back to the
+    bare literal `"section"`, disambiguated only by `_dedupe_slug`'s
+    per-file *encounter-order* counter below ("section", "section-2", ...).
+    Because `claims._content_id` folds the owning section's slug into every
+    claim's content-addressed id (DESIGN.md section 4), that made the slug
+    -- and therefore every claim id beneath it -- silently *position*-
+    derived for most non-ASCII headings: inserting, deleting, or reordering
+    one unrelated same-shaped heading anywhere earlier in the file
+    renumbered every later fallback slug, changing claim ids whose own
+    sentence/number/section-title never changed and silently orphaning any
+    human confirm/reject verdict recorded against them (the exact failure
+    mode section 4 says content-addressed ids exist to prevent).
+    The fallback is instead derived from the title's own text: a short hash
+    of the raw (pre-lowercasing) title, stable no matter what else in the
+    file changes. Two sections whose titles are genuinely identical still
+    hash identically and get disambiguated by `_dedupe_slug`'s counter, same
+    as any other repeated slug -- only a *different* non-ASCII title now
+    also gets a different slug, instead of colliding with every other one.
+    """
+    slug = _SLUG_INVALID_RE.sub("-", title.strip().lower()).strip("-")
+    if slug:
+        return slug
+    digest = hashlib.sha256(title.strip().encode("utf-8")).hexdigest()[:_SLUG_FALLBACK_HASH_HEX_LEN]
+    return f"section-{digest}"
 
 def _dedupe_slug(title: str, slug_counts: dict[str, int]) -> str:
     """Slugify `title` (see _slugify) and disambiguate a repeated slug within
     one file by appending -2, -3, ... in encounter order, mutating
     `slug_counts` as it goes.
+
+    Because `_slugify`'s fallback is itself content-derived (above), this
+    counter only ever fires for a genuine collision -- two sections whose
+    slugified (or fallback-hashed) text is actually the same -- never merely
+    because both happen to fall back to a shared literal constant.
 
     Extracted (task W3) so this exact numbering convention is shared
     verbatim by `parse_tex_file` below (LaTeX \\section/\\subsection) and

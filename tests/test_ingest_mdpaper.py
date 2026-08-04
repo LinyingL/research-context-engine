@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 
 from rce import db
-from rce.ingest import mdpaper
+from rce.ingest import latex, mdpaper
 
 _NO_CLEANUP = {
     "claims_removed": 0,
@@ -50,16 +50,45 @@ def test_parse_md_file_sections_use_same_slug_convention_as_latex(tmp_path):
 
 
 def test_chinese_heading_slug_matches_latex_convention(tmp_path):
-    # rce.ingest.latex._slugify collapses an all-non-ASCII title to the
-    # literal fallback "section" (see that module) -- reused unchanged here
-    # (task W3: "slug 化中文标题用与 latex.py 相同的规则"), so a Chinese-only
-    # heading gets identical, not merely similar, behavior across formats.
+    # rce.ingest.latex._slugify collapses an all-non-ASCII title to a
+    # content-derived `section-<hash>` fallback (see that module) -- reused
+    # unchanged here (task W3: "slug 化中文标题用与 latex.py 相同的规则"), so a
+    # Chinese-only heading gets identical, not merely similar, behavior
+    # across formats.
     repo = _repo(tmp_path, "# 结果与讨论\n\n正文。\n\n## 数据\n\n更多正文。\n")
     result = mdpaper.parse_md_file(repo, "paper.md")
     results_section, data_section = result.sections
-    assert results_section.id == "section:paper.md#section"  # matches latex.py's own fallback exactly
+    expected_results_slug = latex._slugify("结果与讨论")
+    expected_data_slug = latex._slugify("数据")
+    assert expected_results_slug.startswith("section-") and expected_results_slug != "section"
+    assert expected_results_slug != expected_data_slug  # two different titles never collide
+    assert results_section.id == f"section:paper.md#{expected_results_slug}"  # matches latex.py's own fallback exactly
     assert results_section.title == "结果与讨论"  # original title preserved, only the slug collapses
-    assert data_section.id == "section:paper.md#section-2"  # second collapse gets numbered, not overwritten
+    assert data_section.id == f"section:paper.md#{expected_data_slug}"  # different title, different slug, no numbering needed
+
+
+def test_unrelated_earlier_heading_insertion_does_not_change_a_later_chinese_sections_slug(tmp_path):
+    # Regression (evidence-based review, W3): the fallback used to be the
+    # bare literal "section", disambiguated only by a per-file
+    # encounter-order counter -- so inserting one unrelated non-ASCII
+    # heading earlier in the file renumbered every later fallback slug, and
+    # since claims._content_id folds the owning section's slug into every
+    # claim's content-addressed id, that silently changed claim ids whose
+    # own text/section-title never changed (DESIGN.md section 4). The fix
+    # makes the fallback slug a hash of the heading's own title text, so it
+    # must survive an unrelated heading being inserted earlier in the file.
+    before = _repo(tmp_path, "# 结果与讨论\n\n正文。\n", path="before.md")
+    before_id = mdpaper.parse_md_file(before, "before.md").sections[0].id
+
+    after = _repo(
+        tmp_path,
+        "# 二、尝试新方向\n\n不相关的新段落。\n\n# 结果与讨论\n\n正文。\n",
+        path="after.md",
+    )
+    after_sections = mdpaper.parse_md_file(after, "after.md").sections
+    after_id = next(s.id for s in after_sections if s.title == "结果与讨论")
+
+    assert after_id.split("#", 1)[1] == before_id.split("#", 1)[1]  # same slug despite the earlier insertion
 
 
 def test_only_h1_h2_h3_are_recognised_as_sections(tmp_path):

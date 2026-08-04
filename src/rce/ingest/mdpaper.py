@@ -14,9 +14,10 @@ that are already format-agnostic despite living in the LaTeX module --
     numbering rule LaTeX \section/\subsection titles get, so a project
     mixing both formats never sees two different conventions. A title that
     slugifies to nothing printable (e.g. an all-Chinese heading -- see
-    `_slugify`'s own fallback) collapses to "section"/"section-2"/... the
-    same way it already does for LaTeX; this is not a new limitation
-    introduced here, it is the existing rule applied identically.
+    `_slugify`'s own fallback) gets a `section-<hash-of-the-raw-title>` slug
+    derived from that title's own text, the same way it already does for
+    LaTeX; this is not a new limitation introduced here, it is the existing
+    rule applied identically.
   * `_match_known_image` -- extension-aware match against the repo's
     tracked image inventory, for the ghost-figure check below.
 

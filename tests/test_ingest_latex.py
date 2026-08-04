@@ -78,6 +78,43 @@ def test_parse_tex_file_sections_figures_cites_labels_refs(tmp_path):
     assert result.section_attrs[intro.id]["refs"] == [{"name": "fig:overview", "line": cite_line}]
 
 
+def test_slugify_fallback_for_non_ascii_title_is_content_derived_not_a_bare_literal():
+    # A title with no ASCII letters/digits (e.g. an all-Chinese heading --
+    # the common case for a real Chinese-language paper) used to collapse to
+    # the bare literal "section", disambiguated only by _dedupe_slug's
+    # per-file encounter-order counter. Two different such titles must now
+    # get two different slugs on _slugify alone, with no counter involved.
+    results_slug = latex._slugify("结果与讨论")
+    data_slug = latex._slugify("数据")
+    assert results_slug.startswith("section-") and results_slug != "section"
+    assert data_slug.startswith("section-") and data_slug != "section"
+    assert results_slug != data_slug
+    # Deterministic: the same title always slugifies to the same fallback.
+    assert latex._slugify("结果与讨论") == results_slug
+
+
+def test_unrelated_earlier_section_insertion_does_not_change_a_later_chinese_sections_id(tmp_path):
+    # Regression (evidence-based review, W3): with the old bare-literal
+    # "section" fallback, inserting one unrelated all-Chinese \section
+    # earlier in the file renumbered every later fallback slug -- and since
+    # claims._content_id folds the owning section's slug into every claim's
+    # content-addressed id (DESIGN.md section 4), that silently changed
+    # claim ids whose own sentence/number/section-title never changed,
+    # orphaning any human confirm/reject verdict recorded against them. The
+    # fallback slug must instead survive an unrelated heading inserted
+    # anywhere earlier in the same file.
+    (tmp_path / "before.tex").write_text("\\section{结果与讨论}\n正文。\n")
+    before_id = latex.parse_tex_file(tmp_path, "before.tex").sections[0].id
+
+    (tmp_path / "after.tex").write_text(
+        "\\section{二、尝试新方向}\n不相关的新段落。\n\n\\section{结果与讨论}\n正文。\n"
+    )
+    after_sections = latex.parse_tex_file(tmp_path, "after.tex").sections
+    after_id = next(s.id for s in after_sections if s.title == "结果与讨论")
+
+    assert after_id.split("#", 1)[1] == before_id.split("#", 1)[1]  # same slug despite the earlier insertion
+
+
 def test_parse_bib_entries_handles_braced_quoted_and_bare_values():
     entries = {e.key: e for e in latex.parse_bib_entries(BIB_CONTENT)}
     assert entries["smith2020"].fields == {"title": "A Study of Things", "author": "Smith, John", "year": "2020"}
