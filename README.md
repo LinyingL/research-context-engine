@@ -1,4 +1,4 @@
-# RCE — Research Context Engine
+# Research OS
 
 [![tests](https://github.com/LinyingL/research-context-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/LinyingL/research-context-engine/actions/workflows/tests.yml)
 
