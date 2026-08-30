@@ -1,6 +1,7 @@
 """RCE command-line interface (T4): `rce init` / `ingest` / `status` / `query` /
 `trace` / `confirm` (F3) / `judge` (S2, optional semantic layer) / `lineage`
-(W4, read-only four-block report over task W2's dataflow graph).
+(W4, read-only four-block report over task W2's dataflow graph) / `serve`
+(V1, local read-only web view over the graph -- see rce.webapp.server).
 
 stdlib argparse only (DESIGN.md section 0, Occam rule 1). Orchestrates
 the existing extractors (rce.ingest.git/latex/dataflow/pyfig/mlflow/wandb/
@@ -79,6 +80,11 @@ from rce.ingest import wandb as wandb_ingest
 # subcommand's pass-through special case.
 from rce.semantic import backend as semantic_backend
 from rce.semantic import judge as semantic_judge
+# V1: `rce serve`, the local read-only web view (DESIGN.md section 7,
+# "Later"). stdlib http.server only (see rce.webapp.server's module
+# docstring) -- like rce.semantic above, and unlike rce.mcp_server, this
+# needs no optional extra, so it gets a normal top-level subparser.
+from rce.webapp import server as webapp_server
 
 RCE_DIRNAME = ".rce"
 DB_FILENAME = "graph.db"
@@ -846,6 +852,24 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     return 1 if (report["orphans"] or report["broken_links"]) else 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """`rce serve` (task V1): starts `rce.webapp.server`'s local read-only
+    web view over the graph, bound to 127.0.0.1 only. Requires `rce init`
+    (and normally `rce ingest`/`rce attempts`) to have already run, exactly
+    like every other read-only subcommand -- `rce.webapp.server.serve`
+    raises `ProjectNotInitializedError` with the same message shape
+    `_require_db` above gives, re-raised here as `CliError` so it prints and
+    exits the same way any other missing-project error does rather than a
+    raw traceback.
+    """
+    project_root = _resolve_project_root(args.path)
+    try:
+        webapp_server.serve(project_root, args.port, open_browser=not args.no_browser)
+    except webapp_server.ApiError as exc:
+        raise CliError(str(exc)) from exc
+    return 0
+
+
 def _import_mcp_server():
     """Lazy import for the optional 'mcp' extra (positioning ruling
     2026-07-22): rce.mcp_server does `from mcp.server.fastmcp import
@@ -969,6 +993,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="output structured JSON instead of human-readable text"
     )
     p.set_defaults(func=cmd_lineage)
+
+    p = sub.add_parser(
+        "serve",
+        help=(
+            "Start a local read-only web view over the graph, bound to 127.0.0.1 only "
+            "(task V1); prints the URL and opens a browser tab unless --no-browser is given"
+        ),
+    )
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--port", type=int, default=8317, help="TCP port to bind on 127.0.0.1 (default: 8317)"
+    )
+    p.add_argument(
+        "--no-browser", action="store_true", help="do not automatically open a browser tab"
+    )
+    p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser(
         "attempts",
