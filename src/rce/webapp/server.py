@@ -78,6 +78,10 @@ Endpoints (all GET unless noted):
                             "last_error": str|null}`. The frontend polls
                             this and re-fetches its views whenever the
                             generation moved -- see "Auto-refresh" below.
+    POST /api/shutdown  -- respond `{"ok": true}`, then stop this server's
+                            `serve_forever` loop from a separate thread
+                            (task V3 phase 4) -- the app's 停止服务 button;
+                            see "Shutdown defense" below.
     GET  /             -- the single-page app (task V2), served verbatim from
                             `src/rce/webapp/app.html`: inline CSS/JS, zero
                             external resources, zero build step -- it reads
@@ -148,6 +152,25 @@ never ingest concurrently (`ProjectWatcher.ingest_lock`,
 content, and it writes only what DESIGN.md declares the single source of
 truth -- the map file -- letting re-ingest mirror it into the graph, never
 the graph directly ("resync from source", DESIGN.md section 4).
+
+Shutdown defense (`POST /api/shutdown`, task V3 phase 4): the one endpoint
+whose side effect is the server itself, so `_check_local_origin` runs first
+exactly as everywhere else -- a drive-by page must not be able to kill the
+user's running app with a no-preflight cross-origin POST (denial of service
+is a side effect too, and this endpoint needs no body at all, so nothing
+else would stand in the way). POST-only like every other side effect; a GET
+of the path falls through to the ordinary unknown-endpoint 404. The `{"ok":
+true}` response is written before anything stops, and `httpd.shutdown()` is
+then called from a NEW daemon thread: `shutdown()` blocks until
+`serve_forever` has actually exited, so calling it synchronously from the
+handler would, on a single-threaded HTTP server, deadlock the very loop it
+waits on -- and even under `ThreadingHTTPServer` (where the handler thread
+is not the serve loop's thread) detaching it keeps this handler's own
+response/connection teardown independent of the loop's. Only the serve loop
+is stopped here; closing the listening socket and stopping the watcher stay
+where they already live -- `serve()`'s finally-block `server_close`, which
+`serve_forever`'s return now reaches, so a UI-initiated stop and a Ctrl+C
+tear down through the identical path.
 
 The current project root itself is mutable state on `RceHTTPServer`, read
 and written only through accessors holding a `threading.Lock`
@@ -912,6 +935,17 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     200, attempts_write_payload(self._project_root(), body, self.server.watcher)
                 )
+            elif parsed.path == "/api/shutdown":
+                # Stops this whole server (task V3 phase 4). Respond first,
+                # then stop the serve loop from a separate thread -- see
+                # module docstring's "Shutdown defense" for why shutdown()
+                # must never be awaited from a handler, and why socket/
+                # watcher cleanup deliberately stays in serve()'s own
+                # finally-block server_close.
+                self._send_json(200, {"ok": True})
+                threading.Thread(
+                    target=self.server.shutdown, name="rce-shutdown", daemon=True
+                ).start()
             else:
                 raise NotFoundError(f"no such endpoint: {parsed.path}")
         except ApiError as exc:

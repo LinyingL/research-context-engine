@@ -7,8 +7,9 @@
   and read entirely client-side against this same process's JSON API
   (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
   /api/open, /api/projects, /api/projects/switch, /api/generation,
-  /api/attempts/preview, /api/attempts/write -- see rce/webapp/server.py's
-  module docstring for the contract each endpoint promises).
+  /api/attempts/preview, /api/attempts/write, /api/shutdown -- see
+  rce/webapp/server.py's module docstring for the contract each endpoint
+  promises).
 
   Auto-refresh (task V3 phase 2): the server's own watcher re-ingests the
   attempts map / step scripts when they change on disk and bumps a
@@ -43,6 +44,13 @@
   actually changed, so untouched cells keep their raw markdown decoration
   byte-for-byte (prefills come from parsed/cleaned values and must not be
   round-tripped over cells nobody edited).
+
+  Stopping the server (task V3 phase 4): a quiet 停止服务 text button in
+  the page footer, behind an explicit Chinese window.confirm. Confirming
+  POSTs /api/shutdown; on success the whole page is replaced by a plain
+  "服务已停止" state (the generation poll stops too -- the server is gone,
+  so continuing to poll would only spray connection errors). A failure
+  leaves the page fully usable and says so in the header line.
 
   Two views, switched by the top tab bar:
     - Decision Tree (default): GET /api/tree. attempt -> step script ->
@@ -333,9 +341,37 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 .diff-row.new { background: var(--olive-soft); border-color: var(--olive); }
 .confirm-note { font-size: 0.84rem; margin: 0.7rem 0 0.4rem; }
 
+/* -- Page footer: the 停止服务 affordance (task V3 phase 4) -- deliberately
+   quiet: a small ink-soft text button, clay only on hover, tucked after the
+   main content where a launcher-style app's "quit" belongs. */
+.pagefoot {
+  max-width: 1080px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 2rem 1.5rem;
+  display: flex;
+  justify-content: flex-end;
+}
+.shutdown-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.76rem;
+  color: var(--ink-soft);
+  padding: 0.2rem 0;
+}
+.shutdown-btn:hover { color: var(--clay); text-decoration: underline; }
+
+.stopped-note { border: 1px solid var(--line-strong); background: var(--paper-alt); padding: 1.5rem 1.75rem; max-width: 640px; }
+.stopped-note h2 { font-family: var(--font-serif); font-size: 1.15rem; margin: 0 0 0.6rem; }
+.stopped-note p { margin: 0.4rem 0; color: var(--ink-soft); }
+.stopped-note code { font-family: var(--font-mono); font-size: 0.85em; background: var(--paper); border: 1px solid var(--line); padding: 0.05em 0.35em; }
+
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
   .topbar { padding: 1rem 1rem 0.75rem; }
+  .pagefoot { padding: 0 1rem 1.25rem; }
 }
 </style>
 </head>
@@ -359,6 +395,9 @@ details.script-node > summary::-webkit-details-marker { display: none; }
     <section id="view-tree" class="view"></section>
     <section id="view-lineage" class="view hidden"></section>
   </main>
+  <footer class="pagefoot">
+    <button id="shutdown-btn" class="shutdown-btn" type="button" title="停止本地服务进程">停止服务</button>
+  </footer>
 </div>
 
 <div id="panel-backdrop" class="panel-backdrop hidden"></div>
@@ -622,6 +661,7 @@ const REFRESH_POLL_MS = 2000;
 const refreshChip = document.getElementById("refresh-chip");
 let lastGeneration = null;
 let refreshInFlight = false;
+let pollTimer = null; // held so the 停止服务 flow (task V3 phase 4) can stop polling a dead server
 
 function showRefreshingChip() {
   refreshChip.classList.remove("hidden", "err");
@@ -1604,6 +1644,41 @@ function openAttemptForm(mode, attemptId) {
 
 document.getElementById("new-attempt-btn").addEventListener("click", () => openAttemptForm("append"));
 
+// -- 停止服务 (task V3 phase 4) ----------------------------------------------
+// The footer button POSTs /api/shutdown behind an explicit Chinese confirm.
+// Success replaces the whole page with a plain stopped state and stops the
+// generation poll -- the server is gone, and polling it would only spray
+// connection errors into the console. Failure re-enables the button and
+// says so in the header line (same spot a failed project switch reports),
+// leaving the page fully usable.
+
+function renderStoppedState() {
+  if (pollTimer !== null) clearInterval(pollTimer);
+  closePanel();
+  document.getElementById("app").innerHTML =
+    '<main id="main"><div class="stopped-note">' +
+    "<h2>服务已停止</h2>" +
+    "<p>本地服务已经关闭，可以关闭此页。</p>" +
+    "<p>下次要查看时，双击 RCE.app，或在终端运行 <code>rce serve</code>。</p>" +
+    "</div></main>";
+}
+
+document.getElementById("shutdown-btn").addEventListener("click", async () => {
+  if (!window.confirm("确定要停止本地服务吗？停止后这个页面将无法继续使用。")) return;
+  const btn = document.getElementById("shutdown-btn");
+  btn.disabled = true;
+  try {
+    await apiPost("/api/shutdown", {});
+  } catch (err) {
+    btn.disabled = false;
+    const line = document.getElementById("project-line");
+    line.textContent = "停止服务失败：" + (err instanceof Error ? err.message : String(err));
+    line.title = "";
+    return;
+  }
+  renderStoppedState();
+});
+
 // -- Init -------------------------------------------------------------------
 // loadProjects() first (awaited): it fills state.projectLabel, which the
 // summary line prefers over a raw-path basename. The views themselves never
@@ -1618,7 +1693,7 @@ document.getElementById("new-attempt-btn").addEventListener("click", () => openA
   loadProjectSummary();
   activateView("tree");
   syncGeneration();
-  setInterval(pollGeneration, REFRESH_POLL_MS);
+  pollTimer = setInterval(pollGeneration, REFRESH_POLL_MS);
 })();
 </script>
 </body>

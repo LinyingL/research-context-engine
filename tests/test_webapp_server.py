@@ -1184,6 +1184,72 @@ def test_http_summary_attempts_config_null_without_config(live_server):
     assert status == 200 and payload["attempts_config"] is None
 
 
+# -- POST /api/shutdown (task V3 phase 4) ----------------------------------------
+
+
+def test_http_shutdown_actually_stops_serve_forever(tmp_path):
+    """The endpoint's whole contract: respond {ok: true}, then the
+    serve_forever loop exits -- observed as the real background thread
+    finishing. Deliberately not the shared live_server fixture: this test's
+    subject IS the teardown, so it owns the full lifecycle itself (the
+    fixture's own later shutdown() would mask whether the endpoint did
+    anything)."""
+    project = tmp_path / "proj"
+    _init_project(project)
+    httpd = server.build_server(project, 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        status, payload = _post(base_url, "/api/shutdown", {})
+        assert status == 200 and payload == {"ok": True}
+        thread.join(timeout=5)
+        assert not thread.is_alive()  # serve_forever returned
+    finally:
+        httpd.shutdown()  # harmless if the endpoint already stopped the loop
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_shutdown_get_is_rejected_and_server_keeps_serving(live_server):
+    """POST-only: a plain GET of the path (e.g. a link, a prefetch) must
+    never stop the server -- it falls through to the ordinary
+    unknown-endpoint 404, and the server demonstrably still answers."""
+    base_url, _ = live_server
+    status, payload = _get(base_url, "/api/shutdown")
+    assert status == 404 and "error" in payload
+    status, _ = _get(base_url, "/api/summary")
+    assert status == 200  # still alive
+
+
+def test_http_shutdown_rejects_foreign_origin_and_keeps_serving(live_server):
+    """The drive-by shape again (module docstring's "Shutdown defense"): a
+    no-preflight cross-origin POST must be 403'd by _check_local_origin
+    before the shutdown thread is ever spawned -- killing the user's
+    running app is a side effect like any other."""
+    base_url, _ = live_server
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/shutdown",
+        {"Content-Type": "text/plain", "Origin": "http://evil.example"},
+        body=b"",
+    )
+    assert status == 403 and "Origin" in payload["error"]
+    status, _ = _get(base_url, "/api/summary")
+    assert status == 200  # the loop was never told to stop
+
+
+def test_http_shutdown_rejects_mismatched_host_and_keeps_serving(live_server):
+    base_url, _ = live_server
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/shutdown",
+        {"Content-Type": "application/json", "Host": "attacker.example:1234"},
+        body=b"",
+    )
+    assert status == 403 and "Host" in payload["error"]
+    status, _ = _get(base_url, "/api/summary")
+    assert status == 200
+
+
 def test_serve_starts_watcher_and_server_close_stops_it(tmp_path, monkeypatch):
     """serve() is the one place the polling thread starts (build_server
     never does), and its finally-block server_close stops it -- observed

@@ -87,6 +87,11 @@ from rce.semantic import judge as semantic_judge
 # V3 phase 1: rce.webapp.registry is the machine-managed project registry
 # (~/.rce/projects.json) that lets `rce serve` resume the most recently
 # served project when no path is given.
+# V3 phase 4: rce.webapp.macapp generates the double-clickable RCE.app
+# launcher bundle (`rce app`). Generation is pure stdlib file writing,
+# platform-independent -- only cmd_app's *default* install location is
+# macOS-gated -- so this too is a plain eager import.
+from rce.webapp import macapp
 from rce.webapp import registry as project_registry
 from rce.webapp import server as webapp_server
 
@@ -899,6 +904,39 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_app(args: argparse.Namespace) -> int:
+    """`rce app` (task V3 phase 4): generate the double-clickable RCE.app
+    launcher bundle (rce.webapp.macapp) -- a bash launcher that opens the
+    already-running server's page or starts `rce serve` first; see that
+    module's docstring for the bundle's exact shape and why the rce path
+    is baked in absolute.
+
+    `--dir` generates into any directory on any platform (this is what
+    the tests use, and how a user targets /Applications instead). Only
+    the *default* location, ~/Applications, is macOS-gated: on another
+    platform there is no `open`, no .app double-click, and no
+    ~/Applications convention, so defaulting there would generate a
+    bundle nothing can launch -- the error says to pass --dir instead of
+    guessing at a per-platform equivalent."""
+    if args.dir is not None:
+        target_dir = Path(args.dir).expanduser().resolve()
+    else:
+        if not macapp.is_macos():
+            raise CliError(
+                "the default install location (~/Applications) is only meaningful on "
+                "macOS; on this platform pass an explicit --dir to choose where the "
+                "bundle is generated"
+            )
+        target_dir = Path.home() / "Applications"
+    try:
+        bundle = macapp.generate_bundle(target_dir)
+    except macapp.MacAppError as exc:
+        raise CliError(str(exc)) from exc
+    print(f"RCE.app written to {bundle}")
+    print("双击 RCE.app 即可打开研究地图；服务已在运行时会直接打开页面。")
+    return 0
+
+
 def _import_mcp_server():
     """Lazy import for the optional 'mcp' extra (positioning ruling
     2026-07-22): rce.mcp_server does `from mcp.server.fastmcp import
@@ -1044,6 +1082,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-browser", action="store_true", help="do not automatically open a browser tab"
     )
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser(
+        "app",
+        help=(
+            "Generate the double-clickable RCE.app launcher bundle (task V3 phase 4): "
+            "opens the running server's page, or starts 'rce serve' first (default: "
+            "~/Applications, macOS only; --dir works anywhere)"
+        ),
+    )
+    p.add_argument(
+        "--dir", default=None, metavar="DIR",
+        help=(
+            "directory to generate RCE.app into instead of ~/Applications "
+            "(e.g. /Applications); works on any platform"
+        ),
+    )
+    p.set_defaults(func=cmd_app)
 
     p = sub.add_parser(
         "attempts",
