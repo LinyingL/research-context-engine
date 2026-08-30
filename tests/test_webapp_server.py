@@ -15,6 +15,7 @@ requirement.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import threading
@@ -141,6 +142,29 @@ def _post(base_url: str, path: str, body: dict) -> tuple[int, Any]:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
+
+
+def _request_with_headers(
+    base_url: str, method: str, path: str, headers: dict[str, str], body: bytes | None = None
+) -> tuple[int, Any]:
+    """Like `_get`/`_post`, but via `http.client` directly so a caller can
+    set an arbitrary `Host`/`Origin` -- exactly what the cross-origin-defense
+    tests below need to simulate, and something `urllib.request` won't let a
+    caller override for `Host` without this lower-level escape hatch.
+    `http.client` honors an explicit `Host` in `headers` (it skips generating
+    its own only when one is already present -- stdlib's own
+    `HTTPConnection._send_request`), so this reaches the server with exactly
+    the header value under test, not whatever the real socket peer implies.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, (json.loads(raw) if raw else None)
+    finally:
+        conn.close()
 
 
 # -- summary_payload -----------------------------------------------------------
@@ -582,3 +606,79 @@ def test_http_open_traversal_blocked_before_subprocess(live_server, monkeypatch)
 def test_http_open_missing_path_key_returns_400(live_server):
     status, _ = _post(live_server[0], "/api/open", {})
     assert status == 400
+
+
+# -- Cross-origin defense (security-review fix): Host/Origin checks -------------
+
+
+def test_http_open_rejects_mismatched_host_header(live_server, monkeypatch):
+    """DNS-rebinding shape: the request's `Host` names a domain other than
+    this server's own `127.0.0.1:<port>` -- whatever that domain currently
+    resolves to, a legitimate request to *this* server never carries it."""
+    base_url, project = live_server
+    (project / "f.txt").write_text("x")
+    monkeypatch.setattr(server, "_is_macos", lambda: True)
+    calls = []
+    monkeypatch.setattr(server.subprocess, "run", lambda args, **kw: calls.append((args, kw)))
+
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/open",
+        {"Content-Type": "application/json", "Host": "attacker.example:1234"},
+        body=json.dumps({"path": "f.txt"}).encode("utf-8"),
+    )
+
+    assert status == 403 and calls == []
+    assert "Host" in payload["error"]
+
+
+def test_http_open_rejects_foreign_origin_text_plain_simple_request(live_server, monkeypatch):
+    """The exact drive-by shape the security review flagged: a 'simple'
+    cross-origin POST (`Content-Type: text/plain`, so the browser sends it
+    with no CORS preflight at all) whose `Host` is correctly this server's
+    own address -- the browser really is talking to 127.0.0.1:<port> -- but
+    whose `Origin` names the unrelated page that issued the `fetch()`. Must
+    be rejected before `subprocess.run` ever runs."""
+    base_url, project = live_server
+    (project / "f.txt").write_text("x")
+    monkeypatch.setattr(server, "_is_macos", lambda: True)
+    calls = []
+    monkeypatch.setattr(server.subprocess, "run", lambda args, **kw: calls.append((args, kw)))
+
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/open",
+        {"Content-Type": "text/plain", "Origin": "http://evil.example"},
+        body=json.dumps({"path": "f.txt"}).encode("utf-8"),
+    )
+
+    assert status == 403 and calls == []
+    assert "Origin" in payload["error"]
+
+
+def test_http_open_allows_matching_origin_header(live_server, monkeypatch):
+    """The defense must not be so strict it blocks the app's own same-origin
+    fetches -- an `Origin` that actually matches this server is accepted."""
+    base_url, project = live_server
+    (project / "f.txt").write_text("x")
+    monkeypatch.setattr(server, "_is_macos", lambda: True)
+    calls = []
+    monkeypatch.setattr(server.subprocess, "run", lambda args, **kw: calls.append((args, kw)))
+
+    status, _ = _request_with_headers(
+        base_url, "POST", "/api/open",
+        {"Content-Type": "application/json", "Origin": base_url},
+        body=json.dumps({"path": "f.txt"}).encode("utf-8"),
+    )
+
+    assert status == 200 and len(calls) == 1
+
+
+def test_http_summary_rejects_mismatched_host_header(live_server):
+    """Defense in depth on GET too (module docstring): without this, DNS
+    rebinding could make a foreign-looking `Origin`/`Host` pair pass the
+    browser's own same-origin check for reading a GET response back into
+    attacker JS, not just for POST's side effect."""
+    base_url, _ = live_server
+    status, _ = _request_with_headers(
+        base_url, "GET", "/api/summary", {"Host": "attacker.example:1234"}
+    )
+    assert status == 403

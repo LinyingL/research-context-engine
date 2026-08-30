@@ -58,6 +58,28 @@ three end up outside `root` after `Path.resolve()`, so the same one check
 catches every case rather than pattern-matching on `..` textually (which a
 symlink would trivially evade).
 
+Cross-origin defense (every endpoint, `RceRequestHandler._check_local_origin`,
+security-review fix): a page open in the user's browser on any *other*
+origin can still make this loopback server do something just by having the
+browser send it a request -- a "simple" cross-origin POST (e.g.
+`Content-Type: text/plain`) needs no CORS preflight at all, and even a plain
+cross-origin GET always reaches the server; the browser only blocks the
+*page's own script* from reading a cross-origin GET's response body (no
+`Access-Control-Allow-Origin` header is ever sent here), which protects
+nothing against `POST /api/open`'s side effect of shelling out to `open`.
+DNS rebinding defeats even that read-block: a domain the attacker controls
+can resolve to something else while the browser loads the page, then to
+`127.0.0.1` on a later request, and the browser's same-origin check compares
+against the *hostname it believes it dialed*, never the IP it actually
+reached. Both `do_GET` and `do_POST` call `_check_local_origin` before doing
+anything else: it rejects unless `Host` equals `127.0.0.1:<the port this
+process actually bound>` (a rebound or attacker-controlled hostname never
+produces that exact Host value, no matter what it resolves to) and, only
+when a browser actually sends one, `Origin` equals that same
+`http://127.0.0.1:<port>` -- missing entirely is accepted, since a
+non-browser CLI caller (`curl`, this module's own test suite) never sends
+one.
+
 Every handler-facing failure is one of the small `ApiError` subclasses below,
 each carrying its own HTTP status; `RceRequestHandler` catches `ApiError`
 once per request and renders `{"error": str(exc)}` at that status, mirroring
@@ -108,6 +130,10 @@ class MissingParamError(ApiError):
 
 
 class PathTraversalError(ApiError):
+    status = 403
+
+
+class ForbiddenOriginError(ApiError):
     status = 403
 
 
@@ -474,11 +500,32 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             conn.close()
         self._send_json(200, payload)
 
+    def _check_local_origin(self) -> None:
+        """Reject a request whose `Host` does not name this exact loopback
+        server, and one whose `Origin` (when a browser sends one at all)
+        names anything else -- see module docstring's "Cross-origin
+        defense". Called first thing in both `do_GET` and `do_POST`, before
+        any routing or body parsing, so a rejected request never reaches
+        `open_payload` or any other handler."""
+        port = self.server.server_address[1]
+        expected_host = f"127.0.0.1:{port}"
+        host = self.headers.get("Host")
+        if host != expected_host:
+            raise ForbiddenOriginError(
+                f"request Host {host!r} does not match this server ({expected_host!r}); refusing"
+            )
+        origin = self.headers.get("Origin")
+        if origin is not None and origin != f"http://{expected_host}":
+            raise ForbiddenOriginError(
+                f"request Origin {origin!r} does not match this server; refusing"
+            )
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib's own method name)
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            self._check_local_origin()
             if path == "/":
                 self._send_html(200, _app_html())
             elif path == "/api/summary":
@@ -507,6 +554,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 (stdlib's own method name)
         parsed = urllib.parse.urlsplit(self.path)
         try:
+            self._check_local_origin()
             if parsed.path != "/api/open":
                 raise NotFoundError(f"no such endpoint: {parsed.path}")
             length = int(self.headers.get("Content-Length") or "0")
