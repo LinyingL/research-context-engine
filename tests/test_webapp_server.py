@@ -980,6 +980,210 @@ def test_http_tree_reflects_map_edit_after_watcher_poll(tmp_path):
         thread.join(timeout=5)
 
 
+# -- POST /api/attempts/preview + /api/attempts/write (task V3 phase 3) ---------
+
+
+_ROW_1 = "| 1 | 2026-01-01 | first | v | r | ✅ |"
+_APPEND_2 = {
+    "op": "append",
+    "number": "2",
+    "fields": {"date": "2026-01-02", "description": "second", "verdict": "🕒"},
+}
+
+
+def _map_project(project: Path) -> None:
+    """live_server's project plus just enough attempts config + map for the
+    edit endpoints to have a real table to write into."""
+    _write_attempts_config(project)
+    _write_attempts_map(project, [_ROW_1])
+
+
+def test_http_attempts_preview_returns_diff_without_writing(live_server):
+    base_url, project = live_server
+    _map_project(project)
+    before = (project / "map.md").read_text()
+
+    status, payload = _post(base_url, "/api/attempts/preview", _APPEND_2)
+
+    assert status == 200
+    assert payload["file"] == "map.md" and payload["old_row"] is None
+    assert "| 2 |" in payload["new_row"] and "+| 2 |" in payload["diff"]
+    assert (project / "map.md").read_text() == before  # a preview writes nothing
+    assert not (project / ".rce" / "backups").exists()
+
+
+def test_http_attempts_write_appends_row_tree_reflects_it_and_backup_exists(live_server):
+    """The whole write contract at the HTTP surface: the map file gains the
+    row, /api/tree serves it immediately (the write path re-ingested on its
+    own -- no watcher poll ran here), the original is backed up, and the
+    generation moved so open pages re-fetch."""
+    base_url, project = live_server
+    _map_project(project)
+    original = (project / "map.md").read_text()
+
+    status, payload = _post(base_url, "/api/attempts/write", _APPEND_2)
+
+    assert status == 200
+    assert payload["ok"] is True and payload["ingest_error"] is None
+    assert "| 2 | 2026-01-02 | second |" in (project / "map.md").read_text()
+    assert (project / payload["backup"]).read_text() == original  # the pre-edit content
+
+    status, tree = _get(base_url, "/api/tree")
+    assert status == 200
+    assert [a["number"] for a in tree["attempts"]] == ["1", "2"]
+
+    status, generation = _get(base_url, "/api/generation")
+    assert status == 200
+    assert generation["generation"] == payload["generation"] == 2
+    assert generation["last_error"] is None
+
+
+def test_http_attempts_write_update_changes_the_row(live_server):
+    base_url, project = live_server
+    _map_project(project)
+
+    status, payload = _post(
+        base_url, "/api/attempts/write",
+        {"op": "update", "number": "1", "fields": {"verdict": "☠️ 放弃"}},
+    )
+
+    assert status == 200 and payload["ok"] is True
+    _, attempts_data = _get(base_url, "/api/attempts")
+    assert attempts_data["attempts"][0]["verdict"] == "☠️ 放弃"
+    assert attempts_data["attempts"][0]["attrs"]["description"] == "first"  # untouched cell
+
+
+def test_http_attempts_write_duplicate_number_returns_400_and_writes_nothing(live_server):
+    base_url, project = live_server
+    _map_project(project)
+    before = (project / "map.md").read_text()
+
+    status, payload = _post(
+        base_url, "/api/attempts/write", {"op": "append", "number": "1", "fields": {}}
+    )
+
+    assert status == 400 and "already exists" in payload["error"]
+    assert (project / "map.md").read_text() == before
+    assert not (project / ".rce" / "backups").exists()  # refused before backing up
+
+
+def test_http_attempts_write_unknown_number_update_returns_400(live_server):
+    base_url, project = live_server
+    _map_project(project)
+    status, payload = _post(
+        base_url, "/api/attempts/write",
+        {"op": "update", "number": "99", "fields": {"verdict": "x"}},
+    )
+    assert status == 400 and "no row" in payload["error"]
+
+
+def test_http_attempts_write_malformed_op_returns_400(live_server):
+    status, _ = _post(live_server[0], "/api/attempts/write", {"op": "delete", "number": "1"})
+    assert status == 400
+
+
+def test_http_attempts_preview_rejects_foreign_origin(live_server):
+    """Origin-checked exactly like its mutating twin -- a drive-by page
+    must not even get a diff of the user's own research log back."""
+    base_url, project = live_server
+    _map_project(project)
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/attempts/preview",
+        {"Content-Type": "text/plain", "Origin": "http://evil.example"},
+        body=json.dumps(_APPEND_2).encode("utf-8"),
+    )
+    assert status == 403 and "Origin" in payload["error"]
+
+
+def test_http_attempts_write_rejects_foreign_origin_before_touching_the_file(live_server):
+    """THE drive-by shape at the highest-stakes endpoint: a no-preflight
+    cross-origin POST aimed at writing into the user's own map file. The
+    origin check must reject it before mapedit ever runs -- no write, no
+    backup, no generation bump."""
+    base_url, project = live_server
+    _map_project(project)
+    before = (project / "map.md").read_text()
+
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/attempts/write",
+        {"Content-Type": "text/plain", "Origin": "http://evil.example"},
+        body=json.dumps(_APPEND_2).encode("utf-8"),
+    )
+
+    assert status == 403 and "Origin" in payload["error"]
+    assert (project / "map.md").read_text() == before
+    assert not (project / ".rce" / "backups").exists()
+    _, generation = _get(base_url, "/api/generation")
+    assert generation["generation"] == 1
+
+
+def test_http_attempts_write_rejects_mismatched_host_header(live_server):
+    base_url, project = live_server
+    _map_project(project)
+    status, _ = _request_with_headers(
+        base_url, "POST", "/api/attempts/write",
+        {"Content-Type": "application/json", "Host": "attacker.example:1234"},
+        body=json.dumps(_APPEND_2).encode("utf-8"),
+    )
+    assert status == 403
+    assert "| 2 |" not in (project / "map.md").read_text()
+
+
+def test_http_attempts_write_runs_under_the_watchers_ingest_lock(tmp_path):
+    """Concurrency contract: the write path takes the SAME lock the
+    watcher's poll ingests under. Hold that lock and a write request must
+    block -- file untouched -- until it is released, then complete
+    normally. (Deterministic in the failing direction: if the write used
+    any other lock, it would finish while this one is still held.)"""
+    project = tmp_path / "proj"
+    _init_project(project)
+    _map_project(project)
+    httpd = server.build_server(project, 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        results: list[tuple[int, Any]] = []
+        writer = threading.Thread(
+            target=lambda: results.append(_post(base_url, "/api/attempts/write", _APPEND_2)),
+            daemon=True,
+        )
+        httpd.watcher.ingest_lock.acquire()
+        try:
+            writer.start()
+            writer.join(timeout=0.5)
+            assert writer.is_alive()  # blocked on the shared lock
+            assert results == []
+            assert "| 2 |" not in (project / "map.md").read_text()  # not even the write ran
+        finally:
+            httpd.watcher.ingest_lock.release()
+        writer.join(timeout=10)
+        assert not writer.is_alive()
+        status, payload = results[0]
+        assert status == 200 and payload["ok"] is True
+        assert "| 2 |" in (project / "map.md").read_text()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_http_summary_echoes_attempts_config_columns(live_server):
+    """The edit form is built from the project's own [columns] names via
+    this echo -- never hardcoded column labels in the frontend."""
+    base_url, project = live_server
+    _map_project(project)
+    status, payload = _get(base_url, "/api/summary")
+    assert status == 200
+    assert payload["attempts_config"]["file"] == "map.md"
+    assert payload["attempts_config"]["columns"]["verdict"] == "verdict"
+
+
+def test_http_summary_attempts_config_null_without_config(live_server):
+    status, payload = _get(live_server[0], "/api/summary")
+    assert status == 200 and payload["attempts_config"] is None
+
+
 def test_serve_starts_watcher_and_server_close_stops_it(tmp_path, monkeypatch):
     """serve() is the one place the polling thread starts (build_server
     never does), and its finally-block server_close stops it -- observed

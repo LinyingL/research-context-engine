@@ -6,9 +6,9 @@
   resources, zero build step. Served verbatim by rce.webapp.server at "/"
   and read entirely client-side against this same process's JSON API
   (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
-  /api/open, /api/projects, /api/projects/switch, /api/generation -- see
-  rce/webapp/server.py's module docstring for the contract each endpoint
-  promises).
+  /api/open, /api/projects, /api/projects/switch, /api/generation,
+  /api/attempts/preview, /api/attempts/write -- see rce/webapp/server.py's
+  module docstring for the contract each endpoint promises).
 
   Auto-refresh (task V3 phase 2): the server's own watcher re-ingests the
   attempts map / step scripts when they change on disk and bumps a
@@ -27,6 +27,22 @@
   members; this page only ever offers values it got from /api/projects),
   then re-fetches every view from scratch, since everything on screen
   belongs to the previous project.
+
+  Writing from the UI (task V3 phase 3): the "＋ 新增尝试" header button and
+  the attempt panel's "编辑" button open a form in the same slide-out
+  panel, built from the project's OWN column names (the attempts_config
+  echo in /api/summary -- nothing hardcoded). Submitting first POSTs
+  /api/attempts/preview (a pure dry run: old row / new row, nothing
+  written) and shows the change with an explicit Chinese confirm; only the
+  confirm click POSTs /api/attempts/write, which edits the researcher's
+  own map file (backed up first, written atomically, re-ingested
+  server-side) -- the graph then follows the file, per DESIGN.md's
+  "resync from source": this page never writes the graph, only the one
+  source of truth. On success the form closes and the phase-2 auto-refresh
+  renders the new state; update mode submits ONLY the fields the user
+  actually changed, so untouched cells keep their raw markdown decoration
+  byte-for-byte (prefills come from parsed/cleaned values and must not be
+  round-tripped over cells nobody edited).
 
   Two views, switched by the top tab bar:
     - Decision Tree (default): GET /api/tree. attempt -> step script ->
@@ -287,6 +303,36 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 
 .step-broken { color: var(--clay); font-size: 0.84rem; }
 
+/* -- Attempt edit form (task V3 phase 3) -- same paper palette as the rest */
+.new-attempt-btn { align-self: center; white-space: nowrap; }
+
+.attempt-form { display: flex; flex-direction: column; gap: 0.75rem; }
+.form-field label { display: block; font-size: 0.78rem; color: var(--ink-soft); margin-bottom: 0.25rem; }
+.form-input, .form-textarea {
+  font: inherit;
+  font-size: 0.86rem;
+  color: var(--ink);
+  background: var(--paper-alt);
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  padding: 0.35rem 0.55rem;
+  width: 100%;
+}
+.form-textarea { resize: vertical; min-height: 3.2em; line-height: 1.5; }
+.form-input:focus, .form-textarea:focus { outline: 1px solid var(--clay); outline-offset: 1px; }
+.form-input:disabled { color: var(--ink-soft); cursor: not-allowed; }
+.form-mono { font-family: var(--font-mono); }
+.verdict-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.35rem; }
+.chip { font: inherit; font-size: 0.76rem; padding: 0.12rem 0.5rem; background: var(--paper-alt); border: 1px solid var(--line); cursor: pointer; color: var(--ink); }
+.chip:hover { border-color: var(--ink); }
+.form-actions { display: flex; gap: 0.6rem; margin-top: 0.3rem; }
+.btn-primary { background: var(--ochre-soft); border-color: var(--ochre); }
+.diff-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); margin: 0.6rem 0 0.2rem; }
+.diff-row { font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5; padding: 0.45rem 0.6rem; border: 1px solid var(--line); overflow-x: auto; white-space: pre; }
+.diff-row.old { background: var(--clay-soft); border-color: var(--clay); }
+.diff-row.new { background: var(--olive-soft); border-color: var(--olive); }
+.confirm-note { font-size: 0.84rem; margin: 0.7rem 0 0.4rem; }
+
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
   .topbar { padding: 1rem 1rem 0.75rem; }
@@ -302,6 +348,7 @@ details.script-node > summary::-webkit-details-marker { display: none; }
     </div>
     <select id="project-switcher" class="project-switcher hidden" title="切换项目" aria-label="切换项目"></select>
     <span id="refresh-chip" class="refresh-chip hidden" role="status"></span>
+    <button id="new-attempt-btn" class="btn new-attempt-btn" type="button">＋ 新增尝试</button>
     <nav class="tabs" role="tablist">
       <button class="tab active" data-view="tree" role="tab" aria-selected="true">Decision Tree</button>
       <button class="tab" data-view="lineage" role="tab" aria-selected="false">Lineage</button>
@@ -338,11 +385,17 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 // filled by loadProjects() and shown in the header line instead of the raw
 // path (which stays reachable as the line's hover title).
 // panelSubject remembers what the slide-out panel is currently showing
-// ({kind: "attempt", id} or {kind: "file", path}, null when closed), so an
-// auto-refresh (task V3 phase 2) can re-validate it: an attempt whose
-// record survived the re-ingest is re-rendered in place, one that vanished
-// closes the panel instead of showing stale data.
-const state = { attemptsById: new Map(), projectLabel: "", panelSubject: null };
+// ({kind: "attempt", id}, {kind: "file", path}, or {kind: "attempt-form"},
+// null when closed), so an auto-refresh (task V3 phase 2) can re-validate
+// it: an attempt whose record survived the re-ingest is re-rendered in
+// place, one that vanished closes the panel instead of showing stale data.
+// An open edit form is left alone entirely -- yanking a half-typed form
+// out from under the user is never acceptable, and the write path
+// re-validates against the file's real state server-side anyway.
+// attemptsConfig is /api/summary's echo of .rce/attempts.toml (file +
+// [columns] names, task V3 phase 3) -- the edit form is built from these,
+// never from hardcoded column labels; null means no usable config.
+const state = { attemptsById: new Map(), projectLabel: "", panelSubject: null, attemptsConfig: null };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
 
@@ -454,6 +507,10 @@ async function loadProjectSummary() {
     const label = state.projectLabel || basename(data.project_root);
     line.textContent = "项目：" + label + "   ·   待确认：" + data.pending;
     line.title = data.project_root;
+    // The edit form's column names ride along on this same fetch (task V3
+    // phase 3) -- kept fresh here so a config edit mid-serve is picked up
+    // by the next summary refresh, not only by a full page reload.
+    state.attemptsConfig = data.attempts_config || null;
   } catch (err) {
     line.textContent = "";
     line.title = "";
@@ -1192,6 +1249,19 @@ function openAttemptPanel(id) {
     return;
   }
   const attrs = attempt.attrs || {};
+
+  // 编辑 (task V3 phase 3): same form as "＋ 新增尝试", pre-filled for this
+  // row -- writes go into the source map file via preview + confirm.
+  const actions = document.createElement("div");
+  actions.className = "panel-actions";
+  const editBtn = document.createElement("button");
+  editBtn.className = "btn";
+  editBtn.type = "button";
+  editBtn.textContent = "编辑";
+  editBtn.addEventListener("click", () => openAttemptForm("update", id));
+  actions.appendChild(editBtn);
+  panelBody.appendChild(actions);
+
   const table = document.createElement("table");
   table.className = "kv-table";
   kvRow(table, "#", attrs.number || "");
@@ -1221,6 +1291,318 @@ function openAttemptPanel(id) {
   }
   openPanel();
 }
+
+// -- Attempt edit form (task V3 phase 3) ------------------------------------
+// One form for both "＋ 新增尝试" (append) and an attempt panel's 编辑
+// (update), rendered into the same slide-out panel. Two-step by design:
+// submit only ever calls POST /api/attempts/preview (a pure dry run) and
+// shows the old/new row; the write happens exclusively on the explicit
+// confirm click. Update mode submits ONLY dirty fields -- prefills come
+// from the parser's *cleaned* values, so re-writing an untouched cell
+// would silently strip the user's own markdown decoration from it.
+
+const EDITABLE_KEYS = ["date", "description", "variables", "result", "verdict"];
+
+function defaultNewNumber() {
+  // Task spec: max existing top-level number + 1 ("14a" counts as 14).
+  let max = 0;
+  state.attemptsById.forEach((a) => {
+    const n = parseInt((a.attrs && a.attrs.number) || "", 10);
+    if (!isNaN(n) && n > max) max = n;
+  });
+  return String(max + 1);
+}
+
+function defaultDateValue() {
+  const now = new Date();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  // Match the format the table already uses: any existing bare "MM-DD"
+  // row makes new rows follow suit; otherwise full "YYYY-MM-DD".
+  let short = false;
+  state.attemptsById.forEach((a) => {
+    if (/^\d{2}-\d{2}/.test((a.attrs && a.attrs.date) || "")) short = true;
+  });
+  return short ? mm + "-" + dd : now.getFullYear() + "-" + mm + "-" + dd;
+}
+
+function distinctVerdicts() {
+  // Quick choices = verdict values already present in this project's own
+  // data -- never an invented vocabulary (the researcher owns the markers).
+  const seen = new Set();
+  state.attemptsById.forEach((a) => {
+    const v = (a.verdict || "").trim();
+    if (v && v.indexOf("\n") === -1) seen.add(v);
+  });
+  return Array.from(seen).slice(0, 8);
+}
+
+function toCellText(value) {
+  // The exact inverse of the server parser's <br> handling (its cell
+  // cleanup turns a literal <br> into "\n" when reading): a newline typed
+  // -- or carried in from a prefilled multi-line cell -- goes back out as
+  // "<br>", since a markdown table cell cannot hold a raw newline and the
+  // server rejects one outright.
+  return value.replace(/\r\n?/g, "\n").split("\n").map((s) => s.trim()).join("<br>")
+    .replace(/^(<br>)+|(<br>)+$/g, "").trim();
+}
+
+function formFieldEl(labelText, inputEl) {
+  const wrap = document.createElement("div");
+  wrap.className = "form-field";
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  wrap.append(label, inputEl);
+  return wrap;
+}
+
+function panelErrorBoxCn(message) {
+  const box = document.createElement("div");
+  box.className = "error-box";
+  const title = document.createElement("div");
+  title.className = "error-title";
+  title.textContent = "无法打开编辑表单";
+  const msg = document.createElement("div");
+  msg.textContent = message;
+  box.append(title, msg);
+  return box;
+}
+
+function setFormStatus(statusEl, cls, cnText, err) {
+  // Product language up front, the raw technical message folded below it
+  // -- same division as the refresh chip's error handling.
+  statusEl.className = "panel-status " + cls;
+  statusEl.textContent = cnText + (err ? "：" + (err instanceof Error ? err.message : String(err)) : "");
+}
+
+function openAttemptForm(mode, attemptId) {
+  state.panelSubject = { kind: "attempt-form" };
+  panelBody.innerHTML = "";
+  const config = state.attemptsConfig;
+  if (!config) {
+    panelTitle.textContent = mode === "append" ? "新增尝试" : "编辑尝试";
+    panelSubtitle.textContent = "";
+    panelBody.appendChild(panelErrorBoxCn(
+      "尚未找到可用的尝试年表配置（.rce/attempts.toml）。请先在项目里配置年表，再从界面新增或编辑。"
+    ));
+    openPanel();
+    return;
+  }
+  const record = mode === "update" ? state.attemptsById.get(attemptId) : null;
+  if (mode === "update" && !record) {
+    panelTitle.textContent = "编辑尝试";
+    panelSubtitle.textContent = "";
+    panelBody.appendChild(panelErrorBoxCn("找不到这条尝试的记录，请等页面刷新后重试。"));
+    openPanel();
+    return;
+  }
+  const attrs = record ? (record.attrs || {}) : {};
+  const number = mode === "append" ? defaultNewNumber() : (attrs.number || "");
+  panelTitle.textContent = mode === "append" ? "新增尝试" : "编辑尝试 #" + number;
+  panelSubtitle.textContent = "将写入 " + config.file;
+
+  const form = document.createElement("form");
+  form.className = "attempt-form";
+  const inputs = {};
+  const initial = {};
+
+  const numberInput = document.createElement("input");
+  numberInput.className = "form-input form-mono";
+  numberInput.value = number;
+  if (mode === "update") {
+    // The number is the row's identity (the graph node id derives from
+    // it) -- renumbering is a hand edit in the file, not a cell update.
+    numberInput.disabled = true;
+    numberInput.title = "编号是这一行的身份，界面里不改；如需重编号请直接改源文件";
+  }
+  form.appendChild(formFieldEl("编号", numberInput));
+
+  // Field labels come from the project's OWN [columns] header text -- the
+  // researcher's words, not this tool's.
+  const defs = [
+    { key: "date", label: "日期（" + (config.columns.date || "date") + "）", mono: true },
+    { key: "description", label: config.columns.description || "description", multiline: true },
+    { key: "variables", label: config.columns.variables || "variables", multiline: true },
+    { key: "result", label: config.columns.result || "result", multiline: true },
+    { key: "verdict", label: config.columns.verdict || "verdict" },
+  ];
+  defs.forEach((def) => {
+    let input;
+    if (def.multiline) {
+      input = document.createElement("textarea");
+      input.className = "form-textarea";
+      input.rows = 2;
+    } else {
+      input = document.createElement("input");
+      input.className = "form-input" + (def.mono ? " form-mono" : "");
+    }
+    if (mode === "append") {
+      input.value = def.key === "date" ? defaultDateValue() : "";
+    } else {
+      input.value = def.key === "verdict" ? (record.verdict || "")
+        : def.key === "result" ? (record.result || "")
+        : (attrs[def.key] || "");
+    }
+    inputs[def.key] = input;
+    initial[def.key] = input.value;
+    const fieldEl = formFieldEl(def.label, input);
+    if (def.key === "verdict") {
+      const verdicts = distinctVerdicts();
+      if (verdicts.length) {
+        const chips = document.createElement("div");
+        chips.className = "verdict-chips";
+        verdicts.forEach((v) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "chip";
+          chip.textContent = v;
+          chip.addEventListener("click", () => { input.value = v; });
+          chips.appendChild(chip);
+        });
+        fieldEl.appendChild(chips);
+      }
+    }
+    form.appendChild(fieldEl);
+  });
+
+  const statusEl = document.createElement("div");
+  statusEl.className = "panel-status";
+
+  const actionsEl = document.createElement("div");
+  actionsEl.className = "form-actions";
+  const submitBtn = document.createElement("button");
+  submitBtn.type = "submit";
+  submitBtn.className = "btn btn-primary";
+  submitBtn.textContent = "预览改动";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "btn";
+  cancelBtn.textContent = "取消";
+  cancelBtn.addEventListener("click", closePanel);
+  actionsEl.append(submitBtn, cancelBtn);
+  form.appendChild(actionsEl);
+
+  const previewHost = document.createElement("div");
+
+  function collectBody() {
+    const num = mode === "append" ? numberInput.value.trim() : number;
+    if (!num) {
+      setFormStatus(statusEl, "err", "编号不能为空");
+      return null;
+    }
+    const fields = {};
+    if (mode === "append") {
+      EDITABLE_KEYS.forEach((key) => { fields[key] = toCellText(inputs[key].value); });
+    } else {
+      // Dirty fields only (section comment above): an untouched cell must
+      // never be round-tripped through its cleaned prefill.
+      EDITABLE_KEYS.forEach((key) => {
+        if (inputs[key].value !== initial[key]) fields[key] = toCellText(inputs[key].value);
+      });
+      if (Object.keys(fields).length === 0) {
+        setFormStatus(statusEl, "", "没有需要写入的改动");
+        return null;
+      }
+    }
+    return { op: mode, number: num, fields: fields };
+  }
+
+  function setFormDisabled(disabled) {
+    numberInput.disabled = disabled || mode === "update";
+    EDITABLE_KEYS.forEach((key) => { inputs[key].disabled = disabled; });
+    submitBtn.disabled = disabled;
+  }
+
+  function renderPreview(preview, body) {
+    previewHost.innerHTML = "";
+    setFormDisabled(true); // frozen while the preview stands -- 返回修改 unfreezes
+    if (preview.old_row !== null && preview.old_row !== undefined) {
+      const oldLabel = document.createElement("div");
+      oldLabel.className = "diff-label";
+      oldLabel.textContent = "原行";
+      const oldRow = document.createElement("div");
+      oldRow.className = "diff-row old";
+      oldRow.textContent = preview.old_row;
+      previewHost.append(oldLabel, oldRow);
+    }
+    const newLabel = document.createElement("div");
+    newLabel.className = "diff-label";
+    newLabel.textContent = "新行";
+    const newRow = document.createElement("div");
+    newRow.className = "diff-row new";
+    newRow.textContent = preview.new_row;
+    previewHost.append(newLabel, newRow);
+
+    const note = document.createElement("div");
+    note.className = "confirm-note";
+    note.textContent = "将写入 " + preview.file + "（已自动备份）";
+    const confirmActions = document.createElement("div");
+    confirmActions.className = "form-actions";
+    const confirmBtn = document.createElement("button");
+    confirmBtn.type = "button";
+    confirmBtn.className = "btn btn-primary";
+    confirmBtn.textContent = "确认写入";
+    const backBtn = document.createElement("button");
+    backBtn.type = "button";
+    backBtn.className = "btn";
+    backBtn.textContent = "返回修改";
+    backBtn.addEventListener("click", () => {
+      previewHost.innerHTML = "";
+      setFormDisabled(false);
+      statusEl.textContent = "";
+    });
+    confirmActions.append(confirmBtn, backBtn);
+    previewHost.append(note, confirmActions);
+
+    confirmBtn.addEventListener("click", async () => {
+      confirmBtn.disabled = true;
+      backBtn.disabled = true;
+      setFormStatus(statusEl, "", "正在写入…");
+      let result;
+      try {
+        // The confirmed body, verbatim -- the server re-validates against
+        // the file's current state under the ingest lock either way.
+        result = await apiPost("/api/attempts/write", body);
+      } catch (err) {
+        setFormStatus(statusEl, "err", "写入失败，文件没有被修改", err);
+        backBtn.disabled = false; // 返回修改, fix, and re-preview
+        return;
+      }
+      if (result.ingest_error) {
+        // The file edit itself landed (and is backed up) -- only the
+        // rescan failed; the refresh chip carries the same error.
+        setFormStatus(statusEl, "err", "已写入并备份，但重扫失败", result.ingest_error);
+        backBtn.disabled = false;
+        pollGeneration();
+        return;
+      }
+      closePanel(); // success -- the auto-refresh renders the new state
+      pollGeneration();
+    });
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = collectBody();
+    if (!body) return;
+    setFormStatus(statusEl, "", "正在生成预览…");
+    let preview;
+    try {
+      preview = await apiPost("/api/attempts/preview", body);
+    } catch (err) {
+      setFormStatus(statusEl, "err", "无法生成预览", err);
+      return;
+    }
+    statusEl.textContent = "";
+    renderPreview(preview, body);
+  });
+
+  panelBody.append(form, statusEl, previewHost);
+  openPanel();
+  (mode === "append" ? numberInput : inputs.description).focus();
+}
+
+document.getElementById("new-attempt-btn").addEventListener("click", () => openAttemptForm("append"));
 
 // -- Init -------------------------------------------------------------------
 // loadProjects() first (awaited): it fills state.projectLabel, which the

@@ -378,6 +378,51 @@ def test_retarget_follows_a_changed_root(tmp_path):
     assert _attempt_numbers(proj_a) == []  # A was never ingested by any of this
 
 
+# -- record_external_change (UI write path, task V3 phase 3) -------------------
+
+
+def test_record_external_change_bumps_generation_and_absorbs_the_edit(tmp_path):
+    """A UI write edits the map and re-ingests on its own, then calls
+    record_external_change: the generation bumps (open pages re-fetch),
+    and the next poll must NOT re-detect the same edit -- the baseline was
+    re-taken from disk as part of recording it."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()  # baseline
+
+    _write_map(tmp_path, [_row("1"), _row("2")])  # what apply_edit would have written
+    assert w.record_external_change() == 2
+
+    assert w.status_payload() == {"generation": 2, "refreshing": False, "last_error": None}
+    assert w.poll_once() is False  # absorbed -- no second ingest of the same change
+    assert w.status_payload()["generation"] == 2
+
+
+def test_record_external_change_records_and_clears_ingest_errors(tmp_path):
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+
+    w.record_external_change(error="boom")
+    assert w.status_payload()["last_error"] == "boom"
+
+    w.record_external_change()  # the next good write clears it, like a good poll
+    assert w.status_payload() == {"generation": 3, "refreshing": False, "last_error": None}
+
+
+def test_ingest_lock_is_the_poll_cycles_own_lock(tmp_path):
+    """The property must hand out the very lock poll_once ingests under --
+    a copy would let a UI write and a watcher ingest interleave. Holding it
+    still lets a *change-free* poll complete (the lock guards ingest, not
+    snapshotting), which is exactly the granularity the server relies on."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    with w.ingest_lock:
+        assert w.ingest_lock.locked()
+        assert w.poll_once() is False  # no change -> never reaches the ingest lock
+
+
 # -- snapshot helper -----------------------------------------------------------
 
 

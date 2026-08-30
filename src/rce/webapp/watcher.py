@@ -55,10 +55,15 @@ did change (a `/api/file` preview is already stale), and the frontend
 pairs the re-fetch with the error chip rather than silently showing old
 data as if nothing happened.
 
-Thread-safety: `status_payload`/`retarget` are called from HTTP handler
-threads while `poll_once` runs on the watcher thread, so all mutable
-state sits behind `_state_lock`. `_ingest_lock` separately serializes the
-re-ingest itself. A project switch (`retarget`, called by the
+Thread-safety: `status_payload`/`retarget`/`record_external_change` are
+called from HTTP handler threads while `poll_once` runs on the watcher
+thread, so all mutable state sits behind `_state_lock`. `_ingest_lock`
+separately serializes the re-ingest itself -- and is public (task V3
+phase 3) so the UI write path (`rce.webapp.mapedit` via
+`/api/attempts/write`) ingests under the same lock; after such a write,
+`record_external_change` re-baselines and bumps the generation so the
+watcher neither re-ingests the change a second time nor leaves open
+pages unaware of it. A project switch (`retarget`, called by the
 `/api/projects/switch` handler) bumps an internal epoch; a `poll_once`
 that was already mid-ingest against the *old* root notices the epoch
 moved and discards its baseline/error writes instead of clobbering the
@@ -198,7 +203,43 @@ class ProjectWatcher:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    # -- status / retarget (called from HTTP handler threads) -----------------
+    # -- status / retarget / external writes (called from HTTP handler threads) --
+
+    @property
+    def ingest_lock(self) -> threading.Lock:
+        """The lock serializing every re-ingest of the served project.
+        Exposed (task V3 phase 3) so the UI write path
+        (`rce.webapp.mapedit.apply_edit`, via the `/api/attempts/write`
+        handler) runs its own write+re-ingest under the SAME lock this
+        watcher's `poll_once` ingests under -- the two must never
+        interleave, and two locks could only ever drift apart."""
+        return self._ingest_lock
+
+    def record_external_change(self, error: str | None = None) -> int:
+        """A UI write (task V3 phase 3) just edited a watched file and ran
+        its own re-ingest in-process: re-baseline to what is on disk NOW,
+        so the next poll does not re-detect and re-ingest the same change,
+        and bump the generation so every open page's next poll re-fetches
+        -- the exact effect a poll-detected change would have had. `error`
+        is the write path's own contained post-write ingest failure (or
+        None on success, which also clears a stale earlier error -- same
+        "next good ingest clears it" rule as `poll_once`). Returns the new
+        generation so the write endpoint can put it in its response.
+
+        Benign race, on purpose: a poll that was already mid-cycle can
+        commit its own (pre-write) baseline right after this -- the next
+        poll then re-detects the write and re-ingests once more. Ingest is
+        idempotent and serialized by `ingest_lock`, so the cost is one
+        redundant re-ingest and generation bump, never corruption -- the
+        same shape as `poll_once`'s own epoch note, without needing the
+        epoch machinery (nothing here must *discard* anything)."""
+        root = self._get_project_root()
+        snapshot = take_snapshot(root)
+        with self._state_lock:
+            self._baseline, self._baseline_root = snapshot, root
+            self._last_error = error
+            self._generation += 1
+            return self._generation
 
     def status_payload(self) -> dict[str, object]:
         """`GET /api/generation`'s body, verbatim: `{generation,

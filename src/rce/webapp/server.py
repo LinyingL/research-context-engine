@@ -17,7 +17,12 @@ path string contains.
 Endpoints (all GET unless noted):
 
     GET  /api/summary   -- node/edge counts by type, project root, pending
-                            confirmation queue size (see `summary_payload`).
+                            confirmation queue size, plus an echo of the
+                            attempts config's columns/file (or null when no
+                            usable `.rce/attempts.toml` exists) so the app
+                            can build the edit form from the project's OWN
+                            column names, never hardcoded ones (see
+                            `summary_payload`).
     GET  /api/attempts  -- attempt nodes (human_fields verdict/result plus
                             every attrs field); `{"attempts": [], "hint":
                             ...}` when the graph has none (see
@@ -55,6 +60,18 @@ Endpoints (all GET unless noted):
                             must be string-equal to a registry entry --
                             see "Switch-target defense" below (see
                             `switch_project_payload`).
+    POST /api/attempts/preview -- body `{"op": "append"|"update", "number",
+                            "fields"}`: a pure dry run of an attempt-row
+                            edit against the researcher's own map file --
+                            unified diff plus old/new row, NOTHING written
+                            (see `attempts_preview_payload` and
+                            `rce.webapp.mapedit`).
+    POST /api/attempts/write -- same body: actually performs the edit --
+                            backup, atomic write into the source Markdown,
+                            re-ingest under the watcher's own ingest lock,
+                            generation bump -- and returns `{ok, backup,
+                            generation, ingest_error}`. See "Write-path
+                            defense" below (see `attempts_write_payload`).
     GET  /api/generation -- the auto-refresh watcher's status
                             (`rce.webapp.watcher`, task V3 phase 2):
                             `{"generation": int, "refreshing": bool,
@@ -113,6 +130,25 @@ the server at `/etc` or another arbitrary directory. `_check_local_origin`
 still runs first, exactly as for every other endpoint -- this validation is
 depth behind that check, not a replacement for it.
 
+Write-path defense (`POST /api/attempts/preview`/`.../write`, task V3
+phase 3): these are the endpoints that can change the researcher's own map
+file, so the stakes are the drive-by page again -- `_check_local_origin`
+runs first, exactly as for every other endpoint, and is what stands between
+a hostile page's no-preflight cross-origin POST and a write into the user's
+research log. Behind that check, depth: the file written is never named by
+the request at all -- it is always the one `.rce/attempts.toml` configures
+(`rce.webapp.mapedit` loads it server-side), so no request body can steer
+the write to another path; the edit itself is validated against the file's
+current content (duplicate/unknown row numbers, newlines, undecodable
+content all refuse cleanly); the original is backed up to `.rce/backups/`
+before every write and the write is atomic; and the post-write re-ingest
+runs under the watcher's own ingest lock so a UI write and a watcher poll
+never ingest concurrently (`ProjectWatcher.ingest_lock`,
+`record_external_change`). This is the one place the app writes project
+content, and it writes only what DESIGN.md declares the single source of
+truth -- the map file -- letting re-ingest mirror it into the graph, never
+the graph directly ("resync from source", DESIGN.md section 4).
+
 The current project root itself is mutable state on `RceHTTPServer`, read
 and written only through accessors holding a `threading.Lock`
 (`get_project_root`/`set_project_root`) -- `ThreadingHTTPServer` handles
@@ -157,6 +193,7 @@ from typing import Any, Callable
 
 from rce import db, lineage
 from rce.ingest import attempts as attempts_ingest
+from rce.webapp import mapedit
 from rce.webapp import registry as project_registry
 from rce.webapp import watcher as project_watcher
 
@@ -207,6 +244,17 @@ class UnsupportedPlatformError(ApiError):
 
 
 class ProjectNotInitializedError(ApiError):
+    status = 400
+
+
+class AttemptEditError(ApiError):
+    """`POST /api/attempts/preview`/`.../write` asked for an edit the map
+    file's current state refuses (duplicate/unknown number, invalid field
+    content, unusable config/table) -- 400: the request, not the server,
+    is what cannot be satisfied. Wraps `rce.webapp.mapedit.MapEditError`
+    and `rce.ingest.attempts.AttemptsConfigError` with their own messages
+    intact, since those already say precisely what was wrong."""
+
     status = 400
 
 
@@ -262,6 +310,24 @@ def _resolve_within_root(project_root: Path, rel_path: str) -> Path:
 # -- /api/summary -------------------------------------------------------------
 
 
+def _attempts_config_echo(project_root: Path) -> dict[str, Any] | None:
+    """The attempts config's shape, for the frontend's edit form (task V3
+    phase 3): the form's fields come from the project's OWN `[columns]`
+    header names, never hardcoded ones, so the app reads them here rather
+    than inventing any. None when no usable config exists -- the form then
+    explains that instead of guessing at columns (DESIGN.md section 0)."""
+    try:
+        config = attempts_ingest.load_config(project_root)
+    except attempts_ingest.AttemptsConfigError:
+        return None
+    return {
+        "file": config.file,
+        "heading": config.heading,
+        "columns": config.columns,
+        "steps_dir": config.steps_dir,
+    }
+
+
 def summary_payload(conn: Connection, project_root: Path) -> dict[str, Any]:
     node_counts = {t: len(db.get_nodes_by_type(conn, t)) for t in sorted(db.NODE_TYPES)}
     edge_counts = {t: 0 for t in sorted(db.EDGE_TYPES)}
@@ -272,6 +338,7 @@ def summary_payload(conn: Connection, project_root: Path) -> dict[str, Any]:
         "nodes": node_counts,
         "edges": edge_counts,
         "pending": len(db.pending_edges(conn)),
+        "attempts_config": _attempts_config_echo(project_root),
     }
 
 
@@ -555,6 +622,65 @@ def switch_project_payload(requested: str) -> tuple[Path, dict[str, Any]]:
     return new_root, {"current": entry["path"], "label": entry["label"]}
 
 
+# -- POST /api/attempts/preview + /api/attempts/write (task V3 phase 3) -------
+
+
+def _parse_attempt_edit_body(body: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    """Both attempt-edit endpoints share one body contract -- `{"op":
+    "append"|"update", "number": str, "fields": {key: str}}` -- so both go
+    through this single shape check (semantic validation -- duplicate
+    numbers, newline content, unknown field keys -- belongs to
+    `rce.webapp.mapedit`, which owns those rules)."""
+    op = body.get("op")
+    if op not in ("append", "update"):
+        raise MissingParamError("request body 'op' must be \"append\" or \"update\"")
+    number = body.get("number")
+    if not isinstance(number, str):
+        raise MissingParamError("request body must carry a string 'number' key")
+    fields = body.get("fields", {})
+    if not isinstance(fields, dict):
+        raise MissingParamError("request body 'fields' must be a JSON object")
+    return op, number, fields
+
+
+def attempts_preview_payload(project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """A pure dry run: `rce.webapp.mapedit.preview_edit`'s
+    `{file, diff, old_row, new_row}`, verbatim -- nothing on disk moves."""
+    op, number, fields = _parse_attempt_edit_body(body)
+    try:
+        return mapedit.preview_edit(project_root, op, number, fields)
+    except (mapedit.MapEditError, attempts_ingest.AttemptsConfigError) as exc:
+        raise AttemptEditError(str(exc)) from exc
+
+
+def attempts_write_payload(
+    project_root: Path, body: dict[str, Any], watcher: project_watcher.ProjectWatcher
+) -> dict[str, Any]:
+    """The actual write: `rce.webapp.mapedit.apply_edit` under the
+    watcher's own ingest lock (so a UI write and a watcher poll never
+    ingest concurrently -- module docstring's "Write-path defense"), then
+    `record_external_change` re-baselines the watcher and bumps the
+    generation, recording (or clearing) the write's own contained
+    post-write ingest failure. `ingest_error` is passed through to the
+    response so the UI can say "file written and backed up, but the rescan
+    failed" rather than hiding a half-landed state behind a bare ok."""
+    op, number, fields = _parse_attempt_edit_body(body)
+    try:
+        result = mapedit.apply_edit(
+            project_root, op, number, fields, ingest_lock=watcher.ingest_lock,
+        )
+    except (mapedit.MapEditError, attempts_ingest.AttemptsConfigError) as exc:
+        raise AttemptEditError(str(exc)) from exc
+    generation = watcher.record_external_change(result["ingest_error"])
+    return {
+        "ok": True,
+        "file": result["file"],
+        "backup": result["backup"],
+        "generation": generation,
+        "ingest_error": result["ingest_error"],
+    }
+
+
 # -- The single-page app (task V2) -------------------------------------------
 
 _APP_HTML_PATH = Path(__file__).parent / "app.html"
@@ -726,17 +852,27 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             logger.exception("unhandled error handling GET %s", self.path)
             self._send_json(500, {"error": "internal server error"})
 
-    def _read_json_body_with_path(self) -> dict[str, Any]:
-        """Both POST endpoints share one body contract -- a JSON object with
-        a string `"path"` key -- so both go through this single parse+shape
-        check (and get identical 400s for the same malformed input)."""
+    def _read_json_object(self) -> dict[str, Any]:
+        """Every POST endpoint's body is one JSON object -- one shared
+        parse+shape check, identical 400s for the same malformed input.
+        Per-endpoint key requirements layer on top (`_read_json_body_with_
+        path` for the path-shaped endpoints, `_parse_attempt_edit_body`
+        for the attempt-edit ones)."""
         length = int(self.headers.get("Content-Length") or "0")
         raw_body = self.rfile.read(length) if length > 0 else b""
         try:
             body = json.loads(raw_body) if raw_body else {}
         except json.JSONDecodeError as exc:
             raise MissingParamError(f"invalid JSON request body: {exc}") from exc
-        if not isinstance(body, dict) or not isinstance(body.get("path"), str):
+        if not isinstance(body, dict):
+            raise MissingParamError("request body must be a JSON object")
+        return body
+
+    def _read_json_body_with_path(self) -> dict[str, Any]:
+        """The two path-shaped POST endpoints (`/api/open`,
+        `/api/projects/switch`) additionally require a string `"path"` key."""
+        body = self._read_json_object()
+        if not isinstance(body.get("path"), str):
             raise MissingParamError("request body must be a JSON object with a string 'path' key")
         return body
 
@@ -761,6 +897,21 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # generation, so every open page's next poll re-fetches.
                 self.server.watcher.retarget()
                 self._send_json(200, payload)
+            elif parsed.path == "/api/attempts/preview":
+                # Pure dry run (task V3 phase 3) -- but origin-checked like
+                # a write anyway (above), since its twin below mutates and
+                # the two must never drift apart in what reaches them.
+                body = self._read_json_object()
+                self._send_json(200, attempts_preview_payload(self._project_root(), body))
+            elif parsed.path == "/api/attempts/write":
+                # The one endpoint that writes project content: the user's
+                # own map file, via rce.webapp.mapedit (backup + atomic
+                # write + re-ingest under the watcher's ingest lock) --
+                # see module docstring's "Write-path defense".
+                body = self._read_json_object()
+                self._send_json(
+                    200, attempts_write_payload(self._project_root(), body, self.server.watcher)
+                )
             else:
                 raise NotFoundError(f"no such endpoint: {parsed.path}")
         except ApiError as exc:
