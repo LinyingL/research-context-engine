@@ -115,9 +115,12 @@ anything else: it rejects unless `Host` equals `127.0.0.1:<the port this
 process actually bound>` (a rebound or attacker-controlled hostname never
 produces that exact Host value, no matter what it resolves to) and, only
 when a browser actually sends one, `Origin` equals that same
-`http://127.0.0.1:<port>` -- missing entirely is accepted, since a
-non-browser CLI caller (`curl`, this module's own test suite) never sends
-one.
+`http://127.0.0.1:<port>` or the portless `http://127.0.0.1` (Safari drops
+the non-default port when serializing a same-origin POST's Origin -- a
+foreign page's Origin still always names its own host, so the portless
+loopback form proves the same thing the exact one does) -- missing entirely
+is accepted, since a non-browser CLI caller (`curl`, this module's own test
+suite) never sends one.
 
 Switch-target defense (`POST /api/projects/switch`, task V3 phase 1): this
 is the one endpoint that changes what the whole server serves, so its input
@@ -825,7 +828,19 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 f"request Host {host!r} does not match this server ({expected_host!r}); refusing"
             )
         origin = self.headers.get("Origin")
-        if origin is not None and origin != f"http://{expected_host}":
+        # Safari serializes the Origin of a same-origin POST to a
+        # non-default port WITHOUT the port ("http://127.0.0.1", observed
+        # live 2026-08-30 from the RCE.app -> default-browser flow), so the
+        # portless loopback form must be accepted alongside the exact one.
+        # This does not widen the drive-by/rebinding surface: a foreign
+        # page's Origin always carries its own hostname, and the only way a
+        # browser produces a bare "http://127.0.0.1" is a page actually
+        # served from loopback port 80 on this machine -- a local process,
+        # outside this threat model (see module docstring).
+        if origin is not None and origin not in (
+            f"http://{expected_host}",
+            "http://127.0.0.1",
+        ):
             raise ForbiddenOriginError(
                 f"request Origin {origin!r} does not match this server; refusing"
             )

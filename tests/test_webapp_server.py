@@ -733,6 +733,50 @@ def test_http_open_allows_matching_origin_header(live_server, monkeypatch):
     assert status == 200 and len(calls) == 1
 
 
+def test_http_allows_portless_loopback_origin(live_server, monkeypatch):
+    """Safari serializes a same-origin POST's Origin to a non-default port
+    WITHOUT the port -- literally `http://127.0.0.1` -- which the exact-match
+    check used to reject, breaking every POST-backed button in the app for
+    anyone whose default browser is Safari (observed live 2026-08-30 via the
+    RCE.app launch flow). The portless loopback form proves the same thing
+    the exact form does (a foreign/rebound page's Origin always names its own
+    host), so it must be accepted."""
+    base_url, project = live_server
+    (project / "f.txt").write_text("x")
+    monkeypatch.setattr(server, "_is_macos", lambda: True)
+    calls = []
+    monkeypatch.setattr(server.subprocess, "run", lambda args, **kw: calls.append((args, kw)))
+
+    status, _ = _request_with_headers(
+        base_url, "POST", "/api/open",
+        {"Content-Type": "application/json", "Origin": "http://127.0.0.1"},
+        body=json.dumps({"path": "f.txt"}).encode("utf-8"),
+    )
+
+    assert status == 200 and len(calls) == 1
+
+
+def test_http_portless_acceptance_does_not_widen_the_check(live_server):
+    """The Safari accommodation admits exactly one extra literal value --
+    every neighboring shape (wrong port, localhost spelling, https scheme,
+    trailing slash) stays rejected."""
+    base_url, _ = live_server
+    port = int(base_url.rsplit(":", 1)[1])
+    for origin in (
+        f"http://127.0.0.1:{port + 1}",
+        "http://localhost",
+        f"http://localhost:{port}",
+        "https://127.0.0.1",
+        "http://127.0.0.1/",
+    ):
+        status, payload = _request_with_headers(
+            base_url, "POST", "/api/open",
+            {"Content-Type": "application/json", "Origin": origin},
+            body=json.dumps({"path": "f.txt"}).encode("utf-8"),
+        )
+        assert status == 403 and "Origin" in payload["error"], origin
+
+
 def test_http_summary_rejects_mismatched_host_header(live_server):
     """Defense in depth on GET too (module docstring): without this, DNS
     rebinding could make a foreign-looking `Origin`/`Host` pair pass the
