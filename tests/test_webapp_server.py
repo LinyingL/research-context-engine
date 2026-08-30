@@ -881,3 +881,132 @@ def test_http_projects_rejects_mismatched_host_header(live_server, fake_home):
         base_url, "GET", "/api/projects", {"Host": "attacker.example:1234"}
     )
     assert status == 403
+
+
+# -- GET /api/generation + auto-refresh watcher wiring (task V3 phase 2) --------
+
+
+def _write_attempts_map(project: Path, rows: list[str]) -> None:
+    """A real map.md matching `_write_attempts_config`'s file/heading, with
+    `rows` as pre-formatted `| # | date | desc | vars | result | verdict |`
+    lines -- just enough table for `rce.ingest.attempts` to parse."""
+    header = (
+        "## H\n\n"
+        "| # | date | desc | vars | result | verdict |\n"
+        "|---|------|------|------|--------|---------|\n"
+    )
+    (project / "map.md").write_text(header + "\n".join(rows) + "\n")
+
+
+def test_http_generation_reports_watcher_status(live_server):
+    """The endpoint's initial contract: generation starts at 1, nothing is
+    refreshing, no error -- and it answers with no watcher thread running
+    at all (build_server creates the watcher; only serve() starts it)."""
+    status, payload = _get(live_server[0], "/api/generation")
+    assert status == 200
+    assert payload == {"generation": 1, "refreshing": False, "last_error": None}
+
+
+def test_http_generation_rejects_mismatched_host_header(live_server):
+    """_check_local_origin runs before EVERY endpoint, this one included."""
+    base_url, _ = live_server
+    status, _ = _request_with_headers(
+        base_url, "GET", "/api/generation", {"Host": "attacker.example:1234"}
+    )
+    assert status == 403
+
+
+def test_http_switch_bumps_generation(live_server, fake_home, tmp_path):
+    """A project switch retargets the watcher and bumps the generation, so
+    every open page's next /api/generation poll triggers a re-fetch of the
+    new project's data."""
+    base_url, project = live_server
+    registry.register(project)
+    other = tmp_path / "other"
+    _init_project(other)
+    registry.register(other)
+
+    status, _ = _post(base_url, "/api/projects/switch", {"path": _registered_path("other")})
+    assert status == 200
+
+    status, payload = _get(base_url, "/api/generation")
+    assert status == 200
+    assert payload == {"generation": 2, "refreshing": False, "last_error": None}
+
+
+def test_http_failed_switch_does_not_bump_generation(live_server, fake_home):
+    """A rejected switch (unknown path here) must leave the watcher alone --
+    retarget only runs after validation, so a drive-by rejection can never
+    even make open pages re-fetch."""
+    base_url, _ = live_server
+    status, _ = _post(base_url, "/api/projects/switch", {"path": "/not/registered"})
+    assert status == 403
+    _, payload = _get(base_url, "/api/generation")
+    assert payload["generation"] == 1
+
+
+def test_http_tree_reflects_map_edit_after_watcher_poll(tmp_path):
+    """The full auto-refresh loop at the HTTP surface, on the server's OWN
+    watcher (the one RceHTTPServer constructed), driven deterministically
+    via poll_once() instead of a sleeping thread: edit the map, poll, and
+    /api/generation and /api/tree both serve the new state."""
+    project = tmp_path / "proj"
+    _init_project(project)
+    _write_attempts_config(project)
+    _write_attempts_map(project, ["| 1 | 2026-01-01 | first | v | r | ✅ |"])
+    httpd = server.build_server(project, 0, watch_interval=0.01)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        httpd.watcher.poll_once()  # baseline
+
+        _write_attempts_map(
+            project,
+            ["| 1 | 2026-01-01 | first | v | r | ✅ |", "| 2 | 2026-01-02 | second | v | r | 🕒 |"],
+        )
+        assert httpd.watcher.poll_once() is True
+
+        status, payload = _get(base_url, "/api/generation")
+        assert status == 200
+        assert payload == {"generation": 2, "refreshing": False, "last_error": None}
+        status, payload = _get(base_url, "/api/tree")
+        assert status == 200
+        assert [a["number"] for a in payload["attempts"]] == ["1", "2"]
+        assert payload["attempts"][1]["description"] == "second"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_serve_starts_watcher_and_server_close_stops_it(tmp_path, monkeypatch):
+    """serve() is the one place the polling thread starts (build_server
+    never does), and its finally-block server_close stops it -- observed
+    from inside the (stubbed) serve_forever, where the thread must be
+    alive, and after serve() returns, where it must be gone."""
+    _init_project(tmp_path)
+    observed: dict[str, Any] = {}
+
+    def fake_serve_forever(self):
+        observed["alive_during_serve"] = (
+            self.watcher._thread is not None and self.watcher._thread.is_alive()
+        )
+        observed["httpd"] = self
+
+    monkeypatch.setattr(server.RceHTTPServer, "serve_forever", fake_serve_forever)
+
+    server.serve(tmp_path, port=0, open_browser=False)
+
+    assert observed["alive_during_serve"] is True
+    assert observed["httpd"].watcher._thread is None  # server_close stopped it
+
+
+def test_build_server_does_not_start_watcher_thread(tmp_path):
+    """Routing-only consumers (this file's own live_server fixture) must
+    never pay for background polling -- only serve() starts the thread."""
+    httpd = server.build_server(tmp_path, 0, watch_interval=0.01)
+    try:
+        assert httpd.watcher._thread is None
+    finally:
+        httpd.server_close()

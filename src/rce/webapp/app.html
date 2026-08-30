@@ -6,9 +6,19 @@
   resources, zero build step. Served verbatim by rce.webapp.server at "/"
   and read entirely client-side against this same process's JSON API
   (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
-  /api/open, /api/projects, /api/projects/switch -- see
+  /api/open, /api/projects, /api/projects/switch, /api/generation -- see
   rce/webapp/server.py's module docstring for the contract each endpoint
   promises).
+
+  Auto-refresh (task V3 phase 2): the server's own watcher re-ingests the
+  attempts map / step scripts when they change on disk and bumps a
+  generation counter; this page polls GET /api/generation every 2s and,
+  when the number moved, re-fetches the current view's data while
+  PRESERVING UI state -- which attempts/scripts are expanded, which view
+  is active, and (for an attempt whose record still exists) the open
+  panel. A small chip in the header says, in product language, when a
+  rescan is in flight or when the last one failed (the raw error lives on
+  the chip's hover title, technical detail folded away).
 
   Multi-project switching (task V3 phase 1): the header shows the current
   project's registry label (hover for the full path), and -- only when the
@@ -101,6 +111,17 @@ body {
 }
 .project-switcher:hover { border-color: var(--ink); }
 .project-switcher:focus { outline: 1px solid var(--clay); outline-offset: 1px; }
+
+.refresh-chip {
+  font-size: 0.76rem;
+  color: var(--ink);
+  background: var(--ochre-soft);
+  border: 1px solid var(--ochre);
+  padding: 0.18rem 0.6rem;
+  align-self: center;
+  white-space: nowrap;
+}
+.refresh-chip.err { background: var(--clay-soft); border-color: var(--clay); cursor: help; }
 
 .tabs { display: flex; gap: 1.5rem; margin-left: auto; }
 .tab {
@@ -280,6 +301,7 @@ details.script-node > summary::-webkit-details-marker { display: none; }
       <span class="brand-sub">decision tree &amp; lineage</span>
     </div>
     <select id="project-switcher" class="project-switcher hidden" title="切换项目" aria-label="切换项目"></select>
+    <span id="refresh-chip" class="refresh-chip hidden" role="status"></span>
     <nav class="tabs" role="tablist">
       <button class="tab active" data-view="tree" role="tab" aria-selected="true">Decision Tree</button>
       <button class="tab" data-view="lineage" role="tab" aria-selected="false">Lineage</button>
@@ -315,7 +337,12 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 // projectLabel is the current project's registry label (task V3 phase 1),
 // filled by loadProjects() and shown in the header line instead of the raw
 // path (which stays reachable as the line's hover title).
-const state = { attemptsById: new Map(), projectLabel: "" };
+// panelSubject remembers what the slide-out panel is currently showing
+// ({kind: "attempt", id} or {kind: "file", path}, null when closed), so an
+// auto-refresh (task V3 phase 2) can re-validate it: an attempt whose
+// record survived the re-ingest is re-rendered in place, one that vanished
+// closes the panel instead of showing stale data.
+const state = { attemptsById: new Map(), projectLabel: "", panelSubject: null };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
 
@@ -488,6 +515,10 @@ async function reloadAllViews() {
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
   closePanel();
+  // The switch itself bumped the server's generation (watcher.retarget);
+  // resync the poller's notion of "current" so the next tick doesn't
+  // immediately re-fetch everything this function just fetched.
+  await syncGeneration();
   await loadProjects();
   loadProjectSummary();
   if (currentView === "tree") loadTreeView();
@@ -509,6 +540,114 @@ projectSwitcher.addEventListener("change", async () => {
   await reloadAllViews();
   projectSwitcher.disabled = false;
 });
+
+// -- Auto-refresh (task V3 phase 2) -----------------------------------------
+// GET /api/generation every 2s (matching the server watcher's own poll
+// cadence). When the generation moved, the current view's data is
+// re-fetched and re-rendered with UI state preserved: expanded rows stay
+// expanded (captureTreeState/restoreTreeState), the active view stays
+// active (only it re-fetches now; the hidden one is marked stale and
+// reloads lazily on its next activation), and an open attempt panel is
+// re-validated against the fresh data -- re-rendered if its record still
+// exists, closed if the row was deleted from the map. A file panel is left
+// as it stands: its preview is a point-in-time snapshot and yanking it
+// mid-read would lose the user's scroll position for no gain.
+//
+// The chip states, in product language (the raw error string is folded
+// onto the hover title): "正在重扫" while a rescan or re-fetch is in
+// flight, a clay warning when the watcher's last re-ingest failed (a
+// half-saved table, usually -- the next good save clears it), hidden
+// otherwise. A failed generation poll itself is simply retried next tick,
+// never surfaced as an error box: transient, and the page still shows
+// consistent (if momentarily stale) data.
+
+const REFRESH_POLL_MS = 2000;
+const refreshChip = document.getElementById("refresh-chip");
+let lastGeneration = null;
+let refreshInFlight = false;
+
+function showRefreshingChip() {
+  refreshChip.classList.remove("hidden", "err");
+  refreshChip.textContent = "地图有改动，正在重扫…";
+  refreshChip.title = "";
+}
+
+function updateChipFromStatus(status) {
+  if (status.last_error) {
+    refreshChip.classList.remove("hidden");
+    refreshChip.classList.add("err");
+    refreshChip.textContent = "重扫失败，最新改动尚未同步";
+    refreshChip.title = status.last_error;
+  } else if (status.refreshing) {
+    showRefreshingChip();
+  } else {
+    refreshChip.classList.add("hidden");
+    refreshChip.classList.remove("err");
+    refreshChip.title = "";
+  }
+}
+
+function revalidatePanel() {
+  if (!state.panelSubject || panel.classList.contains("hidden")) return;
+  if (state.panelSubject.kind !== "attempt") return;
+  if (state.attemptsById.has(state.panelSubject.id)) {
+    openAttemptPanel(state.panelSubject.id); // re-render from the fresh record
+  } else {
+    closePanel(); // the row is gone; stale details must not linger on screen
+  }
+}
+
+async function refreshCurrentView() {
+  // Both views' data may have moved on disk; only the visible one
+  // re-fetches now, the other is marked stale for its next activation.
+  delete views.tree.dataset.loaded;
+  delete views.lineage.dataset.loaded;
+  if (currentView === "tree") {
+    await loadTreeView(true);
+    revalidatePanel(); // attemptsById was just refreshed by loadTreeView
+  } else if (currentView === "lineage") {
+    await loadLineageView();
+  }
+  loadProjectSummary(); // the pending count may have moved with the graph
+}
+
+async function syncGeneration() {
+  try {
+    const status = await apiGet("/api/generation");
+    lastGeneration = status.generation;
+    updateChipFromStatus(status);
+  } catch (err) {
+    // Leave lastGeneration as-is; the regular poll self-corrects.
+  }
+}
+
+async function pollGeneration() {
+  if (refreshInFlight) return; // never stack refreshes on a slow fetch
+  let status;
+  try {
+    status = await apiGet("/api/generation");
+  } catch (err) {
+    return; // transient; retry on the next tick
+  }
+  if (lastGeneration === null) {
+    lastGeneration = status.generation;
+    updateChipFromStatus(status);
+    return;
+  }
+  if (status.generation === lastGeneration) {
+    updateChipFromStatus(status);
+    return;
+  }
+  lastGeneration = status.generation;
+  refreshInFlight = true;
+  showRefreshingChip();
+  try {
+    await refreshCurrentView();
+  } finally {
+    refreshInFlight = false;
+    updateChipFromStatus(status);
+  }
+}
 
 // -- Decision Tree view --------------------------------------------------------
 
@@ -564,6 +703,10 @@ function verdictBadge(verdictText) {
 function renderAttemptNode(attempt) {
   const details = document.createElement("details");
   details.className = "attempt-node";
+  // Stable key for auto-refresh (task V3 phase 2): captureTreeState()
+  // records which attempt ids were expanded so restoreTreeState() can
+  // re-open the same rows on the freshly built DOM.
+  details.dataset.attemptId = attempt.id;
 
   const summary = document.createElement("summary");
   const caret = document.createElement("span");
@@ -596,7 +739,7 @@ function renderAttemptNode(attempt) {
   if (attempt.scripts && attempt.scripts.length) {
     const scriptList = document.createElement("div");
     scriptList.className = "script-list";
-    attempt.scripts.forEach((s) => scriptList.appendChild(renderScriptNode(s)));
+    attempt.scripts.forEach((s) => scriptList.appendChild(renderScriptNode(s, attempt.id)));
     body.appendChild(scriptList);
   }
   if (attempt.children && attempt.children.length) {
@@ -609,10 +752,14 @@ function renderAttemptNode(attempt) {
   return details;
 }
 
-function renderScriptNode(script) {
+function renderScriptNode(script, attemptId) {
   const details = document.createElement("details");
   details.className = "script-node";
   details.dataset.rendered = "0";
+  // Keyed per owning attempt, not by path alone: two attempts can link the
+  // same step script, and auto-refresh must re-expand only the copy the
+  // user actually had open.
+  details.dataset.scriptKey = attemptId + "::" + script.path;
 
   const summary = document.createElement("summary");
   const caret = document.createElement("span");
@@ -638,12 +785,20 @@ function renderScriptNode(script) {
   // Lazy layer: a project with many attempts x many step scripts can carry
   // thousands of read/write rows in one /api/tree response. The JSON is
   // already all in memory, but the DOM for a script's file list is only
-  // built the first time its <details> is actually opened.
-  details.addEventListener("toggle", () => {
-    if (details.open && details.dataset.rendered === "0") {
+  // built the first time its <details> is actually opened. The renderer is
+  // also kept reachable on the element itself (an expando -- fine for this
+  // inline, build-free app) so restoreTreeState() can re-open a node and
+  // fill its body synchronously, without waiting on the browser's
+  // asynchronous toggle-event dispatch.
+  const ensureRendered = () => {
+    if (details.dataset.rendered === "0") {
       renderScriptBody(body, script);
       details.dataset.rendered = "1";
     }
+  };
+  details._ensureRendered = ensureRendered;
+  details.addEventListener("toggle", () => {
+    if (details.open) ensureRendered();
   });
   return details;
 }
@@ -708,9 +863,46 @@ function renderScriptBody(body, script) {
   }
 }
 
-async function loadTreeView() {
+// -- Expansion-state capture/restore (auto-refresh, task V3 phase 2) --------
+// Both walk the live DOM by the data-keys the renderers stamp on every
+// <details>, so an auto-refresh rebuilds the tree from fresh data yet the
+// user's open rows stay open. A key that no longer exists after re-ingest
+// (row deleted, script unlinked) is simply not matched -- nothing to
+// restore is the correct outcome for it.
+
+function captureTreeState() {
+  const openAttempts = new Set();
+  const openScripts = new Set();
+  views.tree.querySelectorAll("details.attempt-node[open]").forEach((d) => {
+    if (d.dataset.attemptId) openAttempts.add(d.dataset.attemptId);
+  });
+  views.tree.querySelectorAll("details.script-node[open]").forEach((d) => {
+    if (d.dataset.scriptKey) openScripts.add(d.dataset.scriptKey);
+  });
+  return { openAttempts, openScripts };
+}
+
+function restoreTreeState(saved) {
+  views.tree.querySelectorAll("details.attempt-node").forEach((d) => {
+    if (saved.openAttempts.has(d.dataset.attemptId)) d.open = true;
+  });
+  views.tree.querySelectorAll("details.script-node").forEach((d) => {
+    if (saved.openScripts.has(d.dataset.scriptKey)) {
+      d.open = true;
+      // Fill the lazy body now -- the toggle event a property write queues
+      // is asynchronous, and the restored row should not flash empty.
+      if (d._ensureRendered) d._ensureRendered();
+    }
+  });
+}
+
+async function loadTreeView(preserveState) {
   const container = views.tree;
-  container.innerHTML = '<p class="empty-note">Loading…</p>';
+  const saved = preserveState ? captureTreeState() : null;
+  // An auto-refresh keeps the old DOM in place until the new data has
+  // actually arrived -- no "Loading…" flash wiping the user's view every
+  // time they save a file in their editor.
+  if (!saved) container.innerHTML = '<p class="empty-note">Loading…</p>';
   let treeData, attemptsData;
   try {
     [treeData, attemptsData] = await Promise.all([apiGet("/api/tree"), apiGet("/api/attempts")]);
@@ -729,6 +921,7 @@ async function loadTreeView() {
   list.className = "attempt-list";
   treeData.attempts.forEach((a) => list.appendChild(renderAttemptNode(a)));
   container.appendChild(list);
+  if (saved) restoreTreeState(saved);
   views.tree.dataset.loaded = "1";
 }
 
@@ -876,6 +1069,7 @@ function closePanel() {
   panel.classList.add("hidden");
   panelBackdrop.classList.add("hidden");
   panel.setAttribute("aria-hidden", "true");
+  state.panelSubject = null;
 }
 
 document.getElementById("panel-close").addEventListener("click", closePanel);
@@ -942,6 +1136,7 @@ function buildFileActions(path, statusEl) {
 }
 
 async function openFilePanel(path, hint) {
+  state.panelSubject = { kind: "file", path: path };
   panelTitle.textContent = path;
   panelSubtitle.textContent = classifyFileType(path, hint);
   panelBody.innerHTML = "";
@@ -984,6 +1179,7 @@ function kvRow(table, label, value) {
 
 function openAttemptPanel(id) {
   const attempt = state.attemptsById.get(id);
+  state.panelSubject = { kind: "attempt", id: id };
   panelTitle.textContent = id;
   panelSubtitle.textContent = "attempt record";
   panelBody.innerHTML = "";
@@ -1029,12 +1225,18 @@ function openAttemptPanel(id) {
 // -- Init -------------------------------------------------------------------
 // loadProjects() first (awaited): it fills state.projectLabel, which the
 // summary line prefers over a raw-path basename. The views themselves never
-// wait on either -- activateView kicks off its own fetch.
+// wait on either -- activateView kicks off its own fetch. The generation
+// poll (task V3 phase 2) starts alongside: syncGeneration() records the
+// server's current generation as this page's starting point (so the first
+// interval tick compares against reality, not null), then the interval
+// keeps watching for the server-side watcher's bumps.
 
 (async () => {
   await loadProjects();
   loadProjectSummary();
   activateView("tree");
+  syncGeneration();
+  setInterval(pollGeneration, REFRESH_POLL_MS);
 })();
 </script>
 </body>

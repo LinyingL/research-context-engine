@@ -55,6 +55,12 @@ Endpoints (all GET unless noted):
                             must be string-equal to a registry entry --
                             see "Switch-target defense" below (see
                             `switch_project_payload`).
+    GET  /api/generation -- the auto-refresh watcher's status
+                            (`rce.webapp.watcher`, task V3 phase 2):
+                            `{"generation": int, "refreshing": bool,
+                            "last_error": str|null}`. The frontend polls
+                            this and re-fetches its views whenever the
+                            generation moved -- see "Auto-refresh" below.
     GET  /             -- the single-page app (task V2), served verbatim from
                             `src/rce/webapp/app.html`: inline CSS/JS, zero
                             external resources, zero build step -- it reads
@@ -115,6 +121,19 @@ another handler reading the root mid-request. Each handler reads the root
 once per request (via `_project_root()`) and works with that snapshot; a
 switch landing mid-request affects the *next* request, never tears this one.
 
+Auto-refresh (task V3 phase 2): every `RceHTTPServer` owns one
+`rce.webapp.watcher.ProjectWatcher` -- a daemon polling thread that stats
+the current project's attempts config/source file/steps_dir every ~2s,
+re-runs the relevant ingest in-process on a change, and bumps the
+generation counter `GET /api/generation` reports (see that module's own
+docstring for the watch-set bounds and failure containment). The thread is
+started by `serve()` -- never by `build_server`, so tests that only need
+routing get no background polling -- and stopped by `server_close`. A
+successful `POST /api/projects/switch` calls `watcher.retarget()` so
+polling follows the new root and the frontend's next generation poll
+triggers a re-fetch. The watcher endpoint is read-only status; it goes
+through `_check_local_origin` exactly like every other endpoint.
+
 Every handler-facing failure is one of the small `ApiError` subclasses below,
 each carrying its own HTTP status; `RceRequestHandler` catches `ApiError`
 once per request and renders `{"error": str(exc)}` at that status, mirroring
@@ -139,6 +158,7 @@ from typing import Any, Callable
 from rce import db, lineage
 from rce.ingest import attempts as attempts_ingest
 from rce.webapp import registry as project_registry
+from rce.webapp import watcher as project_watcher
 
 logger = logging.getLogger(__name__)
 
@@ -558,7 +578,13 @@ class RceHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address: tuple[str, int], handler_cls: type, project_root: Path) -> None:
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_cls: type,
+        project_root: Path,
+        watch_interval: float = project_watcher.DEFAULT_INTERVAL_SECONDS,
+    ) -> None:
         # Mutable since task V3 phase 1 (POST /api/projects/switch), and
         # only ever touched through the two accessors below: each request
         # runs on its own thread (ThreadingHTTPServer), so a bare attribute
@@ -567,6 +593,15 @@ class RceHTTPServer(ThreadingHTTPServer):
         # accidentally bypass the lock.
         self.__project_root = project_root
         self.__project_root_lock = threading.Lock()
+        # Task V3 phase 2: the auto-refresh watcher. Created here (so
+        # /api/generation always has status to report, and a switch always
+        # has something to retarget) but its polling thread is only started
+        # by serve() -- build_server alone spawns no background work, which
+        # keeps every routing-only test thread-free. Reads the root through
+        # the same locked accessor handlers use.
+        self.watcher = project_watcher.ProjectWatcher(
+            self.get_project_root, interval=watch_interval,
+        )
         super().__init__(server_address, handler_cls)
 
     def get_project_root(self) -> Path:
@@ -576,6 +611,14 @@ class RceHTTPServer(ThreadingHTTPServer):
     def set_project_root(self, project_root: Path) -> None:
         with self.__project_root_lock:
             self.__project_root = project_root
+
+    def server_close(self) -> None:
+        # The watcher thread must never outlive its server (it would keep
+        # statting -- and on a change, re-ingesting -- a project nothing is
+        # serving anymore). stop() is safe when the thread was never
+        # started, and idempotent, so double server_close stays harmless.
+        self.watcher.stop()
+        super().server_close()
 
 
 class RceRequestHandler(BaseHTTPRequestHandler):
@@ -660,6 +703,14 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # projects exist must keep working even when the *current*
                 # project's own graph.db has gone missing mid-serve.
                 self._send_json(200, projects_payload(self._project_root()))
+            elif path == "/api/generation":
+                # Watcher status only (task V3 phase 2) -- like
+                # /api/projects, deliberately not routed through
+                # _open_conn: the frontend's refresh poll must keep
+                # answering even when the current project's own graph.db
+                # has gone missing mid-serve (that failure surfaces as the
+                # watcher's last_error, not as this endpoint erroring).
+                self._send_json(200, self.server.watcher.status_payload())
             elif path == "/api/file":
                 values = query.get("path")
                 if not values:
@@ -705,6 +756,10 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body_with_path()
                 new_root, payload = switch_project_payload(body["path"])
                 self.server.set_project_root(new_root)
+                # Re-target the auto-refresh watcher (task V3 phase 2):
+                # drops the old root's baseline/error and bumps the
+                # generation, so every open page's next poll re-fetches.
+                self.server.watcher.retarget()
                 self._send_json(200, payload)
             else:
                 raise NotFoundError(f"no such endpoint: {parsed.path}")
@@ -715,11 +770,20 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal server error"})
 
 
-def build_server(project_root: Path, port: int) -> RceHTTPServer:
+def build_server(
+    project_root: Path,
+    port: int,
+    watch_interval: float = project_watcher.DEFAULT_INTERVAL_SECONDS,
+) -> RceHTTPServer:
     """Bound to 127.0.0.1 only -- see module docstring. `port=0` (used by
     the test suite) asks the OS for a free ephemeral port; the caller reads
-    the actual bound port back from `server_address[1]`."""
-    return RceHTTPServer(("127.0.0.1", port), RceRequestHandler, project_root)
+    the actual bound port back from `server_address[1]`. `watch_interval`
+    is the auto-refresh watcher's polling period, injectable so tests can
+    run a fast real-thread loop -- the watcher itself is created either
+    way but only serve() starts its thread."""
+    return RceHTTPServer(
+        ("127.0.0.1", port), RceRequestHandler, project_root, watch_interval=watch_interval,
+    )
 
 
 def serve(project_root: Path, port: int, open_browser: bool = True) -> None:
@@ -728,12 +792,19 @@ def serve(project_root: Path, port: int, open_browser: bool = True) -> None:
     tab, then block serving requests until Ctrl+C. `_require_db` runs before
     `build_server` so a project that was never `rce init`ed fails with the
     same clear message every other subcommand gives, before a socket is even
-    opened."""
+    opened.
+
+    This is also the one place the auto-refresh watcher's polling thread is
+    started (task V3 phase 2) -- a served app is the only consumer of live
+    re-ingestion, so build_server callers that never serve (the test
+    suite's routing fixtures) never pay for a background thread. The
+    `finally` block's `server_close` stops it again."""
     _require_db(project_root)
     httpd = build_server(project_root, port)
     bound_port = httpd.server_address[1]
     url = f"http://127.0.0.1:{bound_port}"
     print(f"RCE app: {url}  (Ctrl+C to stop)")
+    httpd.watcher.start()
     if open_browser:
         webbrowser.open(url)
     try:
