@@ -9,6 +9,7 @@ macOS's `open` to reveal a file in Finder or open it with its default
 application, never to execute or modify project content. See
 rce.webapp.server's module docstring for the full endpoint list.
 
-V1 serves a placeholder page at `/`; V2 replaces it with a real single-page
-app (`src/rce/webapp/app.html`) built against the same JSON API.
+`/` serves the single-page app (`src/rce/webapp/app.html`, task V2): a
+two-view client (Decision Tree / Lineage) built entirely against the same
+JSON API -- inline CSS/JS, zero external resources, zero build step.
 """

@@ -43,9 +43,11 @@ Endpoints (all GET unless noted):
                             every other platform gets 501 with an explanation,
                             never a confusing subprocess failure (see
                             `open_payload`/`_is_macos`).
-    GET  /             -- a placeholder page (V2 replaces this with a real
-                            single-page app at `src/rce/webapp/app.html`); all
-                            markup is inline, no external request of any kind.
+    GET  /             -- the single-page app (task V2), served verbatim from
+                            `src/rce/webapp/app.html`: inline CSS/JS, zero
+                            external resources, zero build step -- it reads
+                            this same JSON API entirely client-side (see that
+                            file's own top comment for the two-view contract).
 
 Path-traversal defense (`/api/file` and `/api/open` alike, both required by
 task V1): `_resolve_within_root` resolves the requested path -- symlinks
@@ -407,25 +409,20 @@ def open_payload(project_root: Path, rel_path: str, reveal: bool) -> dict[str, A
     return {"opened": str(target), "reveal": reveal}
 
 
-# -- Placeholder page (V2 replaces this with src/rce/webapp/app.html) --------
+# -- The single-page app (task V2) -------------------------------------------
 
-_PLACEHOLDER_HTML = """\
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>RCE</title></head>
-<body>
-<h1>RCE</h1>
-<p>The single-page decision-tree app lands in V2 (src/rce/webapp/app.html).
-For now, the read-only JSON API is live:</p>
-<ul>
-<li><a href="/api/summary">/api/summary</a></li>
-<li><a href="/api/attempts">/api/attempts</a></li>
-<li><a href="/api/tree">/api/tree</a></li>
-<li><a href="/api/lineage">/api/lineage</a></li>
-</ul>
-</body>
-</html>
-"""
+_APP_HTML_PATH = Path(__file__).parent / "app.html"
+
+
+def _app_html() -> str:
+    """`src/rce/webapp/app.html` verbatim -- read fresh on every request
+    rather than cached in memory, since this is a local single-user tool
+    (no request volume to speak of) and a fresh read means a developer
+    editing the file sees the change on the next reload with no server
+    restart. Packaged as `package-data` (pyproject.toml) so it ships
+    alongside `server.py` in an installed wheel, not just this editable
+    checkout."""
+    return _APP_HTML_PATH.read_text(encoding="utf-8")
 
 
 # -- HTTP plumbing -------------------------------------------------------------
@@ -483,7 +480,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         try:
             if path == "/":
-                self._send_html(200, _PLACEHOLDER_HTML)
+                self._send_html(200, _app_html())
             elif path == "/api/summary":
                 self._json_from_conn(lambda conn: summary_payload(conn, self._project_root()))
             elif path == "/api/attempts":

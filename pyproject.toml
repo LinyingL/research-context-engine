@@ -48,4 +48,4 @@ testpaths = ["tests"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-rce = ["migrations/*.sql"]
+rce = ["migrations/*.sql", "webapp/app.html"]

@@ -16,6 +16,7 @@ requirement.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -464,11 +465,31 @@ def test_cli_serve_reports_clean_error_for_uninitialized_project(tmp_path, capsy
 # -- HTTP-level routing / status codes -------------------------------------------
 
 
-def test_http_root_returns_html_placeholder(live_server):
+def test_http_root_returns_spa_shell_with_key_mount_points(live_server):
+    """task V2: `/` serves the real single-page app (src/rce/webapp/app.html),
+    not the V1 placeholder -- assert the DOM hooks the app's own JS looks up
+    by id/data-attribute are actually present in the served markup."""
     base_url, _ = live_server
     status, body = _get_raw(base_url, "/")
     assert status == 200
-    assert b"<html>" in body and b"/api/summary" in body
+    html = body.decode("utf-8")
+    assert html.lstrip().lower().startswith("<!doctype html>")
+    for mount_point in (
+        'id="app"', 'id="view-tree"', 'id="view-lineage"', 'id="panel"',
+        'id="panel-backdrop"', 'id="panel-body"',
+        'data-view="tree"', 'data-view="lineage"',
+    ):
+        assert mount_point in html, f"missing mount point in served app.html: {mount_point}"
+
+
+def test_http_root_has_zero_external_resources(live_server):
+    """task V2 requirement: the app must be fully self-contained (no CDN, no
+    external stylesheet/script/image/font) so it works entirely offline --
+    assert no http(s):// URL appears anywhere in the served page at all."""
+    base_url, _ = live_server
+    _, body = _get_raw(base_url, "/")
+    html = body.decode("utf-8")
+    assert re.search(r"https?://", html) is None
 
 
 def test_http_summary_endpoint(live_server):

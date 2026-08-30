@@ -1,0 +1,920 @@
+<!doctype html>
+<!--
+  RCE decision-tree / lineage viewer (task V2).
+
+  Single self-contained file: inline CSS, inline JS, zero external
+  resources, zero build step. Served verbatim by rce.webapp.server at "/"
+  and read entirely client-side against this same process's JSON API
+  (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
+  /api/open -- see rce/webapp/server.py's module docstring for the
+  contract each endpoint promises).
+
+  Two views, switched by the top tab bar:
+    - Decision Tree (default): GET /api/tree. attempt -> step script ->
+      read/write data files, all three layers already computed
+      server-side from graph edges; this page only renders them.
+    - Lineage: GET /api/lineage. Four fixed blocks in report order --
+      orphan inputs, chains, broken links, duplicate copies.
+
+  Clicking any file path anywhere in either view opens the right-hand
+  slide-out panel (GET /api/file for a preview, POST /api/open to reveal
+  in Finder or open with the default app). Clicking an attempt row opens
+  the same panel with that attempt's full record.
+
+  Every fetch is wrapped (apiGet/apiPost below) so a failure renders a
+  readable message inside the page -- never only to the console.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RCE</title>
+<style>
+:root {
+  --paper: #F7F2E9;
+  --paper-alt: #F0E9DA;
+  --ink: #26221B;
+  --ink-soft: #5B564A;
+  --line: rgba(38, 34, 27, 0.14);
+  --line-strong: rgba(38, 34, 27, 0.32);
+  --clay: #A64B2A;
+  --clay-soft: #F1DCD0;
+  --ochre: #9A6E1F;
+  --ochre-soft: #F0E3C4;
+  --olive: #6C7042;
+  --olive-soft: #E4E6D4;
+  --gray: #736F63;
+  --gray-soft: #E7E4DB;
+  --font-serif: "Songti SC", "STSong", "Noto Serif SC", "SimSun", serif;
+  --font-sans: "PingFang SC", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.hidden { display: none !important; }
+
+#app { min-height: 100vh; display: flex; flex-direction: column; }
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 2rem;
+  padding: 1.25rem 2rem 1rem;
+  border-bottom: 1px solid var(--line-strong);
+  flex-wrap: wrap;
+}
+.brand { display: flex; align-items: baseline; gap: 0.6rem; }
+.brand-mark { font-family: var(--font-serif); font-size: 1.4rem; letter-spacing: 0.04em; }
+.brand-sub { font-size: 0.78rem; color: var(--ink-soft); }
+
+.tabs { display: flex; gap: 1.5rem; margin-left: auto; }
+.tab {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.92rem;
+  color: var(--ink-soft);
+  padding: 0.3rem 0 0.5rem;
+  border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--ink); border-bottom-color: var(--clay); font-weight: 600; }
+.tab:hover:not(.active) { color: var(--ink); }
+
+.project-line {
+  flex-basis: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink-soft);
+  margin-top: 0.25rem;
+}
+
+main#main { flex: 1; padding: 1.75rem 2rem 4rem; max-width: 1080px; width: 100%; margin: 0 auto; }
+
+.guide-card { border: 1px solid var(--line-strong); background: var(--paper-alt); padding: 1.5rem 1.75rem; max-width: 640px; }
+.guide-card h2 { font-family: var(--font-serif); font-size: 1.15rem; margin: 0 0 0.6rem; }
+.guide-card p { margin: 0.4rem 0; color: var(--ink-soft); }
+.guide-card pre {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.section-title {
+  font-family: var(--font-serif);
+  font-size: 1rem;
+  margin: 2rem 0 0.75rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--line-strong);
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.section-title .count { font-family: var(--font-sans); font-size: 0.78rem; color: var(--ink-soft); font-weight: normal; }
+.section-title.accent-clay { color: var(--clay); border-bottom-color: var(--clay); }
+
+.empty-note { color: var(--ink-soft); font-size: 0.86rem; padding: 0.4rem 0 1rem; }
+
+.attempt-list { margin: 0; }
+.attempt-children { margin-left: 1.4rem; }
+details.attempt-node { border-bottom: 1px solid var(--line); }
+details.attempt-node > summary { list-style: none; cursor: default; padding: 0.55rem 0; display: flex; align-items: flex-start; gap: 0.6rem; }
+details.attempt-node > summary::-webkit-details-marker { display: none; }
+
+.caret {
+  cursor: pointer;
+  color: var(--ink-soft);
+  font-size: 0.75rem;
+  width: 1em;
+  flex: none;
+  padding-top: 0.3em;
+  user-select: none;
+  transition: transform 0.12s;
+}
+details[open] > summary .caret { transform: rotate(90deg); }
+
+.row-content { cursor: pointer; display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; padding: 0.1rem 0.35rem; margin: -0.1rem -0.35rem; }
+.row-content:hover { background: var(--paper-alt); }
+.attempt-number { font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink-soft); }
+.attempt-date { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-soft); }
+.attempt-desc { font-weight: 500; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6em;
+  height: 1.6em;
+  padding: 0 0.25em;
+  border: 1px solid;
+  font-size: 0.9rem;
+  line-height: 1;
+  flex: none;
+}
+.badge-olive { background: var(--olive-soft); border-color: var(--olive); }
+.badge-ochre { background: var(--ochre-soft); border-color: var(--ochre); }
+.badge-clay { background: var(--clay-soft); border-color: var(--clay); }
+.badge-gray { background: var(--gray-soft); border-color: var(--gray); }
+.badge-plain { background: var(--paper-alt); border-color: var(--line-strong); }
+
+.script-list { margin: 0.15rem 0 0.6rem 1.9rem; }
+details.script-node { border-left: 1px dashed var(--line-strong); margin: 0.15rem 0; }
+details.script-node > summary { list-style: none; cursor: default; padding: 0.35rem 0 0.35rem 0.7rem; display: flex; align-items: baseline; gap: 0.5rem; }
+details.script-node > summary::-webkit-details-marker { display: none; }
+.script-path { font-family: var(--font-mono); font-size: 0.85rem; }
+
+.rw-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); margin: 0.3rem 0 0.1rem 1.9rem; }
+
+.file-list { list-style: none; margin: 0 0 0.5rem 1.9rem; padding: 0; }
+.file-row { display: flex; align-items: baseline; gap: 0.45rem; padding: 0.22rem 0.35rem; margin: 0 -0.35rem; cursor: pointer; font-family: var(--font-mono); font-size: 0.83rem; }
+.file-row:hover { background: var(--paper-alt); }
+.flow-icon { flex: none; color: var(--ink-soft); width: 1em; text-align: center; }
+.flow-icon.read { color: var(--olive); }
+.flow-icon.write { color: var(--ochre); }
+.orphan-dot { flex: none; width: 0.5em; height: 0.5em; border-radius: 50%; background: var(--clay); }
+.missing-flag { color: var(--clay); font-size: 0.75rem; font-style: italic; }
+
+.lineage-block { margin-bottom: 1rem; }
+.lineage-item { border-bottom: 1px solid var(--line); padding: 0.5rem 0; }
+.lineage-path { font-family: var(--font-mono); font-size: 0.88rem; }
+.clickable { cursor: pointer; }
+.clickable:hover { text-decoration: underline; }
+.lineage-sub { margin: 0.3rem 0 0 1rem; font-size: 0.8rem; color: var(--ink-soft); font-family: var(--font-mono); }
+.lineage-sub-title { font-family: var(--font-sans); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); margin-top: 0.35rem; }
+.lineage-sub ul { margin: 0.15rem 0; padding-left: 1.1rem; }
+
+.error-box { border: 1px solid var(--clay); background: var(--clay-soft); color: var(--ink); padding: 0.9rem 1.1rem; font-size: 0.88rem; }
+.error-box .error-title { font-weight: 600; color: var(--clay); margin-bottom: 0.25rem; }
+
+.panel-backdrop { position: fixed; inset: 0; background: rgba(38, 34, 27, 0.28); z-index: 40; }
+.panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: min(560px, 92vw);
+  background: var(--paper);
+  border-left: 1px solid var(--line-strong);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  box-shadow: -6px 0 24px rgba(38, 34, 27, 0.12);
+}
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 1.1rem 1.3rem; border-bottom: 1px solid var(--line-strong); }
+.panel-title { font-family: var(--font-mono); font-size: 0.95rem; word-break: break-all; }
+.panel-subtitle { font-size: 0.78rem; color: var(--ink-soft); margin-top: 0.25rem; }
+.panel-close { background: none; border: none; font-size: 1.4rem; line-height: 1; cursor: pointer; color: var(--ink-soft); padding: 0 0.2rem; }
+.panel-close:hover { color: var(--ink); }
+.panel-body { flex: 1; overflow-y: auto; padding: 1.1rem 1.3rem; }
+
+.panel-actions { display: flex; gap: 0.6rem; margin: 0 0 0.7rem; }
+.btn { font: inherit; font-size: 0.82rem; padding: 0.4rem 0.85rem; background: var(--paper-alt); border: 1px solid var(--line-strong); cursor: pointer; color: var(--ink); }
+.btn:hover { border-color: var(--ink); }
+.panel-status { font-size: 0.8rem; margin-bottom: 0.8rem; min-height: 1.1em; }
+.panel-status.ok { color: var(--olive); }
+.panel-status.err { color: var(--clay); }
+
+.kv-table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; font-size: 0.86rem; }
+.kv-table th { text-align: left; vertical-align: top; color: var(--ink-soft); font-weight: normal; padding: 0.3rem 0.8rem 0.3rem 0; white-space: nowrap; }
+.kv-table td { padding: 0.3rem 0; word-break: break-word; }
+
+.code-preview { border: 1px solid var(--line); overflow-x: auto; background: var(--paper-alt); }
+.code-table { border-collapse: collapse; font-family: var(--font-mono); font-size: 0.78rem; width: 100%; }
+.code-table td.ln { color: var(--ink-soft); text-align: right; padding: 0 0.7em; user-select: none; border-right: 1px solid var(--line); white-space: nowrap; }
+.code-table td.src { padding: 0 0.7em; white-space: pre; }
+.truncated-note { font-size: 0.76rem; color: var(--ochre); margin-bottom: 0.6rem; }
+
+.step-broken { color: var(--clay); font-size: 0.84rem; }
+
+@media (max-width: 720px) {
+  main#main { padding: 1.25rem 1rem 3rem; }
+  .topbar { padding: 1rem 1rem 0.75rem; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">RCE</span>
+      <span class="brand-sub">decision tree &amp; lineage</span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="tree" role="tab" aria-selected="true">Decision Tree</button>
+      <button class="tab" data-view="lineage" role="tab" aria-selected="false">Lineage</button>
+    </nav>
+    <div class="project-line" id="project-line"></div>
+  </header>
+  <main id="main">
+    <section id="view-tree" class="view"></section>
+    <section id="view-lineage" class="view hidden"></section>
+  </main>
+</div>
+
+<div id="panel-backdrop" class="panel-backdrop hidden"></div>
+<aside id="panel" class="panel hidden" aria-hidden="true">
+  <div class="panel-head">
+    <div class="panel-head-text">
+      <div class="panel-title" id="panel-title"></div>
+      <div class="panel-subtitle" id="panel-subtitle"></div>
+    </div>
+    <button class="panel-close" id="panel-close" type="button" aria-label="Close">&times;</button>
+  </div>
+  <div class="panel-body" id="panel-body"></div>
+</aside>
+
+<script>
+"use strict";
+
+// -- Small shared state ------------------------------------------------------
+// attemptsById is populated once per Tree-view load from /api/attempts (which
+// carries the full record -- attrs, verdict, result) and keyed by node id so
+// clicking an attempt row in the tree (built from /api/tree, a slimmer shape)
+// can show the complete record without a second round trip per click.
+const state = { attemptsById: new Map() };
+
+// -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
+
+async function apiGet(path) {
+  let res;
+  try {
+    res = await fetch(path, { headers: { "Accept": "application/json" } });
+  } catch (err) {
+    throw new Error("Network error requesting " + path + ": " + err.message);
+  }
+  const text = await res.text();
+  let body = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch (err) {
+      throw new Error("Could not parse response from " + path + " as JSON: " + err.message);
+    }
+  }
+  if (!res.ok) {
+    throw new Error((body && body.error) ? body.error : (path + " failed: HTTP " + res.status));
+  }
+  return body;
+}
+
+async function apiPost(path, payload) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    throw new Error("Network error requesting " + path + ": " + err.message);
+  }
+  const text = await res.text();
+  let body = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch (err) {
+      throw new Error("Could not parse response from " + path + " as JSON: " + err.message);
+    }
+  }
+  if (!res.ok) {
+    throw new Error((body && body.error) ? body.error : (path + " failed: HTTP " + res.status));
+  }
+  return body;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function renderErrorBox(container, err) {
+  container.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "error-box";
+  const title = document.createElement("div");
+  title.className = "error-title";
+  title.textContent = "Something went wrong";
+  const msg = document.createElement("div");
+  msg.textContent = err instanceof Error ? err.message : String(err);
+  box.append(title, msg);
+  container.appendChild(box);
+}
+
+// -- Tabs ---------------------------------------------------------------------
+
+const views = { tree: document.getElementById("view-tree"), lineage: document.getElementById("view-lineage") };
+let currentView = null;
+
+function activateView(name) {
+  if (currentView === name) return;
+  currentView = name;
+  document.querySelectorAll(".tab").forEach((btn) => {
+    const active = btn.dataset.view === name;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", String(active));
+  });
+  Object.entries(views).forEach(([key, node]) => node.classList.toggle("hidden", key !== name));
+  if (name === "tree" && !views.tree.dataset.loaded) loadTreeView();
+  if (name === "lineage" && !views.lineage.dataset.loaded) loadLineageView();
+}
+
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.addEventListener("click", () => activateView(btn.dataset.view));
+});
+
+// -- Project summary line (decorative; a failure here is not shown as an
+// error box since neither view depends on it -- /api/tree and /api/lineage
+// surface the same "project not initialized" failure prominently already
+// whenever it actually matters) -------------------------------------------
+
+async function loadProjectSummary() {
+  const line = document.getElementById("project-line");
+  try {
+    const data = await apiGet("/api/summary");
+    line.textContent = "project: " + data.project_root + "   ·   pending confirmations: " + data.pending;
+  } catch (err) {
+    line.textContent = "";
+  }
+}
+
+// -- Decision Tree view --------------------------------------------------------
+
+const SAMPLE_ATTEMPTS_TOML =
+  'file = "docs/attempt-log.md"     # markdown file, relative to project root\n' +
+  'heading = "Attempt Log"          # heading right above the table\n' +
+  'steps_dir = "scripts"            # optional: numbered step-script directory\n' +
+  "\n" +
+  "[columns]                        # your table's actual header text\n" +
+  'id = "#"\n' +
+  'date = "date"\n' +
+  'description = "path"\n' +
+  'variables = "variables"\n' +
+  'result = "result"\n' +
+  'verdict = "verdict"';
+
+function renderGuideCard(hint) {
+  const card = document.createElement("div");
+  card.className = "guide-card";
+  const h2 = document.createElement("h2");
+  h2.textContent = "No attempt timeline configured yet";
+  const p1 = document.createElement("p");
+  p1.textContent = hint || "Configure .rce/attempts.toml and run 'rce attempts' to ingest your attempt timeline.";
+  const p2 = document.createElement("p");
+  p2.textContent = "Example .rce/attempts.toml:";
+  const pre = document.createElement("pre");
+  pre.textContent = SAMPLE_ATTEMPTS_TOML;
+  card.append(h2, p1, p2, pre);
+  return card;
+}
+
+const VERDICT_MARKERS = ["☠️", "✅", "🕒", "⚠️", "📋", "⛔"];
+const VERDICT_BADGE_CLASS = {
+  "☠️": "badge-gray", "✅": "badge-olive", "🕒": "badge-ochre",
+  "⚠️": "badge-clay", "📋": "badge-plain", "⛔": "badge-plain",
+};
+
+function verdictMarker(text) {
+  if (!text) return null;
+  for (const marker of VERDICT_MARKERS) if (text.startsWith(marker)) return marker;
+  return null;
+}
+
+function verdictBadge(verdictText) {
+  const marker = verdictMarker(verdictText);
+  const span = document.createElement("span");
+  span.className = "badge " + (marker ? VERDICT_BADGE_CLASS[marker] : "badge-plain");
+  span.textContent = marker || "·";
+  span.title = verdictText || "(no verdict)";
+  return span;
+}
+
+function renderAttemptNode(attempt) {
+  const details = document.createElement("details");
+  details.className = "attempt-node";
+
+  const summary = document.createElement("summary");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = "▸";
+
+  const content = document.createElement("span");
+  content.className = "row-content";
+  content.appendChild(verdictBadge(attempt.verdict));
+  const num = document.createElement("span");
+  num.className = "attempt-number";
+  num.textContent = "#" + attempt.number;
+  const date = document.createElement("span");
+  date.className = "attempt-date";
+  date.textContent = attempt.date || "";
+  const desc = document.createElement("span");
+  desc.className = "attempt-desc";
+  desc.textContent = attempt.description || "(no description)";
+  content.append(num, date, desc);
+  content.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openAttemptPanel(attempt.id);
+  });
+
+  summary.append(caret, content);
+  details.appendChild(summary);
+
+  const body = document.createElement("div");
+  if (attempt.scripts && attempt.scripts.length) {
+    const scriptList = document.createElement("div");
+    scriptList.className = "script-list";
+    attempt.scripts.forEach((s) => scriptList.appendChild(renderScriptNode(s)));
+    body.appendChild(scriptList);
+  }
+  if (attempt.children && attempt.children.length) {
+    const childList = document.createElement("div");
+    childList.className = "attempt-list attempt-children";
+    attempt.children.forEach((c) => childList.appendChild(renderAttemptNode(c)));
+    body.appendChild(childList);
+  }
+  details.appendChild(body);
+  return details;
+}
+
+function renderScriptNode(script) {
+  const details = document.createElement("details");
+  details.className = "script-node";
+  details.dataset.rendered = "0";
+
+  const summary = document.createElement("summary");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = "▸";
+  const content = document.createElement("span");
+  content.className = "row-content";
+  const path = document.createElement("span");
+  path.className = "script-path";
+  path.textContent = script.path;
+  content.appendChild(path);
+  content.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openFilePanel(script.path, "script");
+  });
+  summary.append(caret, content);
+  details.appendChild(summary);
+
+  const body = document.createElement("div");
+  details.appendChild(body);
+
+  // Lazy layer: a project with many attempts x many step scripts can carry
+  // thousands of read/write rows in one /api/tree response. The JSON is
+  // already all in memory, but the DOM for a script's file list is only
+  // built the first time its <details> is actually opened.
+  details.addEventListener("toggle", () => {
+    if (details.open && details.dataset.rendered === "0") {
+      renderScriptBody(body, script);
+      details.dataset.rendered = "1";
+    }
+  });
+  return details;
+}
+
+function rwLabel(text) {
+  const d = document.createElement("div");
+  d.className = "rw-label";
+  d.textContent = text;
+  return d;
+}
+
+function fileList(entries, direction) {
+  const ul = document.createElement("ul");
+  ul.className = "file-list";
+  entries.forEach((entry) => {
+    const li = document.createElement("li");
+    li.className = "file-row";
+    const icon = document.createElement("span");
+    icon.className = "flow-icon " + direction;
+    icon.textContent = direction === "read" ? "←" : "→";
+    icon.title = direction === "read" ? "reads (data flows in)" : "writes (data flows out)";
+    li.appendChild(icon);
+    if (entry.role === "orphan_input") {
+      const dot = document.createElement("span");
+      dot.className = "orphan-dot";
+      dot.title = "orphan input: no script anywhere writes this file";
+      li.appendChild(dot);
+    }
+    const pathSpan = document.createElement("span");
+    pathSpan.textContent = entry.path;
+    li.appendChild(pathSpan);
+    if (entry.missing) {
+      const flag = document.createElement("span");
+      flag.className = "missing-flag";
+      flag.textContent = "(not found on disk)";
+      li.appendChild(flag);
+    }
+    li.addEventListener("click", () => openFilePanel(entry.path));
+    ul.appendChild(li);
+  });
+  return ul;
+}
+
+function renderScriptBody(body, script) {
+  body.innerHTML = "";
+  const hasReads = script.reads && script.reads.length;
+  const hasWrites = script.writes && script.writes.length;
+  if (!hasReads && !hasWrites) {
+    const note = document.createElement("div");
+    note.className = "empty-note";
+    note.textContent = "No recorded reads or writes.";
+    body.appendChild(note);
+    return;
+  }
+  if (hasReads) {
+    body.appendChild(rwLabel("Reads"));
+    body.appendChild(fileList(script.reads, "read"));
+  }
+  if (hasWrites) {
+    body.appendChild(rwLabel("Writes"));
+    body.appendChild(fileList(script.writes, "write"));
+  }
+}
+
+async function loadTreeView() {
+  const container = views.tree;
+  container.innerHTML = '<p class="empty-note">Loading…</p>';
+  let treeData, attemptsData;
+  try {
+    [treeData, attemptsData] = await Promise.all([apiGet("/api/tree"), apiGet("/api/attempts")]);
+  } catch (err) {
+    renderErrorBox(container, err);
+    return;
+  }
+  state.attemptsById = new Map((attemptsData.attempts || []).map((a) => [a.id, a]));
+  container.innerHTML = "";
+  if (!treeData.attempts || treeData.attempts.length === 0) {
+    container.appendChild(renderGuideCard(treeData.hint));
+    views.tree.dataset.loaded = "1";
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "attempt-list";
+  treeData.attempts.forEach((a) => list.appendChild(renderAttemptNode(a)));
+  container.appendChild(list);
+  views.tree.dataset.loaded = "1";
+}
+
+// -- Lineage view ---------------------------------------------------------------
+
+function clickablePath(text) {
+  const span = document.createElement("span");
+  span.className = "lineage-path clickable";
+  span.textContent = text;
+  span.addEventListener("click", () => openFilePanel(text));
+  return span;
+}
+
+function scriptRefSpan(scriptPath, line, callee) {
+  const span = document.createElement("span");
+  span.className = "clickable";
+  span.textContent = scriptPath + ":" + line + (callee ? " (" + callee + ")" : "");
+  span.title = "Open " + scriptPath;
+  span.addEventListener("click", () => openFilePanel(scriptPath, "script"));
+  return span;
+}
+
+function subList(label, entries, renderEntry) {
+  const wrap = document.createElement("div");
+  wrap.className = "lineage-sub";
+  const title = document.createElement("div");
+  title.className = "lineage-sub-title";
+  title.textContent = label;
+  const ul = document.createElement("ul");
+  entries.forEach((entry) => {
+    const li = document.createElement("li");
+    li.appendChild(renderEntry(entry));
+    ul.appendChild(li);
+  });
+  wrap.append(title, ul);
+  return wrap;
+}
+
+function renderOrphanItem(item) {
+  const div = document.createElement("div");
+  div.className = "lineage-item";
+  div.appendChild(clickablePath(item.path));
+  if (item.readers && item.readers.length) {
+    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee)));
+  }
+  return div;
+}
+
+function renderChainItem(item) {
+  const div = document.createElement("div");
+  div.className = "lineage-item";
+  div.appendChild(clickablePath(item.path));
+  if (item.writers && item.writers.length) {
+    div.appendChild(subList("Written by", item.writers, (w) => scriptRefSpan(w.script, w.line, w.callee)));
+  }
+  if (item.readers && item.readers.length) {
+    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee)));
+  }
+  return div;
+}
+
+function renderBrokenItem(item) {
+  const div = document.createElement("div");
+  div.className = "lineage-item";
+  const row = document.createElement("div");
+  row.appendChild(scriptRefSpan(item.script, item.line, item.callee));
+  const arrow = document.createElement("span");
+  arrow.textContent = " " + (item.kind === "writes" ? "→" : "←") + " ";
+  row.appendChild(arrow);
+  row.appendChild(clickablePath(item.target));
+  const flag = document.createElement("span");
+  flag.className = "missing-flag";
+  flag.textContent = " (" + item.kind + ", not found)";
+  row.appendChild(flag);
+  div.appendChild(row);
+  return div;
+}
+
+function renderDuplicateItem(item) {
+  const div = document.createElement("div");
+  div.className = "lineage-item";
+  div.appendChild(clickablePath(item.path));
+  if (item.other_copies && item.other_copies.length) {
+    div.appendChild(subList("Other copies", item.other_copies, (p) => clickablePath(p)));
+  }
+  return div;
+}
+
+function lineageBlock(title, items, renderItem, accentClay) {
+  const section = document.createElement("div");
+  section.className = "lineage-block";
+  const heading = document.createElement("div");
+  heading.className = "section-title" + (accentClay ? " accent-clay" : "");
+  const titleSpan = document.createElement("span");
+  titleSpan.textContent = title;
+  const count = document.createElement("span");
+  count.className = "count";
+  count.textContent = "(" + (items ? items.length : 0) + ")";
+  heading.append(titleSpan, count);
+  section.appendChild(heading);
+  if (!items || items.length === 0) {
+    const note = document.createElement("div");
+    note.className = "empty-note";
+    note.textContent = "None found.";
+    section.appendChild(note);
+    return section;
+  }
+  items.forEach((item) => section.appendChild(renderItem(item)));
+  return section;
+}
+
+async function loadLineageView() {
+  const container = views.lineage;
+  container.innerHTML = '<p class="empty-note">Loading…</p>';
+  let data;
+  try {
+    data = await apiGet("/api/lineage");
+  } catch (err) {
+    renderErrorBox(container, err);
+    return;
+  }
+  container.innerHTML = "";
+  container.appendChild(lineageBlock("Orphan inputs", data.orphans, renderOrphanItem, true));
+  container.appendChild(lineageBlock("Chains", data.chains, renderChainItem, false));
+  container.appendChild(lineageBlock("Broken links", data.broken_links, renderBrokenItem, false));
+  container.appendChild(lineageBlock("Duplicate copies", data.duplicates, renderDuplicateItem, false));
+  views.lineage.dataset.loaded = "1";
+}
+
+// -- Slide-out panel (shared by both views) --------------------------------------
+
+const panel = document.getElementById("panel");
+const panelBackdrop = document.getElementById("panel-backdrop");
+const panelTitle = document.getElementById("panel-title");
+const panelSubtitle = document.getElementById("panel-subtitle");
+const panelBody = document.getElementById("panel-body");
+
+function openPanel() {
+  panel.classList.remove("hidden");
+  panelBackdrop.classList.remove("hidden");
+  panel.setAttribute("aria-hidden", "false");
+}
+
+function closePanel() {
+  panel.classList.add("hidden");
+  panelBackdrop.classList.add("hidden");
+  panel.setAttribute("aria-hidden", "true");
+}
+
+document.getElementById("panel-close").addEventListener("click", closePanel);
+panelBackdrop.addEventListener("click", closePanel);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !panel.classList.contains("hidden")) closePanel();
+});
+
+const FILE_TYPE_RULES = [
+  [/\.(py|r|rmd|jl|ipynb|sh)$/i, "script (code)"],
+  [/\.(csv|tsv|json|parquet|dta|rds|rda|pkl|feather|h5|hdf5)$/i, "dataset"],
+  [/\.(png|jpe?g|pdf|svg|eps|gif|tiff?)$/i, "figure"],
+  [/\.(md|txt|tex|bib|rst)$/i, "text / document"],
+  [/\.(toml|yaml|yml|ini|cfg)$/i, "config"],
+];
+
+function classifyFileType(path, hint) {
+  if (hint === "script") return "script (code)";
+  for (const [pattern, label] of FILE_TYPE_RULES) if (pattern.test(path)) return label;
+  return "file";
+}
+
+function codePreview(content) {
+  const wrap = document.createElement("div");
+  wrap.className = "code-preview";
+  const table = document.createElement("table");
+  table.className = "code-table";
+  const lines = content.split("\n");
+  table.innerHTML = lines.map((line, i) =>
+    "<tr><td class=\"ln\">" + (i + 1) + "</td><td class=\"src\">" + escapeHtml(line) + "</td></tr>"
+  ).join("");
+  wrap.appendChild(table);
+  return wrap;
+}
+
+async function runOpenAction(path, reveal, statusEl) {
+  statusEl.className = "panel-status";
+  statusEl.textContent = "Working…";
+  try {
+    const result = await apiPost("/api/open", { path, reveal });
+    statusEl.className = "panel-status ok";
+    statusEl.textContent = (reveal ? "Revealed in Finder: " : "Opened: ") + result.opened;
+  } catch (err) {
+    statusEl.className = "panel-status err";
+    statusEl.textContent = err.message;
+  }
+}
+
+function buildFileActions(path, statusEl) {
+  const actions = document.createElement("div");
+  actions.className = "panel-actions";
+  const openBtn = document.createElement("button");
+  openBtn.className = "btn";
+  openBtn.type = "button";
+  openBtn.textContent = "Open";
+  const revealBtn = document.createElement("button");
+  revealBtn.className = "btn";
+  revealBtn.type = "button";
+  revealBtn.textContent = "Reveal in Finder";
+  openBtn.addEventListener("click", () => runOpenAction(path, false, statusEl));
+  revealBtn.addEventListener("click", () => runOpenAction(path, true, statusEl));
+  actions.append(openBtn, revealBtn);
+  return actions;
+}
+
+async function openFilePanel(path, hint) {
+  panelTitle.textContent = path;
+  panelSubtitle.textContent = classifyFileType(path, hint);
+  panelBody.innerHTML = "";
+  const status = document.createElement("div");
+  status.className = "panel-status";
+  panelBody.appendChild(buildFileActions(path, status));
+  panelBody.appendChild(status);
+  const contentHost = document.createElement("div");
+  contentHost.innerHTML = '<p class="empty-note">Loading preview…</p>';
+  panelBody.appendChild(contentHost);
+  openPanel();
+
+  let data;
+  try {
+    data = await apiGet("/api/file?path=" + encodeURIComponent(path));
+  } catch (err) {
+    renderErrorBox(contentHost, err);
+    return;
+  }
+  contentHost.innerHTML = "";
+  if (data.truncated) {
+    const note = document.createElement("div");
+    note.className = "truncated-note";
+    note.textContent = "Showing the first " + data.content.length + " of " + data.size + " bytes (truncated).";
+    contentHost.appendChild(note);
+  }
+  contentHost.appendChild(codePreview(data.content));
+}
+
+function kvRow(table, label, value) {
+  const tr = document.createElement("tr");
+  const th = document.createElement("th");
+  th.textContent = label;
+  const td = document.createElement("td");
+  if (typeof value === "string") td.textContent = value;
+  else td.appendChild(value);
+  tr.append(th, td);
+  table.appendChild(tr);
+}
+
+function openAttemptPanel(id) {
+  const attempt = state.attemptsById.get(id);
+  panelTitle.textContent = id;
+  panelSubtitle.textContent = "attempt record";
+  panelBody.innerHTML = "";
+  if (!attempt) {
+    renderErrorBox(
+      panelBody,
+      new Error("No details loaded for " + id + " -- reopen the Decision Tree tab and try again."),
+    );
+    openPanel();
+    return;
+  }
+  const attrs = attempt.attrs || {};
+  const table = document.createElement("table");
+  table.className = "kv-table";
+  kvRow(table, "#", attrs.number || "");
+  kvRow(table, "Date", attrs.date || "");
+  kvRow(table, "Path / description", attrs.description || "");
+  kvRow(table, "Variables", attrs.variables || "");
+  kvRow(table, "Verdict", attempt.verdict || "(none)");
+  kvRow(table, "Result", attempt.result || "(none)");
+
+  const sourceSpan = document.createElement("span");
+  if (attrs.source_file) {
+    sourceSpan.className = "clickable";
+    sourceSpan.textContent = attrs.source_file + (attrs.source_line ? ":" + attrs.source_line : "");
+    sourceSpan.addEventListener("click", () => openFilePanel(attrs.source_file));
+  } else {
+    sourceSpan.textContent = "(unknown)";
+  }
+  kvRow(table, "Source", sourceSpan);
+  kvRow(table, "Step files", (attrs.step_files && attrs.step_files.length) ? attrs.step_files.join(", ") : "(none)");
+  panelBody.appendChild(table);
+
+  if (attrs.step_files_broken && attrs.step_files_broken.length) {
+    const warn = document.createElement("div");
+    warn.className = "step-broken";
+    warn.textContent = "Unresolved step references: " + attrs.step_files_broken.join(", ");
+    panelBody.appendChild(warn);
+  }
+  openPanel();
+}
+
+// -- Init -------------------------------------------------------------------
+
+loadProjectSummary();
+activateView("tree");
+</script>
+</body>
+</html>
