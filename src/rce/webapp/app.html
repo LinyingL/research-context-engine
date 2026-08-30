@@ -6,8 +6,17 @@
   resources, zero build step. Served verbatim by rce.webapp.server at "/"
   and read entirely client-side against this same process's JSON API
   (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
-  /api/open -- see rce/webapp/server.py's module docstring for the
-  contract each endpoint promises).
+  /api/open, /api/projects, /api/projects/switch -- see
+  rce/webapp/server.py's module docstring for the contract each endpoint
+  promises).
+
+  Multi-project switching (task V3 phase 1): the header shows the current
+  project's registry label (hover for the full path), and -- only when the
+  registry has more than one entry -- a <select> to switch. Switching
+  POSTs /api/projects/switch (the server accepts only exact registry
+  members; this page only ever offers values it got from /api/projects),
+  then re-fetches every view from scratch, since everything on screen
+  belongs to the previous project.
 
   Two views, switched by the top tab bar:
     - Decision Tree (default): GET /api/tree. attempt -> step script ->
@@ -77,6 +86,21 @@ body {
 .brand { display: flex; align-items: baseline; gap: 0.6rem; }
 .brand-mark { font-family: var(--font-serif); font-size: 1.4rem; letter-spacing: 0.04em; }
 .brand-sub { font-size: 0.78rem; color: var(--ink-soft); }
+
+.project-switcher {
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--ink);
+  background: var(--paper-alt);
+  border: 1px solid var(--line-strong);
+  border-radius: 0;
+  padding: 0.3rem 0.55rem;
+  max-width: 18rem;
+  align-self: center;
+  cursor: pointer;
+}
+.project-switcher:hover { border-color: var(--ink); }
+.project-switcher:focus { outline: 1px solid var(--clay); outline-offset: 1px; }
 
 .tabs { display: flex; gap: 1.5rem; margin-left: auto; }
 .tab {
@@ -255,6 +279,7 @@ details.script-node > summary::-webkit-details-marker { display: none; }
       <span class="brand-mark">RCE</span>
       <span class="brand-sub">decision tree &amp; lineage</span>
     </div>
+    <select id="project-switcher" class="project-switcher hidden" title="切换项目" aria-label="切换项目"></select>
     <nav class="tabs" role="tablist">
       <button class="tab active" data-view="tree" role="tab" aria-selected="true">Decision Tree</button>
       <button class="tab" data-view="lineage" role="tab" aria-selected="false">Lineage</button>
@@ -287,7 +312,10 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 // carries the full record -- attrs, verdict, result) and keyed by node id so
 // clicking an attempt row in the tree (built from /api/tree, a slimmer shape)
 // can show the complete record without a second round trip per click.
-const state = { attemptsById: new Map() };
+// projectLabel is the current project's registry label (task V3 phase 1),
+// filled by loadProjects() and shown in the header line instead of the raw
+// path (which stays reachable as the line's hover title).
+const state = { attemptsById: new Map(), projectLabel: "" };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
 
@@ -385,15 +413,102 @@ document.querySelectorAll(".tab").forEach((btn) => {
 // surface the same "project not initialized" failure prominently already
 // whenever it actually matters) -------------------------------------------
 
+function basename(path) {
+  const parts = String(path).split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(path);
+}
+
 async function loadProjectSummary() {
   const line = document.getElementById("project-line");
   try {
     const data = await apiGet("/api/summary");
-    line.textContent = "project: " + data.project_root + "   ·   pending confirmations: " + data.pending;
+    // Registry label when loadProjects() found one, else the directory
+    // basename -- never the raw path, which lives on as the hover title.
+    const label = state.projectLabel || basename(data.project_root);
+    line.textContent = "项目：" + label + "   ·   待确认：" + data.pending;
+    line.title = data.project_root;
   } catch (err) {
     line.textContent = "";
+    line.title = "";
   }
 }
+
+// -- Project switcher (task V3 phase 1) ------------------------------------
+// The <select> only ever offers paths /api/projects returned -- the server
+// additionally enforces registry membership on switch, so this page can
+// never introduce a new filesystem path, only choose among registered ones.
+
+const projectSwitcher = document.getElementById("project-switcher");
+
+async function loadProjects() {
+  let data;
+  try {
+    data = await apiGet("/api/projects");
+  } catch (err) {
+    // The switcher is a convenience; a registry hiccup must not take the
+    // header down. Each view surfaces its own real errors already.
+    projectSwitcher.classList.add("hidden");
+    state.projectLabel = "";
+    return;
+  }
+  const projects = data.projects || [];
+  const current = data.current || "";
+  const currentEntry = projects.find((p) => p.path === current);
+  state.projectLabel = currentEntry ? currentEntry.label : basename(current);
+
+  projectSwitcher.innerHTML = "";
+  if (!currentEntry && current) {
+    // Currently serving a project that is not (or no longer) a registry
+    // member -- still show it as the selected entry so the select never
+    // silently claims some other project is active.
+    const opt = document.createElement("option");
+    opt.value = current;
+    opt.textContent = basename(current);
+    opt.selected = true;
+    projectSwitcher.appendChild(opt);
+  }
+  projects.forEach((p) => {
+    const opt = document.createElement("option");
+    opt.value = p.path;
+    opt.textContent = p.label + (p.initialized ? "" : "（未初始化）");
+    opt.title = p.path;
+    opt.disabled = !p.initialized;
+    opt.selected = p.path === current;
+    projectSwitcher.appendChild(opt);
+  });
+  // Only worth showing when there is actually something to switch between.
+  projectSwitcher.classList.toggle("hidden", projects.length <= 1);
+}
+
+async function reloadAllViews() {
+  // Everything on screen belongs to the previous project: drop the cached
+  // attempt records, mark both views stale, and re-fetch the one currently
+  // visible (the other reloads lazily on its next activation).
+  state.attemptsById = new Map();
+  delete views.tree.dataset.loaded;
+  delete views.lineage.dataset.loaded;
+  closePanel();
+  await loadProjects();
+  loadProjectSummary();
+  if (currentView === "tree") loadTreeView();
+  else if (currentView === "lineage") loadLineageView();
+}
+
+projectSwitcher.addEventListener("change", async () => {
+  const line = document.getElementById("project-line");
+  projectSwitcher.disabled = true;
+  try {
+    await apiPost("/api/projects/switch", { path: projectSwitcher.value });
+  } catch (err) {
+    line.textContent = "切换项目失败：" + (err instanceof Error ? err.message : String(err));
+    line.title = "";
+    await loadProjects(); // resync the select with what the server actually serves
+    projectSwitcher.disabled = false;
+    return;
+  }
+  await reloadAllViews();
+  projectSwitcher.disabled = false;
+});
 
 // -- Decision Tree view --------------------------------------------------------
 
@@ -912,9 +1027,15 @@ function openAttemptPanel(id) {
 }
 
 // -- Init -------------------------------------------------------------------
+// loadProjects() first (awaited): it fills state.projectLabel, which the
+// summary line prefers over a raw-path basename. The views themselves never
+// wait on either -- activateView kicks off its own fetch.
 
-loadProjectSummary();
-activateView("tree");
+(async () => {
+  await loadProjects();
+  loadProjectSummary();
+  activateView("tree");
+})();
 </script>
 </body>
 </html>

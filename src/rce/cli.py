@@ -84,6 +84,10 @@ from rce.semantic import judge as semantic_judge
 # "Later"). stdlib http.server only (see rce.webapp.server's module
 # docstring) -- like rce.semantic above, and unlike rce.mcp_server, this
 # needs no optional extra, so it gets a normal top-level subparser.
+# V3 phase 1: rce.webapp.registry is the machine-managed project registry
+# (~/.rce/projects.json) that lets `rce serve` resume the most recently
+# served project when no path is given.
+from rce.webapp import registry as project_registry
 from rce.webapp import server as webapp_server
 
 RCE_DIRNAME = ".rce"
@@ -861,8 +865,33 @@ def cmd_serve(args: argparse.Namespace) -> int:
     `_require_db` above gives, re-raised here as `CliError` so it prints and
     exits the same way any other missing-project error does rather than a
     raw traceback.
+
+    V3 phase 1: the path is now optional. Given one, the project is
+    recorded in the machine-managed registry (~/.rce/projects.json,
+    rce.webapp.registry) as most recently served -- but only when it is
+    actually an initialized project, so a typo'd or never-`rce init`ed path
+    fails with the usual clean error without leaving a junk registry entry
+    behind. Given no path, the most recently served registry entry is
+    served instead -- NOT the current directory: an implicit "." would be
+    exactly the kind of guess DESIGN.md section 0 rules out, since a bare
+    `rce serve` is most naturally "reopen what I had open", not "serve
+    wherever my shell happens to be". An empty registry fails with an
+    actionable error rather than guessing either meaning.
     """
-    project_root = _resolve_project_root(args.path)
+    if args.path is not None:
+        project_root = _resolve_project_root(args.path)
+        if project_registry.is_initialized(project_root):
+            project_registry.register(project_root)
+    else:
+        entries = project_registry.load()
+        if not entries:
+            raise CliError(
+                "no project path given and the project registry "
+                f"(~/{project_registry.RCE_DIRNAME}/{project_registry.REGISTRY_FILENAME}) is empty -- "
+                "run 'rce serve <path>' once with an explicit project path to register it; "
+                "after that, a bare 'rce serve' reopens the most recently served project"
+            )
+        project_root = Path(entries[0]["path"])
     try:
         webapp_server.serve(project_root, args.port, open_browser=not args.no_browser)
     except webapp_server.ApiError as exc:
@@ -1001,7 +1030,13 @@ def build_parser() -> argparse.ArgumentParser:
             "(task V1); prints the URL and opens a browser tab unless --no-browser is given"
         ),
     )
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "path", nargs="?", default=None,
+        help=(
+            "project root; also registered in ~/.rce/projects.json as most recently "
+            "served. Omit to reopen the most recently served project instead"
+        ),
+    )
     p.add_argument(
         "--port", type=int, default=8317, help="TCP port to bind on 127.0.0.1 (default: 8317)"
     )

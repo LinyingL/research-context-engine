@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from rce import cli, db, lineage
-from rce.webapp import server
+from rce.webapp import registry, server
 
 
 # -- fixtures / helpers -------------------------------------------------------
@@ -96,6 +96,18 @@ def _init_project(project_root: Path) -> None:
         db.migrate(conn)
     finally:
         conn.close()
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch) -> Path:
+    """A throwaway HOME so registry-touching tests (the /api/projects
+    endpoints, cmd_serve's registration) never read or write the user's
+    real ~/.rce/projects.json -- `registry.registry_path()` resolves
+    `Path.home()` per call precisely to honor this monkeypatch."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 @pytest.fixture
@@ -478,12 +490,61 @@ def test_serve_does_not_open_browser_when_disabled(tmp_path, monkeypatch, capsys
 # -- cli wiring -------------------------------------------------------------------
 
 
-def test_cli_serve_reports_clean_error_for_uninitialized_project(tmp_path, capsys):
+def _capture_serve(monkeypatch) -> list[tuple]:
+    """Stub out the blocking webapp_server.serve loop, recording its args --
+    cmd_serve's own logic (path resolution, registry interplay) is what
+    these tests exercise, never a real socket."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        server, "serve",
+        lambda root, port, open_browser=True: calls.append((root, port, open_browser)),
+    )
+    return calls
+
+
+def test_cli_serve_reports_clean_error_for_uninitialized_project(fake_home, tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
     assert cli.main(["serve", str(project)]) == 1
     err = capsys.readouterr().err
     assert "Error" in err and "rce init" in err
+    # ...and the failed serve never polluted the registry with an
+    # uninitialized path (cmd_serve registers only real projects).
+    assert registry.load() == []
+
+
+def test_cli_serve_with_path_registers_project_then_serves_it(fake_home, tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    _init_project(project)
+    calls = _capture_serve(monkeypatch)
+
+    assert cli.main(["serve", str(project), "--no-browser"]) == 0
+
+    assert [e["path"] for e in registry.load()] == [str(project.resolve())]
+    assert calls == [(project.resolve(), 8317, False)]
+
+
+def test_cli_serve_without_path_serves_most_recent_registry_entry(fake_home, tmp_path, monkeypatch):
+    older, newer = tmp_path / "older", tmp_path / "newer"
+    _init_project(older)
+    _init_project(newer)
+    registry.register(older)
+    registry.register(newer)  # most-recently-served first
+    calls = _capture_serve(monkeypatch)
+
+    assert cli.main(["serve", "--no-browser"]) == 0
+
+    assert len(calls) == 1
+    assert str(calls[0][0]) == registry.load()[0]["path"]
+    assert calls[0][0].name == "newer"
+
+
+def test_cli_serve_without_path_and_empty_registry_gives_actionable_error(fake_home, monkeypatch, capsys):
+    calls = _capture_serve(monkeypatch)
+    assert cli.main(["serve"]) == 1
+    err = capsys.readouterr().err
+    assert "Error" in err and "rce serve" in err  # tells the user the fix, not just the state
+    assert calls == []
 
 
 # -- HTTP-level routing / status codes -------------------------------------------
@@ -500,7 +561,7 @@ def test_http_root_returns_spa_shell_with_key_mount_points(live_server):
     assert html.lstrip().lower().startswith("<!doctype html>")
     for mount_point in (
         'id="app"', 'id="view-tree"', 'id="view-lineage"', 'id="panel"',
-        'id="panel-backdrop"', 'id="panel-body"',
+        'id="panel-backdrop"', 'id="panel-body"', 'id="project-switcher"',
         'data-view="tree"', 'data-view="lineage"',
     ):
         assert mount_point in html, f"missing mount point in served app.html: {mount_point}"
@@ -680,5 +741,143 @@ def test_http_summary_rejects_mismatched_host_header(live_server):
     base_url, _ = live_server
     status, _ = _request_with_headers(
         base_url, "GET", "/api/summary", {"Host": "attacker.example:1234"}
+    )
+    assert status == 403
+
+
+# -- /api/projects + POST /api/projects/switch (task V3 phase 1) -----------------
+
+
+def _registered_path(label: str) -> str:
+    """The path string exactly as the registry stores it (resolved at
+    registration time) -- switch requests must be string-equal to it, so
+    tests read it back rather than re-deriving it from a tmp_path that may
+    or may not already be fully resolved on this platform."""
+    return next(e["path"] for e in registry.load() if e["label"] == label)
+
+
+def test_http_projects_lists_registry_with_initialized_flags(live_server, fake_home, tmp_path):
+    base_url, project = live_server
+    registry.register(project)
+    uninitialized = tmp_path / "empty-proj"
+    uninitialized.mkdir()
+    registry.register(uninitialized)
+
+    status, payload = _get(base_url, "/api/projects")
+
+    assert status == 200
+    assert payload["current"] == str(project)
+    by_label = {p["label"]: p for p in payload["projects"]}
+    assert by_label["proj"]["initialized"] is True
+    assert by_label["empty-proj"]["initialized"] is False
+    # Most-recently-registered first -- the same order load() promises.
+    assert [p["label"] for p in payload["projects"]] == ["empty-proj", "proj"]
+
+
+def test_http_projects_empty_registry_still_reports_current(live_server, fake_home):
+    base_url, project = live_server
+    status, payload = _get(base_url, "/api/projects")
+    assert status == 200
+    assert payload == {"projects": [], "current": str(project)}
+
+
+def test_http_switch_success_repoints_summary_at_new_root(live_server, fake_home, tmp_path):
+    """The core switch contract end to end: after a valid switch, every
+    subsequent request -- /api/summary here -- serves the new root."""
+    base_url, project = live_server
+    registry.register(project)
+    other = tmp_path / "other"
+    _init_project(other)
+    registry.register(other)
+    target = _registered_path("other")
+
+    status, payload = _post(base_url, "/api/projects/switch", {"path": target})
+
+    assert status == 200
+    assert payload == {"current": target, "label": "other"}
+    status, summary = _get(base_url, "/api/summary")
+    assert status == 200 and summary["project_root"] == target
+    # A successful switch is a "serve" for recency purposes: the registry's
+    # most-recent entry is now the switched-to project (cmd_serve without a
+    # path would resume from it).
+    assert registry.load()[0]["path"] == target
+
+
+def test_http_switch_rejects_path_not_in_registry(live_server, fake_home, tmp_path):
+    """Even a real, initialized project is refused if it was never
+    registered -- the registry is the allow-list, and a request body can
+    never introduce a new filesystem path to serve."""
+    base_url, project = live_server
+    registry.register(project)
+    outside = tmp_path / "outside"
+    _init_project(outside)  # initialized, but deliberately NOT registered
+
+    status, payload = _post(base_url, "/api/projects/switch", {"path": str(outside.resolve())})
+
+    assert status == 403 and "not a registered project" in payload["error"]
+    _, summary = _get(base_url, "/api/summary")
+    assert summary["project_root"] == str(project)  # still serving the old root
+
+
+def test_http_switch_rejects_registered_but_uninitialized(live_server, fake_home, tmp_path):
+    base_url, project = live_server
+    registry.register(project)
+    uninitialized = tmp_path / "empty-proj"
+    uninitialized.mkdir()
+    registry.register(uninitialized)
+
+    status, payload = _post(
+        base_url, "/api/projects/switch", {"path": _registered_path("empty-proj")}
+    )
+
+    assert status == 400 and "not initialized" in payload["error"]
+    _, summary = _get(base_url, "/api/summary")
+    assert summary["project_root"] == str(project)
+
+
+def test_http_switch_missing_path_key_returns_400(live_server, fake_home):
+    status, _ = _post(live_server[0], "/api/projects/switch", {})
+    assert status == 400
+
+
+def test_http_switch_rejects_foreign_origin_before_any_registry_check(live_server, fake_home, tmp_path):
+    """The drive-by shape, aimed at the new mutating endpoint: a 'simple'
+    cross-origin POST (text/plain, no CORS preflight) targeting a path that
+    IS a valid registry member -- the origin check must reject it before
+    the switch logic ever runs, or a hostile page could repoint the server
+    among the user's own registered projects."""
+    base_url, project = live_server
+    registry.register(project)
+    other = tmp_path / "other"
+    _init_project(other)
+    registry.register(other)
+
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/projects/switch",
+        {"Content-Type": "text/plain", "Origin": "http://evil.example"},
+        body=json.dumps({"path": _registered_path("other")}).encode("utf-8"),
+    )
+
+    assert status == 403 and "Origin" in payload["error"]
+    _, summary = _get(base_url, "/api/summary")
+    assert summary["project_root"] == str(project)  # switch never happened
+
+
+def test_http_switch_rejects_mismatched_host_header(live_server, fake_home):
+    base_url, _ = live_server
+    status, _ = _request_with_headers(
+        base_url, "POST", "/api/projects/switch",
+        {"Content-Type": "application/json", "Host": "attacker.example:1234"},
+        body=json.dumps({"path": "/whatever"}).encode("utf-8"),
+    )
+    assert status == 403
+
+
+def test_http_projects_rejects_mismatched_host_header(live_server, fake_home):
+    """The origin check runs before EVERY endpoint, the new read-only one
+    included (module docstring's cross-origin defense)."""
+    base_url, _ = live_server
+    status, _ = _request_with_headers(
+        base_url, "GET", "/api/projects", {"Host": "attacker.example:1234"}
     )
     assert status == 403

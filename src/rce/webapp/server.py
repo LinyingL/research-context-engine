@@ -43,6 +43,18 @@ Endpoints (all GET unless noted):
                             every other platform gets 501 with an explanation,
                             never a confusing subprocess failure (see
                             `open_payload`/`_is_macos`).
+    GET  /api/projects  -- the machine-managed project registry
+                            (`rce.webapp.registry`, `~/.rce/projects.json`)
+                            plus which project this server is currently
+                            serving: `{"projects": [{path, label,
+                            initialized}], "current": path}` (see
+                            `projects_payload`).
+    POST /api/projects/switch -- body `{"path"}`: repoint this running
+                            server at another *registered, initialized*
+                            project and return the new current. The path
+                            must be string-equal to a registry entry --
+                            see "Switch-target defense" below (see
+                            `switch_project_payload`).
     GET  /             -- the single-page app (task V2), served verbatim from
                             `src/rce/webapp/app.html`: inline CSS/JS, zero
                             external resources, zero build step -- it reads
@@ -80,6 +92,29 @@ when a browser actually sends one, `Origin` equals that same
 non-browser CLI caller (`curl`, this module's own test suite) never sends
 one.
 
+Switch-target defense (`POST /api/projects/switch`, task V3 phase 1): this
+is the one endpoint that changes what the whole server serves, so its input
+is never treated as a filesystem path at all. The requested string must be
+*string-equal* to a `rce.webapp.registry.load()` entry's `"path"` -- no
+resolution, no normalization, no prefix logic is ever applied to the
+client-supplied value -- and that entry must be an initialized project
+(`.rce/graph.db` exists). The registry lives at `~/.rce/projects.json`,
+outside every project root, and only `rce serve <path>` on this user's own
+command line (plus a successful switch's recency bump) ever writes it; so
+even a request that somehow got past `_check_local_origin` could only ever
+choose among projects the user has already deliberately served, never point
+the server at `/etc` or another arbitrary directory. `_check_local_origin`
+still runs first, exactly as for every other endpoint -- this validation is
+depth behind that check, not a replacement for it.
+
+The current project root itself is mutable state on `RceHTTPServer`, read
+and written only through accessors holding a `threading.Lock`
+(`get_project_root`/`set_project_root`) -- `ThreadingHTTPServer` handles
+each request on its own thread, so a switch must never interleave with
+another handler reading the root mid-request. Each handler reads the root
+once per request (via `_project_root()`) and works with that snapshot; a
+switch landing mid-request affects the *next* request, never tears this one.
+
 Every handler-facing failure is one of the small `ApiError` subclasses below,
 each carrying its own HTTP status; `RceRequestHandler` catches `ApiError`
 once per request and renders `{"error": str(exc)}` at that status, mirroring
@@ -93,6 +128,7 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -102,6 +138,7 @@ from typing import Any, Callable
 
 from rce import db, lineage
 from rce.ingest import attempts as attempts_ingest
+from rce.webapp import registry as project_registry
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +188,15 @@ class UnsupportedPlatformError(ApiError):
 
 class ProjectNotInitializedError(ApiError):
     status = 400
+
+
+class UnknownProjectError(ApiError):
+    """`POST /api/projects/switch` asked for a path that is not a registry
+    member -- 403, same as the traversal/origin rejections, because whatever
+    sent it is trying to steer the server somewhere the user never
+    registered (see module docstring's "Switch-target defense")."""
+
+    status = 403
 
 
 def _require_db(project_root: Path) -> Path:
@@ -435,6 +481,60 @@ def open_payload(project_root: Path, rel_path: str, reveal: bool) -> dict[str, A
     return {"opened": str(target), "reveal": reveal}
 
 
+# -- /api/projects + POST /api/projects/switch (task V3 phase 1) --------------
+
+
+def projects_payload(current_root: Path) -> dict[str, Any]:
+    """The registry (`rce.webapp.registry.load()`, most-recently-served
+    first) with each entry's `initialized` state checked fresh per request
+    -- a project can be `rce init`ed, or its disk unmounted, between two
+    calls -- plus which project this server is currently serving. The
+    current root is reported even when it is not (or no longer) a registry
+    member: it is a fact about this server, not about the registry."""
+    projects = [
+        {
+            "path": entry["path"],
+            "label": entry["label"],
+            "initialized": project_registry.is_initialized(Path(entry["path"])),
+        }
+        for entry in project_registry.load()
+    ]
+    return {"projects": projects, "current": str(current_root)}
+
+
+def switch_project_payload(requested: str) -> tuple[Path, dict[str, Any]]:
+    """Validate a switch request and return `(new_root, response_payload)`;
+    the caller (the handler) is the one that actually repoints the server,
+    via `RceHTTPServer.set_project_root` -- this function owns the
+    validation and the registry recency bump, never the server state.
+
+    The requested string is compared *string-equal* against registry
+    entries' stored `"path"` values -- it is never resolved, joined, or
+    otherwise interpreted as a filesystem path, so there is nothing here
+    for a crafted value to traverse or normalize its way past (module
+    docstring, "Switch-target defense"). Not a member: 403
+    (`UnknownProjectError`). A member that is not an initialized project:
+    400 (`ProjectNotInitializedError`) -- registered but unusable, e.g.
+    never `rce init`ed or its disk currently absent. Only a valid switch
+    bumps the entry to most-recently-served in the registry, so a later
+    bare `rce serve` resumes from it (rce.cli.cmd_serve)."""
+    entry = next((e for e in project_registry.load() if e["path"] == requested), None)
+    if entry is None:
+        raise UnknownProjectError(
+            f"{requested!r} is not a registered project -- only paths already in the "
+            f"registry (~/.rce/{project_registry.REGISTRY_FILENAME}, written by "
+            f"'rce serve <path>') can be switched to"
+        )
+    new_root = Path(entry["path"])
+    if not project_registry.is_initialized(new_root):
+        raise ProjectNotInitializedError(
+            f"registered project {entry['path']!r} is not initialized (missing "
+            f"{RCE_DIRNAME}/{DB_FILENAME}); run 'rce init {entry['path']}' first"
+        )
+    project_registry.register(new_root)  # most-recently-served bump
+    return new_root, {"current": entry["path"], "label": entry["label"]}
+
+
 # -- The single-page app (task V2) -------------------------------------------
 
 _APP_HTML_PATH = Path(__file__).parent / "app.html"
@@ -459,8 +559,23 @@ class RceHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, server_address: tuple[str, int], handler_cls: type, project_root: Path) -> None:
-        self.project_root = project_root
+        # Mutable since task V3 phase 1 (POST /api/projects/switch), and
+        # only ever touched through the two accessors below: each request
+        # runs on its own thread (ThreadingHTTPServer), so a bare attribute
+        # would let a switch interleave with another handler's read. Kept
+        # name-mangled + locked rather than public so no future handler can
+        # accidentally bypass the lock.
+        self.__project_root = project_root
+        self.__project_root_lock = threading.Lock()
         super().__init__(server_address, handler_cls)
+
+    def get_project_root(self) -> Path:
+        with self.__project_root_lock:
+            return self.__project_root
+
+    def set_project_root(self, project_root: Path) -> None:
+        with self.__project_root_lock:
+            self.__project_root = project_root
 
 
 class RceRequestHandler(BaseHTTPRequestHandler):
@@ -471,7 +586,10 @@ class RceRequestHandler(BaseHTTPRequestHandler):
         logger.debug("%s - %s", self.address_string(), format % args)
 
     def _project_root(self) -> Path:
-        return self.server.project_root
+        """One locked read per call (RceHTTPServer.get_project_root) -- a
+        handler takes its snapshot of the root and works with that; a
+        concurrent switch affects the next request, never tears this one."""
+        return self.server.get_project_root()
 
     def _open_conn(self) -> Connection:
         return db.connect(_require_db(self._project_root()))
@@ -536,6 +654,12 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._json_from_conn(lambda conn: tree_payload(conn, self._project_root()))
             elif path == "/api/lineage":
                 self._json_from_conn(lambda conn: lineage_payload(conn, self._project_root()))
+            elif path == "/api/projects":
+                # Registry + current root only -- deliberately not routed
+                # through _open_conn/_json_from_conn, since listing which
+                # projects exist must keep working even when the *current*
+                # project's own graph.db has gone missing mid-serve.
+                self._send_json(200, projects_payload(self._project_root()))
             elif path == "/api/file":
                 values = query.get("path")
                 if not values:
@@ -551,22 +675,39 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             logger.exception("unhandled error handling GET %s", self.path)
             self._send_json(500, {"error": "internal server error"})
 
+    def _read_json_body_with_path(self) -> dict[str, Any]:
+        """Both POST endpoints share one body contract -- a JSON object with
+        a string `"path"` key -- so both go through this single parse+shape
+        check (and get identical 400s for the same malformed input)."""
+        length = int(self.headers.get("Content-Length") or "0")
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        try:
+            body = json.loads(raw_body) if raw_body else {}
+        except json.JSONDecodeError as exc:
+            raise MissingParamError(f"invalid JSON request body: {exc}") from exc
+        if not isinstance(body, dict) or not isinstance(body.get("path"), str):
+            raise MissingParamError("request body must be a JSON object with a string 'path' key")
+        return body
+
     def do_POST(self) -> None:  # noqa: N802 (stdlib's own method name)
         parsed = urllib.parse.urlsplit(self.path)
         try:
+            # Same first-thing origin check as do_GET, before any routing or
+            # body parsing -- POST endpoints have side effects (open shells
+            # out; switch repoints the whole server), so this line is what
+            # stands between them and a drive-by page's cross-origin fetch.
             self._check_local_origin()
-            if parsed.path != "/api/open":
+            if parsed.path == "/api/open":
+                body = self._read_json_body_with_path()
+                payload = open_payload(self._project_root(), body["path"], bool(body.get("reveal", False)))
+                self._send_json(200, payload)
+            elif parsed.path == "/api/projects/switch":
+                body = self._read_json_body_with_path()
+                new_root, payload = switch_project_payload(body["path"])
+                self.server.set_project_root(new_root)
+                self._send_json(200, payload)
+            else:
                 raise NotFoundError(f"no such endpoint: {parsed.path}")
-            length = int(self.headers.get("Content-Length") or "0")
-            raw_body = self.rfile.read(length) if length > 0 else b""
-            try:
-                body = json.loads(raw_body) if raw_body else {}
-            except json.JSONDecodeError as exc:
-                raise MissingParamError(f"invalid JSON request body: {exc}") from exc
-            if not isinstance(body, dict) or not isinstance(body.get("path"), str):
-                raise MissingParamError("request body must be a JSON object with a string 'path' key")
-            payload = open_payload(self._project_root(), body["path"], bool(body.get("reveal", False)))
-            self._send_json(200, payload)
         except ApiError as exc:
             self._send_json(exc.status, {"error": str(exc)})
         except Exception:
