@@ -144,6 +144,33 @@ def test_register_survives_a_corrupt_existing_file(fake_home, tmp_path):
     assert registry.load() == [{"path": str(project.resolve()), "label": "myproj"}]
 
 
+def test_register_refuses_to_clobber_an_unreadable_registry(fake_home, tmp_path):
+    """Regression: a registry file that exists but cannot be READ (chmod
+    slip, sync tool lock) used to degrade to `[]` inside register()'s
+    read-modify-write, so the next `rce serve` atomically replaced the
+    whole registry with a single entry -- silently discarding every other
+    registered project. Now: registration is a logged no-op (the file's
+    entries outrank recording one serve), `load()` still degrades to `[]`
+    for readers, and the original content survives untouched."""
+    file = _registry_file(fake_home)
+    file.parent.mkdir(parents=True)
+    original = json.dumps({"projects": [
+        {"path": "/proj-b", "label": "b"},
+        {"path": "/proj-c", "label": "c"},
+    ]})
+    file.write_text(original)
+    file.chmod(0o000)
+    try:
+        assert registry.load() == []  # readers still degrade, never crash
+
+        registry.register(_mk_project(tmp_path, "proj-a"))  # logged no-op
+    finally:
+        file.chmod(0o644)
+
+    assert file.read_text() == original  # not one byte clobbered
+    assert [e["label"] for e in registry.load()] == ["b", "c"]
+
+
 # -- is_initialized ------------------------------------------------------------
 
 

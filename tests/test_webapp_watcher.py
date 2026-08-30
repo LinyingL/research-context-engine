@@ -398,6 +398,40 @@ def test_record_external_change_bumps_generation_and_absorbs_the_edit(tmp_path):
     assert w.status_payload()["generation"] == 2
 
 
+def test_record_external_change_keeps_pending_steps_change_visible(tmp_path):
+    """Regression: record_external_change used to re-baseline the ENTIRE
+    watch set from disk, so a step-file change that landed after the last
+    poll but before the UI write was absorbed without ever being
+    dataflow-ingested -- and no later map-only save repaired it, because a
+    map write never re-runs the dataflow half. Only the map/config half
+    may be absorbed; the steps entries carry over from the old baseline,
+    so the next poll still detects the step change and runs dataflow."""
+    _make_project(tmp_path)
+    (tmp_path / "steps" / "1-run.py").write_text("x = 1\n")
+    w = _mk_watcher(tmp_path)
+    w.poll_once()  # baseline (includes the step file)
+
+    # The step edit lands in the gap between the last poll and a UI write...
+    (tmp_path / "steps" / "1-run.py").write_text(
+        'import pandas as pd\npd.read_csv("data/in.csv")\n'
+    )
+    # ...then the UI write confirms: map edited + attempts re-ingested by
+    # apply_edit (not simulated here -- the point is what the WATCHER owes).
+    _write_map(tmp_path, [_row("1"), _row("2")])
+    w.record_external_change()
+
+    assert w.poll_once() is True  # the pending step change is still a change
+    conn = db.connect(tmp_path / ".rce" / "graph.db")
+    try:
+        # The dataflow half ran: the script node and its reads edge exist.
+        assert db.get_node(conn, "script:steps/1-run.py") is not None
+        reads = db.query_edges(conn, src="script:steps/1-run.py", type="reads")
+        assert [e["dst"] for e in reads] == ["dataset:data/in.csv"]
+    finally:
+        conn.close()
+    assert w.poll_once() is False  # and it was absorbed by that poll, once
+
+
 def test_record_external_change_records_and_clears_ingest_errors(tmp_path):
     _make_project(tmp_path)
     w = _mk_watcher(tmp_path)

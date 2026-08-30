@@ -11,6 +11,7 @@ point of this module is that what it writes is exactly what ingest reads.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -273,6 +274,35 @@ def test_newlines_in_field_rejected(tmp_path):
     assert _map_text(tmp_path) == before
 
 
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x0b", "\x0c", "\x85", "\x1c"])
+def test_exotic_line_separators_in_field_rejected(tmp_path, sep):
+    """Regression: `str.splitlines()` -- used by BOTH the ingest parser and
+    `_decode_source` -- splits on far more than \\n/\\r (U+2028 rides along
+    in text pasted from PDFs, \\x0b is PowerPoint's soft line break). A
+    value carrying one used to pass the old \\n/\\r-only check, get written,
+    and then break the row in half on re-ingest: the edited row's fragment
+    was skipped, the parser's row loop broke at the second fragment, and
+    every row below was orphan-deleted while the write reported success --
+    after which every further edit was refused by the mixed-line-endings
+    check. Now refused up front, naming the invisible code point."""
+    _make_project(tmp_path)
+    before = _map_text(tmp_path)
+    with pytest.raises(mapedit.MapEditError, match="U\\+"):
+        mapedit.apply_edit(tmp_path, "update", "16", {"description": f"part1{sep}part2"})
+    assert _map_text(tmp_path) == before  # not one byte written
+    # ...and the graph rows the corruption used to silently delete are safe
+    # by construction: nothing was written, so there is nothing to re-ingest.
+
+
+def test_exotic_line_separator_in_number_rejected(tmp_path):
+    """Same regression as above for the `number` argument -- `str.strip()`
+    removes a leading/trailing U+2028 on its own, so only an interior one
+    can reach the check, and it must refuse."""
+    _make_project(tmp_path)
+    with pytest.raises(mapedit.MapEditError, match="U\\+2028"):
+        mapedit.preview_edit(tmp_path, "append", "1\u20287", {})
+
+
 def test_unknown_field_key_rejected(tmp_path):
     _make_project(tmp_path)
     with pytest.raises(mapedit.MapEditError, match="unknown field"):
@@ -347,6 +377,63 @@ def test_backups_pruned_to_newest_20(tmp_path):
     assert (backups_dir / "unrelated.txt").exists()
 
 
+# -- config.file confinement to the project root -------------------------------
+
+
+@pytest.mark.parametrize("escape_shape", ["absolute", "relative"])
+def test_out_of_root_config_file_refused(tmp_path, escape_shape):
+    """Regression: the write path used to build `project_root / config.file`
+    with no `relative_to(root)` guard, so a config whose `file` key carried
+    an absolute or `../` path (an untrusted shared/cloned project's
+    `.rce/attempts.toml`) let one UI edit overwrite a file OUTSIDE the
+    project root -- while the read endpoints refused the very same path.
+    The write path now applies the same resolve-then-relative_to check."""
+    victim_dir = tmp_path / "OUT"
+    victim_dir.mkdir()
+    victim = victim_dir / "victim.md"
+    victim_original = (
+        "## 二、尝试途径总年表\n\n"
+        "| # | 时间 | 途径 | 变量→因变量(频率) | 结果 | 判决 |\n"
+        "|---|------|------|--------------------|------|------|\n"
+    )
+    victim.write_text(victim_original, encoding="utf-8")
+
+    root = tmp_path / "proj"
+    _make_project(root)
+    escaped = str(victim) if escape_shape == "absolute" else "../OUT/victim.md"
+    (root / ".rce" / "attempts.toml").write_text(
+        _CONFIG_TOML.replace('file = "00-项目地图.md"', f'file = "{escaped}"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(mapedit.MapEditError, match="outside the project root"):
+        mapedit.preview_edit(root, "append", "17", _FIELDS_17)
+    with pytest.raises(mapedit.MapEditError, match="outside the project root"):
+        mapedit.apply_edit(root, "append", "17", _FIELDS_17)
+
+    assert victim.read_text(encoding="utf-8") == victim_original  # untouched
+    assert not (root / ".rce" / "backups").exists()  # refused before any backup
+
+
+def test_in_root_symlink_pointing_outside_refused(tmp_path):
+    """Same defense, symlink shape: a `file` value that IS inside the root
+    as written, but resolves outside it -- exactly the case a textual `..`
+    check would miss, and the case `_resolve_within_root`'s read-side
+    resolve() already catches."""
+    victim = tmp_path / "victim.md"
+    victim.write_text("outside\n", encoding="utf-8")
+    root = tmp_path / "proj"
+    _make_project(root)
+    (root / "link.md").symlink_to(victim)
+    (root / ".rce" / "attempts.toml").write_text(
+        _CONFIG_TOML.replace('file = "00-项目地图.md"', 'file = "link.md"'),
+        encoding="utf-8",
+    )
+    with pytest.raises(mapedit.MapEditError, match="outside the project root"):
+        mapedit.preview_edit(root, "append", "17", _FIELDS_17)
+    assert victim.read_text(encoding="utf-8") == "outside\n"
+
+
 # -- atomic write --------------------------------------------------------------
 
 
@@ -365,6 +452,40 @@ def test_injected_replace_failure_leaves_original_intact(tmp_path, monkeypatch):
     # ...and no half-written tmp file was left behind next to it.
     leftovers = [p.name for p in tmp_path.iterdir() if "rce-edit-tmp" in p.name]
     assert leftovers == []
+
+
+def test_write_fsyncs_data_before_replace_and_fsyncs_backup(tmp_path, monkeypatch):
+    """Regression: the tmp file (and the backup) used to reach `os.replace`
+    with no fsync at all, so a power loss right after a save could leave
+    the rename durable while the data blocks -- of the map AND of the
+    just-written backup -- were not: a zero-length or partial map file with
+    no surviving copy anywhere. Both file writes now fsync before close,
+    and the tmp file's fsync must land before the replace."""
+    _make_project(tmp_path)
+    events: list[tuple[str, int]] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_ino))
+        real_fsync(fd)
+
+    def spy_replace(src, dst):
+        events.append(("replace", os.stat(src).st_ino))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(mapedit.os, "fsync", spy_fsync)
+    monkeypatch.setattr(mapedit.os, "replace", spy_replace)
+
+    mapedit.apply_edit(tmp_path, "append", "17", _FIELDS_17)
+
+    replace_idx, tmp_ino = next(
+        (i, ino) for i, (kind, ino) in enumerate(events) if kind == "replace"
+    )
+    before_replace = events[:replace_idx]
+    assert ("fsync", tmp_ino) in before_replace  # tmp data durable before the rename
+    # ...and the backup got its own fsync (a distinct inode) before the
+    # replace too -- it is the copy that must survive if the rename lands.
+    assert len({ino for kind, ino in before_replace if kind == "fsync"}) >= 2
 
 
 # -- fidelity refusals ---------------------------------------------------------

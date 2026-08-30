@@ -14,16 +14,20 @@ Contract:
   - `load()` returns the registered projects, most-recently-served first,
     each as `{"path": <absolute path str>, "label": <display name>}`. The
     label defaults to the directory's basename at registration time. A
-    missing, corrupt, or wrong-shaped registry file degrades to `[]` --
-    the registry is a convenience cache, never something whose corruption
-    should take `rce serve` down; individual malformed entries are dropped
-    (and logged) rather than poisoning the rest.
+    missing, unreadable, corrupt, or wrong-shaped registry file degrades
+    to `[]` -- the registry is a convenience cache, never something whose
+    corruption should take `rce serve` down; individual malformed entries
+    are dropped (and logged) rather than poisoning the rest.
   - `register(path)` is idempotent on the resolved path and moves that
     entry to the front (most-recently-served first), preserving an
     existing entry's stored label. Writes are atomic (tmp file +
     `os.replace` in the same directory), so a crash mid-write can never
     leave a half-written `projects.json` for the next `load()` to choke
-    on -- it either sees the old file or the new one.
+    on -- it either sees the old file or the new one. Unlike `load()`,
+    it does NOT flatten a read failure into `[]`: a registry file that
+    exists but cannot be read makes registration a logged no-op, because
+    a read-modify-write on top of a misread empty list would replace the
+    whole registry with a single entry (see `_read_entries`).
   - `is_initialized(path)` says whether a registry entry is a real,
     initialized RCE project (`.rce/graph.db` exists) -- the same
     definition of "initialized" `rce.cli`/`rce.webapp.server`'s own
@@ -82,17 +86,21 @@ def _valid_entry(entry: object) -> bool:
     )
 
 
-def load() -> list[dict[str, str]]:
-    """Registered projects, most-recently-served first. Degrades to `[]` on
-    a missing/corrupt/wrong-shaped file, and drops (with a log line, never
-    silently) any individual entry that isn't `{"path": str, "label": str}`
-    -- a half-broken registry keeps its good entries rather than crashing
-    `rce serve` or the `/api/projects` endpoint."""
+def _read_entries() -> list[dict[str, str]]:
+    """The registry's entries, or `[]` for a *missing* file (the ordinary
+    first-run state). A file that exists but cannot be read raises the
+    OSError instead: "no registry yet" and "registry temporarily
+    unreadable" must stay distinguishable, because `register()`'s
+    read-modify-write on top of a misread `[]` would atomically replace
+    the whole registry with a single entry -- silently discarding every
+    other registered project over a chmod slip or a sync tool's lock
+    (adversarial-review finding). `load()` below is the one place that
+    flattens the distinction, for read-only consumers."""
     path = registry_path()
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return []  # missing file is the ordinary first-run state, not an error
+    except FileNotFoundError:
+        return []
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -109,6 +117,26 @@ def load() -> list[dict[str, str]]:
             continue
         entries.append({"path": entry["path"], "label": entry["label"]})
     return entries
+
+
+def load() -> list[dict[str, str]]:
+    """Registered projects, most-recently-served first. Degrades to `[]` on
+    a missing/unreadable/corrupt/wrong-shaped file (an unreadable one is
+    logged -- a missing one is just first-run), and drops (with a log
+    line, never silently) any individual entry that isn't `{"path": str,
+    "label": str}` -- a half-broken registry keeps its good entries rather
+    than crashing `rce serve` or the `/api/projects` endpoint. Writers
+    must NOT build on this flattened view: `register()` reads through
+    `_read_entries()` so a transient read failure refuses the rewrite
+    instead of clobbering the file with a one-entry registry."""
+    try:
+        return _read_entries()
+    except OSError as exc:
+        logger.warning(
+            "%s exists but cannot be read (%s) -- treating the registry as empty "
+            "for this read", registry_path(), exc,
+        )
+        return []
 
 
 def _write_atomic(entries: list[dict[str, str]]) -> None:
@@ -129,9 +157,24 @@ def register(path: Path) -> None:
     """Record `path` (resolved to absolute) as the most recently served
     project. Idempotent: an already-registered path is moved to the front,
     keeping its stored label; a new one is inserted at the front with the
-    directory basename as its default label."""
+    directory basename as its default label.
+
+    A registry file that exists but cannot be read makes this a logged
+    no-op rather than a rewrite: the entries that may still be in that
+    file outrank recording this one serve, and skipping the registration
+    costs only convenience (serving still works; the project re-registers
+    on the next successful `rce serve`). Corrupt JSON is different --
+    genuinely unrecoverable content -- and still gets rebuilt cleanly."""
     resolved = str(Path(path).resolve())
-    entries = load()
+    try:
+        entries = _read_entries()
+    except OSError as exc:
+        logger.warning(
+            "%s exists but cannot be read (%s) -- NOT registering %s, since rewriting "
+            "on top of a misread would discard every other registered project",
+            registry_path(), exc, resolved,
+        )
+        return
     existing = next((e for e in entries if e["path"] == resolved), None)
     if existing is not None:
         entries.remove(existing)

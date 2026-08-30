@@ -61,7 +61,10 @@ thread, so all mutable state sits behind `_state_lock`. `_ingest_lock`
 separately serializes the re-ingest itself -- and is public (task V3
 phase 3) so the UI write path (`rce.webapp.mapedit` via
 `/api/attempts/write`) ingests under the same lock; after such a write,
-`record_external_change` re-baselines and bumps the generation so the
+`record_external_change` re-baselines the map/config half of the watch
+set (never the steps_dir half -- a UI write runs no dataflow ingest, so
+a step-file change pending since the last poll must stay visible to the
+next one; see `_absorb_non_steps_only`) and bumps the generation so the
 watcher neither re-ingests the change a second time nor leaves open
 pages unaware of it. A project switch (`retarget`, called by the
 `/api/projects/switch` handler) bumps an internal epoch; a `poll_once`
@@ -172,6 +175,30 @@ def _steps_changed(old: WatchSnapshot, new: WatchSnapshot) -> bool:
     return bool(differing_paths & (old.steps_paths | new.steps_paths))
 
 
+def _absorb_non_steps_only(old: WatchSnapshot, fresh: WatchSnapshot) -> WatchSnapshot:
+    """The baseline `record_external_change` may commit: the fresh
+    snapshot's view of the map/config files (the UI write's own edit,
+    absorbed so the next poll does not re-ingest it a second time), but
+    the OLD baseline's view of every steps_dir member. A UI write runs
+    only the attempts ingest -- never dataflow -- so a step-file change
+    that landed after the last poll but before the write has NOT been
+    dataflow-ingested yet; re-baselining it to its on-disk state here
+    would absorb it unseen, and no later map-only save would ever repair
+    that (a real missed-ingest, adversarial-review finding -- the
+    docstring's "benign race" only ever covered the redundant-re-ingest
+    direction). Carrying the old entries forward keeps that change a
+    visible difference for the next poll, whose ordinary cycle then runs
+    the dataflow half. `steps_paths` is the union of both sides so a
+    member that appeared or vanished in the gap stays classified as a
+    steps change either way."""
+    steps = old.steps_paths | fresh.steps_paths
+    files = {path: entry for path, entry in fresh.files.items() if path not in steps}
+    for path in steps:
+        if path in old.files:
+            files[path] = old.files[path]
+    return WatchSnapshot(files=files, steps_paths=frozenset(steps))
+
+
 class ProjectWatcher:
     """The polling watcher itself. Owned by `RceHTTPServer` (one per server
     process); `get_project_root` is the server's own locked accessor, read
@@ -217,14 +244,20 @@ class ProjectWatcher:
 
     def record_external_change(self, error: str | None = None) -> int:
         """A UI write (task V3 phase 3) just edited a watched file and ran
-        its own re-ingest in-process: re-baseline to what is on disk NOW,
-        so the next poll does not re-detect and re-ingest the same change,
-        and bump the generation so every open page's next poll re-fetches
-        -- the exact effect a poll-detected change would have had. `error`
-        is the write path's own contained post-write ingest failure (or
-        None on success, which also clears a stale earlier error -- same
-        "next good ingest clears it" rule as `poll_once`). Returns the new
-        generation so the write endpoint can put it in its response.
+        its own re-ingest in-process: re-baseline the map/config half of
+        the watch set to what is on disk NOW, so the next poll does not
+        re-detect and re-ingest the same change, and bump the generation
+        so every open page's next poll re-fetches -- the exact effect a
+        poll-detected change would have had. The steps_dir half of the
+        baseline is NOT re-taken here: a UI write never runs the dataflow
+        ingest, so absorbing a step file's fresh mtime would swallow a
+        change the watcher still owes an ingest for -- see
+        `_absorb_non_steps_only` for the full failure this used to cause.
+        `error` is the write path's own contained post-write ingest
+        failure (or None on success, which also clears a stale earlier
+        error -- same "next good ingest clears it" rule as `poll_once`).
+        Returns the new generation so the write endpoint can put it in
+        its response.
 
         Benign race, on purpose: a poll that was already mid-cycle can
         commit its own (pre-write) baseline right after this -- the next
@@ -236,6 +269,8 @@ class ProjectWatcher:
         root = self._get_project_root()
         snapshot = take_snapshot(root)
         with self._state_lock:
+            if self._baseline is not None and self._baseline_root == root:
+                snapshot = _absorb_non_steps_only(self._baseline, snapshot)
             self._baseline, self._baseline_root = snapshot, root
             self._last_error = error
             self._generation += 1

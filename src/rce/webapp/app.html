@@ -1382,8 +1382,15 @@ function toCellText(value) {
   // cleanup turns a literal <br> into "\n" when reading): a newline typed
   // -- or carried in from a prefilled multi-line cell -- goes back out as
   // "<br>", since a markdown table cell cannot hold a raw newline and the
-  // server rejects one outright.
-  return value.replace(/\r\n?/g, "\n").split("\n").map((s) => s.trim()).join("<br>")
+  // server rejects one outright. Normalized FIRST is the full set of
+  // characters Python's str.splitlines() treats as line boundaries (the
+  // server's _LINE_BOUNDARY_CHARS), not just \r\n: U+2028 rides along
+  // invisibly in text pasted from PDFs and \x0b is PowerPoint's soft line
+  // break, and any of them left through would be refused server-side --
+  // here they just become the same <br> a typed newline becomes.
+  return value.replace(/\r\n?/g, "\n")
+    .replace(/[\v\f\x1c\x1d\x1e\x85\u2028\u2029]/g, "\n")
+    .split("\n").map((s) => s.trim()).join("<br>")
     .replace(/^(<br>)+|(<br>)+$/g, "").trim();
 }
 

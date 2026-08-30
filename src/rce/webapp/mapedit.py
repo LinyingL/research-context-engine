@@ -16,7 +16,13 @@ Everything here is driven by `.rce/attempts.toml` exactly as ingest is
 (`rce.ingest.attempts.load_config`): which file, which heading, which header
 text maps to which field. Nothing is guessed (DESIGN.md section 0) -- no
 config, no table, or an ambiguous row is a clean refusal, never a
-best-effort write into somebody's hand-maintained research log.
+best-effort write into somebody's hand-maintained research log. And the
+config's `file` is confined to the project root before any write is
+planned (`_plan_edit`): the write path applies the same resolve-then-
+`relative_to` check the server's read endpoints run, so a config carrying
+an absolute or `../` path -- e.g. in a shared or cloned project whose
+`.rce/attempts.toml` the user never wrote -- is refused rather than
+letting a UI edit overwrite a file outside the project.
 
 Parsing is reused, not re-implemented: locating the table, splitting a row
 into cells, and cleaning a cell all go through `rce.ingest.attempts`' own
@@ -37,10 +43,14 @@ what is actually on disk is the point, not an inefficiency), then:
 
   1. backs the file up verbatim to `.rce/backups/<name>.<UTC stamp>Z.md`,
      pruning to the newest `BACKUP_KEEP` backups of that same file;
-  2. writes atomically -- full new content to a tmp file in the same
-     directory, then `os.replace` -- so a crash mid-write can never leave
-     the map half-written (the original survives any failure before the
-     rename, and the rename itself is atomic on POSIX);
+  2. writes atomically AND durably -- full new content to a tmp file in
+     the same directory, fsynced, then `os.replace`, then a best-effort
+     directory fsync (the backup is fsynced the same way) -- so a crash
+     mid-write can never leave the map half-written (the original
+     survives any failure before the rename, and the rename itself is
+     atomic on POSIX), and a power loss right after a save can no longer
+     leave the rename durable while the data -- and the just-written
+     backup -- are not (see `_write_bytes_durably`);
   3. re-runs the attempts ingest exactly as `rce.cli.cmd_attempts` does
      (`load_config` + `ingest_attempts_repo`), under whatever lock the
      caller passes -- the server passes the watcher's own ingest lock
@@ -131,13 +141,42 @@ class EditPlan:
 
 # -- Field validation ---------------------------------------------------------
 
+# Every character `str.splitlines()` treats as a line boundary -- NOT just
+# \n and \r. This is the exact set the CPython docs list for splitlines,
+# and it matters here because BOTH consumers of what this module writes
+# split on it: `_decode_source` below and the ingest parser's
+# `parse_attempts_table` (via `str.splitlines()`). A cell value carrying,
+# say, U+2028 (a common invisible stowaway in text copied out of PDFs or
+# JS-generated sources) or \x0b (PowerPoint's soft line break) would pass
+# a \n/\r-only check, get written into the map, and then be re-read as TWO
+# physical lines -- the edited row breaks in half, the parser's row loop
+# stops at the non-`|` second fragment, and every row below it looks
+# deleted to orphan cleanup. Rejecting the full set here (a real bug,
+# adversarial-review finding) is what keeps "what is written is exactly
+# what the parser reads back" true.
+_LINE_BOUNDARY_CHARS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+
+def _reject_line_boundaries(value: str, what: str) -> None:
+    """Refuse any character the write/read round trip would split a line on
+    (see `_LINE_BOUNDARY_CHARS`), naming the exact code point -- these are
+    mostly invisible, so an unnamed refusal would leave the user hunting
+    for a character they cannot see."""
+    for ch in value:
+        if ch in _LINE_BOUNDARY_CHARS:
+            raise MapEditError(
+                f"{what} must not contain raw newlines or other line-break characters "
+                f"-- found {ch!r} (U+{ord(ch):04X}), which Markdown table parsing would "
+                f"split the row on (use a literal <br> if you mean a line break inside "
+                f"a cell)"
+            )
+
 
 def _validate_number(number: object) -> str:
     if not isinstance(number, str) or not number.strip():
         raise MapEditError("attempt number must be a non-empty string")
     number = number.strip()
-    if "\n" in number or "\r" in number:
-        raise MapEditError("attempt number must not contain newlines")
+    _reject_line_boundaries(number, "attempt number")
     # A number whose parsed (cleaned) form differs from what was typed
     # (e.g. "**5**") would collide with "5" only after ingest cleaned it --
     # too late for the duplicate check below to have seen it. Plain text
@@ -150,11 +189,13 @@ def _validate_number(number: object) -> str:
 
 
 def _validate_fields(fields: object) -> dict[str, str]:
-    """Trimmed plain-string cells only. Newlines are rejected because a
-    Markdown table cell cannot hold a raw newline -- the parser's own
-    convention for an intentional line break inside a cell is a literal
-    `<br>` (`rce.ingest.attempts._clean_cell` turns it back into `\\n`),
-    and writing that marker is the caller's explicit choice, never an
+    """Trimmed plain-string cells only. Line breaks -- the FULL
+    `str.splitlines()` set, not just `\\n`/`\\r` (see
+    `_LINE_BOUNDARY_CHARS`) -- are rejected because a Markdown table cell
+    cannot hold a raw one: the parser's own convention for an intentional
+    line break inside a cell is a literal `<br>`
+    (`rce.ingest.attempts._clean_cell` turns it back into `\\n`), and
+    writing that marker is the caller's explicit choice, never an
     automatic translation done here."""
     if not isinstance(fields, dict):
         raise MapEditError("fields must be an object of column-key -> string")
@@ -168,11 +209,7 @@ def _validate_fields(fields: object) -> dict[str, str]:
         if not isinstance(value, str):
             raise MapEditError(f"field {key!r} must be a string, got {type(value).__name__}")
         value = value.strip()
-        if "\n" in value or "\r" in value:
-            raise MapEditError(
-                f"field {key!r} must not contain raw newlines -- a markdown table cell "
-                f"cannot hold them (use a literal <br> if you mean a line break)"
-            )
+        _reject_line_boundaries(value, f"field {key!r}")
         cleaned[key] = value
     return cleaned
 
@@ -296,6 +333,27 @@ def _plan_edit(project_root: Path, op: str, number: str, fields: dict[str, str])
 
     config = attempts_ingest.load_config(project_root)
     source_path = project_root / config.file
+    # Confine the write to the project root, the same check (resolve, then
+    # relative_to) `rce.webapp.server._resolve_within_root` applies to every
+    # READ endpoint -- the higher-stakes write path must never be *less*
+    # path-confined than the reads (adversarial-review finding). Not
+    # reachable from a request body (the file written is always whatever
+    # `.rce/attempts.toml` says, never request-named), so this is depth for
+    # the one case where that config itself is untrusted: a shared/cloned
+    # project whose `file` key carries an absolute or `../` path would
+    # otherwise let a single UI edit overwrite a file anywhere the user can
+    # write. `resolve()` also catches an in-root symlink pointing outside
+    # (and works on a not-yet-existing path: it walks what exists and
+    # normalizes the rest, which is all the check needs).
+    try:
+        source_path.resolve().relative_to(project_root.resolve())
+    except ValueError:
+        raise MapEditError(
+            f"attempts config's file = {config.file!r} resolves outside the project "
+            f"root {project_root} -- refusing to write there (the write path is "
+            f"confined to the project, matching the read endpoints' path-traversal "
+            f"defense)"
+        ) from None
     try:
         raw = source_path.read_bytes()
     except OSError as exc:
@@ -374,6 +432,38 @@ def preview_edit(project_root: str | Path, op: str, number: str, fields: dict[st
     return {"file": plan.config.file, "diff": diff, "old_row": plan.old_row, "new_row": plan.new_row}
 
 
+def _write_bytes_durably(path: Path, data: bytes) -> None:
+    """`write_bytes` plus an `fsync` before close: `os.replace` makes the
+    RENAME atomic, but on most filesystems the rename's metadata can reach
+    disk before the new file's data blocks do -- a power loss or kernel
+    panic in that window leaves a truncated or zero-length file behind a
+    "successful" save (adversarial-review finding). For an irreplaceable
+    hand-written map file that is the one failure class the backup+atomic
+    dance exists for, so both the tmp file and the backup are fsynced; a
+    few ms per save on a local single-user tool."""
+    with open(path, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Best-effort fsync of a directory, making a just-renamed or
+    just-created entry itself durable. Failures are swallowed: some
+    filesystems refuse fsync on a directory fd, and the file-content
+    fsyncs in `_write_bytes_durably` are the load-bearing ones."""
+    try:
+        fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _write_backup(project_root: Path, plan: EditPlan) -> str:
     """The original bytes, verbatim, to `.rce/backups/<name>.<stamp>Z.md`;
     then prune that file's own backups to the newest `BACKUP_KEEP`. The
@@ -388,7 +478,8 @@ def _write_backup(project_root: Path, plan: EditPlan) -> str:
     while backup_path.exists():  # same microsecond twice: disambiguate, never overwrite
         counter += 1
         backup_path = backups_dir / f"{source_name}.{stamp}Z.{counter}.md"
-    backup_path.write_bytes(plan.original_raw)
+    _write_bytes_durably(backup_path, plan.original_raw)
+    _fsync_dir(backups_dir)  # the new backup's directory entry, durable too
 
     siblings = sorted(
         p for p in backups_dir.iterdir()
@@ -402,13 +493,17 @@ def _write_backup(project_root: Path, plan: EditPlan) -> str:
 
 def _atomic_write(plan: EditPlan) -> None:
     """Full new content to a tmp file in the same directory (same
-    filesystem, so the rename is atomic), then `os.replace` over the
-    original -- a failure at any point before the replace leaves the
-    original untouched, and the tmp file is cleaned up on the way out."""
+    filesystem, so the rename is atomic), fsynced (`_write_bytes_durably`
+    -- the rename must never become durable before the data it renames
+    into place), then `os.replace` over the original, then a best-effort
+    directory fsync so the rename itself sticks -- a failure at any point
+    before the replace leaves the original untouched, and the tmp file is
+    cleaned up on the way out."""
     tmp_path = plan.source_path.parent / f".{plan.source_path.name}.rce-edit-tmp"
     try:
-        tmp_path.write_bytes(plan.new_text.encode("utf-8"))
+        _write_bytes_durably(tmp_path, plan.new_text.encode("utf-8"))
         os.replace(tmp_path, plan.source_path)
+        _fsync_dir(plan.source_path.parent)
     finally:
         tmp_path.unlink(missing_ok=True)
 
