@@ -6,13 +6,19 @@ A **local-first** provenance engine for research projects. It reads your
 existing git repo, LaTeX/.bib sources, and W&B/MLflow run history, and builds
 a queryable evidence graph that answers one question: *where did this result
 come from?* No cloud, no accounts, no lock-in — everything lives in one
-SQLite file inside your project (`.rce/graph.db`).
+SQLite file on your own machine, at `~/.rce/graphs/<id>/graph.db`. It sits
+outside the project on purpose: a project in an iCloud- or Dropbox-synced
+folder makes opening a database there block until the file provider hands it
+back, and SQLite under a sync provider is a documented corruption path. Your
+project's own `.rce/` keeps only files you wrote (`attempts.toml`, backups),
+and `rce init` leaves a one-line `.rce/README` saying where the graph went.
+Set `RCE_HOME` to put that state somewhere else.
 
 ## Quick start
 
 ```bash
 pip install -e .            # zero required third-party dependencies
-rce init /path/to/project   # creates .rce/graph.db
+rce init /path/to/project   # creates the graph (outside the project; `rce status` prints where)
 rce ingest /path/to/project [--mlruns DIR] [--wandb entity/project]
 rce trace figure:overview.png --path /path/to/project --hops 4
 ```
@@ -41,8 +47,14 @@ its own from the command line.
   `--orphans` narrows the report to the first block alone. Exits 1 if any
   orphan input or broken link was found, 0 otherwise (duplicates/chains are
   informational and never affect the exit code).
+- `rce projects list` / `rce projects remove <path>` — inspect and prune the
+  registry of known projects that the app's project switcher reads
+  (`~/.rce/projects.json`). `list` flags an entry whose directory is gone or
+  which was never `rce init`ed; `remove` drops one entry and deletes nothing
+  on disk. Both exist so the registry never has to be hand-edited.
 - `rce status [--path P] [--pending] [--limit N]` — whole-graph node/edge
-  counts and the pending confirmation queue's size; `--pending` also lists
+  counts, the graph file's actual location, and the pending confirmation
+  queue's size; `--pending` also lists
   each pending edge (src/dst/type/extractor/confidence/evidence), so it can
   be reviewed and acted on without the optional `mcp` extra.
 - `rce confirm <src> <dst> <type> <extractor> --status confirmed|rejected`

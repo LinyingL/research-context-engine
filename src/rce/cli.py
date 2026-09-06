@@ -31,9 +31,14 @@ the same way -- it is a pure read over edges `rce ingest` already wrote (task
 W2's dataflow extractor), never a re-parse of source files and never a write
 path; see rce.lineage's own module docstring for the four blocks it reports.
 
-A project is "initialized" once `<root>/.rce/graph.db` exists (`rce init`);
-every other command requires that file and errors clearly if absent (no
-guessing, per the constitution).
+A project is "initialized" once its graph exists (`rce init`); every other
+command requires that file and errors clearly if absent (no guessing, per
+the constitution). Since DESIGN.md section 8.10 rule 1 the graph is NOT in
+the project -- it lives at `~/.rce/graphs/<id>/graph.db`, out of reach of
+iCloud/Dropbox file providers, and `rce.paths` is the one module that says
+where. `_require_db` below resolves through `rce.paths.resolve_graph_db`,
+which also performs the one-time migration of a legacy in-project
+`.rce/graph.db` on first touch by any subcommand.
 
 Positioning ruling 2026-07-22 (Owner): RCE is a local-first standalone tool;
 MCP is one optional exit among several, not a requirement. Concretely: (1)
@@ -61,7 +66,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import consistency, db, lineage, query
+from rce import consistency, db, lineage, paths, query
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import claims as claims_ingest
 from rce.ingest import dataflow as dataflow_ingest
@@ -95,8 +100,11 @@ from rce.webapp import macapp
 from rce.webapp import registry as project_registry
 from rce.webapp import server as webapp_server
 
-RCE_DIRNAME = ".rce"
-DB_FILENAME = "graph.db"
+# Kept as module attributes (error messages and tests quote them), but the
+# definitions live in rce.paths now -- no module computes the graph's
+# location itself anymore (DESIGN.md section 8.10 rule 1).
+RCE_DIRNAME = paths.RCE_DIRNAME
+DB_FILENAME = paths.DB_FILENAME
 
 
 class CliError(Exception):
@@ -134,10 +142,20 @@ def _resolve_project_root(path_str: str) -> Path:
 
 
 def _require_db(project_root: Path) -> Path:
-    path = project_root / RCE_DIRNAME / DB_FILENAME
+    """The graph for `project_root`, or a clear CliError. Resolved through
+    `rce.paths.resolve_graph_db` -- which is `graph_db_path` plus the
+    one-time migration of a legacy in-project `.rce/graph.db` -- so this
+    is one of the "first touch by any subcommand" sites section 8.10
+    rule 1 names. A migration that could not be verified is fatal for the
+    run: the legacy graph is still there and untouched, and continuing
+    would mean silently building a second, empty one."""
+    try:
+        path = paths.resolve_graph_db(project_root)
+    except paths.GraphMigrationError as exc:
+        raise CliError(str(exc)) from exc
     if not path.exists():
         raise CliError(
-            f"no RCE project at {project_root} (missing {RCE_DIRNAME}/{DB_FILENAME}); "
+            f"no RCE project at {project_root} (missing its graph at {path}); "
             f"run 'rce init {project_root}' first"
         )
     return path
@@ -237,10 +255,24 @@ def _print_pending_queue(conn: Connection, limit: int | None) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    """Create the project's graph -- at `~/.rce/graphs/<id>/graph.db`,
+    outside the project (DESIGN.md section 8.10 rule 1) -- plus the two
+    things that keep that from being hidden: the one-line `.rce/README`
+    signpost inside the project, and the graph's path printed here.
+
+    A project whose graph is still in the old in-project location is
+    migrated first, so `rce init` on an existing project adopts it rather
+    than starting a second, empty graph beside it."""
     project_root = _resolve_project_root(args.path)
-    rce_dir = project_root / RCE_DIRNAME
+    try:
+        paths.migrate_legacy_graph(project_root)
+    except paths.GraphMigrationError as exc:
+        raise CliError(str(exc)) from exc
+    rce_dir = paths.project_rce_dir(project_root)
     rce_dir.mkdir(parents=True, exist_ok=True)
-    conn = db.connect(rce_dir / DB_FILENAME)
+    paths.ensure_graph_dir(project_root)
+    db_path = paths.graph_db_path(project_root)
+    conn = db.connect(db_path)
     try:
         applied = db.migrate(conn)
         project_id = f"project:{project_root.name}"
@@ -250,13 +282,21 @@ def cmd_init(args: argparse.Namespace) -> int:
         )
     finally:
         conn.close()
-    print(f"Initialized RCE project at {rce_dir} (project node: {project_id})")
+    readme = paths.write_project_readme(project_root)
+    print(f"Initialized RCE project at {project_root} (project node: {project_id})")
+    print(f"Graph: {db_path}")
     if applied:
         print(f"Applied migrations: {applied}")
-    # T5.5 review item 5: a nudge only -- RCE never edits the user's own
-    # files (DESIGN.md section 2, "零习惯改变"), so this is printed,
-    # not applied.
-    print(f"Tip: add '{RCE_DIRNAME}/' to your project's .gitignore -- RCE will not do this for you.")
+    # T5.5 review item 5, restated for section 8.10: still a nudge only --
+    # RCE never edits the user's own files (DESIGN.md section 2,
+    # "零习惯改变"). What changed is the advice itself: with the graph out
+    # of the project, `.rce/` holds only files the researcher wrote and may
+    # well want in git, so telling them to ignore it would now be wrong.
+    print(
+        f"Note: '{RCE_DIRNAME}/' in your project now holds only your own files "
+        f"(attempts.toml, mappings.toml, backups/) -- commit or .gitignore it as you "
+        f"prefer. The derived graph is outside the project; see {readme}."
+    )
     return 0
 
 
@@ -375,9 +415,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     project_root = _resolve_project_root(args.path)
-    conn = db.connect(_require_db(project_root))
+    db_path = _require_db(project_root)
+    conn = db.connect(db_path)
     try:
         print(f"Project: {project_root}")
+        # Section 8.10 rule 1: "`rce status` and `/api/summary` report the
+        # graph's actual location so nothing is hidden" -- the graph is no
+        # longer where a user would think to look for it.
+        print(f"Graph: {db_path}")
         _print_graph_counts(conn)
         if args.pending:  # purely additive -- omitting it reproduces the prior output exactly
             _print_pending_queue(conn, args.limit)
@@ -904,6 +949,64 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _project_state_note(entry: dict[str, str]) -> str:
+    """The one thing a listing must say about an entry beyond its path:
+    whether it is usable, and if not, which of the two ways it is not.
+    Same two questions `GET /api/projects` answers with its `available`/
+    `initialized` pair (DESIGN.md section 8.10 rule 3) -- a directory that
+    is gone is a dead entry worth removing; one that was merely never
+    `rce init`ed is fine and just needs initializing."""
+    root = Path(entry["path"])
+    if not project_registry.is_available(root):
+        return "  (directory missing -- 'rce projects remove' to drop this entry)"
+    if not project_registry.is_initialized(root):
+        return f"  (not initialized -- run 'rce init {entry['path']}')"
+    return ""
+
+
+def cmd_projects_list(args: argparse.Namespace) -> int:
+    """`rce projects list`: the registry the app's project switcher shows,
+    on the command line (DESIGN.md section 8.10 rule 3 asks for CLI
+    parity, so the researcher never has to hand-edit
+    ~/.rce/projects.json). Most-recently-served first, exactly the order
+    `GET /api/projects` returns."""
+    entries = project_registry.load()
+    if not entries:
+        print(
+            f"No registered projects yet ({project_registry.registry_path()} is empty or absent). "
+            "'rce serve <path>' registers one."
+        )
+        return 0
+    print(f"Registered projects ({len(entries)}, most recently served first):")
+    for entry in entries:
+        print(f"  {entry['label']}  {entry['path']}{_project_state_note(entry)}")
+    return 0
+
+
+def cmd_projects_remove(args: argparse.Namespace) -> int:
+    """`rce projects remove <path>`: drop one registry entry. Removes a
+    bookmark, never a project -- nothing on disk is touched and nothing is
+    ingested again, which is why this needs no confirmation prompt.
+
+    The stored paths are absolute and resolved (`registry.register`), so a
+    literal match is tried first and the resolved spelling second: a user
+    typing `rce projects remove .` means the directory they are standing
+    in. That convenience is deliberately NOT extended to
+    `POST /api/projects/remove`, whose caller may be a web page and which
+    therefore matches by string equality alone."""
+    if not project_registry.remove(args.path):
+        resolved = str(Path(args.path).expanduser().resolve())
+        if resolved == args.path or not project_registry.remove(resolved):
+            raise CliError(
+                f"{args.path!r} is not in the project registry "
+                f"({project_registry.registry_path()}); 'rce projects list' shows what is"
+            )
+        print(f"Removed {resolved} from the project registry (nothing on disk was deleted).")
+        return 0
+    print(f"Removed {args.path} from the project registry (nothing on disk was deleted).")
+    return 0
+
+
 def cmd_app(args: argparse.Namespace) -> int:
     """`rce app` (task V3 phase 4): generate the double-clickable RCE.app
     launcher bundle (rce.webapp.macapp) -- a bash launcher that opens the
@@ -988,7 +1091,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("init", help="Initialize an RCE project (.rce/graph.db) at a path")
+    p = sub.add_parser(
+        "init",
+        help=(
+            "Initialize an RCE project at a path: creates its graph under "
+            "~/.rce/graphs/<id>/ (outside the project) and a .rce/README saying so"
+        ),
+    )
     p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
     p.set_defaults(func=cmd_init)
 
@@ -1082,6 +1191,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-browser", action="store_true", help="do not automatically open a browser tab"
     )
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser(
+        "projects",
+        help=(
+            "Inspect and prune the project registry the app's switcher reads "
+            "(~/.rce/projects.json): 'rce projects list' / 'rce projects remove <path>'"
+        ),
+    )
+    projects_sub = p.add_subparsers(dest="projects_command", required=True)
+    q = projects_sub.add_parser(
+        "list", help="List registered projects, most recently served first, flagging dead entries",
+    )
+    q.set_defaults(func=cmd_projects_list)
+    q = projects_sub.add_parser(
+        "remove", help="Remove one entry from the registry (a bookmark only -- deletes nothing)",
+    )
+    q.add_argument("path", help="the registered project path to drop (as 'rce projects list' prints it)")
+    q.set_defaults(func=cmd_projects_remove)
 
     p = sub.add_parser(
         "app",

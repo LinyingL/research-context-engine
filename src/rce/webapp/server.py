@@ -52,8 +52,16 @@ Endpoints (all GET unless noted):
                             (`rce.webapp.registry`, `~/.rce/projects.json`)
                             plus which project this server is currently
                             serving: `{"projects": [{path, label,
-                            initialized}], "current": path}` (see
-                            `projects_payload`).
+                            initialized, available}], "current": path}`.
+                            `available` is DESIGN.md section 8.10 rule 3's
+                            question -- is the directory still there at all
+                            -- so the switcher can mark a dead entry and
+                            offer to remove it (see `projects_payload`).
+    POST /api/projects/remove -- body `{"path"}`: drop one entry from the
+                            registry, matched by the same string equality
+                            `/switch` uses. Removes a bookmark, never a
+                            project: nothing on disk is touched (see
+                            `remove_project_payload`).
     POST /api/projects/switch -- body `{"path"}`: repoint this running
                             server at another *registered, initialized*
                             project and return the new current. The path
@@ -128,8 +136,9 @@ is never treated as a filesystem path at all. The requested string must be
 *string-equal* to a `rce.webapp.registry.load()` entry's `"path"` -- no
 resolution, no normalization, no prefix logic is ever applied to the
 client-supplied value -- and that entry must be an initialized project
-(`.rce/graph.db` exists). The registry lives at `~/.rce/projects.json`,
-outside every project root, and only `rce serve <path>` on this user's own
+(its graph exists, `rce.paths.graph_exists`). The registry lives at
+`~/.rce/projects.json`, outside every project root, and only
+`rce serve <path>` on this user's own
 command line (plus a successful switch's recency bump) ever writes it; so
 even a request that somehow got past `_check_local_origin` could only ever
 choose among projects the user has already deliberately served, never point
@@ -196,10 +205,30 @@ polling follows the new root and the frontend's next generation poll
 triggers a re-fetch. The watcher endpoint is read-only status; it goes
 through `_check_local_origin` exactly like every other endpoint.
 
+Where the graph is, and what happens when it is not there (DESIGN.md
+section 8.10, resilience rules 1 and 2): the graph is NOT in the project --
+it is at `~/.rce/graphs/<id>/graph.db`, resolved by `rce.paths`, because a
+project inside an iCloud-synced folder made `sqlite3.connect` block for over
+a minute on an evicted file while `/api/generation` and `/api/projects` kept
+answering. `_require_db` therefore does three things before any handler gets
+a connection: it runs the one-time legacy migration (`resolve_graph_db`), it
+refuses a missing graph with `ProjectNotInitializedError`, and -- the
+non-obvious one -- it checks macOS's `SF_DATALESS` flag on the file and
+raises `GraphDownloadingError` rather than calling `open()` on a file whose
+content is still in the cloud, since that call is what blocks and there is
+no non-blocking form of it. Both errors carry a machine-readable `state`
+alongside their message so the page can render a header state in product
+language (「项目不可用 — 图谱文件已不存在」 / 「图谱文件正在从云端下载…」) instead
+of an English error box, with the project switcher left usable so the
+researcher can move to another project. `/api/projects` and
+`/api/generation` still deliberately bypass the database entirely, so a
+degraded project can always be navigated away from.
+
 Every handler-facing failure is one of the small `ApiError` subclasses below,
 each carrying its own HTTP status; `RceRequestHandler` catches `ApiError`
-once per request and renders `{"error": str(exc)}` at that status, mirroring
-`rce.cli`'s single `CliError` catch in `main()`.
+once per request and renders `{"error": str(exc)}` -- plus `"state"` when the
+error names one -- at that status, mirroring `rce.cli`'s single `CliError`
+catch in `main()`.
 """
 
 from __future__ import annotations
@@ -217,7 +246,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable
 
-from rce import db, lineage
+from rce import db, lineage, paths
 from rce.ingest import attempts as attempts_ingest
 from rce.webapp import mapedit
 from rce.webapp import registry as project_registry
@@ -225,8 +254,10 @@ from rce.webapp import watcher as project_watcher
 
 logger = logging.getLogger(__name__)
 
-RCE_DIRNAME = ".rce"
-DB_FILENAME = "graph.db"
+# Kept as module attributes for the messages that quote them; rce.paths
+# owns the definitions (DESIGN.md section 8.10 rule 1).
+RCE_DIRNAME = paths.RCE_DIRNAME
+DB_FILENAME = paths.DB_FILENAME
 
 _FILE_SIZE_LIMIT = 200 * 1024  # 200KB (task V1 spec)
 
@@ -236,9 +267,18 @@ _FILE_SIZE_LIMIT = 200 * 1024  # 200KB (task V1 spec)
 
 class ApiError(Exception):
     """Base for every error an endpoint can raise; `status` is the HTTP code
-    `RceRequestHandler` sends back alongside `{"error": str(self)}`."""
+    `RceRequestHandler` sends back alongside `{"error": str(self)}`.
+
+    `state` is the optional machine-readable name of a *degraded project*
+    condition the frontend has its own product-language wording for
+    (DESIGN.md section 8.10 rule 2). It exists because the alternative is
+    the page pattern-matching English engine prose to decide what to
+    render, which would break the first time a message is reworded. Only
+    the two states the design names carry one; every other error stays a
+    plain message the page shows in its error box."""
 
     status = 400
+    state: str | None = None
 
 
 class NotFoundError(ApiError):
@@ -270,7 +310,34 @@ class UnsupportedPlatformError(ApiError):
 
 
 class ProjectNotInitializedError(ApiError):
+    """No graph for this project -- never initialized, or (section 8.10
+    rule 2) it vanished mid-serve. The `state` is what turns this into the
+    header state 「项目不可用 — 图谱文件已不存在」 with the project switcher
+    still usable, rather than an English error box over an empty view."""
+
     status = 400
+    state = "graph_missing"
+
+
+class GraphDownloadingError(ApiError):
+    """The graph file exists but macOS has evicted its content to iCloud
+    (`SF_DATALESS`). 503 because it is transient by nature -- the download
+    is presumably in flight -- and answering it immediately is the entire
+    point: `open()`ing a dataless file blocks the handler thread until the
+    transfer completes, which is the hang section 8.10 rule 1 was written
+    to end. The page says 「图谱文件正在从云端下载…」 and keeps polling."""
+
+    status = 503
+    state = "graph_downloading"
+
+
+class GraphMigrationError(ApiError):
+    """A legacy in-project `graph.db` could not be moved out of the project
+    safely (`rce.paths.GraphMigrationError`). 500, not 400: nothing about
+    the request is wrong, and the graph is still exactly where it was --
+    this needs a human looking at a log line, not a retry."""
+
+    status = 500
 
 
 class AttemptEditError(ApiError):
@@ -296,12 +363,30 @@ class UnknownProjectError(ApiError):
 def _require_db(project_root: Path) -> Path:
     """Same message shape as `rce.cli`/`rce.mcp_server`'s own `_require_db`
     -- each subsystem owns its copy (existing convention in this codebase),
-    since each raises its own module's error type."""
-    path = project_root / RCE_DIRNAME / DB_FILENAME
+    since each raises its own module's error type -- and, in this copy
+    only, the two checks that stand between a handler thread and a file it
+    should not touch (module docstring, "Where the graph is"):
+
+    1. the graph resolves through `rce.paths.resolve_graph_db`, so a legacy
+       in-project database is migrated out on the server's first touch;
+    2. `is_dataless` is asked BEFORE the caller opens the file, because
+       `sqlite3.connect` on a cloud-evicted file blocks for as long as the
+       download takes and cannot be interrupted -- an honest 503 now beats
+       a hung request thread later.
+    """
+    try:
+        path = paths.resolve_graph_db(project_root)
+    except paths.GraphMigrationError as exc:
+        raise GraphMigrationError(str(exc)) from exc
     if not path.exists():
         raise ProjectNotInitializedError(
-            f"no RCE project at {project_root} (missing {RCE_DIRNAME}/{DB_FILENAME}); "
+            f"no RCE project at {project_root} (missing its graph at {path}); "
             f"run 'rce init {project_root}' first"
+        )
+    if paths.is_dataless(path):
+        raise GraphDownloadingError(
+            f"the graph at {path} is not on this disk right now (macOS has evicted it to "
+            f"iCloud); waiting for the download instead of opening it"
         )
     return path
 
@@ -361,6 +446,10 @@ def summary_payload(conn: Connection, project_root: Path) -> dict[str, Any]:
         edge_counts[edge["type"]] += 1
     return {
         "project_root": str(project_root),
+        # Section 8.10 rule 1: "`rce status` and `/api/summary` report the
+        # graph's actual location so nothing is hidden" -- it is no longer
+        # inside the project, so a user who is not told cannot find it.
+        "graph_path": str(paths.graph_db_path(project_root)),
         "nodes": node_counts,
         "edges": edge_counts,
         "pending": len(db.pending_edges(conn)),
@@ -599,16 +688,24 @@ def open_payload(project_root: Path, rel_path: str, reveal: bool) -> dict[str, A
 
 def projects_payload(current_root: Path) -> dict[str, Any]:
     """The registry (`rce.webapp.registry.load()`, most-recently-served
-    first) with each entry's `initialized` state checked fresh per request
-    -- a project can be `rce init`ed, or its disk unmounted, between two
-    calls -- plus which project this server is currently serving. The
-    current root is reported even when it is not (or no longer) a registry
-    member: it is a fact about this server, not about the registry."""
+    first) with each entry's `initialized` and `available` state checked
+    fresh per request -- a project can be `rce init`ed, deleted, or its
+    disk unmounted between two calls -- plus which project this server is
+    currently serving. The current root is reported even when it is not
+    (or no longer) a registry member: it is a fact about this server, not
+    about the registry.
+
+    The two flags answer different questions and the UI treats them
+    differently (DESIGN.md section 8.10 rule 3): `initialized` false means
+    "registered but has no graph yet" -- greyed out, still a real
+    directory; `available` false means the directory itself is gone, which
+    is a dead entry the switcher offers to remove."""
     projects = [
         {
             "path": entry["path"],
             "label": entry["label"],
             "initialized": project_registry.is_initialized(Path(entry["path"])),
+            "available": project_registry.is_available(Path(entry["path"])),
         }
         for entry in project_registry.load()
     ]
@@ -641,11 +738,53 @@ def switch_project_payload(requested: str) -> tuple[Path, dict[str, Any]]:
     new_root = Path(entry["path"])
     if not project_registry.is_initialized(new_root):
         raise ProjectNotInitializedError(
-            f"registered project {entry['path']!r} is not initialized (missing "
-            f"{RCE_DIRNAME}/{DB_FILENAME}); run 'rce init {entry['path']}' first"
+            f"registered project {entry['path']!r} is not initialized (missing its graph at "
+            f"{paths.graph_db_path(new_root)}); run 'rce init {entry['path']}' first"
         )
+    try:
+        # This IS the server's first touch of the new project (section 8.10
+        # rule 1), and it must happen here rather than on the first read:
+        # the write path (`/api/attempts/write` -> `rce.webapp.mapedit`)
+        # goes nowhere near `_require_db`, so a switch followed by an edit
+        # would otherwise find no graph at the new location while a
+        # perfectly good legacy one sat unmigrated in the project.
+        paths.migrate_legacy_graph(new_root)
+    except paths.GraphMigrationError as exc:
+        raise GraphMigrationError(str(exc)) from exc
     project_registry.register(new_root)  # most-recently-served bump
     return new_root, {"current": entry["path"], "label": entry["label"]}
+
+
+def remove_project_payload(requested: str) -> dict[str, Any]:
+    """Drop one entry from the registry (DESIGN.md section 8.10 rule 3), so
+    the researcher never has to hand-edit `~/.rce/projects.json` when a
+    project directory is gone.
+
+    Matched by string equality against a `registry.load()` entry, exactly
+    as `switch_project_payload` matches and for exactly the same reason
+    (module docstring, "Switch-target defense"): the client-supplied string
+    is never resolved, joined, or treated as a filesystem path, so a
+    crafted value has nothing to traverse -- it either names an entry the
+    user already registered, or it names nothing (403).
+
+    Deliberately NOT gated on the entry being dead: `available` is checked
+    per request and can flip between the page rendering a button and the
+    user clicking it (a disk remounts, a directory is restored), and
+    refusing a removal because the project came back is a worse failure
+    than removing a bookmark the user asked to remove. This deletes
+    nothing on disk -- no graph, no project, no file -- so the blast
+    radius of being wrong is one re-registration by `rce serve <path>`.
+
+    Removing the currently-served project is allowed too: this server keeps
+    serving what it serves, and `projects_payload` already reports a
+    current root that is not a registry member."""
+    if not project_registry.remove(requested):
+        raise UnknownProjectError(
+            f"{requested!r} is not a registered project -- only paths already in the "
+            f"registry (~/{project_registry.RCE_DIRNAME}/{project_registry.REGISTRY_FILENAME}) "
+            f"can be removed from it"
+        )
+    return {"removed": requested}
 
 
 # -- POST /api/attempts/preview + /api/attempts/write (task V3 phase 3) -------
@@ -789,6 +928,16 @@ class RceRequestHandler(BaseHTTPRequestHandler):
     def _open_conn(self) -> Connection:
         return db.connect(_require_db(self._project_root()))
 
+    def _send_api_error(self, exc: ApiError) -> None:
+        """`{"error": msg}` plus `"state"` when the error names one -- the
+        two degraded-project conditions the page has its own product
+        language for (see `ApiError.state`). Absent for every other error,
+        so the page's generic error box stays the default."""
+        body: dict[str, Any] = {"error": str(exc)}
+        if exc.state is not None:
+            body["state"] = exc.state
+        self._send_json(exc.status, body)
+
     def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -885,7 +1034,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             else:
                 raise NotFoundError(f"not found: {path}")
         except ApiError as exc:
-            self._send_json(exc.status, {"error": str(exc)})
+            self._send_api_error(exc)
         except Exception:
             logger.exception("unhandled error handling GET %s", self.path)
             self._send_json(500, {"error": "internal server error"})
@@ -935,6 +1084,13 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # generation, so every open page's next poll re-fetches.
                 self.server.watcher.retarget()
                 self._send_json(200, payload)
+            elif parsed.path == "/api/projects/remove":
+                # Section 8.10 rule 3. POST, and origin-checked above like
+                # every other side effect: this writes ~/.rce/projects.json,
+                # which is the allow-list /api/projects/switch validates
+                # against, so a drive-by page must never be able to edit it.
+                body = self._read_json_body_with_path()
+                self._send_json(200, remove_project_payload(body["path"]))
             elif parsed.path == "/api/attempts/preview":
                 # Pure dry run (task V3 phase 3) -- but origin-checked like
                 # a write anyway (above), since its twin below mutates and
@@ -964,7 +1120,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             else:
                 raise NotFoundError(f"no such endpoint: {parsed.path}")
         except ApiError as exc:
-            self._send_json(exc.status, {"error": str(exc)})
+            self._send_api_error(exc)
         except Exception:
             logger.exception("unhandled error handling POST %s", self.path)
             self._send_json(500, {"error": "internal server error"})

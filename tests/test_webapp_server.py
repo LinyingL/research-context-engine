@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from rce import cli, db, lineage
+from rce import cli, db, lineage, paths
 from rce.webapp import registry, server
 
 
@@ -89,9 +89,13 @@ def _write_attempts_config(project_root: Path, *, steps_dir: str | None = None) 
 
 
 def _init_project(project_root: Path) -> None:
-    rce_dir = project_root / ".rce"
-    rce_dir.mkdir(parents=True, exist_ok=True)
-    conn = db.connect(rce_dir / "graph.db")
+    """What `rce init` leaves behind since DESIGN.md section 8.10 rule 1:
+    a `.rce/` in the project for the researcher's own files, and the graph
+    OUTSIDE it under `rce.paths.graph_db_path` (the conftest-wide
+    `RCE_HOME` keeps that inside tmp_path)."""
+    (project_root / ".rce").mkdir(parents=True, exist_ok=True)
+    paths.ensure_graph_dir(project_root)
+    conn = db.connect(paths.graph_db_path(project_root))
     try:
         db.migrate(conn)
     finally:
@@ -100,10 +104,12 @@ def _init_project(project_root: Path) -> None:
 
 @pytest.fixture
 def fake_home(tmp_path: Path, monkeypatch) -> Path:
-    """A throwaway HOME so registry-touching tests (the /api/projects
-    endpoints, cmd_serve's registration) never read or write the user's
-    real ~/.rce/projects.json -- `registry.registry_path()` resolves
-    `Path.home()` per call precisely to honor this monkeypatch."""
+    """A throwaway HOME for registry-touching tests (the /api/projects
+    endpoints, cmd_serve's registration). The registry itself now lives
+    under `rce.paths.rce_home()`, which conftest's autouse
+    `isolated_rce_home` already points inside tmp_path -- so isolation from
+    the user's real `~/.rce/projects.json` holds either way; this fixture
+    additionally pins HOME for anything still reading it."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -191,6 +197,10 @@ def test_summary_payload_counts_nodes_edges_and_pending(conn, tmp_path):
     )
     payload = server.summary_payload(conn, tmp_path)
     assert payload["project_root"] == str(tmp_path)
+    # Section 8.10 rule 1: the graph is no longer inside the project, so
+    # the summary has to say where it actually is.
+    assert payload["graph_path"] == str(paths.graph_db_path(tmp_path))
+    assert payload["graph_path"] != str(tmp_path / ".rce" / "graph.db")
     assert payload["nodes"]["project"] == 1 and payload["nodes"]["figure"] == 1
     assert payload["edges"]["includes"] == 1
     assert payload["pending"] == 1
@@ -562,9 +572,33 @@ def test_http_root_returns_spa_shell_with_key_mount_points(live_server):
     for mount_point in (
         'id="app"', 'id="view-tree"', 'id="view-lineage"', 'id="panel"',
         'id="panel-backdrop"', 'id="panel-body"', 'id="project-switcher"',
+        # Section 8.10's two additions: the degraded-project header state
+        # and the dead-registry-entry cleanup button.
+        'id="project-state"', 'id="remove-missing-btn"',
         'data-view="tree"', 'data-view="lineage"',
     ):
         assert mount_point in html, f"missing mount point in served app.html: {mount_point}"
+
+
+def test_served_app_carries_the_degraded_state_copy_in_product_language(live_server):
+    """DESIGN.md sections 8.8 and 8.10: what the researcher reads for a
+    degraded project is Chinese product language, and the wording is the
+    design's own -- the English engine string lives on a hover title. Pinned
+    here because this copy is binding, not a placeholder someone may
+    casually reword.
+
+    Also pins the keying: the page selects its wording by the server's
+    machine-readable `state` name, never by matching English error prose."""
+    _, body = _get_raw(live_server[0], "/")
+    html = body.decode("utf-8")
+    for copy in (
+        "项目不可用 — 图谱文件已不存在",   # rule 2's header state
+        "图谱文件正在从云端下载…",           # rule 1's dataless state
+        "移除失效项目",                      # rule 3's cleanup button
+        "（目录已不存在）",                  # rule 3's dead entry marker
+    ):
+        assert copy in html, f"missing product-language copy in app.html: {copy}"
+    assert "graph_missing" in html and "graph_downloading" in html
 
 
 def test_http_root_has_zero_external_resources(live_server):
@@ -1324,3 +1358,293 @@ def test_build_server_does_not_start_watcher_thread(tmp_path):
         assert httpd.watcher._thread is None
     finally:
         httpd.server_close()
+
+
+# -- DESIGN.md section 8.10 rule 1: the graph lives outside the project -------
+
+
+def test_require_db_resolves_outside_the_project(tmp_path):
+    project = tmp_path / "proj"
+    _init_project(project)
+    assert server._require_db(project) == paths.graph_db_path(project)
+
+
+def test_require_db_migrates_a_legacy_in_project_graph_on_first_touch(tmp_path):
+    """"Migrated on first touch by any subcommand or the server" -- the
+    server's touch is `_require_db`, and the rows must survive it."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = paths.legacy_graph_db_path(project)
+    legacy.parent.mkdir(parents=True)
+    conn = db.connect(legacy)
+    try:
+        db.migrate(conn)
+        db.upsert_node(conn, "figure:old.png", "figure", title="old.png")
+    finally:
+        conn.close()
+
+    resolved = server._require_db(project)
+
+    assert resolved == paths.graph_db_path(project) and resolved.exists()
+    assert not legacy.exists()
+    conn = db.connect(resolved)
+    try:
+        assert db.get_node(conn, "figure:old.png") is not None
+    finally:
+        conn.close()
+
+
+def test_require_db_reports_a_failed_migration_as_a_500_not_a_missing_project(tmp_path, monkeypatch):
+    """A graph that could not be verified is a different fact from no graph
+    at all, and must not be reported as "run rce init" -- that advice would
+    invite the user to build an empty graph beside their real one."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = paths.legacy_graph_db_path(project)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"not a database" * 100)
+
+    with pytest.raises(server.GraphMigrationError) as excinfo:
+        server._require_db(project)
+
+    assert excinfo.value.status == 500
+    assert legacy.exists()
+
+
+def test_http_summary_reports_the_graphs_actual_location(live_server, tmp_path):
+    base_url, project = live_server
+    status, payload = _get(base_url, "/api/summary")
+    assert status == 200
+    assert payload["graph_path"] == str(paths.graph_db_path(project))
+
+
+# -- rule 1: a cloud-evicted graph answers instead of blocking ----------------
+
+
+def test_require_db_refuses_to_open_a_dataless_graph(tmp_path, monkeypatch):
+    """`sqlite3.connect` on an iCloud-evicted file blocks for as long as the
+    download takes and cannot be interrupted -- so the check happens before
+    anyone opens it, and it raises rather than waits."""
+    project = tmp_path / "proj"
+    _init_project(project)
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+
+    with pytest.raises(server.GraphDownloadingError) as excinfo:
+        server._require_db(project)
+
+    assert excinfo.value.status == 503
+    assert excinfo.value.state == "graph_downloading"
+
+
+def test_http_dataless_graph_returns_503_with_its_own_state(live_server, monkeypatch):
+    base_url, _ = live_server
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+
+    status, payload = _get(base_url, "/api/summary")
+
+    assert status == 503
+    assert payload["state"] == "graph_downloading"
+    assert "iCloud" in payload["error"]
+
+
+def test_dataless_check_is_not_asked_of_a_graph_that_is_not_there(tmp_path, monkeypatch):
+    """Order matters: "missing" outranks "downloading", or a project that
+    was never initialized would be reported as one that is still syncing."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+
+    with pytest.raises(server.ProjectNotInitializedError):
+        server._require_db(project)
+
+
+# -- rule 2: a vanished graph degrades, it does not deadlock ------------------
+
+
+def test_http_vanished_graph_reports_a_state_the_page_can_render(live_server):
+    base_url, project = live_server
+    paths.graph_db_path(project).unlink()
+
+    status, payload = _get(base_url, "/api/tree")
+
+    assert status == 400
+    assert payload["state"] == "graph_missing"
+    assert "graph.db" in payload["error"]
+
+
+def test_http_vanished_graph_leaves_the_project_switcher_usable(live_server, fake_home, tmp_path):
+    """The whole point of rule 2: the reads fail, but the endpoints the
+    switcher needs keep answering, so the researcher can move to another
+    project instead of staring at a dead page."""
+    base_url, project = live_server
+    registry.register(project)
+    other = tmp_path / "other"
+    _init_project(other)
+    registry.register(other)
+    paths.graph_db_path(project).unlink()
+
+    assert _get(base_url, "/api/summary")[0] == 400
+    status, payload = _get(base_url, "/api/projects")
+    assert status == 200 and len(payload["projects"]) == 2
+    assert _get(base_url, "/api/generation")[0] == 200
+
+    status, _ = _post(base_url, "/api/projects/switch", {"path": _registered_path("other")})
+    assert status == 200
+    assert _get(base_url, "/api/summary")[0] == 200  # recovered by switching
+
+
+def test_ordinary_errors_carry_no_state_so_the_page_shows_its_error_box(live_server):
+    """Only the two degraded-project conditions get a state; everything
+    else stays a plain message, or the page would start rendering header
+    states for unrelated failures."""
+    status, payload = _get(live_server[0], "/api/file?path=nope.txt")
+    assert status == 404 and "state" not in payload
+
+
+# -- rule 3: a registry entry whose directory is gone -------------------------
+
+
+def test_http_projects_marks_an_entry_whose_directory_is_gone(live_server, fake_home, tmp_path):
+    base_url, project = live_server
+    registry.register(project)
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    registry.register(doomed)
+    doomed.rmdir()
+
+    status, payload = _get(base_url, "/api/projects")
+
+    assert status == 200
+    by_label = {p["label"]: p for p in payload["projects"]}
+    assert by_label["doomed"]["available"] is False
+    assert by_label["proj"]["available"] is True
+
+
+def test_http_projects_available_and_initialized_are_separate_facts(live_server, fake_home, tmp_path):
+    """A directory that exists but was never `rce init`ed is available and
+    uninitialized -- greyed out in the switcher, but NOT offered for
+    removal: nothing about it is dead."""
+    base_url, project = live_server
+    uninitialized = tmp_path / "empty-proj"
+    uninitialized.mkdir()
+    registry.register(uninitialized)
+
+    _, payload = _get(base_url, "/api/projects")
+
+    entry = next(p for p in payload["projects"] if p["label"] == "empty-proj")
+    assert entry["available"] is True and entry["initialized"] is False
+
+
+def test_http_projects_remove_drops_the_entry(live_server, fake_home, tmp_path):
+    base_url, project = live_server
+    registry.register(project)
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    registry.register(doomed)
+    target = _registered_path("doomed")
+    doomed.rmdir()
+
+    status, payload = _post(base_url, "/api/projects/remove", {"path": target})
+
+    assert status == 200 and payload == {"removed": target}
+    _, listing = _get(base_url, "/api/projects")
+    assert [p["label"] for p in listing["projects"]] == ["proj"]
+
+
+def test_http_projects_remove_deletes_nothing_on_disk(live_server, fake_home, tmp_path):
+    """It removes a bookmark. The project and its graph must survive, or a
+    mis-click would cost the researcher their graph."""
+    base_url, project = live_server
+    registry.register(project)
+
+    status, _ = _post(base_url, "/api/projects/remove", {"path": _registered_path("proj")})
+
+    assert status == 200
+    assert project.is_dir() and paths.graph_db_path(project).exists()
+
+
+def test_http_projects_remove_rejects_a_path_not_in_the_registry(live_server, fake_home, tmp_path):
+    """Same allow-list rule as /switch: a request body can never introduce
+    a filesystem path the user did not register."""
+    base_url, project = live_server
+    registry.register(project)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    status, payload = _post(base_url, "/api/projects/remove", {"path": str(outside.resolve())})
+
+    assert status == 403 and "not a registered project" in payload["error"]
+    assert len(registry.load()) == 1
+
+
+def test_http_projects_remove_matches_by_string_equality_only(live_server, fake_home, tmp_path):
+    """No resolution, no normalization of the client-supplied value -- the
+    same defense /switch relies on."""
+    base_url, project = live_server
+    registry.register(project)
+    stored = _registered_path("proj")
+
+    status, _ = _post(base_url, "/api/projects/remove", {"path": stored + "/"})
+
+    assert status == 403
+    assert len(registry.load()) == 1
+
+
+def test_http_projects_remove_missing_path_key_returns_400(live_server, fake_home):
+    status, _ = _post(live_server[0], "/api/projects/remove", {})
+    assert status == 400
+
+
+def test_http_projects_remove_rejects_a_foreign_origin_before_touching_the_registry(
+    live_server, fake_home
+):
+    """The drive-by shape aimed at the newest mutating endpoint: this one
+    writes ~/.rce/projects.json, which IS the allow-list /switch validates
+    against, so a hostile page must not be able to edit it."""
+    base_url, project = live_server
+    registry.register(project)
+    stored = _registered_path("proj")
+
+    status, payload = _request_with_headers(
+        base_url, "POST", "/api/projects/remove",
+        {
+            "Host": urllib.parse.urlsplit(base_url).netloc,
+            "Origin": "http://evil.example",
+            "Content-Type": "text/plain",
+        },
+        body=json.dumps({"path": stored}).encode("utf-8"),
+    )
+
+    assert status == 403 and "Origin" in payload["error"]
+    assert len(registry.load()) == 1  # nothing was removed
+
+
+def test_get_of_the_remove_endpoint_is_a_plain_404(live_server, fake_home):
+    """POST-only, like every other side effect here: a GET falls through to
+    the ordinary unknown-endpoint 404 rather than acting."""
+    status, _ = _get(live_server[0], "/api/projects/remove")
+    assert status == 404
+
+
+def test_switch_migrates_a_legacy_graph_in_the_project_switched_to(live_server, fake_home, tmp_path):
+    """A switch is the server's first touch of the new project, and the
+    write path never goes through `_require_db` -- so the migration has to
+    happen on the switch itself, not on the first read after it."""
+    base_url, project = live_server
+    registry.register(project)
+    legacy_project = tmp_path / "legacy"
+    legacy_project.mkdir()
+    legacy = paths.legacy_graph_db_path(legacy_project)
+    legacy.parent.mkdir(parents=True)
+    conn = db.connect(legacy)
+    try:
+        db.migrate(conn)
+    finally:
+        conn.close()
+    registry.register(legacy_project)
+
+    status, _ = _post(base_url, "/api/projects/switch", {"path": _registered_path("legacy")})
+
+    assert status == 200
+    assert not legacy.exists()
+    assert paths.graph_db_path(legacy_project).exists()

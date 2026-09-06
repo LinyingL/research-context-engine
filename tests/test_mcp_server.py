@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from rce import db, mcp_server
+from rce import db, mcp_server, paths
 
 
 def _mk(conn, src, dst, edge_type, extractor="test", evidence=None, confidence=0.9, status="auto"):
@@ -139,8 +139,9 @@ def test_confirm_edge_rejects_unknown_type_and_status(conn):
 
 def test_build_server_registers_tools_with_legal_schemas(tmp_path):
     project = tmp_path / "proj"
-    (project / ".rce").mkdir(parents=True)
-    conn = db.connect(project / ".rce" / "graph.db")
+    project.mkdir()
+    paths.ensure_graph_dir(project)  # the graph lives outside the project (section 8.10 rule 1)
+    conn = db.connect(paths.graph_db_path(project))
     try:
         db.migrate(conn)
     finally:

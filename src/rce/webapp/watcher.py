@@ -44,6 +44,18 @@ from, cheap enough to re-run on a local project. A map-file-only edit
 never re-runs dataflow; nothing about commits/latex/mlflow is re-ingested
 here at all (an edited step script or attempt row changes none of those).
 
+A vanished graph is not a transient failure (DESIGN.md section 8.10
+rule 2). Observed in real use: the graph disappeared mid-serve and this
+watcher raised the same "graph database disappeared" error -- with a full
+traceback -- once per 2-second poll, forever, into the log. So the missing
+graph is now checked FIRST, before the snapshot is even compared: the
+watcher logs one line, records it as `last_error`, bumps the generation
+once (so open pages re-fetch and land on the header state 「项目不可用 —
+图谱文件已不存在」), and then stops re-ingesting this root entirely until the
+file reappears. The baseline is deliberately left untouched while the
+graph is away, so an edit made during the outage is still a visible
+difference when the graph comes back and the ordinary cycle resumes.
+
 Failure containment: a half-saved table, a heading mid-rename, a script
 with a syntax hiccup -- the user editing their own files *will* produce
 transient ingest failures, and none of them may kill the watcher or the
@@ -84,7 +96,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from rce import db
+from rce import db, paths
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
@@ -92,10 +104,11 @@ from rce.ingest import git as git_ingest
 
 logger = logging.getLogger(__name__)
 
-# Same constants as rce.cli / rce.webapp.server / rce.webapp.registry --
-# each subsystem owns its copy (existing convention in this codebase).
-RCE_DIRNAME = ".rce"
-DB_FILENAME = "graph.db"
+# The graph's location is rce.paths' business alone since DESIGN.md
+# section 8.10 rule 1; these stay as module attributes only for callers
+# that quote them.
+RCE_DIRNAME = paths.RCE_DIRNAME
+DB_FILENAME = paths.DB_FILENAME
 
 DEFAULT_INTERVAL_SECONDS = 2.0
 
@@ -226,6 +239,11 @@ class ProjectWatcher:
         self._last_error: str | None = None
         self._baseline: WatchSnapshot | None = None
         self._baseline_root: Path | None = None
+        # Section 8.10 rule 2: the root whose graph is currently missing,
+        # or None. Remembering WHICH root is what makes the log line fire
+        # once instead of once per poll, while still firing again for a
+        # different project whose graph is also gone.
+        self._graph_missing_root: Path | None = None
         self._epoch = 0  # bumped by retarget(); lets a mid-ingest poll notice a switch
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -299,6 +317,10 @@ class ProjectWatcher:
             self._baseline = None
             self._baseline_root = None
             self._last_error = None
+            # The old root's missing graph is not the new root's problem:
+            # clear it, so a new project whose graph is also gone gets its
+            # own (single) log line rather than being silenced by the old.
+            self._graph_missing_root = None
             self._generation += 1
 
     # -- the poll cycle --------------------------------------------------------
@@ -310,8 +332,17 @@ class ProjectWatcher:
 
         The first poll after construction or `retarget` only establishes
         the baseline -- serving a project is not evidence it changed, so
-        nothing is ingested and the generation stays put."""
+        nothing is ingested and the generation stays put.
+
+        A root whose graph has vanished is short-circuited before any of
+        that (section 8.10 rule 2): nothing is snapshotted, compared or
+        ingested, and the baseline is left exactly as it was so a change
+        made during the outage is still pending when the file returns."""
         root = self._get_project_root()
+        if not paths.graph_db_path(root).exists():
+            self._note_graph_missing(root)
+            return False
+        self._note_graph_present()
         snapshot = take_snapshot(root)
         with self._state_lock:
             epoch = self._epoch
@@ -349,22 +380,59 @@ class ProjectWatcher:
             self._generation += 1
         return True
 
+    def _note_graph_missing(self, root: Path) -> None:
+        """First poll to find `root`'s graph gone: one log line (a warning,
+        not an exception -- there is no traceback worth printing for "the
+        file is not there"), `last_error` set so `GET /api/generation`
+        reports it, and one generation bump so every open page re-fetches
+        once and lands on the degraded header state. Every subsequent poll
+        while it is still gone does nothing at all -- that silence IS the
+        rule."""
+        with self._state_lock:
+            if self._graph_missing_root == root:
+                return
+            self._graph_missing_root = root
+            self._last_error = (
+                f"no RCE project at {root} (missing its graph at {paths.graph_db_path(root)}); "
+                "the graph database disappeared while being served"
+            )
+            self._generation += 1
+        logger.warning(
+            "graph for %s is gone (%s) -- auto re-ingest paused for this project until it "
+            "reappears", root, paths.graph_db_path(root),
+        )
+
+    def _note_graph_present(self) -> None:
+        """The graph is readable. If it had been missing, say so once,
+        clear the error and bump the generation so the degraded pages
+        recover on their next poll; otherwise this is a no-op on the hot
+        path (one lock acquisition, one comparison)."""
+        with self._state_lock:
+            if self._graph_missing_root is None:
+                return
+            recovered = self._graph_missing_root
+            self._graph_missing_root = None
+            self._last_error = None
+            self._generation += 1
+        logger.info("graph for %s is back -- auto re-ingest resumed", recovered)
+
     def _reingest(self, root: Path, steps_changed: bool) -> None:
         """Re-run the ingests the changed files feed (module docstring):
         always the attempts ingest -- exactly `rce.cli.cmd_attempts`'s own
         calls -- plus, only when the change touched `steps_dir`, the same
         dataflow step `rce.cli.cmd_ingest` runs. Raises on failure; the
         caller (`poll_once`) is the one place that catches and records."""
-        db_path = root / RCE_DIRNAME / DB_FILENAME
+        db_path = paths.graph_db_path(root)
         if not db_path.exists():
-            # Never let db.connect() conjure a fresh graph.db inside a
-            # project that was never `rce init`ed -- the served project is
-            # validated as initialized at serve/switch time, so this only
-            # trips if the database vanished mid-serve, which the user
-            # should hear about via last_error rather than have papered
-            # over with an empty new file.
+            # Never let db.connect() conjure a fresh graph.db where the
+            # real one used to be -- the served project is validated as
+            # initialized at serve/switch time, and `poll_once` now
+            # short-circuits a missing graph before ever reaching here, so
+            # this only trips on a vanish inside the poll cycle itself. It
+            # stays as the last line of defense rather than being deleted:
+            # `_reingest` must be safe to call on its own terms.
             raise RuntimeError(
-                f"no RCE project at {root} (missing {RCE_DIRNAME}/{DB_FILENAME}); "
+                f"no RCE project at {root} (missing its graph at {db_path}); "
                 "the graph database disappeared while being served"
             )
         conn = db.connect(db_path)

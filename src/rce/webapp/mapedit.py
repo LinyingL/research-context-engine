@@ -93,15 +93,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from rce import db
+from rce import db, paths
 from rce.ingest import attempts as attempts_ingest
 
 logger = logging.getLogger(__name__)
 
-# Same constants as rce.cli / rce.webapp.server / rce.webapp.watcher --
-# each subsystem owns its copy (existing convention in this codebase).
-RCE_DIRNAME = ".rce"
-DB_FILENAME = "graph.db"
+# The project-side directory (this module's backups live in it -- they are
+# the researcher's own file's history, so they stay in the project) and the
+# graph's filename, both from rce.paths: since DESIGN.md section 8.10 rule 1
+# no module computes the graph's location itself.
+RCE_DIRNAME = paths.RCE_DIRNAME
+DB_FILENAME = paths.DB_FILENAME
 
 BACKUPS_DIRNAME = "backups"
 BACKUP_KEEP = 20
@@ -512,11 +514,16 @@ def _reingest_attempts(project_root: Path) -> None:
     """Exactly `rce.cli.cmd_attempts`'s own calls (reuse, never
     re-implement -- same rule as the watcher's `_reingest`), with the same
     missing-db refusal: never let `db.connect` conjure a fresh graph.db
-    inside a project whose database vanished mid-serve."""
-    db_path = project_root / RCE_DIRNAME / DB_FILENAME
+    where the real one used to be if it vanished mid-serve.
+
+    `paths.graph_db_path`, not `resolve_graph_db`: this runs on every UI
+    write, and the one-time legacy migration belongs to the server's own
+    startup `_require_db`, not to a hot write path that would re-ask the
+    same question on every keystroke-driven save."""
+    db_path = paths.graph_db_path(project_root)
     if not db_path.exists():
         raise RuntimeError(
-            f"no RCE project at {project_root} (missing {RCE_DIRNAME}/{DB_FILENAME}); "
+            f"no RCE project at {project_root} (missing its graph at {db_path}); "
             "the file was written and backed up, but the graph could not be re-ingested"
         )
     conn = db.connect(db_path)

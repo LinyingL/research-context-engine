@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from rce import cli, db
+from rce import cli, db, paths
+from rce.webapp import registry as project_registry
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -78,7 +79,7 @@ def test_init_creates_db_and_project_node_idempotently(tmp_path, capsys):
     assert cli.main(["init", str(project)]) == 0
     assert cli.main(["init", str(project)]) == 0  # idempotent: no duplicate node, no error
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         node = db.get_node(conn, f"project:{project.name}")
         assert node is not None and node["type"] == "project"
@@ -138,7 +139,7 @@ def test_ingest_on_non_git_repo_degrades_gracefully(tmp_path, capsys):
     # pyfig cannot resolve a commit source node without git -- no generates edge.
     assert "generates=0" in out
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='commit'").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM nodes WHERE type='contributor'").fetchone()[0] == 0
@@ -190,7 +191,7 @@ def test_ingest_reports_dataflow_summary_and_creates_lineage_nodes(tmp_path, cap
     out = capsys.readouterr().out
     assert "dataflow: 1 .py, 0 .R, 0 .Rmd scanned -> reads=1 writes=1" in out
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         assert db.get_node(conn, "script:gen.py")["type"] == "script"
         assert db.get_node(conn, "dataset:data/raw.csv") is not None
@@ -227,7 +228,7 @@ def test_ingest_reports_mdpaper_summary_and_creates_claim_backed_by_edge(tmp_pat
     assert "mdpaper: 2 .md scanned (1 skipped as README/CHANGELOG/LICENSE)" in out
     assert all(s in out for s in ("sections=1", "figures=0", "claims=1", "candidates=1"))
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         assert db.get_node(conn, "section:paper.md#results")["type"] == "section"
         assert db.get_node(conn, "section:README.md#not-a-paper") is None  # README never ingested
@@ -241,7 +242,12 @@ def test_ingest_reports_mdpaper_summary_and_creates_claim_backed_by_edge(tmp_pat
 # -- T5.5 review item 5: `rce init` gitignore tip --
 
 
-def test_init_prints_gitignore_tip(tmp_path, capsys):
+def test_init_explains_what_dot_rce_now_holds(tmp_path, capsys):
+    """Was "add .rce/ to your .gitignore". Since DESIGN.md section 8.10
+    rule 1 the derived graph is NOT in there -- `.rce/` holds only files
+    the researcher wrote and may well want in git -- so the advice is now
+    that the choice is theirs, and still a printed nudge, never an edit to
+    their .gitignore (DESIGN.md section 2, "零习惯改变")."""
     project = tmp_path / "proj"
     project.mkdir()
 
@@ -249,6 +255,183 @@ def test_init_prints_gitignore_tip(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert ".rce/" in out and ".gitignore" in out
+    assert "attempts.toml" in out
+    assert not (project / ".gitignore").exists()  # printed, never applied
+
+
+# -- section 8.10 rule 1: `rce init` puts the graph outside the project --
+
+
+def test_init_creates_the_graph_outside_the_project(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert cli.main(["init", str(project)]) == 0
+
+    assert paths.graph_db_path(project).exists()
+    assert not (project / ".rce" / "graph.db").exists()
+    assert str(paths.graph_db_path(project)) in capsys.readouterr().out
+
+
+def test_init_leaves_a_readme_saying_where_the_graph_went(tmp_path):
+    """"so nothing is hidden": the one place a researcher WILL look is the
+    `.rce/` directory in their own project."""
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    cli.main(["init", str(project)])
+
+    readme = (project / ".rce" / "README").read_text(encoding="utf-8")
+    assert str(paths.graph_dir(project)) in readme
+
+
+def test_init_migrates_a_legacy_in_project_graph_instead_of_starting_a_second_one(tmp_path, capsys):
+    """`rce init` on a project from before the move must adopt the existing
+    graph, not quietly build an empty one beside it."""
+    project = tmp_path / "proj"
+    legacy = project / ".rce" / "graph.db"
+    legacy.parent.mkdir(parents=True)
+    conn = db.connect(legacy)
+    try:
+        db.migrate(conn)
+        db.upsert_node(conn, "figure:kept.png", "figure", title="kept.png")
+    finally:
+        conn.close()
+
+    assert cli.main(["init", str(project)]) == 0
+
+    assert not legacy.exists()
+    conn = db.connect(paths.graph_db_path(project))
+    try:
+        assert db.get_node(conn, "figure:kept.png") is not None
+    finally:
+        conn.close()
+
+
+def test_any_subcommand_migrates_a_legacy_graph_on_first_touch(tmp_path, capsys):
+    """"Migrated on first touch by ANY subcommand": `rce status` is not a
+    write command, but it is a touch, and it must not report an
+    uninitialized project just because the graph has not moved yet."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert cli.main(["init", str(project)]) == 0
+    # Put it back the old way, as an upgrade from an older RCE would leave it.
+    legacy = project / ".rce" / "graph.db"
+    paths.graph_db_path(project).rename(legacy)
+
+    assert cli.main(["status", "--path", str(project)]) == 0
+
+    assert not legacy.exists()
+    assert paths.graph_db_path(project).exists()
+
+
+def test_a_legacy_graph_that_fails_verification_is_a_clean_error_not_a_traceback(tmp_path, capsys):
+    project = tmp_path / "proj"
+    (project / ".rce").mkdir(parents=True)
+    (project / ".rce" / "graph.db").write_bytes(b"not a database" * 100)
+
+    assert cli.main(["status", "--path", str(project)]) == 1
+
+    err = capsys.readouterr().err
+    assert err.startswith("Error: ")
+    assert "Nothing was deleted" in err
+    assert (project / ".rce" / "graph.db").exists()
+
+
+def test_status_reports_the_graphs_actual_location(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.main(["init", str(project)])
+    capsys.readouterr()
+
+    assert cli.main(["status", "--path", str(project)]) == 0
+
+    out = capsys.readouterr().out
+    assert f"Graph: {paths.graph_db_path(project)}" in out
+
+
+def test_uninitialized_error_names_the_graph_it_looked_for(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    assert cli.main(["status", "--path", str(project)]) == 1
+
+    err = capsys.readouterr().err
+    assert str(paths.graph_db_path(project)) in err
+    assert "rce init" in err
+
+
+# -- section 8.10 rule 3: `rce projects list` / `rce projects remove` --
+
+
+def test_projects_list_reports_an_empty_registry_without_guessing(tmp_path, capsys):
+    assert cli.main(["projects", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "No registered projects" in out and "rce serve" in out
+
+
+def test_projects_list_shows_entries_most_recently_served_first(tmp_path, capsys):
+    a, b = tmp_path / "aaa", tmp_path / "bbb"
+    for project in (a, b):
+        project.mkdir()
+        cli.main(["init", str(project)])
+        project_registry.register(project)
+    capsys.readouterr()
+
+    assert cli.main(["projects", "list"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.index("bbb") < out.index("aaa")
+
+
+def test_projects_list_flags_a_dead_entry_and_an_uninitialized_one(tmp_path, capsys):
+    gone, fresh = tmp_path / "gone", tmp_path / "fresh"
+    gone.mkdir()
+    project_registry.register(gone)
+    gone.rmdir()
+    fresh.mkdir()
+    project_registry.register(fresh)
+
+    assert cli.main(["projects", "list"]) == 0
+
+    out = capsys.readouterr().out
+    assert "directory missing" in out and "rce projects remove" in out
+    assert "not initialized" in out and "rce init" in out
+
+
+def test_projects_remove_drops_the_entry_and_deletes_nothing(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    cli.main(["init", str(project)])
+    project_registry.register(project)
+    capsys.readouterr()
+
+    assert cli.main(["projects", "remove", str(project.resolve())]) == 0
+
+    assert project_registry.load() == []
+    assert project.is_dir() and paths.graph_db_path(project).exists()
+    assert "nothing on disk was deleted" in capsys.readouterr().out
+
+
+def test_projects_remove_accepts_the_spelling_a_human_would_type(tmp_path, capsys, monkeypatch):
+    """The registry stores resolved absolute paths; a person standing in
+    the directory types `.`. The CLI resolves as a second attempt -- a
+    convenience deliberately NOT given to the HTTP endpoint, whose caller
+    may be a web page."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    project_registry.register(project)
+    monkeypatch.chdir(project)
+
+    assert cli.main(["projects", "remove", "."]) == 0
+
+    assert project_registry.load() == []
+
+
+def test_projects_remove_unknown_path_is_a_clean_error(tmp_path, capsys):
+    assert cli.main(["projects", "remove", "/definitely/not/registered"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: ") and "rce projects list" in err
 
 
 # -- T5.5 review item 4: list_source_files' GitIngestError must be caught too --
@@ -292,7 +475,7 @@ def test_ingest_skips_ghost_figure_not_tracked_by_git(tmp_path, capsys):
     assert "figures=0" in out
     assert "Skipped/unresolved during this run (see logs): 1" in out
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         assert db.get_node(conn, "figure:ghost.png") is None
     finally:
@@ -502,7 +685,7 @@ def test_mcp_command_reports_clear_error_when_mcp_extra_not_installed(monkeypatc
 
 
 def _sole_pending_edge(project_root: Path) -> dict:
-    conn = db.connect(project_root / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project_root))
     try:
         return db.pending_edges(conn)[0]
     finally:
@@ -534,7 +717,7 @@ def test_status_pending_omits_metric_field_for_legacy_semantic_review_without_it
     cli.main(["ingest", str(claim_repo)])
     capsys.readouterr()
 
-    conn = db.connect(claim_repo / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(claim_repo))
     try:
         edge = db.pending_edges(conn)[0]
         db.set_edge_semantic_review(
@@ -609,7 +792,7 @@ def test_confirm_then_reingest_never_overwrites_human_judgement(claim_repo, caps
     assert cli.main(["status", "--path", str(claim_repo), "--pending"]) == 0
     assert "Pending confirmation queue (0):" in capsys.readouterr().out
 
-    conn = db.connect(claim_repo / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(claim_repo))
     try:
         updated = [e for e in db.query_edges(conn, src=edge["src"], dst=edge["dst"], type=edge["type"])
                    if e["extractor"] == edge["extractor"]][0]

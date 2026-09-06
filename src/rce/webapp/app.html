@@ -6,7 +6,8 @@
   resources, zero build step. Served verbatim by rce.webapp.server at "/"
   and read entirely client-side against this same process's JSON API
   (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
-  /api/open, /api/projects, /api/projects/switch, /api/generation,
+  /api/open, /api/projects, /api/projects/switch, /api/projects/remove,
+  /api/generation,
   /api/attempts/preview, /api/attempts/write, /api/shutdown -- see
   rce/webapp/server.py's module docstring for the contract each endpoint
   promises).
@@ -44,6 +45,20 @@
   actually changed, so untouched cells keep their raw markdown decoration
   byte-for-byte (prefills come from parsed/cleaned values and must not be
   round-tripped over cells nobody edited).
+
+  Degraded projects (DESIGN.md section 8.10 rules 2 and 3): when a view's
+  fetch fails with a known project state -- the server sends `state`
+  alongside `error` for exactly two conditions -- the page shows a header
+  state in product language instead of an English error box: 「项目不可用 —
+  图谱文件已不存在」 for a graph that vanished mid-serve, 「图谱文件正在从云端
+  下载…」 for one macOS has evicted to iCloud. The raw engine message stays
+  on the hover title. Crucially the project switcher stays usable in both
+  (and is shown even for a single registered project while degraded), since
+  switching away is the one action that can actually fix it. A registry
+  entry whose directory is gone is marked 「目录已不存在」 and disabled, and a
+  「移除失效项目」 button appears beside the switcher to drop those entries
+  from ~/.rce/projects.json (POST /api/projects/remove) -- a bookmark
+  removal, nothing on disk.
 
   Stopping the server (task V3 phase 4): a quiet 停止服务 text button in
   the page footer, behind an explicit Chinese window.confirm. Confirming
@@ -146,6 +161,43 @@ body {
   white-space: nowrap;
 }
 .refresh-chip.err { background: var(--clay-soft); border-color: var(--clay); cursor: help; }
+
+/* A degraded project (DESIGN.md section 8.10 rules 1-2). Clay, because in
+   this app clay means "a human did this" or "something is wrong" -- and
+   this is the second kind. Sits next to the switcher, which stays usable:
+   the state is about the project, not about the page. */
+.project-state {
+  font-size: 0.76rem;
+  color: var(--clay);
+  background: var(--clay-soft);
+  border: 1px solid var(--clay);
+  padding: 0.18rem 0.6rem;
+  align-self: center;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* 「移除失效项目」 -- quiet until needed, like the footer's 停止服务, since a
+   dead registry entry is a chore rather than an action worth advertising. */
+.remove-missing-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.76rem;
+  color: var(--clay);
+  align-self: center;
+  padding: 0.2rem 0;
+  white-space: nowrap;
+}
+.remove-missing-btn:hover { text-decoration: underline; }
+.remove-missing-btn:disabled { color: var(--ink-soft); cursor: default; text-decoration: none; }
+
+/* The in-view companion to the header state: product language where the
+   error box would have been, with the engine's English on hover. */
+.state-note { border: 1px solid var(--clay); background: var(--clay-soft); padding: 0.9rem 1.1rem; font-size: 0.88rem; max-width: 640px; }
+.state-note .state-note-title { font-weight: 600; color: var(--clay); margin-bottom: 0.25rem; }
+.state-note p { margin: 0.3rem 0 0; color: var(--ink-soft); }
 
 .tabs { display: flex; gap: 1.5rem; margin-left: auto; }
 .tab {
@@ -383,6 +435,8 @@ details.script-node > summary::-webkit-details-marker { display: none; }
       <span class="brand-sub">decision tree &amp; lineage</span>
     </div>
     <select id="project-switcher" class="project-switcher hidden" title="切换项目" aria-label="切换项目"></select>
+    <span id="project-state" class="project-state hidden" role="status"></span>
+    <button id="remove-missing-btn" class="remove-missing-btn hidden" type="button">移除失效项目</button>
     <span id="refresh-chip" class="refresh-chip hidden" role="status"></span>
     <button id="new-attempt-btn" class="btn new-attempt-btn" type="button">＋ 新增尝试</button>
     <nav class="tabs" role="tablist">
@@ -434,9 +488,44 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 // attemptsConfig is /api/summary's echo of .rce/attempts.toml (file +
 // [columns] names, task V3 phase 3) -- the edit form is built from these,
 // never from hardcoded column labels; null means no usable config.
-const state = { attemptsById: new Map(), projectLabel: "", panelSubject: null, attemptsConfig: null };
+// projectState is the degraded-project condition currently on screen
+// ("graph_missing" / "graph_downloading", null when healthy) -- it decides
+// whether the header chip shows and whether the switcher is forced visible.
+const state = {
+  attemptsById: new Map(), projectLabel: "", panelSubject: null,
+  attemptsConfig: null, projectState: null,
+};
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
+// A failure additionally carries the server's machine-readable `state` when
+// it named one (see rce/webapp/server.py's ApiError.state): the two
+// degraded-project conditions DESIGN.md section 8.10 rule 2 gives this page
+// its own product language for. Matching on that name rather than on the
+// English message is the whole point -- a reworded engine string must never
+// silently change what the user reads.
+
+const PROJECT_STATES = {
+  graph_missing: {
+    chip: "项目不可用 — 图谱文件已不存在",
+    title: "图谱文件已不存在",
+    body: "这个项目的图谱文件不在了。可以在上方切换到别的项目；要重建图谱，在项目目录里运行 rce init，再运行 rce ingest。",
+  },
+  graph_downloading: {
+    chip: "图谱文件正在从云端下载…",
+    title: "图谱文件正在从云端下载",
+    body: "系统把图谱文件收进了 iCloud，正在取回。下载完成后页面会自动恢复，不用重开。",
+  },
+};
+
+function apiError(path, res, body) {
+  const err = new Error((body && body.error) ? body.error : (path + " failed: HTTP " + res.status));
+  if (body && typeof body.state === "string") err.state = body.state;
+  return err;
+}
+
+function projectStateOf(err) {
+  return (err && err.state && PROJECT_STATES[err.state]) ? err.state : null;
+}
 
 async function apiGet(path) {
   let res;
@@ -455,7 +544,7 @@ async function apiGet(path) {
     }
   }
   if (!res.ok) {
-    throw new Error((body && body.error) ? body.error : (path + " failed: HTTP " + res.status));
+    throw apiError(path, res, body);
   }
   return body;
 }
@@ -481,7 +570,7 @@ async function apiPost(path, payload) {
     }
   }
   if (!res.ok) {
-    throw new Error((body && body.error) ? body.error : (path + " failed: HTTP " + res.status));
+    throw apiError(path, res, body);
   }
   return body;
 }
@@ -503,6 +592,58 @@ function renderErrorBox(container, err) {
   msg.textContent = err instanceof Error ? err.message : String(err);
   box.append(title, msg);
   container.appendChild(box);
+}
+
+// -- Degraded project state (DESIGN.md section 8.10 rules 1-2) ---------------
+// A read that fails with a known state does NOT get the generic error box:
+// it gets one clay chip in the header (raw engine message on hover) and one
+// product-language note where the view would have been. The switcher is
+// left alone -- more than that, it is forced visible while degraded even
+// for a single registered project, because switching away is the one action
+// that can fix this from here.
+
+const projectStateChip = document.getElementById("project-state");
+
+function setProjectState(err) {
+  const name = projectStateOf(err);
+  if (!name) return false;
+  state.projectState = name;
+  projectStateChip.textContent = PROJECT_STATES[name].chip;
+  projectStateChip.title = err.message;
+  projectStateChip.classList.remove("hidden");
+  updateSwitcherVisibility();
+  return true;
+}
+
+function clearProjectState() {
+  if (!state.projectState) return;
+  state.projectState = null;
+  projectStateChip.classList.add("hidden");
+  projectStateChip.textContent = "";
+  projectStateChip.title = "";
+  updateSwitcherVisibility();
+}
+
+function renderStateNote(container, err) {
+  const name = projectStateOf(err);
+  container.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "state-note";
+  box.title = err.message; // the engine's own English, folded onto the hover
+  const title = document.createElement("div");
+  title.className = "state-note-title";
+  title.textContent = PROJECT_STATES[name].title;
+  const body = document.createElement("p");
+  body.textContent = PROJECT_STATES[name].body;
+  box.append(title, body);
+  container.appendChild(box);
+}
+
+// Every view load funnels its failure through here: a known project state
+// degrades in product language, anything else is still an error box.
+function renderViewFailure(container, err) {
+  if (setProjectState(err)) renderStateNote(container, err);
+  else renderErrorBox(container, err);
 }
 
 // -- Tabs ---------------------------------------------------------------------
@@ -562,6 +703,7 @@ async function loadProjectSummary() {
 // never introduce a new filesystem path, only choose among registered ones.
 
 const projectSwitcher = document.getElementById("project-switcher");
+const removeMissingBtn = document.getElementById("remove-missing-btn");
 
 async function loadProjects() {
   let data;
@@ -571,13 +713,17 @@ async function loadProjects() {
     // The switcher is a convenience; a registry hiccup must not take the
     // header down. Each view surfaces its own real errors already.
     projectSwitcher.classList.add("hidden");
+    removeMissingBtn.classList.add("hidden");
     state.projectLabel = "";
+    state.projectCount = 0;
+    state.deadProjects = [];
     return;
   }
   const projects = data.projects || [];
   const current = data.current || "";
   const currentEntry = projects.find((p) => p.path === current);
   state.projectLabel = currentEntry ? currentEntry.label : basename(current);
+  state.projectCount = projects.length;
 
   projectSwitcher.innerHTML = "";
   if (!currentEntry && current) {
@@ -592,16 +738,61 @@ async function loadProjects() {
   }
   projects.forEach((p) => {
     const opt = document.createElement("option");
+    // Two different failures, two different words (DESIGN.md section 8.10
+    // rule 3): 「目录已不存在」 is a dead entry worth removing; 「未初始化」 is a
+    // real directory that simply needs `rce init`, and must NOT be offered
+    // for removal.
+    const mark = !p.available ? "（目录已不存在）" : (p.initialized ? "" : "（未初始化）");
+    opt.textContent = p.label + mark;
     opt.value = p.path;
-    opt.textContent = p.label + (p.initialized ? "" : "（未初始化）");
     opt.title = p.path;
-    opt.disabled = !p.initialized;
+    opt.disabled = !p.initialized || !p.available;
     opt.selected = p.path === current;
     projectSwitcher.appendChild(opt);
   });
-  // Only worth showing when there is actually something to switch between.
-  projectSwitcher.classList.toggle("hidden", projects.length <= 1);
+  state.deadProjects = projects.filter((p) => !p.available);
+  removeMissingBtn.classList.toggle("hidden", state.deadProjects.length === 0);
+  removeMissingBtn.disabled = false;
+  updateSwitcherVisibility();
 }
+
+// Normally the switcher only earns its place when there is something to
+// switch between. While the current project is degraded it is shown
+// regardless: switching away is the one repair available from this page,
+// and hiding the control that performs it is how a degraded state becomes
+// a dead end (DESIGN.md section 8.10 rule 2, "leaves the project switcher
+// usable").
+function updateSwitcherVisibility() {
+  const worthShowing = (state.projectCount || 0) > 1 || state.projectState !== null;
+  projectSwitcher.classList.toggle("hidden", !worthShowing);
+}
+
+// 「移除失效项目」 (DESIGN.md section 8.10 rule 3). One button rather than a
+// control per row: a <select> cannot hold buttons, and the confirm names
+// every entry it is about to drop, so nothing is removed unseen. The
+// removal is a bookmark removal -- the confirm says so, because "移除项目"
+// otherwise reads like "delete my project".
+removeMissingBtn.addEventListener("click", async () => {
+  const dead = state.deadProjects || [];
+  if (dead.length === 0) return;
+  const names = dead.map((p) => p.label + "  " + p.path).join("\n");
+  if (!window.confirm(
+    "从项目列表里移除这些已经找不到的项目？\n\n" + names +
+    "\n\n只是把它们从列表里去掉，不会删除任何文件。"
+  )) return;
+  const line = document.getElementById("project-line");
+  removeMissingBtn.disabled = true;
+  try {
+    for (const p of dead) await apiPost("/api/projects/remove", { path: p.path });
+  } catch (err) {
+    line.textContent = "移除失效项目失败：" + (err instanceof Error ? err.message : String(err));
+    line.title = "";
+  }
+  // Re-read the registry either way: a partial failure must leave the list
+  // showing what the server actually holds now, not what we hoped it would.
+  await loadProjects();
+  loadProjectSummary(); // the header line quotes the registry label too
+});
 
 async function reloadAllViews() {
   // Everything on screen belongs to the previous project: drop the cached
@@ -1004,9 +1195,10 @@ async function loadTreeView(preserveState) {
   try {
     [treeData, attemptsData] = await Promise.all([apiGet("/api/tree"), apiGet("/api/attempts")]);
   } catch (err) {
-    renderErrorBox(container, err);
+    renderViewFailure(container, err);
     return;
   }
+  clearProjectState(); // the graph answered: whatever was wrong is over
   state.attemptsById = new Map((attemptsData.attempts || []).map((a) => [a.id, a]));
   container.innerHTML = "";
   if (!treeData.attempts || treeData.attempts.length === 0) {
@@ -1137,9 +1329,10 @@ async function loadLineageView() {
   try {
     data = await apiGet("/api/lineage");
   } catch (err) {
-    renderErrorBox(container, err);
+    renderViewFailure(container, err);
     return;
   }
+  clearProjectState(); // the graph answered: whatever was wrong is over
   container.innerHTML = "";
   container.appendChild(lineageBlock("Orphan inputs", data.orphans, renderOrphanItem, true));
   container.appendChild(lineageBlock("Chains", data.chains, renderChainItem, false));

@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from rce import db
+from rce import db, paths
 from rce.webapp import watcher
 
 
@@ -28,7 +28,9 @@ def _init_project(project_root: Path) -> None:
     don't share fixtures across files in this codebase."""
     rce_dir = project_root / ".rce"
     rce_dir.mkdir(parents=True, exist_ok=True)
-    conn = db.connect(rce_dir / "graph.db")
+    # The graph lives outside the project (DESIGN.md section 8.10 rule 1).
+    paths.ensure_graph_dir(project_root)
+    conn = db.connect(paths.graph_db_path(project_root))
     try:
         db.migrate(conn)
     finally:
@@ -78,7 +80,7 @@ def _make_project(project_root: Path, rows: list[str] | None = None) -> None:
 
 
 def _attempt_numbers(project_root: Path) -> list[str]:
-    conn = db.connect(project_root / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project_root))
     try:
         nodes = db.get_nodes_by_type(conn, "attempt")
         return sorted(n["attrs"]["number"] for n in nodes)
@@ -194,7 +196,7 @@ def test_steps_dir_change_triggers_dataflow_ingest(tmp_path):
     )
 
     assert w.poll_once() is True
-    conn = db.connect(tmp_path / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(tmp_path))
     try:
         script = db.get_node(conn, "script:steps/1-run.py")
         assert script is not None
@@ -280,19 +282,118 @@ def test_broken_table_edit_surfaces_last_error_and_keeps_polling(tmp_path):
 
 
 def test_missing_graph_db_surfaces_last_error_instead_of_creating_one(tmp_path):
-    """If graph.db vanishes mid-serve, the re-ingest must refuse rather
-    than let sqlite conjure a fresh empty database inside a project that is
-    no longer initialized -- the failure is reported, not papered over."""
+    """If the graph vanishes mid-serve, the watcher must refuse rather than
+    let sqlite conjure a fresh empty database where the real one was -- the
+    failure is reported, not papered over (DESIGN.md section 8.10 rule 2)."""
     _make_project(tmp_path)
     w = _mk_watcher(tmp_path)
     w.poll_once()
-    (tmp_path / ".rce" / "graph.db").unlink()
+    paths.graph_db_path(tmp_path).unlink()
 
     _write_map(tmp_path, [_row("1"), _row("2")])
 
-    assert w.poll_once() is True
+    assert w.poll_once() is False  # nothing ingested; the graph is gone
     assert "graph.db" in (w.status_payload()["last_error"] or "")
-    assert not (tmp_path / ".rce" / "graph.db").exists()
+    assert not paths.graph_db_path(tmp_path).exists()
+
+
+# -- section 8.10 rule 2: a vanished graph degrades, it does not spam ---------
+
+
+def test_vanished_graph_is_logged_once_not_once_per_poll(tmp_path, caplog):
+    """The observed failure this rule exists for: the same error, with a
+    traceback, once per 2-second poll, forever. One line for the outage --
+    and the later polls are silent, not merely quieter."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    paths.graph_db_path(tmp_path).unlink()
+
+    with caplog.at_level("WARNING", logger="rce.webapp.watcher"):
+        for _ in range(5):
+            assert w.poll_once() is False
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is None  # a warning, not a traceback
+    assert "paused" in caplog.records[0].getMessage()
+
+
+def test_vanished_graph_bumps_the_generation_exactly_once(tmp_path):
+    """One bump so every open page re-fetches and lands on the degraded
+    header state -- and then stillness, so the page is not re-fetching
+    every two seconds against a project that cannot answer."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    before = w.status_payload()["generation"]
+    paths.graph_db_path(tmp_path).unlink()
+
+    w.poll_once()
+    after_first = w.status_payload()["generation"]
+    for _ in range(3):
+        w.poll_once()
+
+    assert after_first == before + 1
+    assert w.status_payload()["generation"] == after_first
+
+
+def test_vanished_graph_stops_reingesting_even_as_files_keep_changing(tmp_path):
+    """"Stops re-ingesting that root until the file reappears": edits during
+    the outage change the watch set, and still nothing is attempted."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    paths.graph_db_path(tmp_path).unlink()
+
+    for n in ("2", "3", "4"):
+        _write_map(tmp_path, [_row("1"), _row(n)])
+        assert w.poll_once() is False
+
+    assert not paths.graph_db_path(tmp_path).exists()  # nothing conjured, ever
+
+
+def test_graph_reappearing_resumes_ingestion_and_clears_the_error(tmp_path):
+    """The recovery half: the baseline was deliberately left untouched
+    during the outage, so the edit made while the graph was away is still a
+    visible change when it returns -- and is ingested then."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    graph = paths.graph_db_path(tmp_path)
+    saved = graph.read_bytes()
+    graph.unlink()
+    _write_map(tmp_path, [_row("1"), _row("2")])
+    w.poll_once()
+    assert w.status_payload()["last_error"]
+
+    graph.write_bytes(saved)  # the file comes back
+
+    assert w.poll_once() is True
+    assert w.status_payload()["last_error"] is None
+    assert _attempt_numbers(tmp_path) == ["1", "2"]
+
+
+def test_a_switch_lets_the_new_root_report_its_own_missing_graph(tmp_path):
+    """The once-only log is remembered per root: switching to another
+    project whose graph is also gone must not be silenced by the first
+    one's outage."""
+    first, second = tmp_path / "a", tmp_path / "b"
+    _make_project(first)
+    _make_project(second)
+    current = {"root": first}
+    w = watcher.ProjectWatcher(lambda: current["root"])
+    w.poll_once()
+    paths.graph_db_path(first).unlink()
+    w.poll_once()
+    generation_after_first = w.status_payload()["generation"]
+
+    current["root"] = second
+    w.retarget()
+    paths.graph_db_path(second).unlink()
+    w.poll_once()
+
+    assert str(second) in (w.status_payload()["last_error"] or "")
+    assert w.status_payload()["generation"] > generation_after_first
 
 
 def test_project_without_config_polls_quietly(tmp_path):
@@ -421,7 +522,7 @@ def test_record_external_change_keeps_pending_steps_change_visible(tmp_path):
     w.record_external_change()
 
     assert w.poll_once() is True  # the pending step change is still a change
-    conn = db.connect(tmp_path / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(tmp_path))
     try:
         # The dataflow half ran: the script node and its reads edge exist.
         assert db.get_node(conn, "script:steps/1-run.py") is not None

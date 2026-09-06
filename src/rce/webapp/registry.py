@@ -29,13 +29,25 @@ Contract:
     a read-modify-write on top of a misread empty list would replace the
     whole registry with a single entry (see `_read_entries`).
   - `is_initialized(path)` says whether a registry entry is a real,
-    initialized RCE project (`.rce/graph.db` exists) -- the same
-    definition of "initialized" `rce.cli`/`rce.webapp.server`'s own
-    `_require_db` copies use. The registry deliberately keeps
+    initialized RCE project -- delegated to `rce.paths.graph_exists`, the
+    same definition of "initialized" `rce.cli`/`rce.webapp.server`'s own
+    `_require_db` copies use (since DESIGN.md section 8.10 rule 1 that
+    means the external `~/.rce/graphs/<id>/graph.db`, or a legacy
+    in-project one not yet migrated). The registry deliberately keeps
     uninitialized entries on `load()` (they are facts about what was
     registered, and the project may simply live on an unmounted disk);
     it is the *consumers* -- `POST /api/projects/switch` refusing to
     switch, the web UI greying the option out -- that gate on this check.
+  - `is_available(path)` is the weaker, blunter question section 8.10
+    rule 3 asks: is the directory still there at all? A project the user
+    deleted or moved is not merely uninitialized -- it is gone, and the
+    switcher says so (「目录已不存在」) and offers to remove the entry.
+  - `remove(path)` drops one entry, matched by STRING EQUALITY against the
+    stored `"path"` -- never resolved or normalized, exactly as
+    `POST /api/projects/switch` matches, so the two agree on what "this
+    entry" means and a client can only ever name an entry it was shown.
+    Returns whether anything was removed; the atomicity and
+    unreadable-registry rules are `register()`'s, unchanged.
 
 Security note (why `load()` membership matters): `rce.webapp.server`'s
 `POST /api/projects/switch` accepts a path only if it is string-equal to a
@@ -53,28 +65,41 @@ import logging
 import os
 from pathlib import Path
 
+from rce import paths
+
 logger = logging.getLogger(__name__)
 
-# Same constants as rce.cli / rce.webapp.server -- each subsystem owns its
-# copy (existing convention in this codebase); importing server here would
-# invert the dependency direction (server imports this module).
-RCE_DIRNAME = ".rce"
-DB_FILENAME = "graph.db"
+# Kept as module attributes for the callers that quote them in their own
+# error messages (rce.cli's empty-registry hint), but the definitions now
+# live in rce.paths -- one module owns where RCE's state is (DESIGN.md
+# section 8.10 rule 1), and this one no longer computes any of it itself.
+RCE_DIRNAME = paths.RCE_DIRNAME
+DB_FILENAME = paths.DB_FILENAME
 
 REGISTRY_FILENAME = "projects.json"
 
 
 def registry_path() -> Path:
-    """`~/.rce/projects.json` -- resolved per call, not at import time, so a
-    test monkeypatching `HOME` (which `Path.home()` honors on POSIX) gets a
-    throwaway registry without touching the user's real one."""
-    return Path.home() / RCE_DIRNAME / REGISTRY_FILENAME
+    """`~/.rce/projects.json` (or under `$RCE_HOME`) -- resolved per call
+    through `rce.paths.rce_home()`, not at import time, so a test pointing
+    `RCE_HOME` at a throwaway directory never touches the user's real one."""
+    return paths.rce_home() / REGISTRY_FILENAME
 
 
 def is_initialized(path: Path) -> bool:
-    """Whether `path` is an initialized RCE project: `.rce/graph.db` exists
-    -- the same definition every `_require_db` copy in this codebase uses."""
-    return (Path(path) / RCE_DIRNAME / DB_FILENAME).exists()
+    """Whether `path` is an initialized RCE project -- `rce.paths.graph_exists`,
+    the same definition every `_require_db` copy in this codebase uses."""
+    return paths.graph_exists(path)
+
+
+def is_available(path: Path) -> bool:
+    """Whether the registered directory is still there at all (DESIGN.md
+    section 8.10 rule 3). Distinct from `is_initialized` on purpose: a
+    project on an unmounted disk or one the user deleted both fail that
+    check, but only the second is a dead entry the switcher should offer
+    to remove -- and only this one can answer "is it dead or just
+    asleep?" the way a human would."""
+    return Path(path).is_dir()
 
 
 def _valid_entry(entry: object) -> bool:
@@ -182,3 +207,36 @@ def register(path: Path) -> None:
     else:
         entries.insert(0, {"path": resolved, "label": Path(resolved).name})
     _write_atomic(entries)
+
+
+def remove(path: str | Path) -> bool:
+    """Drop `path` from the registry; return whether anything matched.
+
+    Matched by STRING EQUALITY against the stored `"path"` value -- never
+    resolved, joined, or normalized -- the same rule
+    `rce.webapp.server.switch_project_payload` applies, and for the same
+    reason: the caller may be a browser page, so the only paths it can
+    ever name are ones the registry already told it about. A dead entry's
+    directory is gone anyway, which is precisely when resolution is least
+    trustworthy.
+
+    Removing an entry removes a *bookmark*: nothing on disk is touched,
+    no graph is deleted, and re-serving the path registers it again. Like
+    `register()`, a registry file that exists but cannot be read makes
+    this a logged no-op rather than a rewrite -- the entries still in that
+    file outrank this one removal."""
+    requested = str(path)
+    try:
+        entries = _read_entries()
+    except OSError as exc:
+        logger.warning(
+            "%s exists but cannot be read (%s) -- NOT removing %s, since rewriting on top "
+            "of a misread would discard every other registered project",
+            registry_path(), exc, requested,
+        )
+        return False
+    kept = [entry for entry in entries if entry["path"] != requested]
+    if len(kept) == len(entries):
+        return False
+    _write_atomic(kept)
+    return True

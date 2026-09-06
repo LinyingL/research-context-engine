@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from rce import db
+from rce import db, paths
 from rce.ingest import attempts as attempts_ingest
 from rce.webapp import mapedit
 
@@ -61,7 +61,10 @@ def _make_project(root: Path, map_md: str = _MAP_MD) -> Path:
     rce_dir.mkdir(parents=True, exist_ok=True)
     (rce_dir / "attempts.toml").write_text(_CONFIG_TOML, encoding="utf-8")
     (root / "00-项目地图.md").write_text(map_md, encoding="utf-8")
-    conn = db.connect(rce_dir / "graph.db")
+    # The graph lives outside the project (DESIGN.md section 8.10 rule 1);
+    # `.rce/` here holds only the researcher's own attempts.toml + backups.
+    paths.ensure_graph_dir(root)
+    conn = db.connect(paths.graph_db_path(root))
     try:
         db.migrate(conn)
     finally:
@@ -76,7 +79,7 @@ def _map_text(root: Path) -> str:
 def _reingest_and_get(root: Path, number: str) -> dict | None:
     """The real round trip this module exists for: run the REAL attempts
     ingest over the edited file and read the node back from the graph."""
-    conn = db.connect(root / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(root))
     try:
         config = attempts_ingest.load_config(root)
         attempts_ingest.ingest_attempts_repo(conn, root, config)
@@ -136,7 +139,7 @@ def test_append_preserves_column_order_and_style_and_reingests(tmp_path):
     assert result["ingest_error"] is None
 
     # ...and the write path's own re-ingest already mirrored it into the graph.
-    conn = db.connect(tmp_path / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(tmp_path))
     try:
         node = db.get_node(conn, "attempt:00-项目地图.md#17")
     finally:
@@ -522,10 +525,10 @@ def test_missing_graph_db_contained_as_ingest_error(tmp_path):
     edit (the file is the authority): the write happens, is backed up, and
     the ingest failure comes back contained -- never a fresh conjured db."""
     _make_project(tmp_path)
-    (tmp_path / ".rce" / "graph.db").unlink()
+    paths.graph_db_path(tmp_path).unlink()
 
     result = mapedit.apply_edit(tmp_path, "append", "17", _FIELDS_17)
 
     assert "graph.db" in str(result["ingest_error"])
     assert "| 17 |" in _map_text(tmp_path)  # file written regardless
-    assert not (tmp_path / ".rce" / "graph.db").exists()  # nothing conjured
+    assert not paths.graph_db_path(tmp_path).exists()  # nothing conjured

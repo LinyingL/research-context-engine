@@ -19,7 +19,7 @@ import logging
 
 import pytest
 
-from rce import cli, db
+from rce import cli, db, paths
 from rce.semantic import judge as semantic_judge
 from rce.semantic.backend import LlmError
 
@@ -435,7 +435,7 @@ def test_cli_judge_writes_annotations_and_status_pending_surfaces_them(tmp_path,
     assert cli.main(["init", str(project)]) == 0
     capsys.readouterr()
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         _seed_pending_edge(conn)
     finally:
@@ -470,7 +470,7 @@ def test_cli_judge_dry_run_flag_writes_nothing(tmp_path, monkeypatch, capsys):
     project.mkdir()
     cli.main(["init", str(project)])
     capsys.readouterr()
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         _seed_pending_edge(conn)
     finally:
@@ -484,7 +484,7 @@ def test_cli_judge_dry_run_flag_writes_nothing(tmp_path, monkeypatch, capsys):
     assert cli.main(["judge", "--path", str(project), "--dry-run"]) == 0
     assert "dry run" in capsys.readouterr().out.lower()
 
-    conn = db.connect(project / ".rce" / "graph.db")
+    conn = db.connect(paths.graph_db_path(project))
     try:
         edge = db.pending_edges(conn)[0]
         assert "semantic_review" not in edge["evidence"]

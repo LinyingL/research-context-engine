@@ -27,10 +27,12 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from rce import db, query
+from rce import db, paths, query
 
-RCE_DIRNAME = ".rce"
-DB_FILENAME = "graph.db"
+# Kept as module attributes for callers quoting them; the definitions live
+# in rce.paths (DESIGN.md section 8.10 rule 1).
+RCE_DIRNAME = paths.RCE_DIRNAME
+DB_FILENAME = paths.DB_FILENAME
 
 
 class McpServerError(Exception):
@@ -38,10 +40,18 @@ class McpServerError(Exception):
 
 
 def _require_db(project_root: Path) -> Path:
-    path = project_root / RCE_DIRNAME / DB_FILENAME
+    """This subsystem's copy of the gate (each raises its own error type),
+    resolving through `rce.paths.resolve_graph_db` like every other copy:
+    the graph is at `~/.rce/graphs/<id>/graph.db`, and a legacy in-project
+    one is migrated here on first touch -- an MCP client may well be the
+    first thing to open a project after the upgrade."""
+    try:
+        path = paths.resolve_graph_db(project_root)
+    except paths.GraphMigrationError as exc:
+        raise McpServerError(str(exc)) from exc
     if not path.exists():
         raise McpServerError(
-            f"no RCE project at {project_root} (missing {RCE_DIRNAME}/{DB_FILENAME}); "
+            f"no RCE project at {project_root} (missing its graph at {path}); "
             f"run 'rce init {project_root}' first"
         )
     return path
@@ -153,7 +163,8 @@ def confirm_edge(conn: Connection, src: str, dst: str, type: str, extractor: str
 
 
 def build_server(project_root: str | Path) -> FastMCP:
-    """Register the four tools against project_root's .rce/graph.db."""
+    """Register the four tools against project_root's graph (resolved by
+    rce.paths -- outside the project since DESIGN.md section 8.10 rule 1)."""
     root = Path(project_root).resolve()
     mcp = FastMCP("rce")
 
@@ -207,7 +218,11 @@ def build_server(project_root: str | Path) -> FastMCP:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rce mcp", description="Run the RCE MCP stdio server.")
-    parser.add_argument("--path", default=".", help="project root containing .rce/graph.db (default: '.')")
+    parser.add_argument(
+        "--path", default=".",
+        help="project root of an initialized RCE project (default: '.'); the graph itself "
+             "lives at ~/.rce/graphs/<id>/graph.db, see rce.paths",
+    )
     args = parser.parse_args(argv)
     project_root = Path(args.path).resolve()
     try:
