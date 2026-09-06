@@ -787,3 +787,324 @@ An optional MCP server exposes the same graph to any MCP-capable client,
 including open-source clients and ones backed by local models. MCP is a
 protocol, not a vendor — the engine depends on no particular AI product, and
 the default install pulls none in.
+
+## Section 8 — The app: node canvas and native shell (task V4)
+
+Section 7's "later" web view exists (tasks V1–V3: decision tree, lineage,
+multi-project, auto-refresh, writing attempt rows back into the map file).
+The researcher's verdict on it was exact: *"it still isn't an app"* — and,
+asked what an app would be, two answers: **not a browser tab**, and **draw
+the graph in the app, ComfyUI-style, and let me add the mappings between
+figures, code and datasets myself.** This section is the design for both.
+Every UI decision below is binding for whoever implements it; the visual
+system is the one already carried by `src/rce/webapp/app.html` (paper /
+ink / clay / ochre / olive / gray tokens, Songti for the brand mark and
+headings, PingFang for UI, a mono face for paths). Nothing here introduces
+a new palette, a new font, or a third-party dependency.
+
+### 8.0 Why a canvas, and why ComfyUI is the right reference
+
+The decision tree answers "what did I try and what did I decide"; the
+lineage report answers "who wrote this file". Neither answers the question
+a researcher asks while *building*: **which dataset feeds which script
+produces which figure — and where is the link I know exists but the
+machine could not see?** That is a graph question, and the honest UI for a
+graph the user is expected to *edit* is a node editor: boxes with typed
+sockets, links drawn between sockets, an infinite canvas you pan and zoom.
+ComfyUI is the reference because its conventions are already muscle memory
+for anyone who has used a node editor: drag from an output socket to an
+input socket to connect; drag a node's title to move it; drag empty canvas
+to pan; wheel to zoom; only *compatible* sockets accept a link. We adopt
+those conventions wholesale and change only what the domain demands.
+
+What we deliberately do **not** copy: ComfyUI's dark theme (this is a paper
+tool), node creation from a blank search box (RCE never invents research
+objects — every node is a file that exists in the project), and executing
+the graph (RCE observes a pipeline; it does not run one).
+
+### 8.1 Nodes: the object model on the canvas
+
+Only three node types appear in v1 — exactly the three the researcher
+named — plus attempts as *frames*, not nodes:
+
+| Canvas node | Graph node type | Left sockets (inputs) | Right sockets (outputs) |
+|---|---|---|---|
+| 数据集 | `dataset` | 来源 (a script that `writes` it) | 数据 (feeds a script's 读取) |
+| 脚本 | `script` | 读取 (datasets it `reads`) | 写出 (datasets it `writes`) · 生成 (figures it `generates`/`writes`) |
+| 图表 | `figure` | 生成自 (the script that produced it) | — |
+
+Socket compatibility is the whole grammar of what a human may draw:
+`数据集.数据 → 脚本.读取` creates a `reads` edge; `脚本.写出 → 数据集.来源`
+creates `writes`; `脚本.生成 → 图表.生成自` creates `generates`. Any other
+pairing is refused at drop time with a one-line explanation in product
+language ("只能把数据集接到脚本的「读取」插口"). This is how the canvas stays
+honest: the user can only assert relationships the object model already
+knows how to store, and every link on screen is a real edge type.
+
+**Attempts are frames, not nodes.** An attempt row (`attempt` node) owns
+step scripts (`attrs.step_files`). On the canvas an attempt is drawn as a
+ComfyUI-style *group frame*: a dashed, lightly tinted rectangle behind its
+scripts, titled `#16 · TopicShift→波动+采用` in the attempt's verdict color
+(the same badge colors the decision tree already uses). Frames are
+scope, not objects — you cannot connect a socket to a frame.
+
+**Ghost nodes.** An attempt's `step_files` routinely includes outputs no
+extractor produced a node for (a knitted `.pdf`, a `.docx`) — in the
+researcher's real project every `17-….pdf`/`18-….pdf` is such a file. Those
+appear on the canvas as *ghost nodes*: dashed border, muted title, tag
+「尚未入图」, typed by extension (image/pdf → 图表; csv/dta/parquet/xlsx/rds
+/feather → 数据集; py/R/Rmd/jl → 脚本 — the same extension classification
+`rce.ingest.dataflow` already applies, a deterministic classification, not
+an inference about relationships). The moment the user connects a ghost, it
+becomes a real node (the mapping ingest upserts it, see 8.5). This is the
+only way a node comes into existence from the canvas, and it is exactly the
+case the researcher asked for: "my figure is not linked to my code — let me
+link it."
+
+### 8.2 Visual language
+
+*Node anatomy.* A rounded card (radius 6px) on `--paper-alt`, 1px
+`--line-strong` border, soft shadow only while dragging. A 26px title bar
+carries a 3px left rule in the type color and a small mono type label
+(`数据集` / `脚本` / `图表`); the body shows the file's basename in the UI
+face at 13px and its directory in the mono face at 11px `--ink-soft`,
+truncated from the left so the meaningful tail survives. Sockets are 10px
+circles sitting *on* the card edge, labeled inside the card in 11px mono.
+Type colors: 数据集 `--ochre` (raw material), 脚本 `--olive` (the work),
+图表 `--ink` (the product). Clay is **not** a type color — in this app clay
+means "a human did this" or "something is wrong", and we keep it that way.
+
+*Node states.* Selected: 2px `--clay` border. Hovered: border to
+`--line-strong` at full opacity. Missing on disk (the graph knows it, the
+filesystem does not): dashed border + tag 「文件不存在」 in clay. Orphan
+input (a dataset no script writes — the lineage report's own definition):
+a clay dot on its 来源 socket, the same red dot the decision tree uses.
+Ghost: see 8.1.
+
+*Links.* Cubic Béziers with horizontal tangents (ComfyUI's curve), drawn
+under nodes. **Machine-extracted edges** (any extractor other than
+`mapping`): 1.5px `--ink` at 45% opacity, solid; `pending` status → dashed
+(a candidate awaiting `rce confirm`); `rejected` → not drawn. **Human
+mappings** (extractor `mapping`, 8.5): 2.25px `--clay`, solid, with a 6px
+clay dot at the curve's midpoint. The two must never be confusable at a
+glance — that is Section 4's "machine annotation vs. human judgement" rule
+made visible. Hover shows a small card: for a machine link 「dataflow 提取 ·
+第 15 行」 (extractor + evidence line when present), for a human link 「你于
+2026-09-06 标注 · <note>」. A link whose endpoints are both selected/hovered
+brightens to full opacity; while dragging a new link, compatible target
+sockets pulse with a `--clay-soft` halo and incompatible ones dim.
+
+*Canvas.* `--paper` background with a 24px dot grid in `--line` (dots, not
+lines — lines fight the Béziers). A quiet toolbar floats top-left inside
+the canvas: scope selector (8.7), search field 「查找节点…」, and buttons
+适应全部 · 100% · ＋ · －. Bottom-left: a zoom readout in mono (`72%`).
+No minimap in v1.
+
+### 8.3 Interaction
+
+| Gesture | Effect |
+|---|---|
+| Drag empty canvas · two-finger scroll · Space+drag | Pan |
+| ⌘/Ctrl + wheel · pinch | Zoom 25%–250% about the cursor |
+| Drag node title or body | Move (8px grid snap while ⇧ held); position persisted, debounced 400ms |
+| Drag from an output socket | Start a link; compatible inputs highlight; drop on one → confirm popover (below); drop elsewhere → cancel, nothing happens |
+| Click node | Select; opens the existing slide-out panel (file preview, Open, Reveal in Finder) |
+| Double-click node | Open with default application (existing `POST /api/open`) |
+| Click link | Select it; the hover card stays pinned |
+| Right-click human link · ⌫ with a human link selected | 「删除标注」 with confirm |
+| Right-click machine link | 「标记为错误提取」→ `set_edge_status(..., "rejected")` — the one human-only status path Section 4 already allows, reused rather than a second mechanism |
+| Esc | Clear selection / cancel a link drag |
+| F | Fit all visible nodes |
+
+The **confirm popover** for a new link is the canvas's only write dialog:
+one line stating the assertion in product language (`17-叙事更替与汇率波动.Rmd
+生成 → 17-叙事更替与汇率波动.pdf`), an optional 备注 field, buttons 确认标注 /
+取消. Confirm writes the mapping (8.5); the link appears as a human link
+once the re-ingest lands (the existing generation poll does the
+re-render; the UI draws it optimistically in the meantime and reverts with
+an error chip if the write fails). Exactly the same "preview → explicit
+confirm → file write → graph follows" shape as writing an attempt row.
+
+### 8.4 Layout
+
+Nodes without a saved position are placed by a layered layout, left to
+right, computed client-side with no library:
+
+1. **Layer** = longest path from a source. A dataset nobody writes is layer
+   0; a script is 1 + max(layer of the datasets it reads); a dataset or
+   figure some script writes is that script's layer + 1. (This is what
+   makes the researcher's own pipeline read correctly: `16.py` writes
+   `topicshift_monthly.csv`, which `17.Rmd` and `18.Rmd` read, so 17/18 sit
+   two columns right of 16 rather than beside it.) Cycles, should a
+   pipeline contain one, are broken at the edge that closes them and that
+   edge is drawn dashed in clay with a hover note 「检测到循环」.
+2. **Order within a layer** by one barycenter pass (mean y of already
+   placed neighbors), ties broken by the numeric step prefix of the path so
+   step order survives.
+3. Columns 320px apart, rows packed with 24px gaps; frames (8.1) are
+   drawn around the scripts of each attempt after placement and never move
+   nodes.
+
+A saved position always wins over the layout. 「重新排列」 in the toolbar
+overflow re-runs the layout for *all* visible nodes and therefore asks
+first (「将丢弃你手动摆放的位置」). Fit-all never moves nodes; it moves the
+camera.
+
+### 8.5 Human mappings are a file: `.rce/mappings.toml`
+
+Section 4's doctrine — the researcher's own file is the truth and the graph
+resyncs from it — applies to hand-drawn links exactly as it applies to
+attempt verdicts. A link the user draws is therefore **appended to
+`.rce/mappings.toml`**, a file they can read, diff, and commit; the graph
+edge is derived from it by an ingest, never written directly by the UI.
+
+```toml
+# 手工标注的映射。RCE 只记录它能读到的；它读不到的，由你在这里补上。
+# 此文件是唯一真相：图谱里的人工连线从它派生，删掉 graph.db 也不会丢。
+[[mapping]]
+from = "复现包_分步/17-叙事更替与汇率波动.Rmd"
+to   = "复现包_分步/17-叙事更替与汇率波动.pdf"
+type = "generates"                 # reads | writes | generates
+note = "knitr 渲染产出"             # 可选
+date = "2026-09-06"                # 标注日期（本地日期，写入时填）
+```
+
+Rules:
+
+- `from`/`to` are project-relative paths, confined to the project root by
+  the same resolve-then-`relative_to` check every other path takes (the
+  write path is never less confined than the read path — a lesson already
+  paid for in the V3 review). `type` must be one of the three; the
+  (`from` type, `to` type, `type`) triple must satisfy the socket grammar
+  in 8.1 or the ingest refuses that entry with a line number and keeps the
+  others.
+- The ingest (`rce mappings`, also run by the watcher — the file joins the
+  watch set) upserts missing endpoint nodes (the ghost → real transition,
+  typed by extension) and upserts each edge with `extractor = "mapping"`
+  and status `confirmed` — the human wrote the file; the ingest is their
+  hand, the same way `rce attempts` writes `human_fields.verdict` from the
+  human's own table. No machine extractor may write `extractor =
+  "mapping"`, and no machine re-ingest may remove or downgrade a `mapping`
+  edge; the only thing that removes one is its entry disappearing from the
+  file (resync-from-source, exactly as attempt orphans in Section 4).
+- Writes from the canvas (add, delete) go through the same discipline as
+  the map file: backup to `.rce/backups/`, atomic replace with fsync,
+  re-ingest under the watcher's ingest lock, generation bump. The
+  TOML is emitted by a small fixed-schema writer (stdlib has no TOML
+  writer; the schema above is all it ever needs to emit) that preserves
+  the header comment and entry order and appends new entries at the end.
+- Duplicate assertions (same `from`, `to`, `type`) are refused at write
+  time with 「这条映射已存在」; a mapping that contradicts a machine edge is
+  *allowed* — the human is asserting the machine missed nothing/was wrong,
+  and both lines will show, distinguishable by style.
+
+### 8.6 Layout state is not truth: `.rce/canvas.json`
+
+Node positions and the last viewport are UI state — machine-managed JSON,
+safe to delete (everything re-lays out), not something the researcher is
+expected to read: `{"positions": {"script:复现包_分步/16-….py": [x, y], …},
+"viewport": {"x": …, "y": …, "zoom": …}}`. Written atomically by a
+debounced `POST /api/canvas/layout`; never backed up (there is nothing
+irreplaceable in it). A missing or corrupt file degrades to "no saved
+positions", never to an error the user sees.
+
+### 8.7 Scope and search
+
+The researcher's project has dozens of scripts and datasets; the whole
+graph at once is a hairball. The toolbar's scope selector defaults to
+**the current attempt** (the ✅ row when there is exactly one; else the
+most recent) and offers 全部 plus every attempt. Scoping to an attempt
+shows its step scripts, every dataset/figure they touch, and one hop
+further along `writes → reads` chains so upstream generators stay visible;
+its frame is drawn; other attempts' nodes are simply absent, not dimmed.
+Positions are global (a node keeps its place across scopes). Search
+(「查找节点…」) highlights matching nodes and dims the rest without
+changing scope; Enter fits the camera to the matches.
+
+### 8.8 Product language
+
+New UI copy is Chinese product language (the established rule for this
+app), and this task also brings the two existing tabs in line: the tabs
+read 「决策树」「血缘」「画布」. The brand mark stays `RCE`. Raw error strings
+from the engine remain English and live on hover titles; what the user
+reads is the Chinese framing (「无法标注：…」). Nothing on the canvas says
+"node", "edge", or "socket" to the user — it says 数据集, 脚本, 图表, 连线,
+插口, 标注.
+
+### 8.9 The native shell: `RCE.app`
+
+"Not a browser tab" means: a real macOS application window — Dock icon,
+menu bar, ⌘-shortcuts, no address bar, no browser chrome. The engine stays
+Python and the interface stays `app.html`; the shell is a native window
+that shows it, the same architecture Obsidian, Notion and VS Code use, and
+the one that keeps every feature written once. The researcher chose this
+over a SwiftUI rewrite knowingly.
+
+- **Build.** A single Swift source file (AppKit + WebKit) shipped inside
+  the package (`src/rce/webapp/shell/RCEShell.swift`) and compiled by `rce
+  app` with the system `swiftc` — verified present on the researcher's
+  machine with Xcode 16 — into `~/Applications/RCE.app/Contents/MacOS/RCE`.
+  Zero third-party dependencies, no Xcode project, no signing beyond
+  ad-hoc. If `swiftc` is absent, `rce app` falls back to the existing
+  launcher-script bundle and says so in one line.
+- **Lifecycle.** On launch the shell probes `http://127.0.0.1:7357/api/
+  projects`; if nothing answers it spawns `rce serve --port 7357
+  --no-browser` (the absolute venv path baked in at build time, exactly
+  as the launcher script does) as a child `Process` and shows a placeholder
+  page — paper background, the serif brand mark, 「正在启动引擎…」 — until the
+  probe succeeds (≤10s; on timeout the placeholder shows the last lines of
+  `~/.rce/serve.log`). On quit it POSTs `/api/shutdown` and terminates the
+  child *only if it spawned it*; an engine the user started from a terminal
+  is left alone.
+- **Window.** 1280×840 default, 900×600 minimum, frame autosaved under the
+  name `RCEMain`, title `RCE` (`RCE — <project label>` once the bridge
+  reports one). Standard traffic lights, full-size content view off (the
+  page has its own header). Closing the window quits the app.
+- **Menus.** RCE (关于 RCE · 退出 ⌘Q) · 文件 (新增尝试 ⌘N · 在 Finder 中显示项目
+  ⌘⇧R · 关闭 ⌘W) · 编辑 (the standard undo/cut/copy/paste/select-all set —
+  without it no form field pastes) · 视图 (决策树 ⌘1 · 血缘 ⌘2 · 画布 ⌘3 ·
+  重新载入 ⌘R · 放大 ⌘+ · 缩小 ⌘- · 实际大小 ⌘0 · 适应全部 F) · 窗口 (最小化 ⌘M ·
+  缩放) · 帮助 (打开项目地图).
+- **Bridge.** Native → page: `evaluateJavaScript("window.RCE && RCE.command('canvas')")`
+  for every menu item; the page exposes one `window.RCE.command(name)`
+  dispatcher and works unchanged in a plain browser (no bridge, no menus,
+  nothing else lost). Page → native: a single `webkit.messageHandlers.rce`
+  channel carrying `{type: "title", text}` on project switch. Links to any
+  origin other than `127.0.0.1` open in the default browser. Developer
+  extras off; JavaScript on; no other WebKit preferences touched.
+- **Icon.** Generated at build time by the same toolchain (a tiny Swift
+  program draws PNGs at 16–1024px; `iconutil` folds them into `.icns`):
+  paper (`#F7F2E9`) squircle, and — echoing the canvas — three sockets in a
+  left-to-right flow joined by two ink Béziers: an ochre dot (数据集), an
+  olive rounded square (脚本), a clay dot (图表). At 16–32px the links drop
+  and only the three marks remain. No text on the icon. The bundle is
+  `dev.researchos.rce`, `LSUIElement` **false** (it is a windowed app now),
+  replacing the V3 launcher-only bundle in place.
+- **Origin.** WebKit sends the portless `Origin: http://127.0.0.1` on
+  same-origin POSTs — the Safari behaviour the V3 fix already accepts; the
+  shell adds no new origin shape.
+
+### 8.10 Resilience rules surfaced by V3 in use
+
+Two failures seen in the first week of real use become rules:
+
+1. **A project whose `graph.db` vanishes mid-serve must degrade, not
+   deadlock.** Observed: switching away from such a project left every
+   DB-backed endpoint hanging while `/api/generation`/`/api/projects`
+   still answered. The rule: no request handler may block on the watcher's
+   ingest lock for a read; a read opens its own connection with a bounded
+   busy timeout and surfaces `ProjectNotInitializedError` as a header state
+   (「项目不可用 — 图谱文件已不存在」) that leaves the project switcher usable.
+   The watcher, on a missing DB, stops re-ingesting that root (one log
+   line, `last_error` set) rather than raising once per poll.
+2. **A registry entry whose directory is gone is shown as such and can be
+   removed from the switcher** (「移除失效项目」 next to a disabled entry), so
+   the researcher never has to hand-edit `~/.rce/projects.json`.
+
+### 8.11 Deliberately later
+
+Minimap; multi-select and box-select; adding an arbitrary project file as a
+node from a picker (ghosts from `step_files` cover the researcher's actual
+case); frames for anything other than attempts; drawing `cites`/`supports`
+links (claims and references are not on this canvas); a Windows/Linux
+shell.
