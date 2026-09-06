@@ -1086,18 +1086,39 @@ over a SwiftUI rewrite knowingly.
 
 ### 8.10 Resilience rules surfaced by V3 in use
 
-Two failures seen in the first week of real use become rules:
+Three failures seen in the first week of real use become rules:
 
-1. **A project whose `graph.db` vanishes mid-serve must degrade, not
-   deadlock.** Observed: switching away from such a project left every
-   DB-backed endpoint hanging while `/api/generation`/`/api/projects`
-   still answered. The rule: no request handler may block on the watcher's
-   ingest lock for a read; a read opens its own connection with a bounded
-   busy timeout and surfaces `ProjectNotInitializedError` as a header state
-   (「项目不可用 — 图谱文件已不存在」) that leaves the project switcher usable.
-   The watcher, on a missing DB, stops re-ingesting that root (one log
-   line, `last_error` set) rather than raising once per poll.
-2. **A registry entry whose directory is gone is shown as such and can be
+1. **The derived graph never lives inside a cloud-synced folder.**
+   Observed: the researcher's project sits in `~/Documents`, which this Mac
+   syncs to iCloud Drive ("Desktop & Documents Folders"). `sqlite3.connect`
+   on `.rce/graph.db` blocked for over a minute — a file the sync provider
+   has evicted or is mid-transfer is materialized on `open()`, and there is
+   no non-blocking way to open it — so every DB-backed endpoint hung while
+   `/api/generation` and `/api/projects` kept answering. SQLite under a
+   file-provider sync is also a documented corruption path. The rule:
+   `graph.db` moves out of the project to `~/.rce/graphs/<id>/graph.db`,
+   `<id>` a stable hash of the project's *resolved* path, resolved by one
+   helper (`rce.paths.graph_db_path(project_root)`) that every `_require_db`
+   copy (cli, mcp_server, webapp) calls — no module computes the path
+   itself. `.rce/` inside the project keeps only what the researcher owns
+   and may want under git: `attempts.toml`, `mappings.toml` (8.5),
+   `backups/`. `canvas.json` (8.6) lives beside the graph, not in the
+   project — it is derived too. A legacy in-project `graph.db` is migrated
+   on first touch by any subcommand: copied, checked with `PRAGMA
+   integrity_check`, then removed, one log line, and `rce init` leaves a
+   one-line `.rce/README` saying where the graph went. `rce status` and
+   `/api/summary` report the graph's actual location so nothing is hidden.
+   Before opening, the server checks macOS's dataless flag on the file
+   (`st_flags & SF_DATALESS`) and, if set, answers with a header state
+   「图谱文件正在从云端下载…」 instead of blocking a handler thread.
+2. **A project whose graph vanishes mid-serve must degrade, not deadlock.**
+   Observed: the watcher raised the same "graph database disappeared" error
+   once per 2-second poll, forever, into the log. The rule: a read opens
+   its own connection and surfaces `ProjectNotInitializedError` as a header
+   state (「项目不可用 — 图谱文件已不存在」) that leaves the project switcher
+   usable; the watcher, on a missing graph, logs once, sets `last_error`,
+   and stops re-ingesting that root until the file reappears.
+3. **A registry entry whose directory is gone is shown as such and can be
    removed from the switcher** (「移除失效项目」 next to a disabled entry), so
    the researcher never has to hand-edit `~/.rce/projects.json`.
 
