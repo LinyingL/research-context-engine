@@ -75,6 +75,16 @@ def test_migrate_rolls_back_and_self_heals_on_mid_script_failure(tmp_path):
 # -- migration 0002: attempt/uses ontology extension -----------------------
 
 
+def _without_scan_stamps(edges):
+    """Migration 0004 adds scan-stamp columns (all NULL on existing rows);
+    the earlier migrations' preservation tests compare the columns that
+    existed before it."""
+    stamps = {"scan_basis", "scan_seen", "scan_source", "scan_appeared", "scan_lost"}
+    for edge in edges:
+        assert all(edge.get(k) is None for k in stamps)
+    return [{k: v for k, v in edge.items() if k not in stamps} for edge in edges]
+
+
 def test_0002_migration_preserves_data_from_0001_only_db(tmp_path):
     """The real-world upgrade path: a project whose .rce/graph.db already
     ran 0001 (and has real nodes/edges in it) picks up 0002 later, once this
@@ -113,11 +123,11 @@ def test_0002_migration_preserves_data_from_0001_only_db(tmp_path):
         # Now upgrade with the package's real migrations dir: 0001 is already
         # recorded, so this applies [2, 3] (migration 0003 -- task W2 -- now
         # also ships in DEFAULT_MIGRATIONS_DIR).
-        assert db.migrate(conn) == [2, 3]
+        assert db.migrate(conn) == [2, 3, 4]
 
         for node_id, before in nodes_before.items():
             assert db.get_node(conn, node_id) == before
-        assert db.query_edges(conn) == edges_before
+        assert _without_scan_stamps(db.query_edges(conn)) == edges_before
 
         # And the widened CHECK constraints are now live.
         db.upsert_node(conn, "attempt:map.md#1", "attempt", title="attempt 1")
@@ -133,7 +143,7 @@ def test_0002_migration_applies_cleanly_on_a_fresh_empty_db(tmp_path):
     conn = db.connect(tmp_path / "fresh.db")
     try:
         # Migration 0003 (task W2) now also ships in DEFAULT_MIGRATIONS_DIR.
-        assert db.migrate(conn) == [1, 2, 3]
+        assert db.migrate(conn) == [1, 2, 3, 4]
         tables = {
             row[0]
             for row in conn.execute(
@@ -194,11 +204,11 @@ def test_0003_migration_preserves_data_from_0001_0002_db(tmp_path):
 
         # Upgrade with the package's real migrations dir: 0001/0002 already
         # recorded, so this applies exactly [3].
-        assert db.migrate(conn) == [3]
+        assert db.migrate(conn) == [3, 4]
 
         for node_id, before in nodes_before.items():
             assert db.get_node(conn, node_id) == before
-        assert db.query_edges(conn) == edges_before
+        assert _without_scan_stamps(db.query_edges(conn)) == edges_before
 
         # And the widened CHECK constraints (task W2) are now live.
         db.upsert_node(conn, "script:scripts/gen.py", "script", title="scripts/gen.py")

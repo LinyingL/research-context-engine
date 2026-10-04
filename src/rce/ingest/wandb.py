@@ -35,6 +35,8 @@ from typing import Any
 
 from rce import db
 from rce.ingest import git as git_ingest
+from rce.ingest import scan as scan_mod
+from rce.ingest.mlflow import _stamp_store_links
 
 logger = logging.getLogger(__name__)
 
@@ -195,14 +197,34 @@ def _parse_json_blob(raw: Any, run_id: str, field_name: str) -> dict[str, Any]:
         return {}
     return _strip_media_blobs(parsed) if isinstance(parsed, dict) else {}
 
-def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, int]:
+def transform_runs(
+    conn: Connection,
+    runs: list[dict[str, Any]],
+    *,
+    scan: scan_mod.Scan | None = None,
+    store: str = "wandb",
+) -> dict[str, int]:
     """Write each run's Experiment node + implements/produces edges via
     rce.db. Idempotent via db.upsert_node/upsert_edge.
 
     T11: counts["produces"] counts distinct (experiment, figure) edges
     actually affected, not files scanned -- mirrors rce.ingest.mlflow.
+
+    Scan report (DESIGN.md 9.6): the fetched run list is the tracking store
+    read in this run (`store`, `wandb:<entity>/<project>` from
+    `ingest_wandb_project`), one source; a run with no id makes it
+    `UNPARSEABLE` for this scan, as a corrupt run does for mlflow. A
+    `produces` link's basis is the W&B file path.
     """
+    with scan_mod.own_scan(conn, scan, "wandb") as sc:
+        sc.ran("wandb")
+        return _transform_runs(conn, runs, store, sc)
+
+
+def _transform_runs(conn: Connection, runs: list[dict[str, Any]], store: str, sc: scan_mod.Scan) -> dict[str, int]:
     counts = {"experiments": 0, "implements": 0, "produces": 0}
+    status = scan_mod.READ_AND_PARSED
+    stamped: list[tuple[str, str, str, dict, dict]] = []
     produces_edges: set[tuple[str, str]] = set()
 
     figure_basenames: dict[str, list[str]] = {}  # built once, mirrors rce.ingest.mlflow
@@ -214,6 +236,7 @@ def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, in
         run_id = run.get("name")  # wandb's real run id; displayName is just the UI label
         if not run_id:
             logger.warning("skipping run with no 'name' (run id): %r", run.get("displayName"))
+            status = scan_mod.UNPARSEABLE
             continue
 
         experiment_id = f"experiment:{run_id}"
@@ -231,6 +254,7 @@ def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, in
             },
         )
         counts["experiments"] += 1
+        sc.node(experiment_id, "wandb", store)
 
         sha = (run.get("commit") or "").strip()
         if sha:
@@ -240,6 +264,8 @@ def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, in
                     conn, commit_id, experiment_id, "implements", extractor="wandb",
                     evidence={"run_id": run_id, "sha": sha}, confidence=1.0, status="auto",
                 )
+                stamped.append((commit_id, experiment_id, "implements", {"run_id": run_id, "sha": sha},
+                                scan_mod.basis("wandb", "implements")))
                 counts["implements"] += 1
             else:
                 logger.warning(
@@ -265,16 +291,23 @@ def transform_runs(conn: Connection, runs: list[dict[str, Any]]) -> dict[str, in
                 evidence={"run_id": run_id, "file_name": file_name},
                 confidence=1.0, status="auto",
             )
+            stamped.append((experiment_id, matches[0], "produces", {"run_id": run_id, "file_name": file_name},
+                            scan_mod.basis("wandb", "produces", artifact=file_name)))
             produces_edges.add((experiment_id, matches[0]))
 
     counts["produces"] = len(produces_edges)
+    _stamp_store_links(conn, sc, "wandb", store, status, stamped)
     return counts
 
 def ingest_wandb_project(
     conn: Connection, entity: str, project: str,
     api_key: str | None = None, base_url: str = DEFAULT_BASE_URL,
+    *,
+    scan: scan_mod.Scan | None = None,
 ) -> dict[str, int]:
     """Fetch + transform in one call -- what cli.py uses. WandbError
-    propagates uncaught (cli.py wraps it into CliError, as with GitIngestError)."""
+    propagates uncaught (cli.py wraps it into CliError, as with GitIngestError);
+    a fetch that fails reports nothing for the store (9.6: a failed read is
+    not an observation)."""
     runs = fetch_wandb_runs(entity, project, api_key=api_key, base_url=base_url)
-    return transform_runs(conn, runs)
+    return transform_runs(conn, runs, scan=scan, store=f"wandb:{entity}/{project}")

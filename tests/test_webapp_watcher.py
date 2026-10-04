@@ -215,7 +215,7 @@ def test_map_only_edit_does_not_rerun_dataflow(tmp_path, monkeypatch):
     dataflow_calls: list[Path] = []
     monkeypatch.setattr(
         watcher.dataflow_ingest, "ingest_dataflow_repo",
-        lambda conn, root, py, r, rmd: dataflow_calls.append(Path(root)) or {"reads": 0, "writes": 0},
+        lambda conn, root, py, r, rmd, scan=None: dataflow_calls.append(Path(root)) or {"reads": 0, "writes": 0},
     )
 
     _write_map(tmp_path, [_row("1"), _row("2")])

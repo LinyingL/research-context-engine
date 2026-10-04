@@ -14,7 +14,6 @@ from rce.ingest import latex, mdpaper
 _NO_CLEANUP = {
     "claims_removed": 0,
     "backed_by_edges_removed": 0,
-    "claims_preserved_with_human_judgement": 0,
 }
 
 
@@ -431,3 +430,43 @@ def test_unreadable_md_path_is_not_treated_as_evidence_its_content_is_gone(tmp_p
     assert second["claims"] == 0
     assert second["claims_removed"] == 0  # not wiped out just because the read failed
     assert len(db.get_nodes_by_type(conn, "claim")) == 1
+
+
+# --- Chinese sentence ends (DESIGN.md 9.10, decided 2026-10-05) ---------------
+
+
+def test_editing_one_sentence_of_a_chinese_paragraph_changes_exactly_one_claim_id(tmp_path):
+    """。！？ end a sentence: a three-sentence Chinese paragraph on one line
+    gives three sentences, so rewording one changes one claim id, not all
+    three (before 9.10 the whole line was one "sentence")."""
+    before = "## 结果\n\n准确率为 87.3%。召回率为 65.1%！F1 达到 70.2%？\n"
+    after = "## 结果\n\n准确率为 87.3%。召回率提高到 65.1%！F1 达到 70.2%？\n"
+    ids_before = [c.id for c in mdpaper.parse_md_claims(_repo(tmp_path, before), "paper.md")]
+    ids_after = [c.id for c in mdpaper.parse_md_claims(_repo(tmp_path, after), "paper.md")]
+    assert len(ids_before) == len(ids_after) == 3
+    assert ids_before[0] == ids_after[0]
+    assert ids_before[1] != ids_after[1]
+    assert ids_before[2] == ids_after[2]
+
+
+def test_chinese_sentence_is_bounded_by_terminator_and_closing_quote(tmp_path):
+    md = "## 结果\n\n他说“准确率为 87.3%。”随后误差降到 3.1%。\n"
+    first, second = mdpaper.parse_md_claims(_repo(tmp_path, md), "paper.md")
+    assert first.sentence == "他说“准确率为 87.3%。”"
+    assert second.sentence == "随后误差降到 3.1%。"
+
+
+def test_appending_a_sentence_no_longer_changes_earlier_chinese_claim_ids(tmp_path):
+    """The verified 9.10 cause: appending '稳健。' after the last number
+    used to change every claim id in the paragraph."""
+    base = "## 结果\n\n准确率为 87.3%。召回率为 65.1%。"
+    ids_before = [c.id for c in mdpaper.parse_md_claims(_repo(tmp_path, base + "\n"), "paper.md")]
+    ids_after = [c.id for c in mdpaper.parse_md_claims(_repo(tmp_path, base + "稳健。\n"), "paper.md")]
+    assert ids_before == ids_after
+
+
+def test_ascii_sentence_ends_still_need_whitespace(tmp_path):
+    md = "## Results\n\nAccuracy is 87.3% on v1.2 data. Recall is 65.1%.\n"
+    first, second = mdpaper.parse_md_claims(_repo(tmp_path, md), "paper.md")
+    assert first.sentence == "Accuracy is 87.3% on v1.2 data."
+    assert second.sentence == "Recall is 65.1%."

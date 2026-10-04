@@ -21,6 +21,7 @@ from sqlite3 import Connection
 
 from rce import db
 from rce.ingest import git as git_ingest
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,13 @@ def _iter_run_dirs(mlruns_root: Path):
                 continue  # MLflow-internal (e.g. experiment-level tags/), not a run -- silent skip
             yield candidate
 
-def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, int]:
+def ingest_mlflow_dir(
+    conn: Connection,
+    mlruns_root: str | Path,
+    *,
+    scan: scan_mod.Scan | None = None,
+    source_key: str | None = None,
+) -> dict[str, int]:
     """Per run: upsert Experiment node `experiment:<run_id>` (attrs:
     params/metrics/key tags); `Commit --implements--> Experiment` if
     tags/mlflow.source.git.commit names a SHA already in the graph;
@@ -143,12 +150,31 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
     logged per-run above), one summary warning is logged at the end of this
     function -- "N of M runs have no git commit tag; implements edges cannot
     be built" -- rather than per-run noise across dozens/hundreds of runs.
+
+    Scan report (DESIGN.md 9.6): the tracking store read in this run is the
+    one source, `source_key` (default `mlflow:<absolute dir>`; the pipeline
+    passes the project-relative form). A missing directory is `UNREADABLE`;
+    a run that cannot be read (no or unreadable meta.yaml) makes the whole
+    store `UNPARSEABLE` for this scan -- the scan cannot say what that run
+    produces, so it says nothing about any run. Experiments are produced by
+    the store; a `produces` link's basis is its artifact path, an
+    `implements` link rests on its identity alone.
     """
     mlruns_root = Path(mlruns_root)
+    store = source_key or f"mlflow:{mlruns_root.resolve()}"
+    with scan_mod.own_scan(conn, scan, "mlflow") as sc:
+        sc.ran("mlflow")
+        return _ingest_mlflow(conn, mlruns_root, store, sc)
+
+
+def _ingest_mlflow(conn: Connection, mlruns_root: Path, store: str, sc: scan_mod.Scan) -> dict[str, int]:
     counts = {"experiments": 0, "implements": 0, "produces": 0}
     if not mlruns_root.is_dir():
         logger.warning("mlruns directory not found: %s", mlruns_root)
+        sc.source("mlflow", store, scan_mod.UNREADABLE)
         return counts
+    status = scan_mod.READ_AND_PARSED
+    stamped: list[tuple[str, str, str, dict, dict]] = []
 
     # T10: a run with no mlflow.source.git.commit tag at all (as opposed to
     # one whose tagged sha just isn't in the graph, handled separately below)
@@ -174,11 +200,13 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
         meta_path = run_dir / "meta.yaml"
         if not meta_path.is_file():
             logger.warning("skipping run dir with no meta.yaml: %s", run_dir)
+            status = scan_mod.UNPARSEABLE
             continue
         try:
             meta = _parse_meta_yaml(meta_path.read_text(errors="replace"))
         except OSError as exc:
             logger.warning("cannot read %s: %s", meta_path, exc)
+            status = scan_mod.UNPARSEABLE
             continue
 
         run_id = run_dir.name
@@ -200,6 +228,7 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
             },
         )
         counts["experiments"] += 1
+        sc.node(experiment_id, "mlflow", store)
 
         sha = tags.get("mlflow.source.git.commit", "").strip()
         if sha:
@@ -209,6 +238,8 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
                     conn, commit_id, experiment_id, "implements", extractor="mlflow",
                     evidence={"run_id": run_id, "sha": sha}, confidence=1.0, status="auto",
                 )
+                stamped.append((commit_id, experiment_id, "implements", {"run_id": run_id, "sha": sha},
+                                scan_mod.basis("mlflow", "implements")))
                 counts["implements"] += 1
             else:
                 # T5.5 review item 3: was logger.info -- promoted to warning so this
@@ -232,14 +263,16 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
                     "produces edge", run_id, artifact_path.name, len(matches),
                 )
                 continue
+            evidence = {
+                "run_id": run_id,
+                "artifact_path": artifact_path.relative_to(artifacts_dir).as_posix(),
+            }
             db.upsert_edge(
                 conn, experiment_id, matches[0], "produces", extractor="mlflow",
-                evidence={
-                    "run_id": run_id,
-                    "artifact_path": artifact_path.relative_to(artifacts_dir).as_posix(),
-                },
-                confidence=1.0, status="auto",
+                evidence=evidence, confidence=1.0, status="auto",
             )
+            stamped.append((experiment_id, matches[0], "produces", evidence,
+                            scan_mod.basis("mlflow", "produces", artifact=evidence["artifact_path"])))
             produces_edges.add((experiment_id, matches[0]))
 
     if runs_missing_git_tag:
@@ -249,4 +282,23 @@ def ingest_mlflow_dir(conn: Connection, mlruns_root: str | Path) -> dict[str, in
         )
 
     counts["produces"] = len(produces_edges)
+    _stamp_store_links(conn, sc, "mlflow", store, status, stamped)
     return counts
+
+
+def _stamp_store_links(
+    conn: Connection, sc: scan_mod.Scan, extractor: str, store: str, status: str,
+    stamped: list[tuple[str, str, str, dict, dict]],
+) -> None:
+    """Stamp the links of a fully read store, then report it. Done after the
+    whole store is read, because a run that fails late makes the store
+    `UNPARSEABLE` and the scan must then stamp none of its links (the same
+    upsert again only re-merges an occurrence already present). Shared with
+    `rce.ingest.wandb`."""
+    if status == scan_mod.READ_AND_PARSED:
+        for src, dst, edge_type, evidence, basis in stamped:
+            db.upsert_edge(
+                conn, src, dst, edge_type, extractor=extractor, evidence=evidence,
+                confidence=1.0, status="auto", **sc.mark(extractor, store, basis),
+            )
+    sc.source(extractor, store, status)

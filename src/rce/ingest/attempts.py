@@ -47,13 +47,10 @@ source file) rather than discover it by losing an edit.
 The same "source file is the sole authority" reasoning applies to a row's
 *existence*, not just its verdict/result: a row deleted (or renumbered) out
 of the table has its `attempt` node, and every edge touching it, deleted on
-the next parse -- unless a human has confirmed or rejected one of those
-edges in the graph itself (e.g. via `rce confirm` on a `uses` edge
-`rce.consistency` wrote), in which case the node and its edges are left
-alone and logged instead, the same `edges.status` signal
-`rce.ingest.claims`'s own orphan cleanup already checks for. This still
-differs from claims in scope (which edges count, not whether the check
-happens at all) -- see `_cleanup_orphans` below for the full rule and why
+the next parse, judged edges included (DESIGN.md 9.1: the judgment
+ledger, not the index, keeps a confirm or reject, so there is nothing
+left in the graph to preserve). This still differs from claims in scope
+(which edges go) -- see `_cleanup_orphans` below for the full rule and why
 an earlier version of this function got that scope question wrong.
 
 Separately, and upstream of all of the above: a row's existence must never
@@ -113,6 +110,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -473,9 +471,8 @@ def _node_id(file: str, number: str) -> str:
 def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[str, int]:
     """Attempt nodes from `file` produced on an earlier run but not this one
     (the row was deleted, or its `#` was renumbered out from under it):
-    delete the node, and every edge touching it -- unless a human has
-    confirmed or rejected one of those edges in the graph, in which case
-    the node (and all its edges) are preserved instead.
+    delete the node, and every edge touching it (DESIGN.md 9.1 -- see the
+    last paragraphs for the history of the judged-edge exception).
 
     This is the deletion-direction half of "resync from source, not
     write-once" (module docstring above, DESIGN.md section 4): the source
@@ -488,11 +485,8 @@ def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[st
     -- its history still has the deleted row, so the graph does not have
     to be the archive of record.
 
-    Do NOT read this as "the old preserve-if-judged behavior was a bug, so
-    rce.ingest.claims's `_cleanup_orphaned_claims` must have the same bug":
-    that one preserves an orphaned claim node whose `backed_by` edge
-    carries a confirmed/rejected `edges.status`, and that is correct and
-    stays correct. `human_fields` looking truthy is not evidence of a
+    Historical note: an earlier version preserved an orphan whose
+    `human_fields` looked truthy, wrongly. `human_fields` looking truthy is not evidence of a
     decision *in the graph* the way a confirmed/rejected edge is -- it is
     simply the last mirrored copy of whatever the row's verdict cell said,
     and the row no longer exists to mirror. Checking `human_fields` here,
@@ -521,18 +515,14 @@ def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[st
     and re-ingested, silently: no log line, no count, nothing to indicate
     a human judgement had just been erased.
 
-    The right check, restored here, is the same signal claims already
-    uses: `edges.status` in `('confirmed', 'rejected')`, not
-    `human_fields`. Every edge touching an orphaned node -- `src` or `dst`,
-    any extractor -- is inspected; if any of them carries that status, the
-    node and every one of its edges are left exactly as they are, and this
-    is logged (which node, which file it vanished from, how many edges
-    carry a decision) and counted under `orphans_preserved_with_human_
-    decision` so it surfaces in `rce attempts`'s own summary line, not
-    only in the log. Only when none of a node's edges are confirmed or
-    rejected does the delete proceed, exactly as before: every edge
+    That check is gone again, for a different reason (DESIGN.md 9.1,
+    superseding Section 4's preservation rule): a confirm or reject is no
+    longer recorded only in `edges.status` -- the judgment ledger
+    (`.rce/judgements.toml`) keeps it, and the review of 9.6 shows it. So an
+    orphan is deleted like any other, judged edges included: every edge
     touching the node is removed (counted under `orphan_edges_removed`,
-    mirroring claims's `backed_by_edges_removed`), then the node itself.
+    mirroring claims's `backed_by_edges_removed`, their scan stamps kept in
+    `removed_edges`), then the node itself.
 
     This still differs from claims in one respect, unchanged from before:
     the edge check and the eventual delete are not scoped to edges this
@@ -553,27 +543,10 @@ def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[st
     """
     removed = 0
     edges_removed = 0
-    preserved = 0
     prefix = f"attempt:{file}#"
     for node in db.get_nodes_by_type(conn, "attempt"):
         node_id = node["id"]
         if node_id in seen_ids or not node_id.startswith(prefix):
-            continue
-        # Both directions, deduped by the edges table's own integer `id`:
-        # an attempt is `src` of every edge this codebase currently writes
-        # (`uses`), but nothing here assumes that stays true forever.
-        touching = {e["id"]: e for e in db.query_edges(conn, src=node_id)}
-        touching.update({e["id"]: e for e in db.query_edges(conn, dst=node_id)})
-        human_judged = [e for e in touching.values() if e["status"] in ("confirmed", "rejected")]
-        if human_judged:
-            preserved += 1
-            logger.warning(
-                "%s no longer present in %s, but %d of its edge(s) carry a human confirm/reject "
-                "decision (via rce confirm) -- preserving the node instead of deleting it, "
-                "since deleting it would destroy that decision with no record anywhere else; "
-                "resolve manually",
-                node_id, file, len(human_judged),
-            )
             continue
         edges_removed += db.delete_edges_for_node(conn, node_id)
         db.delete_node(conn, node_id)
@@ -582,11 +555,12 @@ def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[st
     return {
         "orphans_removed": removed,
         "orphan_edges_removed": edges_removed,
-        "orphans_preserved_with_human_decision": preserved,
     }
 
 
-def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: AttemptsConfig) -> dict[str, int]:
+def ingest_attempts_repo(
+    conn: Connection, project_root: str | Path, config: AttemptsConfig, *, scan: scan_mod.Scan | None = None,
+) -> dict[str, int]:
     """Parse the configured attempt timeline and mirror it into `attempt`
     nodes. Idempotent on (file, id): re-running never duplicates a node,
     always refreshes `attrs` (description/date/variables/step_refs/
@@ -606,9 +580,8 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
     collision -- skipped and logged, never merged onto the first (see
     module docstring). A row no longer present this parse (deleted, or
     renumbered away) is an orphan: its node, and every edge touching it, is
-    deleted -- unless a human has confirmed or rejected one of those edges,
-    in which case the node is preserved instead; see `_cleanup_orphans` for
-    the full rule and its one remaining scope difference from
+    deleted, judged edges included (DESIGN.md 9.1); see `_cleanup_orphans`
+    for the full rule and its one remaining scope difference from
     `rce.ingest.claims`'s own orphan handling.
 
     Two distinct failures short-circuit before any of the above runs, and
@@ -626,18 +599,30 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
     config-shaped error and exits 1, because unlike a transient read
     failure this means the run's own request could not be satisfied at all
     and the operator should notice, not see a quiet zero-count success
-    line."""
-    project_root = Path(project_root)
+    line.
+
+    Scan report (DESIGN.md 9.6): the attempt table's Markdown file is the
+    source -- `UNREADABLE` on a read failure, `UNPARSEABLE` when the table
+    cannot be located, else `READ_AND_PARSED`; attempt nodes are produced
+    by it. This ingest writes no links of its own."""
+    with scan_mod.own_scan(conn, scan, "attempts") as sc:
+        sc.ran("attempts")
+        return _ingest_attempts(conn, Path(project_root), config, sc)
+
+
+def _ingest_attempts(
+    conn: Connection, project_root: Path, config: AttemptsConfig, sc: scan_mod.Scan,
+) -> dict[str, int]:
     counts = {
         "attempts": 0, "created": 0, "updated": 0, "collisions_skipped": 0,
         "orphans_removed": 0, "orphan_edges_removed": 0,
-        "orphans_preserved_with_human_decision": 0,
     }
     source_path = project_root / config.file
     try:
         text = source_path.read_text(errors="replace")
     except OSError as exc:
         logger.error("cannot read %s: %s", source_path, exc)
+        sc.source("attempts", config.file, scan_mod.UNREADABLE)
         return counts
 
     steps_dir = (project_root / config.steps_dir) if config.steps_dir else None
@@ -652,6 +637,7 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
             "attempt node for %r is left exactly as it was",
             source_path, config.file,
         )
+        sc.source("attempts", config.file, scan_mod.UNPARSEABLE)
         raise
 
     for row in rows:
@@ -681,6 +667,7 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
 
         is_new = existing is None
         db.upsert_node(conn, node_id, "attempt", title=row.description, attrs=attrs)
+        sc.node(node_id, "attempts", config.file)
         counts["created" if is_new else "updated"] += 1
 
         # Resync every parse (module docstring): the source file is the
@@ -693,4 +680,5 @@ def ingest_attempts_repo(conn: Connection, project_root: str | Path, config: Att
             db.set_human_fields(conn, node_id, new_human_fields)
 
     counts.update(_cleanup_orphans(conn, config.file, seen_ids))
+    sc.source("attempts", config.file, scan_mod.READ_AND_PARSED)
     return counts

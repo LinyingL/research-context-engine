@@ -127,6 +127,7 @@ from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import mappings as mappings_ingest
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -707,14 +708,20 @@ class ProjectWatcher:
         applies (W1), then `ingest_dataflow_repo` over the .py/.R/.Rmd
         lists. Any other `GitIngestError` propagates to `poll_once`'s
         containment, mirroring `cmd_ingest` treating it as fatal for the
-        run rather than guessing at an inventory."""
+        run rather than guessing at an inventory.
+
+        One partial scan (DESIGN.md 9.6): the inventory it read and the
+        dataflow extractor, nothing else -- a scan speaks only for the
+        extractors it ran and the sources it read."""
         try:
             inventory = git_ingest.list_source_files(root)
         except git_ingest.NotAGitRepositoryError:
             inventory = files_ingest.list_source_files(root)
-        counts = dataflow_ingest.ingest_dataflow_repo(
-            conn, root, inventory["py"], inventory["r"], inventory["rmd"],
-        )
+        with scan_mod.scan(conn, "watcher: dataflow") as sc:
+            sc.inventory(inventory)
+            counts = dataflow_ingest.ingest_dataflow_repo(
+                conn, root, inventory["py"], inventory["r"], inventory["rmd"], scan=sc,
+            )
         logger.info("watcher re-ingested dataflow for %s: %s", root, counts)
 
     # -- background thread -----------------------------------------------------

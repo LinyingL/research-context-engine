@@ -395,6 +395,78 @@ def _merge_edge_evidence(
     return json.dumps({"occurrences": occurrences, **extra})
 
 
+def canonical_basis(basis: dict[str, Any] | None) -> str | None:
+    """The comparable form of a scan basis (DESIGN.md 9.6): JSON with sorted
+    keys and no insignificant whitespace, non-ASCII kept as written (a
+    Chinese sentence stays readable in the index). Two bases are equal iff
+    their canonical forms are equal strings. None stays None ("no basis
+    recorded"), which is different from `{}` ("the link's identity alone")."""
+    if basis is None:
+        return None
+    return json.dumps(basis, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def merge_basis(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """Fold a second production of the same link IN THE SAME SCAN into its
+    basis: lists are unioned and sorted (two calls named `read_csv` and
+    `open` both produced the read), dicts merge key by key (claims: one
+    more matching metric of that experiment), any other value takes the
+    newer one. Never used across scans -- a new scan replaces the basis."""
+    merged = dict(old)
+    for key, value in new.items():
+        prior = merged.get(key)
+        if isinstance(prior, list) and isinstance(value, list):
+            merged[key] = sorted(set(prior) | set(value))
+        elif isinstance(prior, dict) and isinstance(value, dict):
+            merged[key] = merge_basis(prior, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _has_scan_stamps(conn: sqlite3.Connection) -> bool:
+    """Whether this index has migration 0004's scan columns. An index is
+    migrated on open (`rce.project`), so this is False only for a
+    connection a caller migrated partially on purpose (the migration
+    tests); every write path then behaves exactly as before 0004."""
+    try:
+        conn.execute("SELECT scan_seen FROM edges LIMIT 0")
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
+def _scan_columns(
+    existing: sqlite3.Row | None,
+    scan_id: int,
+    scan_source: str,
+    basis: dict[str, Any],
+    prior_scan: int | None,
+) -> tuple[str, int, str, int]:
+    """(scan_basis, scan_seen, scan_source, scan_appeared) for a link
+    produced in scan `scan_id` (`upsert_edge`'s scan keywords). A second
+    production in the same scan merges into the basis; a production in a
+    new scan replaces it. `scan_appeared` restarts at this scan when the
+    link was not produced by the previous scan that observed its source
+    (`prior_scan`) -- a link that comes back, or a brand-new one -- and is
+    kept while the productions are unbroken."""
+    if existing is not None and existing["scan_seen"] == scan_id and existing["scan_basis"] is not None:
+        merged = merge_basis(json.loads(existing["scan_basis"]), basis)
+        return (
+            canonical_basis(merged) or "{}", scan_id,
+            existing["scan_source"] or scan_source, existing["scan_appeared"] or scan_id,
+        )
+    continuous = (
+        existing is not None
+        and existing["scan_seen"] is not None
+        and prior_scan is not None
+        and existing["scan_seen"] >= prior_scan
+        and existing["scan_appeared"] is not None
+    )
+    appeared = existing["scan_appeared"] if continuous else scan_id
+    return canonical_basis(basis) or "{}", scan_id, scan_source, appeared
+
+
 def upsert_edge(
     conn: sqlite3.Connection,
     src: str,
@@ -407,6 +479,10 @@ def upsert_edge(
     *,
     edge_attrs: dict[str, Any] | None = None,
     human_source: bool = False,
+    scan_id: int | None = None,
+    scan_source: str | None = None,
+    basis: dict[str, Any] | None = None,
+    prior_scan: int | None = None,
 ) -> None:
     """Insert or update an edge, keyed on (src, dst, type, extractor).
 
@@ -473,7 +549,20 @@ def upsert_edge(
     `confidence` must be within [0.0, 1.0] -- enforced in Python only (no
     migration/CHECK constraint added: Occam rule 4, a range check needs no
     schema change to enforce).
+
+    Scan stamps (DESIGN.md 9.6, migration 0004): a caller inside a scan that
+    actually read the link's source passes `scan_id`, `scan_source` and
+    `basis` (`rce.ingest.scan.Scan.mark` builds them, `prior_scan`
+    included). They record what THIS scan saw -- `scan_basis`,
+    `scan_seen`, `scan_source`, `scan_appeared`, and `scan_lost` cleared --
+    beside the evidence, never inside it: the accumulated `occurrences`
+    above are unchanged by any of this. Without `scan_id` the stamps are
+    left exactly as they were (a source the scan could not read speaks
+    for nothing). A brand-new row also drops any `removed_edges` stamp left
+    by an earlier orphan cleanup of the same link.
     """
+    if scan_id is not None and (scan_source is None or basis is None):
+        raise ValueError("a scan stamp needs scan_source and basis alongside scan_id")
     if type not in EDGE_TYPES:
         raise ValueError(f"unknown edge type: {type!r}")
     if extractor in HUMAN_EXTRACTORS and not human_source:
@@ -503,10 +592,17 @@ def upsert_edge(
             time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
             continue
         try:
+            stamped = _has_scan_stamps(conn)
+            columns = (
+                "evidence, status, scan_basis, scan_seen, scan_source, scan_appeared"
+                if stamped else "evidence, status"
+            )
             existing = conn.execute(
-                "SELECT evidence, status FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                f"SELECT {columns} FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
                 (src, dst, type, extractor),
             ).fetchone()
+            if scan_id is not None and not stamped:
+                raise ValueError("this index predates migration 0004; it cannot record scan stamps")
             # Called with exactly 2 positional args when edge_attrs is falsy
             # (the overwhelmingly common case) rather than always passing a
             # 3rd `None` -- tests/test_db.py's concurrency tests mock this
@@ -538,6 +634,22 @@ def upsert_edge(
                     WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
                     """,
                     (evidence_json, confidence, effective_status, now, src, dst, type, extractor),
+                )
+            if existing is None and stamped:
+                conn.execute(
+                    "DELETE FROM removed_edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                    (src, dst, type, extractor),
+                )
+            if scan_id is not None:
+                assert scan_source is not None and basis is not None
+                stamps = _scan_columns(existing, scan_id, scan_source, basis, prior_scan)
+                conn.execute(
+                    """
+                    UPDATE edges SET scan_basis = ?, scan_seen = ?, scan_source = ?,
+                        scan_appeared = ?, scan_lost = NULL
+                    WHERE src = ? AND dst = ? AND type = ? AND extractor = ?
+                    """,
+                    (*stamps, src, dst, type, extractor),
                 )
         except sqlite3.OperationalError as exc:
             conn.rollback()
@@ -812,6 +924,28 @@ def set_edge_semantic_review(
     raise last_error
 
 
+def _remember_removed_edges(conn: sqlite3.Connection, where: str, params: list[Any]) -> None:
+    """Keep the scan stamps of edges about to be deleted (migration 0004,
+    `removed_edges`): an orphan cleanup now removes a link a human judged
+    (DESIGN.md 9.1), and the review of that judgment (9.6) still needs to
+    say when the link stopped being produced and on what basis it last
+    was. Only links some scan stamped are remembered; a no-op on an index
+    that predates 0004."""
+    if not _has_scan_stamps(conn):
+        return
+    conn.execute(
+        f"""
+        INSERT OR REPLACE INTO removed_edges
+            (src, dst, type, extractor, scan_basis, scan_seen, scan_source,
+             scan_appeared, scan_lost, removed_at)
+        SELECT src, dst, type, extractor, scan_basis, scan_seen, scan_source,
+             scan_appeared, scan_lost, ?
+        FROM edges WHERE ({where}) AND scan_seen IS NOT NULL
+        """,
+        [_now(), *params],
+    )
+
+
 def delete_edges_for_node(
     conn: sqlite3.Connection, node_id: str, *, extractor: str | None = None
 ) -> int:
@@ -842,7 +976,9 @@ def delete_edges_for_node(
         placeholders = ", ".join("?" for _ in HUMAN_EXTRACTORS)
         clauses.append(f"extractor NOT IN ({placeholders})")
         params.extend(sorted(HUMAN_EXTRACTORS))
-    cursor = conn.execute(f"DELETE FROM edges WHERE {' AND '.join(clauses)}", params)
+    where = " AND ".join(clauses)
+    _remember_removed_edges(conn, where, params)
+    cursor = conn.execute(f"DELETE FROM edges WHERE {where}", params)
     conn.commit()
     return cursor.rowcount
 
@@ -853,10 +989,9 @@ def delete_edge(conn: sqlite3.Connection, src: str, dst: str, type: str, extract
     a human-authored source (`rce.ingest.mappings`): its entry left the
     file, so its edge goes -- and only that edge, never another
     extractor's judgement on the same pair."""
-    cursor = conn.execute(
-        "DELETE FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
-        (src, dst, type, extractor),
-    )
+    where = "src = ? AND dst = ? AND type = ? AND extractor = ?"
+    _remember_removed_edges(conn, where, [src, dst, type, extractor])
+    cursor = conn.execute(f"DELETE FROM edges WHERE {where}", (src, dst, type, extractor))
     conn.commit()
     return cursor.rowcount
 
@@ -903,3 +1038,169 @@ def query_edges(
 def pending_edges(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """The confirmation queue: edges awaiting human review (status='pending')."""
     return query_edges(conn, status="pending")
+
+
+# -- scans (DESIGN.md 9.6, migration 0004) ---------------------------------------
+#
+# The SQL half of `rce.ingest.scan`: that module decides what a scan saw;
+# these functions only store and fetch it, keeping raw SQL in this file.
+
+SCAN_SOURCE_STATUSES = frozenset({"read_and_parsed", "absent", "unreadable", "unparseable"})
+OBSERVING_SCAN_STATUSES = frozenset({"read_and_parsed", "absent"})
+
+
+def begin_scan(conn: sqlite3.Connection, label: str) -> int:
+    """Open a `scans` row (outcome 'running') and return its id."""
+    cursor = conn.execute("INSERT INTO scans (label, started) VALUES (?, ?)", (label, _now()))
+    conn.commit()
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def finish_scan(
+    conn: sqlite3.Connection,
+    scan_id: int,
+    *,
+    outcome: str,
+    extractors: list[str],
+    sources: list[tuple[str, str, str]],
+    nodes: list[tuple[str, str, str]],
+) -> None:
+    """Record, in one transaction, what scan `scan_id` saw: each
+    `(extractor, source, status)` replaces that source's latest status (an
+    observing status also moves `observed_scan` here; a failure status
+    leaves it); each `(node_id, extractor, source)` says the source
+    produced that node in this scan; and every link last produced by an
+    observed source in an earlier scan, and not since, gets `scan_lost =
+    scan_id` (once -- the first such scan). Sources not listed keep their
+    previous state."""
+    counts: dict[str, dict[str, int]] = {}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for extractor, source, status in sources:
+            if status not in SCAN_SOURCE_STATUSES:
+                raise ValueError(f"unknown scan source status: {status!r}")
+            observed = scan_id if status in OBSERVING_SCAN_STATUSES else None
+            conn.execute(
+                """
+                INSERT INTO scan_sources (extractor, source, last_scan, status, observed_scan)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(extractor, source) DO UPDATE SET
+                    last_scan = excluded.last_scan,
+                    status = excluded.status,
+                    observed_scan = COALESCE(excluded.observed_scan, scan_sources.observed_scan)
+                """,
+                (extractor, source, scan_id, status, observed),
+            )
+            by_status = counts.setdefault(extractor, {})
+            by_status[status] = by_status.get(status, 0) + 1
+            if observed is None:
+                continue
+            for table in ("edges", "removed_edges"):
+                conn.execute(
+                    f"""
+                    UPDATE {table} SET scan_lost = ?
+                    WHERE extractor = ? AND scan_source = ? AND scan_seen IS NOT NULL
+                      AND scan_seen < ? AND scan_lost IS NULL
+                    """,
+                    (scan_id, extractor, source, scan_id),
+                )
+        conn.executemany(
+            """
+            INSERT INTO node_sources (node_id, extractor, source, scan_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(node_id, extractor, source) DO UPDATE SET scan_seen = excluded.scan_seen
+            """,
+            [(node_id, extractor, source, scan_id) for node_id, extractor, source in nodes],
+        )
+        conn.execute(
+            "UPDATE scans SET finished = ?, outcome = ?, extractors = ?, source_counts = ? WHERE id = ?",
+            (_now(), outcome, json.dumps(sorted(set(extractors))), json.dumps(counts, sort_keys=True), scan_id),
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def get_scan(conn: sqlite3.Connection, scan_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
+    if row is None:
+        return None
+    scan = dict(row)
+    scan["extractors"] = json.loads(scan["extractors"])
+    scan["source_counts"] = json.loads(scan["source_counts"])
+    return scan
+
+
+def scan_source_row(conn: sqlite3.Connection, extractor: str, source: str) -> dict[str, Any] | None:
+    """The latest status of one source, or None if no scan ever reported it."""
+    row = conn.execute(
+        "SELECT * FROM scan_sources WHERE extractor = ? AND source = ?", (extractor, source),
+    ).fetchone()
+    return None if row is None else dict(row)
+
+
+def scan_sources_of(conn: sqlite3.Connection, extractor: str) -> list[dict[str, Any]]:
+    """Every source any scan ever reported for `extractor`."""
+    rows = conn.execute("SELECT * FROM scan_sources WHERE extractor = ?", (extractor,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def node_source_rows(conn: sqlite3.Connection, node_id: str) -> list[dict[str, Any]]:
+    """Which sources produced `node_id` and in which scan, each joined with
+    that source's latest observing scan (`observed_scan`, None if the
+    source's row is gone)."""
+    rows = conn.execute(
+        """
+        SELECT ns.node_id, ns.extractor, ns.source, ns.scan_seen,
+               ss.observed_scan, ss.status
+        FROM node_sources ns
+        LEFT JOIN scan_sources ss ON ss.extractor = ns.extractor AND ss.source = ns.source
+        WHERE ns.node_id = ?
+        """,
+        (node_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def edge_scan_row(
+    conn: sqlite3.Connection, src: str, dst: str, type: str, extractor: str,
+) -> dict[str, Any] | None:
+    """A link's scan stamps: from `edges` (`removed: False`), else from the
+    stamps an orphan cleanup kept in `removed_edges` (`removed: True`),
+    else None."""
+    key = (src, dst, type, extractor)
+    where = "src = ? AND dst = ? AND type = ? AND extractor = ?"
+    row = conn.execute(
+        f"SELECT src, dst, type, extractor, status, scan_basis, scan_seen, scan_source, "
+        f"scan_appeared, scan_lost FROM edges WHERE {where}",
+        key,
+    ).fetchone()
+    if row is not None:
+        return {**dict(row), "removed": False}
+    row = conn.execute(
+        f"SELECT src, dst, type, extractor, scan_basis, scan_seen, scan_source, "
+        f"scan_appeared, scan_lost FROM removed_edges WHERE {where}",
+        key,
+    ).fetchone()
+    if row is not None:
+        return {**dict(row), "status": None, "removed": True}
+    return None
+
+
+def edges_appeared_in_scan(
+    conn: sqlite3.Connection, scan_id: int, type: str, extractor: str, scan_basis: str,
+) -> list[dict[str, Any]]:
+    """Links whose current run of productions began in scan `scan_id`, of
+    one type and extractor, on exactly the canonical basis `scan_basis`."""
+    rows = conn.execute(
+        """
+        SELECT src, dst, type, extractor, status, scan_basis, scan_seen, scan_source,
+               scan_appeared, scan_lost
+        FROM edges
+        WHERE scan_appeared = ? AND type = ? AND extractor = ? AND scan_basis = ?
+        ORDER BY src, dst
+        """,
+        (scan_id, type, extractor, scan_basis),
+    ).fetchall()
+    return [dict(row) for row in rows]

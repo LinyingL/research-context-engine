@@ -156,6 +156,7 @@ from typing import Any
 
 from rce import db
 from rce.ingest import dataflow as dataflow_ingest
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,12 @@ class MappingsFileError(Exception):
     """The mappings file exists but could not be observed as a whole
     (unreadable, not UTF-8, not valid TOML, wrong top-level shape). Raised
     before the graph is touched -- see module docstring."""
+
+
+class MappingsParseError(MappingsFileError):
+    """The file was read but is not UTF-8, not TOML, or not shaped as
+    `[[mapping]]` tables -- `UNPARSEABLE` in the scan report (DESIGN.md
+    9.6), where any other `MappingsFileError` is `UNREADABLE`."""
 
 
 class MappingsWriteError(Exception):
@@ -420,10 +427,10 @@ def _parse_text(text: str) -> list[Any]:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        raise MappingsFileError(f"{MAPPINGS_RELATIVE_PATH} is not valid TOML: {exc}") from exc
+        raise MappingsParseError(f"{MAPPINGS_RELATIVE_PATH} is not valid TOML: {exc}") from exc
     raw = data.get("mapping", [])
     if not isinstance(raw, list):
-        raise MappingsFileError(
+        raise MappingsParseError(
             f"{MAPPINGS_RELATIVE_PATH}: 'mapping' must be an array of tables ([[mapping]])"
         )
     return raw
@@ -440,7 +447,7 @@ def _read_text(path: Path) -> str | None:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise MappingsFileError(f"{MAPPINGS_RELATIVE_PATH} is not valid UTF-8: {exc}") from exc
+        raise MappingsParseError(f"{MAPPINGS_RELATIVE_PATH} is not valid UTF-8: {exc}") from exc
 
 
 def _validate_entries(project_root: Path, raw_entries: list[Any], text: str) -> LoadResult:
@@ -516,16 +523,38 @@ def _maybe_remove_ghost_node(conn: Connection, node_id: str) -> bool:
     return True
 
 
-def ingest_mappings(conn: Connection, project_root: str | Path) -> IngestReport:
+def ingest_mappings(
+    conn: Connection, project_root: str | Path, *, scan: scan_mod.Scan | None = None,
+) -> IngestReport:
     """Mirror `.rce/mappings.toml` into the graph (module docstring): create
     missing endpoint nodes, upsert each valid entry's `mapping` edge and
     confirm it through the human-only path, then -- only if the file was
     actually read -- remove `mapping` edges whose entry is gone, and any
     endpoint node this ingest created that nothing references any more.
     Raises `MappingsFileError` (graph untouched) when the file exists but
-    cannot be observed. Idempotent."""
-    project_root = Path(project_root)
-    result = load_mappings(project_root)
+    cannot be observed. Idempotent.
+
+    Scan report (DESIGN.md 9.6): the file is the source, `READ_AND_PARSED`,
+    `UNREADABLE` or `UNPARSEABLE` (`MappingsParseError`); a missing file
+    reports nothing (not having observed it is not evidence of anything,
+    as above). A hand-drawn link rests on its identity alone."""
+    with scan_mod.own_scan(conn, scan, "mappings") as sc:
+        sc.ran(EXTRACTOR)
+        return _ingest_mappings(conn, Path(project_root), sc)
+
+
+def _ingest_mappings(conn: Connection, project_root: Path, sc: scan_mod.Scan) -> IngestReport:
+    try:
+        result = load_mappings(project_root)
+    except MappingsParseError:
+        sc.source(EXTRACTOR, MAPPINGS_RELATIVE_PATH, scan_mod.UNPARSEABLE)
+        raise
+    except MappingsFileError:
+        sc.source(EXTRACTOR, MAPPINGS_RELATIVE_PATH, scan_mod.UNREADABLE)
+        raise
+    mark: dict[str, Any] = {}
+    if result.file_present:
+        mark = sc.mark(EXTRACTOR, MAPPINGS_RELATIVE_PATH, scan_mod.basis(EXTRACTOR, "reads"))
     counts = {
         "mappings": len(result.mappings), "refused": 0, "nodes_created": 0,
         "edges_confirmed": 0, "edges_removed": 0, "nodes_removed": 0,
@@ -542,6 +571,7 @@ def ingest_mappings(conn: Connection, project_root: str | Path) -> IngestReport:
             if db.get_node(conn, node_id) is None:
                 db.upsert_node(conn, node_id, node_type, title=rel, attrs={"ghost_origin": EXTRACTOR})
                 counts["nodes_created"] += 1
+            sc.node(node_id, EXTRACTOR, MAPPINGS_RELATIVE_PATH)
         details: dict[str, Any] = {"line": m.line, "entry": m.index}
         if m.note is not None:
             details["note"] = m.note
@@ -551,7 +581,7 @@ def ingest_mappings(conn: Connection, project_root: str | Path) -> IngestReport:
             conn, m.src_id, m.dst_id, m.type, EXTRACTOR,
             evidence={"file": MAPPINGS_RELATIVE_PATH, "source": "human"},
             confidence=1.0, status="auto",
-            edge_attrs={"mapping": details}, human_source=True,
+            edge_attrs={"mapping": details}, human_source=True, **mark,
         )
         current = [
             e for e in db.query_edges(conn, src=m.src_id, dst=m.dst_id, type=m.type)
@@ -565,6 +595,7 @@ def ingest_mappings(conn: Connection, project_root: str | Path) -> IngestReport:
     if not result.file_present:
         # Not having observed the file is not evidence its entries are gone.
         return IngestReport(file_present=False, counts=counts, problems=list(result.problems))
+    sc.source(EXTRACTOR, MAPPINGS_RELATIVE_PATH, scan_mod.READ_AND_PARSED)
 
     for edge in _mapping_edges(conn):
         if (edge["src"], edge["dst"], edge["type"]) in asserted:

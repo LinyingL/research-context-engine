@@ -137,6 +137,7 @@ from typing import Any
 from rce import db
 from rce.ingest import git as git_ingest
 from rce.ingest import pyconst
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,28 @@ class DataflowCall:
     kind: str
     literal: str
     folded_from: str | None = None
+    # The bare call name (9.6 basis): Python's attribute or name without
+    # its receiver (`read_csv`, `open`), R's function without `pkg::`
+    # (`read.csv`, `read_dta`). Empty only for a hand-built call in a test.
+    name: str = ""
+
+    @property
+    def bare_name(self) -> str:
+        if self.name:
+            return self.name
+        language = "python" if self.script_path.lower().endswith(".py") else "r"
+        return scan_mod.bare_call_name(self.callee, language=language)
+
+
+@dataclass(frozen=True)
+class ParseOutcome:
+    """One file's scan (9.6 "What a scan must report"): its status --
+    `scan.READ_AND_PARSED`, `UNREADABLE` or `UNPARSEABLE` -- and the calls
+    found. An unreadable or unparseable file and a file with no calls no
+    longer look the same."""
+
+    status: str
+    calls: list[DataflowCall]
 
 
 # ---------------------------------------------------------------------------
@@ -402,22 +425,29 @@ def _collect_default_param_overlays(
 
 
 def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[DataflowCall]:
+    """The calls of `scan_py_file` alone (an unreadable or unparseable file
+    gives `[]`, as it always has)."""
+    return scan_py_file(repo_root, py_rel_path).calls
+
+
+def scan_py_file(repo_root: str | Path, py_rel_path: str) -> ParseOutcome:
     """Scan one .py file for read/write call sites. A file that fails to
     parse (SyntaxError -- e.g. non-Python source under a .py extension) is
-    skipped + logged, not fatal to the whole ingest run. Module-level string
-    constants are collected once per file (T9, `rce.ingest.pyconst`) so
-    every call site can fold against the same table."""
+    skipped + logged and reported `UNPARSEABLE`, one that cannot be read
+    `UNREADABLE` -- neither is fatal to the whole ingest run. Module-level
+    string constants are collected once per file (T9, `rce.ingest.pyconst`)
+    so every call site can fold against the same table."""
     path = Path(repo_root) / py_rel_path
     try:
         text = path.read_text(errors="replace")
     except OSError as exc:
         logger.warning("cannot read %s: %s", py_rel_path, exc)
-        return []
+        return ParseOutcome(scan_mod.UNREADABLE, [])
     try:
         tree = ast.parse(text, filename=py_rel_path)
-    except SyntaxError as exc:
+    except (SyntaxError, ValueError) as exc:
         logger.warning("%s: cannot parse as Python (%s); skipping file", py_rel_path, exc)
-        return []
+        return ParseOutcome(scan_mod.UNPARSEABLE, [])
 
     module_constants = pyconst.collect_module_string_constants(tree)
     default_param_overlays = _collect_default_param_overlays(tree, module_constants, py_rel_path)
@@ -458,8 +488,8 @@ def parse_py_file(repo_root: str | Path, py_rel_path: str) -> list[DataflowCall]
         folded_from = None
         if folded_expr is not None:
             folded_from = ast.get_source_segment(text, folded_expr) or ast.unparse(folded_expr)
-        calls.append(DataflowCall(py_rel_path, node.lineno, label, kind, literal, folded_from))
-    return calls
+        calls.append(DataflowCall(py_rel_path, node.lineno, label, kind, literal, folded_from, bare_name))
+    return ParseOutcome(scan_mod.READ_AND_PARSED, calls)
 
 
 # ---------------------------------------------------------------------------
@@ -863,11 +893,14 @@ def _extract_r_chunks(text: str) -> str:
     return "\n".join(out)
 
 
-def _scan_r_calls(text: str, script_rel_path: str) -> list[DataflowCall]:
-    """Shared by `parse_r_file` (whole file) and `parse_rmd_file` (already
+def _scan_r_calls(text: str, script_rel_path: str) -> ParseOutcome:
+    """Shared by `scan_r_file` (whole file) and `scan_rmd_file` (already
     masked to its R chunks by `_extract_r_chunks`) -- one scanner, one set of
-    rules, for both source kinds."""
+    rules, for both source kinds. A call skipped for unbalanced parentheses
+    makes the file `UNPARSEABLE` (9.6): the scanner lost its place, so it
+    cannot say which calls the file does not make."""
     calls: list[DataflowCall] = []
+    status = scan_mod.READ_AND_PARSED
     scan_text = _strip_r_comments(text)
     constants = _collect_r_constants(scan_text)
     for match in _R_CALL_RE.finditer(scan_text):
@@ -882,6 +915,7 @@ def _scan_r_calls(text: str, script_rel_path: str) -> list[DataflowCall]:
                 "%s:%d: unbalanced parentheses scanning %s(...); skipping, not guessing",
                 script_rel_path, line, label,
             )
+            status = scan_mod.UNPARSEABLE
             continue
         args_text = scan_text[open_paren_idx + 1:close_idx]
         resolved = _resolve_r_call_path(name, args_text, constants)
@@ -894,22 +928,32 @@ def _scan_r_calls(text: str, script_rel_path: str) -> list[DataflowCall]:
             )
             continue
         literal, folded_from = resolved
-        calls.append(DataflowCall(script_rel_path, line, label, kind, literal, folded_from))
-    return calls
+        calls.append(DataflowCall(script_rel_path, line, label, kind, literal, folded_from, name))
+    return ParseOutcome(status, calls)
 
 
 def parse_r_file(repo_root: str | Path, r_rel_path: str) -> list[DataflowCall]:
+    """The calls of `scan_r_file` alone."""
+    return scan_r_file(repo_root, r_rel_path).calls
+
+
+def scan_r_file(repo_root: str | Path, r_rel_path: str) -> ParseOutcome:
     """Scan one .R file for read/write call sites."""
     path = Path(repo_root) / r_rel_path
     try:
         text = path.read_text(errors="replace")
     except OSError as exc:
         logger.warning("cannot read %s: %s", r_rel_path, exc)
-        return []
+        return ParseOutcome(scan_mod.UNREADABLE, [])
     return _scan_r_calls(text, r_rel_path)
 
 
 def parse_rmd_file(repo_root: str | Path, rmd_rel_path: str) -> list[DataflowCall]:
+    """The calls of `scan_rmd_file` alone."""
+    return scan_rmd_file(repo_root, rmd_rel_path).calls
+
+
+def scan_rmd_file(repo_root: str | Path, rmd_rel_path: str) -> ParseOutcome:
     """Scan one .Rmd file's ```` ```{r} ```` fenced code chunks (only) for
     read/write call sites -- ordinary prose, and any non-R chunk, is never
     scanned."""
@@ -918,7 +962,7 @@ def parse_rmd_file(repo_root: str | Path, rmd_rel_path: str) -> list[DataflowCal
         text = path.read_text(errors="replace")
     except OSError as exc:
         logger.warning("cannot read %s: %s", rmd_rel_path, exc)
-        return []
+        return ParseOutcome(scan_mod.UNREADABLE, [])
     return _scan_r_calls(_extract_r_chunks(text), rmd_rel_path)
 
 
@@ -1048,59 +1092,89 @@ def ingest_dataflow_repo(
     py_paths: list[str],
     r_paths: list[str],
     rmd_paths: list[str],
+    *,
+    scan: scan_mod.Scan | None = None,
 ) -> dict[str, int]:
     """Ingest read/write call sites from .py/.R/.Rmd files into
     `Script --reads/writes--> Dataset` (or `--writes--> Figure` for an image
     target) edges (task W2). Needs no git repository at all -- see module
     docstring; runs identically on a git repo or a plain filesystem-scanned
     project (W1). Idempotent via `db.upsert_node`/`db.upsert_edge`.
+
+    Scan report (DESIGN.md 9.6): each script is a source, reported with its
+    `ParseOutcome` status once its links are written. A link from a script
+    the scan read and parsed is stamped with its basis -- the set of bare
+    call names that produced it, nothing positional (not the line, the
+    receiver, the folded expression or the path, which IS the `dst`). The
+    calls an unparseable R file still yields are written as before but not
+    stamped: that scan does not speak for the file.
     """
     repo_root = Path(repo_root)
     counts = {"reads": 0, "writes": 0}
-
-    calls: list[DataflowCall] = []
-    for py_path in py_paths:
-        calls.extend(parse_py_file(repo_root, py_path))
-    for r_path in r_paths:
-        calls.extend(parse_r_file(repo_root, r_path))
-    for rmd_path in rmd_paths:
-        calls.extend(parse_rmd_file(repo_root, rmd_path))
-
-    for call in calls:
-        resolved = _resolve_target(call.script_path, call.literal, repo_root)
-        if resolved is None:
-            logger.warning(
-                "%s:%d: %s(%r) cannot be safely mapped into the repo (absolute path, "
-                "or escapes the project root); skipping, not guessing",
-                call.script_path, call.line, call.callee, call.literal,
-            )
-            continue
-        target_path, missing, remapped_from_absolute = resolved
-        node_type = _node_type_for_extension(target_path)
-        if node_type is None:
-            logger.warning(
-                "%s:%d: %s(%r) resolves to %r, whose extension is neither a tracked "
-                "data nor image extension; skipping, not guessing which node type it is",
-                call.script_path, call.line, call.callee, call.literal, target_path,
-            )
-            continue
-        script_id = f"script:{call.script_path}"
-        target_id = f"{node_type}:{target_path}"
-        edge_type = "reads" if call.kind == "read" else "writes"
-        evidence: dict[str, Any] = {
-            "file": call.script_path, "line": call.line, "callee": call.callee,
-        }
-        if call.folded_from is not None:
-            evidence["folded_from"] = call.folded_from  # folded argument only
-        if missing:
-            evidence["missing"] = True
-        if remapped_from_absolute:
-            evidence["remapped_from_absolute"] = True
-        db.upsert_node(conn, script_id, "script", title=call.script_path)
-        db.upsert_node(conn, target_id, node_type, title=target_path)
-        db.upsert_edge(
-            conn, script_id, target_id, edge_type, extractor="dataflow",
-            evidence=evidence, confidence=1.0, status="auto",
-        )
-        counts[edge_type] += 1
+    with scan_mod.own_scan(conn, scan, "dataflow") as sc:
+        sc.ran("dataflow")
+        outcomes: dict[str, ParseOutcome] = {}
+        for py_path in py_paths:
+            outcomes[py_path] = scan_py_file(repo_root, py_path)
+        for r_path in r_paths:
+            outcomes[r_path] = scan_r_file(repo_root, r_path)
+        for rmd_path in rmd_paths:
+            outcomes[rmd_path] = scan_rmd_file(repo_root, rmd_path)
+        for outcome in outcomes.values():
+            for call in outcome.calls:
+                edge_type = _ingest_call(conn, repo_root, call, outcome.status, sc)
+                if edge_type:
+                    counts[edge_type] += 1
+        for path, outcome in outcomes.items():
+            sc.source("dataflow", path, outcome.status)
     return counts
+
+
+def _ingest_call(
+    conn: Connection, repo_root: Path, call: DataflowCall, status: str, sc: scan_mod.Scan,
+) -> str:
+    """Write one call's link; returns its edge type, or "" when skipped."""
+    resolved = _resolve_target(call.script_path, call.literal, repo_root)
+    if resolved is None:
+        logger.warning(
+            "%s:%d: %s(%r) cannot be safely mapped into the repo (absolute path, "
+            "or escapes the project root); skipping, not guessing",
+            call.script_path, call.line, call.callee, call.literal,
+        )
+        return ""
+    target_path, missing, remapped_from_absolute = resolved
+    node_type = _node_type_for_extension(target_path)
+    if node_type is None:
+        logger.warning(
+            "%s:%d: %s(%r) resolves to %r, whose extension is neither a tracked "
+            "data nor image extension; skipping, not guessing which node type it is",
+            call.script_path, call.line, call.callee, call.literal, target_path,
+        )
+        return ""
+    script_id = f"script:{call.script_path}"
+    target_id = f"{node_type}:{target_path}"
+    edge_type = "reads" if call.kind == "read" else "writes"
+    evidence: dict[str, Any] = {
+        "file": call.script_path, "line": call.line, "callee": call.callee,
+    }
+    if call.folded_from is not None:
+        evidence["folded_from"] = call.folded_from  # folded argument only
+    if missing:
+        evidence["missing"] = True
+    if remapped_from_absolute:
+        evidence["remapped_from_absolute"] = True
+    db.upsert_node(conn, script_id, "script", title=call.script_path)
+    db.upsert_node(conn, target_id, node_type, title=target_path)
+    mark: dict[str, Any] = {}
+    if status == scan_mod.READ_AND_PARSED:
+        sc.node(script_id, "dataflow", call.script_path)
+        sc.node(target_id, "dataflow", call.script_path)
+        mark = sc.mark(
+            "dataflow", call.script_path,
+            scan_mod.basis("dataflow", edge_type, call=call.bare_name),
+        )
+    db.upsert_edge(
+        conn, script_id, target_id, edge_type, extractor="dataflow",
+        evidence=evidence, confidence=1.0, status="auto", **mark,
+    )
+    return edge_type

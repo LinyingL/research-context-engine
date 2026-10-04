@@ -34,6 +34,7 @@ from typing import Any
 from rce import db
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import git as git_ingest
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,11 @@ def _ensure_commit_node(conn: Connection, commit: git_ingest.GitCommit) -> str:
 
 
 def check_stale_verdicts(
-    conn: Connection, project_root: str | Path, config: attempts_ingest.AttemptsConfig
+    conn: Connection,
+    project_root: str | Path,
+    config: attempts_ingest.AttemptsConfig,
+    *,
+    scan: scan_mod.Scan | None = None,
 ) -> CheckResult:
     """Attempts whose recorded date is earlier than the last time one of
     their resolved dependency scripts (`attrs["step_files"]`) was touched --
@@ -239,13 +244,28 @@ def check_stale_verdicts(
     Every git-resolved script also gets an `attempt --uses--> commit` edge
     (migration 0002), evidence = {"script", "commit_time"} -- a mtime
     fallback has no commit to point at, so no edge is written for it.
+
+    Scan report (DESIGN.md 9.6): the check is the one source
+    (`scan.CHECK_SOURCE`) of the `uses` links, which rest on their identity
+    alone. It is `READ_AND_PARSED` when the git history was read, and
+    `UNREADABLE` when it could not be (the mtime fallback writes no link,
+    so that run cannot say which links the check no longer produces). A
+    check skipped for want of `steps_dir` reports nothing.
     """
     if not config.steps_dir:
         return CheckResult(
             "stale_verdicts", skipped=True,
             skip_reason="steps_dir not configured in .rce/attempts.toml -- no dependency scripts to check",
         )
-    project_root = Path(project_root)
+    with scan_mod.own_scan(conn, scan, "attempts --check") as sc:
+        sc.ran(_EXTRACTOR)
+        return _check_stale_verdicts(conn, Path(project_root), config, sc)
+
+
+def _check_stale_verdicts(
+    conn: Connection, project_root: Path, config: attempts_ingest.AttemptsConfig, sc: scan_mod.Scan,
+) -> CheckResult:
+    status = scan_mod.READ_AND_PARSED
     try:
         commits = git_ingest.read_commits(project_root)
     except git_ingest.GitIngestError as exc:
@@ -253,6 +273,7 @@ def check_stale_verdicts(
             "no usable git history at %s (%s) -- every script falls back to file mtime", project_root, exc,
         )
         commits = []
+        status = scan_mod.UNREADABLE
 
     # Oldest-first (read_commits' own order), so the last write per path
     # wins and ends up the most recent commit that touched it.
@@ -286,10 +307,12 @@ def check_stale_verdicts(
                 script_date = _iso_date(commit.authored_at[:10])
                 basis = "git"
                 commit_id = _ensure_commit_node(conn, commit)
+                sc.node(commit_id, _EXTRACTOR, scan_mod.CHECK_SOURCE)
                 db.upsert_edge(
                     conn, node["id"], commit_id, "uses", extractor=_EXTRACTOR,
                     evidence={"script": rel_path, "commit_time": commit.authored_at},
                     confidence=1.0, status="auto",
+                    **sc.mark(_EXTRACTOR, scan_mod.CHECK_SOURCE, scan_mod.basis(_EXTRACTOR, "uses")),
                 )
             else:
                 try:
@@ -305,6 +328,7 @@ def check_stale_verdicts(
                     "script_last_touched": script_date.isoformat(), "basis": basis,
                 })
     skipped_count = len(nodes) - checked
+    sc.source(_EXTRACTOR, scan_mod.CHECK_SOURCE, status)
     return CheckResult(
         "stale_verdicts", findings=findings, total=len(nodes), checked=checked,
         items_skipped_reason="unparseable date" if skipped_count else None,

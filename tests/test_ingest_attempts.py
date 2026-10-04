@@ -375,7 +375,7 @@ def test_row_removed_from_table_is_deleted_with_its_node(conn, tmp_path):
     (tmp_path / "map.md").write_text(trimmed_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
     assert counts["orphans_removed"] == 1
-    assert counts["orphans_preserved_with_human_decision"] == 0
+    assert "orphans_preserved_with_human_decision" not in counts
     assert db.get_node(conn, "attempt:map.md#16") is None
 
 
@@ -432,20 +432,17 @@ def test_deleted_row_orphan_cleanup_also_removes_edges_from_other_extractors(con
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)  # must not raise
     assert counts["orphans_removed"] == 1
     assert counts["orphan_edges_removed"] == 1
-    assert counts["orphans_preserved_with_human_decision"] == 0
+    assert "orphans_preserved_with_human_decision" not in counts
     assert db.get_node(conn, node_id) is None
     assert db.query_edges(conn, src=node_id, type="uses") == []
 
 
-def test_orphan_with_confirmed_edge_is_preserved_not_deleted(conn, tmp_path):
-    """Blocker 2 regression: the previous unconditional-delete `_cleanup_
-    orphans` assumed a `uses` edge is "a fact no human ever confirms or
-    rejects" -- but `rce confirm` (db.set_edge_status) accepts any edge,
-    with no allowlist. Confirming a `uses` edge end-to-end (as a human
-    could do via `rce confirm ... uses attempts_consistency`) and then
-    deleting the row it belongs to must preserve the node and that
-    decision, exactly as rce.ingest.claims already preserves a claim whose
-    backed_by edge is confirmed/rejected."""
+@pytest.mark.parametrize("verdict", ["confirmed", "rejected"])
+def test_orphan_with_judged_edge_is_deleted_like_any_other(conn, tmp_path, verdict):
+    """DESIGN.md 9.1 supersedes the Blocker 2 preservation rule: the
+    judgment ledger keeps a confirm or reject, the index is no longer its
+    sole record, so an orphan attempt goes with its judged edges -- whose
+    scan stamps (if any) stay in `removed_edges` for the 9.6 review."""
     node_id = "attempt:map.md#1"
     config = _config(tmp_path, TABLE_MD)
     attempts.ingest_attempts_repo(conn, tmp_path, config)
@@ -454,41 +451,20 @@ def test_orphan_with_confirmed_edge_is_preserved_not_deleted(conn, tmp_path):
     db.upsert_edge(
         conn, node_id, commit_node_id, "uses", extractor="attempts_consistency",
         confidence=1.0, status="auto", evidence={"occurrences": [{"script": "steps/1-a.py"}]},
+        scan_id=db.begin_scan(conn, "test"), scan_source="check", basis={},
     )
-    db.set_edge_status(conn, node_id, commit_node_id, "uses", "attempts_consistency", "confirmed")
+    db.set_edge_status(conn, node_id, commit_node_id, "uses", "attempts_consistency", verdict)
 
     trimmed_md = "\n".join(line for line in TABLE_MD.splitlines() if "| 1 |" not in line)
     (tmp_path / "map.md").write_text(trimmed_md)
     counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
 
-    assert counts["orphans_removed"] == 0
-    assert counts["orphans_preserved_with_human_decision"] == 1
-    assert db.get_node(conn, node_id) is not None  # node preserved
-    edge = db.query_edges(conn, src=node_id, dst=commit_node_id, type="uses")[0]
-    assert edge["status"] == "confirmed"  # decision untouched, edge not deleted either
-
-
-def test_orphan_with_only_rejected_edge_is_also_preserved(conn, tmp_path):
-    """Same as the confirmed case, but for "rejected" -- both are human
-    decisions, only "auto"/"pending" are machine-owned and safe to drop."""
-    node_id = "attempt:map.md#1"
-    config = _config(tmp_path, TABLE_MD)
-    attempts.ingest_attempts_repo(conn, tmp_path, config)
-    commit_node_id = "commit:deadbeef"
-    db.upsert_node(conn, commit_node_id, "commit", attrs={})
-    db.upsert_edge(
-        conn, node_id, commit_node_id, "uses", extractor="attempts_consistency",
-        confidence=1.0, status="auto", evidence={"occurrences": [{"script": "steps/1-a.py"}]},
-    )
-    db.set_edge_status(conn, node_id, commit_node_id, "uses", "attempts_consistency", "rejected")
-
-    trimmed_md = "\n".join(line for line in TABLE_MD.splitlines() if "| 1 |" not in line)
-    (tmp_path / "map.md").write_text(trimmed_md)
-    counts = attempts.ingest_attempts_repo(conn, tmp_path, config)
-
-    assert counts["orphans_removed"] == 0
-    assert counts["orphans_preserved_with_human_decision"] == 1
-    assert db.get_node(conn, node_id) is not None
+    assert counts["orphans_removed"] == 1
+    assert counts["orphan_edges_removed"] == 1
+    assert db.get_node(conn, node_id) is None
+    assert db.query_edges(conn, src=node_id) == []
+    kept = db.edge_scan_row(conn, node_id, commit_node_id, "uses", "attempts_consistency")
+    assert kept["removed"] is True and kept["scan_source"] == "check"
 
 
 def test_table_location_failure_does_not_wipe_existing_nodes(conn, tmp_path, caplog):

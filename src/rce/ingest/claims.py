@@ -68,6 +68,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
+from rce.ingest import scan as scan_mod
 from rce.ingest.latex import ParsedSection, _strip_comment, parse_tex_file
 
 logger = logging.getLogger(__name__)
@@ -200,7 +201,20 @@ _CLAIM_RE = re.compile(
     rf"|(?<!\\)\$\s*(?P<math>\d+\.\d+)\s*\$"
     rf"|(?<![\w.\\])(?P<plain>\d+\.\d+)(?!\.\d)(?!\w)"
 )
-_SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
+# A sentence ends at an ASCII . ! ? followed by whitespace or the end of
+# the line, or (DESIGN.md 9.10, decided 2026-10-05) at a run of the
+# full-width 。！？ with any closing quotes or brackets after it -- Chinese
+# prose needs no space after its terminator. Before this, a Chinese
+# paragraph written on one line was ONE "sentence", so any edit anywhere in
+# it changed the id of every claim in it. This changes the ids of claims
+# in CJK prose once, on the first scan after the change; that is intended
+# and safe: it was made while the researcher's project held no judgment on
+# any claim (9.10), and the ids are stable against unrelated edits from
+# here on.
+_SENTENCE_END_RE = re.compile(
+    r"[.!?](?:\s|$)"
+    r"|[。！？]+[」』”’）】》〉\"')\]]*"
+)
 
 # A number immediately followed by "-<letter>" (`1.58-bit`, `3-fold`) is a
 # compound modifier, not a claim -- deterministic syntax rule, no tuned
@@ -479,27 +493,19 @@ def _cleanup_orphaned_claims(
     and must never be treated as though it were (DESIGN.md section 0,
     "never guess").
 
-    Conservative by construction (DESIGN.md section 0, "humans own
-    judgement" / section 2, "re-ingestion leaves confirmed and rejected
-    edges alone"): a claim with a confirmed/rejected backed_by edge is never
-    deleted even once orphaned, only logged for manual resolution. Only
-    auto/pending orphans -- no recorded human judgement -- are deleted.
+    No exception for a judged claim any more (DESIGN.md 9.1, superseding
+    Section 4's preservation rule): an orphan whose backed_by link a human
+    confirmed or rejected used to be kept forever, "because the graph is the
+    sole record of that decision". It no longer is -- the judgment ledger
+    (`.rce/judgements.toml`) keeps the judgment, and the review of 9.6 shows
+    it with the claim's original sentence. The link's last scan stamps
+    survive in `removed_edges` (`db.delete_edges_for_node`) so that review
+    can still say when and on what basis it was last produced.
     """
     removed_claims = 0
     removed_edges = 0
-    preserved = 0
     for node in db.get_nodes_by_type(conn, "claim"):
         if node["id"] in seen_ids or node["attrs"].get("tex_path") not in scanned_tex_paths:
-            continue
-        claim_edges = [e for e in db.query_edges(conn, src=node["id"]) if e["extractor"] == "claims"]
-        human_judged = [e for e in claim_edges if e["status"] in ("confirmed", "rejected")]
-        if human_judged:
-            preserved += 1
-            logger.info(
-                "claim %s no longer produced re-ingesting %s, but has %d human-judged "
-                "backed_by edge(s); preserving for manual review, not deleting",
-                node["id"], node["attrs"].get("tex_path"), len(human_judged),
-            )
             continue
         removed_edges += db.delete_edges_for_node(conn, node["id"], extractor="claims")
         db.delete_node(conn, node["id"])
@@ -507,12 +513,15 @@ def _cleanup_orphaned_claims(
     return {
         "claims_removed": removed_claims,
         "backed_by_edges_removed": removed_edges,
-        "claims_preserved_with_human_judgement": preserved,
     }
 
 
 def ingest_parsed_claims(
-    conn: Connection, parsed_by_path: dict[str, list[ParsedClaim]],
+    conn: Connection,
+    parsed_by_path: dict[str, list[ParsedClaim]],
+    *,
+    scan: scan_mod.Scan | None = None,
+    unreadable: tuple[str, ...] | list[str] = (),
 ) -> dict[str, int]:
     """Write claim nodes + candidate (pending) backed_by edges for an
     already-parsed set of claims, one list per source file, then clean up
@@ -606,7 +615,49 @@ def ingest_parsed_claims(
     free through this one shared function; renaming it to something
     format-neutral would require touching `rce.query` and every existing
     consumer for a purely cosmetic gain, which is out of scope here.
+
+    Scan report (DESIGN.md 9.6): each file in `parsed_by_path` is a source
+    read and parsed, each in `unreadable` one that could not be read. A
+    `backed_by` link's basis -- the claim's normalized sentence and printed
+    number, and the metrics OF THAT EXPERIMENT that match, each rounded to
+    the claim's printed precision -- is computed only against experiments
+    read in the same ingest run: the experiments `scan`'s mlflow/wandb
+    extractors produced. So its source is the pair (file, tracking store),
+    reported for the stores this scan read and no other; a link to an
+    experiment whose store was not read this run is written as before but
+    not stamped, and keeps its previous state.
     """
+    with scan_mod.own_scan(conn, scan, "claims") as sc:
+        return _ingest_parsed_claims(conn, parsed_by_path, tuple(unreadable), sc)
+
+
+def _store_statuses(sc: scan_mod.Scan) -> tuple[dict[str, str], dict[str, str]]:
+    """({store: status} of the tracking stores this scan read, {experiment
+    node id: store} of the experiments it read from them)."""
+    stores: dict[str, str] = {}
+    fresh: dict[str, str] = {}
+    for extractor in ("mlflow", "wandb"):
+        stores.update(sc.sources_of(extractor))
+        fresh.update(sc.nodes_of(extractor))
+    return stores, fresh
+
+
+def _ingest_parsed_claims(
+    conn: Connection, parsed_by_path: dict[str, list[ParsedClaim]], unreadable: tuple[str, ...],
+    sc: scan_mod.Scan,
+) -> dict[str, int]:
+    sc.ran("claims")
+    stores, fresh = _store_statuses(sc)
+    pair_status: dict[tuple[str, str], str] = {}
+    for file in parsed_by_path:
+        sc.source("claims", file, scan_mod.READ_AND_PARSED)
+        for store, store_status in stores.items():
+            pair_status[(file, store)] = store_status
+    for file in unreadable:
+        sc.source("claims", file, scan_mod.UNREADABLE)
+        for store in stores:
+            pair_status[(file, store)] = scan_mod.UNREADABLE
+
     counts = {"claims": 0, "candidates": 0}
     metrics = _collect_experiment_metrics(conn)
     seen_ids: set[str] = set()
@@ -626,6 +677,7 @@ def ingest_parsed_claims(
                 "line": claim.line,
             }
             db.upsert_node(conn, claim.id, "claim", title=claim.sentence, attrs=attrs)
+            sc.node(claim.id, "claims", claim.tex_path)
             counts["claims"] += 1
 
             matches = _match_candidates(claim, metrics)
@@ -639,6 +691,17 @@ def ingest_parsed_claims(
                     ", ".join(f"{eid}:{name}" for eid, name, _ in matches),
                 )
             for exp_id, metric_name, metric_value in matches:
+                mark: dict[str, Any] = {}
+                store = fresh.get(exp_id)
+                if store is not None and pair_status.get((claim.tex_path, store)) == scan_mod.READ_AND_PARSED:
+                    mark = sc.mark(
+                        "claims", scan_mod.claims_source(claim.tex_path, store),
+                        scan_mod.basis(
+                            "claims", "backed_by",
+                            sentence=_normalize_for_id(claim.sentence), number=claim.raw,
+                            metrics={metric_name: scan_mod.rounded(metric_value, claim.precision_decimals)},
+                        ),
+                    )
                 db.upsert_edge(
                     conn, claim.id, exp_id, "backed_by", extractor="claims",
                     # No "line" here (bug fix, F2's sibling): the claim's
@@ -669,14 +732,19 @@ def ingest_parsed_claims(
                     # of "occurrences", overwritten to the latest value each
                     # time rather than folded into the deduped occurrence.
                     edge_attrs={"candidate_count": candidate_count},
+                    **mark,
                 )
                 counts["candidates"] += 1
 
     counts.update(_cleanup_orphaned_claims(conn, set(parsed_by_path.keys()), seen_ids))
+    for (file, store), status in pair_status.items():
+        sc.source("claims", scan_mod.claims_source(file, store), status)
     return counts
 
 
-def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[str]) -> dict[str, int]:
+def ingest_claims_repo(
+    conn: Connection, repo_root: str | Path, tex_paths: list[str], *, scan: scan_mod.Scan | None = None,
+) -> dict[str, int]:
     """Ingest claim nodes and candidate (pending) backed_by edges from LaTeX
     sources: parses every path with `parse_tex_claims`, then hands the
     result to `ingest_parsed_claims` (the write path shared with Markdown,
@@ -692,10 +760,12 @@ def ingest_claims_repo(conn: Connection, repo_root: str | Path, tex_paths: list[
     (DESIGN.md section 0, "never guess"; see `_cleanup_orphaned_claims`).
     """
     parsed_by_path: dict[str, list[ParsedClaim]] = {}
+    unreadable: list[str] = []
     for tex_rel_path in tex_paths:
         try:
             parsed_by_path[tex_rel_path] = parse_tex_claims(repo_root, tex_rel_path)
         except OSError as exc:
             logger.warning("cannot read tex file %s: %s", tex_rel_path, exc)
+            unreadable.append(tex_rel_path)
             continue
-    return ingest_parsed_claims(conn, parsed_by_path)
+    return ingest_parsed_claims(conn, parsed_by_path, scan=scan, unreadable=unreadable)

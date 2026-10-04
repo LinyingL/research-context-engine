@@ -19,7 +19,6 @@ TEX_87_3_PCT = "\\section{Results}\nWe reach 87.3\\% accuracy.\n"
 _NO_CLEANUP = {
     "claims_removed": 0,
     "backed_by_edges_removed": 0,
-    "claims_preserved_with_human_judgement": 0,
 }
 
 _CLAIM_ID_RE = r"^claim:paper\.tex#[0-9a-f]{16}$"
@@ -588,8 +587,7 @@ def test_orphaned_pending_claim_is_removed_once_its_sentence_disappears(tmp_path
     assert second == {
         "claims": 0, "candidates": 0,
         "claims_removed": 1, "backed_by_edges_removed": 1,
-        "claims_preserved_with_human_judgement": 0,
-    }
+        }
     assert db.get_nodes_by_type(conn, "claim") == []
     assert db.query_edges(conn, type="backed_by") == []
 
@@ -614,7 +612,11 @@ def test_unreadable_tex_path_is_not_treated_as_evidence_its_claims_are_gone(tmp_
     assert len(db.get_nodes_by_type(conn, "claim")) == 1
 
 
-def test_orphaned_claim_with_human_judgement_is_preserved_and_logged(tmp_path, caplog):
+def test_orphaned_claim_with_human_judgement_is_removed_like_any_other(tmp_path):
+    """DESIGN.md 9.1 supersedes Section 4's preservation rule: the ledger,
+    not the index, keeps the judgment, so a judged orphan claim goes like
+    any other -- and the link's scan stamps are kept in `removed_edges`
+    for the review of 9.6."""
     repo = _repo(tmp_path, TEX_87_3_PCT)
     conn = _seeded_conn(run_a={"accuracy": 0.87312})
 
@@ -624,12 +626,9 @@ def test_orphaned_claim_with_human_judgement_is_preserved_and_logged(tmp_path, c
 
     # The claim's sentence disappears entirely (not merely shifted/reworded).
     (tmp_path / "paper.tex").write_text("\\section{Results}\nNothing quantitative here.\n")
-    with caplog.at_level(logging.INFO, logger="rce.ingest.claims"):
-        counts = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
+    counts = claims.ingest_claims_repo(conn, repo, ["paper.tex"])
 
-    assert counts["claims_removed"] == 0
-    assert counts["claims_preserved_with_human_judgement"] == 1
-    assert db.get_node(conn, claim_id) is not None  # node kept, not deleted
-    edge = db.query_edges(conn, src=claim_id, dst="experiment:run_a", type="backed_by")[0]
-    assert edge["status"] == "rejected"  # human verdict untouched
-    assert any("human-judged" in r.message for r in caplog.records)
+    assert counts["claims_removed"] == 1
+    assert "claims_preserved_with_human_judgement" not in counts
+    assert db.get_node(conn, claim_id) is None
+    assert db.query_edges(conn, src=claim_id) == []

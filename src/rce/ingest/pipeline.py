@@ -36,6 +36,7 @@ from rce.ingest import mappings as mappings_ingest
 from rce.ingest import mdpaper as mdpaper_ingest
 from rce.ingest import mlflow as mlflow_ingest
 from rce.ingest import pyfig as pyfig_ingest
+from rce.ingest import scan as scan_mod
 from rce.ingest import wandb as wandb_ingest
 
 Echo = Callable[[str], None]
@@ -74,6 +75,17 @@ def count_ingest_warnings() -> Iterator[_WarningCounter]:
         ingest_logger.removeHandler(counter)
 
 
+def mlflow_source_key(project_root: Path, mlruns_path: Path) -> str:
+    """The tracking-store source of an mlflow directory (9.6): its path
+    relative to the project when it lies inside it, so the key survives a
+    move of the project folder; absolute otherwise."""
+    try:
+        location = mlruns_path.resolve().relative_to(project_root.resolve()).as_posix()
+    except (ValueError, OSError):
+        location = str(mlruns_path.resolve())
+    return f"mlflow:{location}"
+
+
 def ingest_sources(
     conn: Connection,
     project_root: Path,
@@ -84,10 +96,15 @@ def ingest_sources(
 ) -> int:
     """Run every source extractor over `project_root`; returns how many
     warnings (skips/unresolved) the run logged. The caller holds the
-    project's write guard."""
-    with count_ingest_warnings() as warnings:
+    project's write guard.
+
+    One scan (`rce.ingest.scan`, DESIGN.md 9.6) covers the whole run: every
+    extractor reports into it, and the inventory is recorded so a file it
+    no longer lists is reported ABSENT. If the run fails, the scan is
+    recorded as failed and speaks for nothing it read."""
+    with count_ingest_warnings() as warnings, scan_mod.scan(conn, "ingest") as sc:
         try:
-            commits = git_ingest.ingest_git_repo(conn, project_root)
+            commits = git_ingest.ingest_git_repo(conn, project_root, scan=sc)
         except git_ingest.NotAGitRepositoryError:
             # W1: a project root with no git repository at all is a
             # normal, supported case: commit/contributor nodes are simply
@@ -107,11 +124,15 @@ def ingest_sources(
             except git_ingest.GitIngestError as exc:
                 raise IngestFailed(f"git ingestion failed: {exc}") from exc
             echo(f"  git: {commits} commit(s) ingested")
+        # 9.6: a successfully read inventory is an observation -- a file it
+        # no longer lists is ABSENT for every file-based extractor below,
+        # and a script/dataset/figure it lists is "in the scan".
+        sc.inventory(inventory)
         # inventory["image"] lets the latex ingester reject "ghost figures"
         # (\includegraphics targets not actually tracked in the repo).
         latex_counts = latex_ingest.ingest_latex_repo(
             conn, project_root, inventory["tex"], inventory["bib"],
-            image_paths=inventory["image"],
+            image_paths=inventory["image"], scan=sc,
         )
         echo(
             f"  latex: {len(inventory['tex'])} .tex, {len(inventory['bib'])} .bib "
@@ -119,7 +140,7 @@ def ingest_sources(
         )
         # W2: data lineage; needs no git at all.
         dataflow_counts = dataflow_ingest.ingest_dataflow_repo(
-            conn, project_root, inventory["py"], inventory["r"], inventory["rmd"],
+            conn, project_root, inventory["py"], inventory["r"], inventory["rmd"], scan=sc,
         )
         echo(
             f"  dataflow: {len(inventory['py'])} .py, {len(inventory['r'])} .R, "
@@ -128,7 +149,7 @@ def ingest_sources(
         # T6: static savefig() analysis; each edge's src commit is resolved
         # internally via git blame, not HEAD.
         pyfig_counts = pyfig_ingest.ingest_pyfig_repo(
-            conn, project_root, inventory["py"], inventory["image"],
+            conn, project_root, inventory["py"], inventory["image"], scan=sc,
         )
         echo(f"  pyfig: {len(inventory['py'])} .py scanned -> {_format_counts(pyfig_counts)}")
         if mlruns:
@@ -137,7 +158,9 @@ def ingest_sources(
             default_mlruns = project_root / "mlruns"
             mlruns_path = default_mlruns if default_mlruns.is_dir() else None
         if mlruns_path is not None:
-            mlflow_counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns_path)
+            mlflow_counts = mlflow_ingest.ingest_mlflow_dir(
+                conn, mlruns_path, scan=sc, source_key=mlflow_source_key(project_root, mlruns_path),
+            )
             echo(f"  mlflow: {mlruns_path} -> {_format_counts(mlflow_counts)}")
         else:
             echo("  mlflow: skipped (no --mlruns given and no mlruns/ directory found)")
@@ -146,7 +169,7 @@ def ingest_sources(
             if not sep or not entity or not wandb_project:
                 raise IngestFailed(f"--wandb expects 'entity/project', got {wandb!r}")
             try:
-                wandb_counts = wandb_ingest.ingest_wandb_project(conn, entity, wandb_project)
+                wandb_counts = wandb_ingest.ingest_wandb_project(conn, entity, wandb_project, scan=sc)
             except wandb_ingest.WandbError as exc:
                 raise IngestFailed(f"wandb ingestion failed: {exc}") from exc
             echo(f"  wandb: {wandb} -> {_format_counts(wandb_counts)}")
@@ -155,14 +178,14 @@ def ingest_sources(
         # W3: Markdown papers, after mlflow/wandb for the same reason the
         # tex claims step must be last.
         md_counts = mdpaper_ingest.ingest_md_repo(
-            conn, project_root, inventory["md"], image_paths=inventory["image"],
+            conn, project_root, inventory["md"], image_paths=inventory["image"], scan=sc,
         )
         echo(
             f"  mdpaper: {len(inventory['md'])} .md scanned "
             f"({md_counts['md_skipped_non_paper']} skipped as README/CHANGELOG/LICENSE) "
             f"-> {_format_counts(md_counts)}"
         )
-        claims_counts = claims_ingest.ingest_claims_repo(conn, project_root, inventory["tex"])
+        claims_counts = claims_ingest.ingest_claims_repo(conn, project_root, inventory["tex"], scan=sc)
         echo(f"  claims: {_format_counts(claims_counts)}")
         return warnings.count
 
@@ -171,7 +194,8 @@ def ingest_records(conn: Connection, project_root: Path, *, echo: Echo = lambda 
     """Mirror the researcher's own files into the index: `.rce/mappings.toml`
     (as `rce mappings`) and, when `.rce/attempts.toml` loads, the attempt
     table (as `rce attempts`). A file that cannot be read is reported and
-    skipped, never treated as a deletion (Section 4)."""
+    skipped, never treated as a deletion (Section 4). Each is its own
+    partial scan, as when the watcher or the CLI runs it alone."""
     try:
         report = mappings_ingest.ingest_mappings(conn, project_root)
         if report.file_present:

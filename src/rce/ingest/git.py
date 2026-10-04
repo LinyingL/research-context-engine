@@ -64,6 +64,7 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from rce import db
+from rce.ingest import scan as scan_mod
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +220,7 @@ def read_commits(repo_path: str | Path) -> list[GitCommit]:
         ))
     return commits
 
-def ingest_git_repo(conn: Connection, repo_path: str | Path) -> int:
+def ingest_git_repo(conn: Connection, repo_path: str | Path, *, scan: scan_mod.Scan | None = None) -> int:
     """Ingest a repo's commit history into the provenance graph.
 
     Per commit: upsert Commit node `commit:<sha>`, upsert Contributor node
@@ -229,9 +230,22 @@ def ingest_git_repo(conn: Connection, repo_path: str | Path) -> int:
     dedup logic here. A commit with no parseable author email skips only
     its contributor node/edge (logged, not guessed). Returns the number of
     commits for which a Commit node was written.
+
+    Scan report (DESIGN.md 9.6): the commit list is the one source
+    (`scan.GIT_SOURCE`), `READ_AND_PARSED` once `git log` was read; a
+    failure raises before anything is reported. Commits and contributors
+    are produced by it; `authored_by` rests on its identity alone.
     """
     repo_path = Path(repo_path)
-    commits = read_commits(repo_path)
+    with scan_mod.own_scan(conn, scan, "git") as sc:
+        commits = read_commits(repo_path)
+        sc.ran("git")
+        ingested = _ingest_commits(conn, commits, sc)
+        sc.source("git", scan_mod.GIT_SOURCE, scan_mod.READ_AND_PARSED)
+    return ingested
+
+
+def _ingest_commits(conn: Connection, commits: list[GitCommit], sc: scan_mod.Scan) -> int:
     ingested = 0
     for commit in commits:
         commit_id = f"commit:{commit.sha}"
@@ -247,6 +261,7 @@ def ingest_git_repo(conn: Connection, repo_path: str | Path) -> int:
             },
         )
         ingested += 1
+        sc.node(commit_id, "git", scan_mod.GIT_SOURCE)
 
         email = commit.author_email.strip().lower()
         if not email:
@@ -259,9 +274,11 @@ def ingest_git_repo(conn: Connection, repo_path: str | Path) -> int:
             conn, contributor_id, "contributor", title=commit.author_name or email,
             attrs={"name": commit.author_name, "email": email},
         )
+        sc.node(contributor_id, "git", scan_mod.GIT_SOURCE)
         db.upsert_edge(
             conn, commit_id, contributor_id, "authored_by",
             extractor="git", evidence={"sha": commit.sha}, confidence=1.0, status="auto",
+            **sc.mark("git", scan_mod.GIT_SOURCE, scan_mod.basis("git", "authored_by")),
         )
     return ingested
 

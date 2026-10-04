@@ -68,6 +68,7 @@ from typing import Any
 
 from rce import db
 from rce.ingest import claims as claims_ingest
+from rce.ingest import scan as scan_mod
 from rce.ingest.latex import Link, ParsedSection, _compute_ordered_slugs, _match_known_image
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,8 @@ def parse_md_claims(repo_root: str | Path, md_rel_path: str) -> list[claims_inge
 
 def ingest_md_repo(
     conn: Connection, repo_root: str | Path, md_paths: list[str], image_paths: list[str] | None = None,
+    *,
+    scan: scan_mod.Scan | None = None,
 ) -> dict[str, int]:
     """Ingest Markdown paper sources into the graph (task W3): ATX headings
     as section nodes, image references as `section --includes--> figure`
@@ -326,13 +329,28 @@ def ingest_md_repo(
     filtered out as a non-paper convention name) is excluded from that
     scope, never treated as evidence its content is gone (DESIGN.md section
     0, "never guess"; see `rce.ingest.claims._cleanup_orphaned_claims`).
+
+    Scan report (DESIGN.md 9.6): each paper .md file is a source for
+    `mdpaper` (and, through `ingest_parsed_claims`, for `claims`),
+    `READ_AND_PARSED` or `UNREADABLE`; a README/CHANGELOG/LICENSE is not
+    read and reports nothing. `includes` links rest on their identity
+    alone (basis `{}`).
     """
-    repo_root = Path(repo_root)
+    with scan_mod.own_scan(conn, scan, "mdpaper") as sc:
+        return _ingest_md(conn, Path(repo_root), md_paths, image_paths, sc)
+
+
+def _ingest_md(
+    conn: Connection, repo_root: Path, md_paths: list[str], image_paths: list[str] | None,
+    sc: scan_mod.Scan,
+) -> dict[str, int]:
+    sc.ran("mdpaper")
     known_images: set[str] | None = None if image_paths is None else set(image_paths)
 
     parsed: list[MdParseResult] = []
     parsed_claims_by_path: dict[str, list[claims_ingest.ParsedClaim]] = {}
     skipped_non_paper = 0
+    unreadable: list[str] = []
     for md_rel_path in md_paths:
         if not _is_paper_markdown(md_rel_path):
             skipped_non_paper += 1
@@ -346,6 +364,8 @@ def ingest_md_repo(
             claims_here = parse_md_claims(repo_root, md_rel_path)
         except OSError as exc:
             logger.warning("cannot read md file %s: %s", md_rel_path, exc)
+            sc.source("mdpaper", md_rel_path, scan_mod.UNREADABLE)
+            unreadable.append(md_rel_path)
             continue
         parsed.append(result)
         parsed_claims_by_path[md_rel_path] = claims_here
@@ -362,6 +382,7 @@ def ingest_md_repo(
             attrs["tex_path"] = result.md_path
             attrs["level"] = section.level
             db.upsert_node(conn, section.id, "section", title=section.title, attrs=attrs)
+            sc.node(section.id, "mdpaper", result.md_path)
             counts["sections"] += 1
 
         for fig_link in result.figure_links:
@@ -379,13 +400,18 @@ def ingest_md_repo(
                 fig_path = matched_path
             fig_id = f"figure:{fig_path}"
             db.upsert_node(conn, fig_id, "figure", title=fig_path)
+            sc.node(fig_id, "mdpaper", result.md_path)
             db.upsert_edge(
                 conn, fig_link.section_id, fig_id, "includes",
                 extractor="mdpaper", evidence={"file": result.md_path, "line": fig_link.line},
                 confidence=1.0, status="auto",
+                **sc.mark("mdpaper", result.md_path, scan_mod.basis("mdpaper", "includes")),
             )
             counts["figures"] += 1
+        sc.source("mdpaper", result.md_path, scan_mod.READ_AND_PARSED)
 
-    claim_counts = claims_ingest.ingest_parsed_claims(conn, parsed_claims_by_path)
+    claim_counts = claims_ingest.ingest_parsed_claims(
+        conn, parsed_claims_by_path, scan=sc, unreadable=unreadable,
+    )
     counts.update(claim_counts)
     return counts

@@ -20,6 +20,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
+from rce.ingest import scan as scan_mod
 from rce.ingest import git as git_ingest
 
 logger = logging.getLogger(__name__)
@@ -473,6 +474,8 @@ def parse_bib_file(bib_path: str | Path) -> list[BibEntry]:
 def ingest_latex_repo(
     conn: Connection, repo_root: str | Path, tex_paths: list[str], bib_paths: list[str],
     image_paths: list[str] | None = None,
+    *,
+    scan: scan_mod.Scan | None = None,
 ) -> dict[str, int]:
     """Ingest LaTeX sources + .bib files into the provenance graph.
 
@@ -501,8 +504,23 @@ def ingest_latex_repo(
     file (T5.5 review item 2). `None` (the default) disables this check
     entirely, keeping this function usable as a standalone library call
     (e.g. in tests) without requiring a repo file inventory.
+
+    Scan report (DESIGN.md 9.6): every .tex and .bib file is a source,
+    `READ_AND_PARSED` or `UNREADABLE` (this parser has no failure mode
+    beyond reading). Section and figure nodes are produced by their .tex
+    file, a reference by its .bib entry and by every .tex citing it.
+    `includes`/`cites` links rest on their identity alone, so their basis
+    is `{}`.
     """
-    repo_root = Path(repo_root)
+    with scan_mod.own_scan(conn, scan, "latex") as sc:
+        return _ingest_latex(conn, Path(repo_root), tex_paths, bib_paths, image_paths, sc)
+
+
+def _ingest_latex(
+    conn: Connection, repo_root: Path, tex_paths: list[str], bib_paths: list[str],
+    image_paths: list[str] | None, sc: scan_mod.Scan,
+) -> dict[str, int]:
+    sc.ran("latex")
     resolved_keys: set[str] = set()  # normalized (lowercase) keys with a real bib entry
     known_images: set[str] | None = None if image_paths is None else set(image_paths)
     # normalized key -> as-written key of the bib entry currently stored at
@@ -514,7 +532,9 @@ def ingest_latex_repo(
             entries = parse_bib_file(repo_root / bib_rel_path)
         except OSError as exc:
             logger.warning("cannot read bib file %s: %s", bib_rel_path, exc)
+            sc.source("latex", bib_rel_path, scan_mod.UNREADABLE)
             continue
+        sc.source("latex", bib_rel_path, scan_mod.READ_AND_PARSED)
         for entry in entries:
             norm_key = _normalize_bib_key(entry.key)
             prior_key = seen_bib_keys.get(norm_key)
@@ -536,6 +556,7 @@ def ingest_latex_repo(
                 },
             )
             resolved_keys.add(norm_key)
+            sc.node(f"ref:{norm_key}", "latex", bib_rel_path)
 
     parsed: list[TexParseResult] = []
     all_cited_keys: set[str] = set()  # normalized (lowercase)
@@ -544,6 +565,7 @@ def ingest_latex_repo(
             result = parse_tex_file(repo_root, tex_rel_path)
         except OSError as exc:
             logger.warning("cannot read tex file %s: %s", tex_rel_path, exc)
+            sc.source("latex", tex_rel_path, scan_mod.UNREADABLE)
             continue
         parsed.append(result)
         all_cited_keys.update(_normalize_bib_key(link.target) for link in result.cite_links)
@@ -558,6 +580,7 @@ def ingest_latex_repo(
             attrs["tex_path"] = result.tex_path
             attrs["level"] = section.level
             db.upsert_node(conn, section.id, "section", title=section.title, attrs=attrs)
+            sc.node(section.id, "latex", result.tex_path)
             counts["sections"] += 1
 
         for fig_link in result.figure_links:
@@ -575,20 +598,25 @@ def ingest_latex_repo(
                 fig_path = matched_path
             fig_id = f"figure:{fig_path}"
             db.upsert_node(conn, fig_id, "figure", title=fig_path)
+            sc.node(fig_id, "latex", result.tex_path)
             db.upsert_edge(
                 conn, fig_link.section_id, fig_id, "includes",
                 extractor="latex", evidence={"file": result.tex_path, "line": fig_link.line},
                 confidence=1.0, status="auto",
+                **sc.mark("latex", result.tex_path, scan_mod.basis("latex", "includes")),
             )
             counts["figures"] += 1
 
         for cite_link in result.cite_links:
             norm_key = _normalize_bib_key(cite_link.target)
+            sc.node(f"ref:{norm_key}", "latex", result.tex_path)
             db.upsert_edge(
                 conn, cite_link.section_id, f"ref:{norm_key}", "cites",
                 extractor="latex", evidence={"file": result.tex_path, "line": cite_link.line},
                 confidence=1.0, status="auto",
+                **sc.mark("latex", result.tex_path, scan_mod.basis("latex", "cites")),
             )
             counts["cites"] += 1
+        sc.source("latex", result.tex_path, scan_mod.READ_AND_PARSED)
 
     return counts

@@ -239,7 +239,9 @@ ingestion never overwrites a human decision" -- it is that same rule,
 pointed at the place the decision actually lives. `edges.status` and
 attempt `human_fields` therefore behave oppositely on purpose:
 `edges.status` must never be touched by re-ingestion because the graph is
-the sole record of that decision; attempt `human_fields` must always be
+the sole record of that decision (superseded by 9.1: the judgment ledger
+`.rce/judgements.toml` is now that record, and the index derives
+`edges.status` from it); attempt `human_fields` must always be
 resynced by re-ingestion because the source file is the sole record and
 the graph must not be allowed to go stale and start lying about what that
 file currently says.
@@ -428,7 +430,10 @@ source file, because the file, not the graph, is the sole record of a
 verdict; an edge's `status`, and now an attempt node carrying a
 confirmed/rejected edge, must never be overwritten or deleted by
 re-ingestion, because the graph is the sole record of *that* decision,
-wherever in the graph it happens to be attached.
+wherever in the graph it happens to be attached. (Superseded by 9.1: the
+graph is no longer that record -- the judgment ledger is -- so claims and
+attempts cleanup now delete such orphans like any other; 9.6 says how the
+judgment is shown.)
 
 Edge types, grouped by the layer that produces them:
 
