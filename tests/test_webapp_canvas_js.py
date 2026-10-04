@@ -1066,3 +1066,195 @@ def test_a_header_error_outlives_the_summary_refresh():
     assert "loadProjectSummary();" in refresh[: refresh.index("\n}\n")]  # not forced
     reload = _APP_SRC[_APP_SRC.index("async function reloadAllViews"):]
     assert "loadProjectSummary(true)" in reload[: reload.index("\n}\n")]
+
+
+# -- The attempt form's defaults and its loader (verifier finding on 53c61a7) ---
+# The page reopened on 画布 and 「＋ 新增尝试」 built the form from an empty
+# record map: number 1, a full date in an MM-DD table, no verdict choices.
+# The pure defaults and the "ensure loaded" rule are loaded from app.html's
+# "Attempt records" block into node with a stub apiGet.
+
+_ATTEMPT_RUNNER = r"""
+const block = require("fs").readFileSync(0, "utf8");
+const input = JSON.parse(process.argv[1]);
+global.state = { attemptsById: new Map(), attemptsConfig: null, attemptsGen: null, configGen: null, dataEpoch: 0 };
+global.calls = [];
+global.server = input.server || {};
+global.apiGet = async (path) => {
+  calls.push(path);
+  if (server.onCall) eval(server.onCall);
+  const answer = server[path];
+  if (answer === undefined || answer === "fail") throw new Error("boom " + path);
+  return JSON.parse(JSON.stringify(answer));
+};
+eval(block + "; global.F = { attemptDataStale, defaultNewNumber, defaultDateValue, distinctVerdicts, ensureAttemptData, fetchAttemptRecords };");
+(async () => {
+  const out = await eval("(async () => {" + input.body + "})()");
+  process.stdout.write(JSON.stringify({ out: out === undefined ? null : out, calls }));
+})().catch((err) => { process.stdout.write(JSON.stringify({ error: String(err) })); });
+"""
+
+
+def _attempt_block() -> str:
+    start = _APP_SRC.index("// -- Attempt records: one loader, one freshness rule")
+    return _APP_SRC[start: _APP_SRC.index("function toCellText(")]
+
+
+def _attempt_run(body: str, **inputs: Any) -> dict[str, Any]:
+    result = subprocess.run(
+        [NODE, "-e", _ATTEMPT_RUNNER, json.dumps(dict(inputs, body=body))],
+        input=_attempt_block(), capture_output=True, text=True, check=True, timeout=30,
+    )
+    out = json.loads(result.stdout)
+    assert "error" not in out, out
+    return out
+
+
+def _attempt(number: str, date: str = "", verdict: str = "") -> dict[str, Any]:
+    return {"id": f"attempt:docs/map.md#{number}", "attrs": {"number": number, "date": date}, "verdict": verdict}
+
+
+def _real_table() -> list[dict[str, Any]]:
+    """24 rows written MM-DD, the shape of the lead's real table: 1..13,
+    a 14a/14b split, 15..23."""
+    numbers = [str(n) for n in range(1, 14)] + ["14a", "14b"] + [str(n) for n in range(15, 24)]
+    verdicts = ["☠️ 放弃", "✅ 采用", "🕒 待定", "", "✅ 采用", "多行\n结论"]
+    return [
+        _attempt(n, f"{(i % 9) + 1:02d}-{(i % 27) + 1:02d}", verdicts[i % len(verdicts)])
+        for i, n in enumerate(numbers)
+    ]
+
+
+_DEFAULTS_BODY = """
+  const list = input.attempts;
+  const now = new Date(2026, 9, 4);
+  return { number: F.defaultNewNumber(list), date: F.defaultDateValue(list, now),
+           verdicts: F.distinctVerdicts(list), viaMap: F.defaultNewNumber(new Map(list.map((a) => [a.id, a])).values()) };
+"""
+
+
+def test_form_defaults_follow_a_populated_mm_dd_table():
+    table = _real_table()
+    assert len(table) == 24
+    out = _attempt_run(_DEFAULTS_BODY, attempts=table)["out"]
+    # max top-level number + 1: "14a"/"14b" count as 14, the max is 23.
+    assert out["number"] == "24" and out["viaMap"] == "24"
+    assert out["date"] == "10-04"  # every row is MM-DD, so the new one is too
+    # Existing values only, in order of appearance; blank and multi-line skipped.
+    assert out["verdicts"] == ["☠️ 放弃", "✅ 采用", "🕒 待定"]
+
+
+def test_form_defaults_keep_a_full_date_table_full_and_an_empty_project_at_one():
+    full = [_attempt("1", "2026-03-01", "✅ 采用"), _attempt("2", "2026-03-02 晚")]
+    out = _attempt_run(_DEFAULTS_BODY, attempts=full)["out"]
+    assert out == {"number": "3", "date": "2026-10-04", "verdicts": ["✅ 采用"], "viaMap": "3"}
+    out = _attempt_run(_DEFAULTS_BODY, attempts=[])["out"]
+    assert out == {"number": "1", "date": "2026-10-04", "verdicts": [], "viaMap": "1"}
+    # A single MM-DD row among full dates is enough to switch (the table's
+    # own convention, as before); a split row alone still counts.
+    mixed = [_attempt("1", "2026-03-01"), _attempt("7b", "03-02")]
+    out = _attempt_run(_DEFAULTS_BODY, attempts=mixed)["out"]
+    assert (out["number"], out["date"]) == ("8", "10-04")
+
+
+def test_attempt_data_is_stale_unless_stamped_with_the_current_generation():
+    out = _attempt_run("""
+      return [[null, 5], [undefined, 5], [5, null], [4, 5], [5, 5], [0, 0], [0, 1]]
+        .map(([a, b]) => F.attemptDataStale(a, b));
+    """)["out"]
+    assert out == [True, True, True, True, False, False, True]
+
+
+_SERVER = {
+    "/api/generation": {"generation": 7},
+    "/api/attempts": {"attempts": [_attempt("1", "03-01", "✅"), _attempt("2", "03-02")]},
+    "/api/summary": {"attempts_config": {"file": "docs/map.md", "columns": {}}, "pending": 0},
+}
+_STATE = "return { ok, ids: [...state.attemptsById.keys()], gen: state.attemptsGen, cgen: state.configGen, file: state.attemptsConfig && state.attemptsConfig.file };"
+
+
+def test_ensure_loads_never_loaded_data_and_stamps_it():
+    run = _attempt_run("const ok = await F.ensureAttemptData();" + _STATE, server=_SERVER)
+    assert run["out"] == {"ok": True, "ids": ["attempt:docs/map.md#1", "attempt:docs/map.md#2"], "gen": 7, "cgen": 7, "file": "docs/map.md"}
+    # The generation is read first, so a stamp is never newer than its data.
+    assert run["calls"][0] == "/api/generation"
+    assert sorted(run["calls"][1:]) == ["/api/attempts", "/api/summary"]
+
+
+def test_ensure_skips_current_data_and_refetches_after_a_generation_bump():
+    run = _attempt_run("""
+      await F.ensureAttemptData();
+      calls.length = 0;
+      await F.ensureAttemptData();
+      const same = calls.slice();
+      calls.length = 0;
+      server["/api/generation"] = { generation: 8 };
+      server["/api/attempts"].attempts.push(input.extra);
+      await F.ensureAttemptData();
+      return { same, moved: calls.slice().sort(), gen: state.attemptsGen, cgen: state.configGen,
+               number: F.defaultNewNumber(state.attemptsById.values()) };
+    """, server=_SERVER, extra=_attempt("3", "03-03"))
+    out = run["out"]
+    assert out["same"] == ["/api/generation"]  # current: nothing re-fetched
+    assert out["moved"] == ["/api/attempts", "/api/generation", "/api/summary"]
+    assert (out["gen"], out["cgen"], out["number"]) == (8, 8, "4")
+
+
+def test_ensure_refetches_when_the_generation_cannot_be_read_and_rejects_on_failure():
+    server = dict(_SERVER, **{"/api/generation": "fail"})
+    run = _attempt_run("""
+      state.attemptsGen = 7; state.configGen = 7;
+      const ok = await F.ensureAttemptData();
+    """ + _STATE, server=server)
+    assert run["out"]["ok"] is True and run["out"]["gen"] is None  # unknown: re-read next time too
+    assert sorted(run["calls"]) == ["/api/attempts", "/api/generation", "/api/summary"]
+    server = dict(_SERVER, **{"/api/attempts": "fail"})
+    run = _attempt_run("""
+      try { await F.ensureAttemptData(); return "resolved"; }
+      catch (err) { return { message: err.message, gen: state.attemptsGen, size: state.attemptsById.size }; }
+    """, server=server)
+    assert run["out"] == {"message": "boom /api/attempts", "gen": None, "size": 0}
+
+
+def test_ensure_drops_data_that_arrives_after_a_project_switch():
+    server = dict(_SERVER, onCall='if (path === "/api/attempts") state.dataEpoch += 1;')
+    run = _attempt_run("const ok = await F.ensureAttemptData();" + _STATE, server=server)
+    assert run["out"]["ok"] is False
+    assert run["out"]["ids"] == [] and run["out"]["gen"] is None
+
+
+def _function_body(src: str, signature: str) -> str:
+    body = src[src.index(signature):]
+    return body[: body.index("\n}\n")]
+
+
+def test_every_way_into_the_attempt_form_awaits_the_loader_first():
+    """Source pins: the form is built in exactly one place, which only
+    openAttemptForm calls, after awaiting ensureAttemptData; every entry
+    point (header button, native menu, a panel's 编辑) goes through
+    openAttemptForm; the defaults read nothing but the records handed in."""
+    opener = _function_body(_APP_SRC, "async function openAttemptForm(")
+    assert opener.index("载入中…") < opener.index("await ensureAttemptData()") < opener.index("renderAttemptForm(mode, attemptId)")
+    assert "panelErrorBoxCn(" in opener and "state.panelSubject !== subject" in opener
+    assert _APP_SRC.count("renderAttemptForm(") == 2  # its definition and that one call
+    assert 'addEventListener("click", () => openAttemptForm("append"))' in _APP_SRC
+    assert '"new-attempt": () => openAttemptForm("append"),' in _APP_SRC
+    assert 'editBtn.addEventListener("click", () => openAttemptForm("update", id));' in _APP_SRC
+    assert _APP_SRC.count("openAttemptForm(") == 4  # definition + the three entry points
+    form = _function_body(_APP_SRC, "function renderAttemptForm(")
+    for call in ("defaultNewNumber(attempts)", "defaultDateValue(attempts, new Date())", "distinctVerdicts(attempts)"):
+        assert call in form
+    for name in ("defaultNewNumber", "defaultDateValue", "distinctVerdicts"):
+        assert _APP_SRC.count(name + "(") == 2, name  # defined once, called only by the form
+        assert "state." not in _function_body(_APP_SRC, f"function {name}(")
+    # One fetch path for the records, used by the tree view as well.
+    assert _APP_SRC.count('apiGet("/api/attempts")') == 1
+    assert "fetchAttemptRecords()" in _function_body(_APP_SRC, "async function loadTreeView(")
+    assert _APP_SRC.count("state.attemptsById = ") == 2  # the loader, and the project-switch reset
+    reset = _function_body(_APP_SRC, "async function reloadAllViews(")
+    for line in ("state.dataEpoch += 1;", "state.attemptsGen = null;", "state.attemptsConfig = null;", "state.configGen = null;"):
+        assert line in reset
+    # An attempt panel left open under another view is revalidated there too.
+    refresh = _function_body(_APP_SRC, "async function refreshCurrentView(")
+    assert "await revalidatePanel();" in refresh
+    assert "await ensureAttemptData()" in _function_body(_APP_SRC, "async function revalidatePanel(")

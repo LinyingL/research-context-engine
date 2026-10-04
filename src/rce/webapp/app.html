@@ -682,9 +682,14 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 // projectState is the degraded-project condition currently on screen
 // ("graph_missing" / "graph_downloading", null when healthy) -- it decides
 // whether the header chip shows and whether the switcher is forced visible.
+// attemptsGen / configGen stamp attemptsById / attemptsConfig with the
+// server generation they reflect (null: never loaded, or unknown), and
+// dataEpoch counts project switches so a fetch that started for the
+// previous project never lands in this one -- see "Attempt records" below.
 const state = {
   attemptsById: new Map(), projectLabel: "", panelSubject: null,
   attemptsConfig: null, projectState: null,
+  attemptsGen: null, configGen: null, dataEpoch: 0,
   headerError: false, // the header line holds a blocking error (showHeaderError)
 };
 
@@ -929,8 +934,10 @@ function storedView() {
   }
 }
 
+// Returns the canvas's load when this call started one, so a command that
+// acts on the canvas (适应全部 from the menu) can wait for it.
 function activateView(name) {
-  if (currentView === name) return;
+  if (currentView === name) return null;
   currentView = name;
   try { window.localStorage.setItem(VIEW_STORAGE_KEY, name); } catch (err) { /* convenience only */ }
   document.querySelectorAll(".tab").forEach((btn) => {
@@ -945,9 +952,10 @@ function activateView(name) {
   if (name === "tree" && !views.tree.dataset.loaded) loadTreeView();
   if (name === "lineage" && !views.lineage.dataset.loaded) loadLineageView();
   if (name === "canvas") {
-    if (!views.canvas.dataset.loaded) RCECanvas.load(views.canvas);
-    else RCECanvas.activate();
+    if (!views.canvas.dataset.loaded) return RCECanvas.load(views.canvas);
+    RCECanvas.activate();
   }
+  return null;
 }
 
 document.querySelectorAll(".tab").forEach((btn) => {
@@ -985,8 +993,8 @@ async function loadProjectSummary(force) {
   const line = document.getElementById("project-line");
   if (force) state.headerError = false;
   try {
-    const data = await apiGet("/api/summary");
-    state.attemptsConfig = data.attempts_config || null;
+    const data = await fetchSummary();
+    if (!data) return; // the project was switched meanwhile; its own refresh is under way
     if (state.headerError) return;
     // Registry label when loadProjects() found one, else the directory
     // basename -- never the raw path, which lives on as the hover title.
@@ -1109,8 +1117,14 @@ removeMissingBtn.addEventListener("click", async () => {
 async function reloadAllViews() {
   // Everything on screen belongs to the previous project: drop the cached
   // attempt records, mark both views stale, and re-fetch the one currently
-  // visible (the other reloads lazily on its next activation).
+  // visible (the other reloads lazily on its next activation). The attempt
+  // records and the map config are dropped with their stamps, and the epoch
+  // moves so a fetch still in flight for the previous project is discarded.
+  state.dataEpoch += 1;
   state.attemptsById = new Map();
+  state.attemptsGen = null;
+  state.attemptsConfig = null;
+  state.configGen = null;
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
@@ -1197,11 +1211,21 @@ function updateChipFromStatus(status) {
   }
 }
 
-function revalidatePanel() {
-  if (!state.panelSubject || panel.classList.contains("hidden")) return;
-  if (state.panelSubject.kind !== "attempt") return;
-  if (state.attemptsById.has(state.panelSubject.id)) {
-    openAttemptPanel(state.panelSubject.id); // re-render from the fresh record
+// An attempt panel stays open when the native menu switches view under it,
+// so its record is brought current here whatever view is showing (in the
+// tree, loadTreeView has just done so and this costs one generation read).
+// If that fails the panel is left as it stands until the next bump.
+async function revalidatePanel() {
+  const subject = state.panelSubject;
+  if (!subject || subject.kind !== "attempt" || panel.classList.contains("hidden")) return;
+  try {
+    if (!(await ensureAttemptData())) return;
+  } catch (err) {
+    return;
+  }
+  if (state.panelSubject !== subject) return; // closed or replaced meanwhile
+  if (state.attemptsById.has(subject.id)) {
+    openAttemptPanel(subject.id); // re-render from the fresh record
   } else {
     closePanel(); // the row is gone; stale details must not linger on screen
   }
@@ -1215,7 +1239,6 @@ async function refreshCurrentView() {
   delete views.canvas.dataset.loaded;
   if (currentView === "tree") {
     await loadTreeView(true);
-    revalidatePanel(); // attemptsById was just refreshed by loadTreeView
   } else if (currentView === "lineage") {
     await loadLineageView();
   } else if (currentView === "canvas") {
@@ -1223,6 +1246,7 @@ async function refreshCurrentView() {
     // re-fetches /api/canvas and re-renders in place).
     await RCECanvas.load(views.canvas);
   }
+  await revalidatePanel();
   loadProjectSummary(); // the pending count may have moved with the graph
 }
 
@@ -1518,15 +1542,17 @@ async function loadTreeView(preserveState) {
   // actually arrived -- no 「载入中…」 flash wiping the user's view every
   // time they save a file in their editor.
   if (!saved) container.innerHTML = '<p class="empty-note">载入中…</p>';
-  let treeData, attemptsData;
+  let treeData, current;
   try {
-    [treeData, attemptsData] = await Promise.all([apiGet("/api/tree"), apiGet("/api/attempts")]);
+    // The attempt records come through the same loader the edit form uses
+    // (fetchAttemptRecords), which stamps them with their generation.
+    [treeData, current] = await Promise.all([apiGet("/api/tree"), fetchAttemptRecords()]);
   } catch (err) {
     renderViewFailure(container, err);
     return;
   }
+  if (!current) return; // the project was switched meanwhile; reloadAllViews loads the new one
   clearProjectState(); // the graph answered: whatever was wrong is over
-  state.attemptsById = new Map((attemptsData.attempts || []).map((a) => [a.id, a]));
   container.innerHTML = "";
   if (!treeData.attempts || treeData.attempts.length === 0) {
     container.appendChild(renderGuideCard());
@@ -1874,38 +1900,113 @@ function openAttemptPanel(id) {
 
 const EDITABLE_KEYS = ["date", "description", "variables", "result", "verdict"];
 
-function defaultNewNumber() {
+// -- Attempt records: one loader, one freshness rule -------------------------
+// state.attemptsById (full records, from /api/attempts) and
+// state.attemptsConfig (the map file and its column names, from
+// /api/summary) are read by the attempt panel and by this form, and the
+// form can be opened from any view: the header button and the native
+// menu's 新增尝试 work on 画布 and 血缘 too, where nothing has loaded the
+// records (verifier finding on 53c61a7: a page that reopened on 画布 built
+// the form from an empty map -- number 1, a full date in an MM-DD table,
+// no verdict choices). So each is stamped with the server generation it
+// reflects, and ensureAttemptData() re-fetches whichever is missing or
+// older than the server's current generation before the form is built.
+// The generation is read BEFORE the data, so a stamp can only ever be
+// older than its data (a harmless extra fetch next time), never newer.
+// Everything from here to toCellText is loaded into node by
+// tests/test_webapp_canvas_js.py; the first four functions are pure.
+
+// True when data stamped `loadedGen` cannot be trusted at `currentGen`:
+// never loaded, an unknown generation on either side, or the server moved.
+function attemptDataStale(loadedGen, currentGen) {
+  if (loadedGen === null || loadedGen === undefined) return true;
+  if (currentGen === null || currentGen === undefined) return true;
+  return loadedGen !== currentGen;
+}
+
+// `attempts`: any iterable of /api/attempts records.
+function defaultNewNumber(attempts) {
   // Task spec: max existing top-level number + 1 ("14a" counts as 14).
   let max = 0;
-  state.attemptsById.forEach((a) => {
+  for (const a of attempts) {
     const n = parseInt((a.attrs && a.attrs.number) || "", 10);
     if (!isNaN(n) && n > max) max = n;
-  });
+  }
   return String(max + 1);
 }
 
-function defaultDateValue() {
-  const now = new Date();
+function defaultDateValue(attempts, now) {
   const mm = String(now.getMonth() + 1).padStart(2, "0");
   const dd = String(now.getDate()).padStart(2, "0");
   // Match the format the table already uses: any existing bare "MM-DD"
   // row makes new rows follow suit; otherwise full "YYYY-MM-DD".
   let short = false;
-  state.attemptsById.forEach((a) => {
+  for (const a of attempts) {
     if (/^\d{2}-\d{2}/.test((a.attrs && a.attrs.date) || "")) short = true;
-  });
+  }
   return short ? mm + "-" + dd : now.getFullYear() + "-" + mm + "-" + dd;
 }
 
-function distinctVerdicts() {
+function distinctVerdicts(attempts) {
   // Quick choices = verdict values already present in this project's own
   // data -- never an invented vocabulary (the researcher owns the markers).
   const seen = new Set();
-  state.attemptsById.forEach((a) => {
+  for (const a of attempts) {
     const v = (a.verdict || "").trim();
     if (v && v.indexOf("\n") === -1) seen.add(v);
-  });
+  }
   return Array.from(seen).slice(0, 8);
+}
+
+// The server's current generation, or null when it could not be read
+// (which attemptDataStale treats as "re-fetch").
+async function currentGeneration() {
+  try {
+    const status = await apiGet("/api/generation");
+    return typeof status.generation === "number" ? status.generation : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// The ONE path that fills state.attemptsById (the tree view loads through
+// it too). Resolves true when the records were stored, false when the
+// project was switched while the request was out (they are dropped);
+// rejects when /api/attempts failed.
+async function fetchAttemptRecords(knownGen) {
+  const epoch = state.dataEpoch;
+  const gen = knownGen === undefined ? await currentGeneration() : knownGen;
+  const data = await apiGet("/api/attempts");
+  if (epoch !== state.dataEpoch) return false;
+  state.attemptsById = new Map((data.attempts || []).map((a) => [a.id, a]));
+  state.attemptsGen = gen;
+  return true;
+}
+
+// The ONE path that fills state.attemptsConfig (the header's summary line
+// reads through it too). Resolves the /api/summary body, or null when the
+// project was switched meanwhile. Unstamped when called without a
+// generation (the summary refresh), so the form re-reads it before use.
+async function fetchSummary(knownGen) {
+  const epoch = state.dataEpoch;
+  const data = await apiGet("/api/summary");
+  if (epoch !== state.dataEpoch) return null;
+  state.attemptsConfig = data.attempts_config || null;
+  state.configGen = knownGen === undefined ? null : knownGen;
+  return data;
+}
+
+// Makes the records and the config current. Resolves true when both are,
+// false when a project switch overtook it; rejects with the fetch's error.
+async function ensureAttemptData() {
+  const epoch = state.dataEpoch;
+  const gen = await currentGeneration();
+  if (epoch !== state.dataEpoch) return false;
+  const jobs = [];
+  if (attemptDataStale(state.attemptsGen, gen)) jobs.push(fetchAttemptRecords(gen));
+  if (attemptDataStale(state.configGen, gen)) jobs.push(fetchSummary(gen).then((d) => d !== null));
+  const results = await Promise.all(jobs);
+  return epoch === state.dataEpoch && results.every(Boolean);
 }
 
 function toCellText(value) {
@@ -1934,14 +2035,17 @@ function formFieldEl(labelText, inputEl) {
   return wrap;
 }
 
-function panelErrorBoxCn(message) {
+// `err` (optional): the engine failure behind it, shown through the shared
+// blocking-error helper -- the Chinese sentence, the raw text behind 「详情」.
+function panelErrorBoxCn(message, err) {
   const box = document.createElement("div");
   box.className = "error-box";
   const title = document.createElement("div");
   title.className = "error-title";
   title.textContent = "无法打开编辑表单";
   const msg = document.createElement("div");
-  msg.textContent = message;
+  if (err) renderBlockingError(msg, message, err);
+  else msg.textContent = message;
   box.append(title, msg);
   return box;
 }
@@ -1959,10 +2063,44 @@ function setFormStatus(statusEl, cls, cnText, err) {
   statusEl.title = "";
 }
 
-function openAttemptForm(mode, attemptId) {
-  state.panelSubject = { kind: "attempt-form" };
+// Every way into the form -- 「＋ 新增尝试」, the native menu's 新增尝试,
+// an attempt panel's 编辑 -- comes through here, and the form's defaults
+// (next number, date format, verdict choices) and an edit's prefill are
+// derived only after ensureAttemptData() has made the records and the
+// config current. Meanwhile the panel says 载入中…; a failure is said in
+// Chinese with the engine's text behind 「详情」, never an empty form with
+// wrong defaults.
+async function openAttemptForm(mode, attemptId) {
+  const subject = { kind: "attempt-form" };
+  state.panelSubject = subject;
+  panelTitle.textContent = mode === "append" ? "新增尝试" : "编辑尝试";
+  panelTitle.title = "";
+  panelSubtitle.textContent = "";
+  panelBody.innerHTML = '<p class="empty-note">载入中…</p>';
+  openPanel();
+  let ready = false;
+  let failure = null;
+  try {
+    ready = await ensureAttemptData();
+  } catch (err) {
+    failure = err;
+  }
+  if (state.panelSubject !== subject) return; // closed, replaced, or the project switched
+  if (!ready) {
+    panelBody.innerHTML = "";
+    panelBody.appendChild(failure
+      ? panelErrorBoxCn("没能读到最新的尝试年表，表单先不打开，以免编号和日期填错。", failure)
+      : panelErrorBoxCn("项目刚刚切换，请重新打开表单。"));
+    return;
+  }
+  renderAttemptForm(mode, attemptId);
+}
+
+// Builds the form from the (now current) records and config.
+function renderAttemptForm(mode, attemptId) {
   panelTitle.title = "";
   panelBody.innerHTML = "";
+  const attempts = Array.from(state.attemptsById.values());
   const config = state.attemptsConfig;
   if (!config) {
     panelTitle.textContent = mode === "append" ? "新增尝试" : "编辑尝试";
@@ -1977,12 +2115,12 @@ function openAttemptForm(mode, attemptId) {
   if (mode === "update" && !record) {
     panelTitle.textContent = "编辑尝试";
     panelSubtitle.textContent = "";
-    panelBody.appendChild(panelErrorBoxCn("找不到这条尝试的记录，请等页面刷新后重试。"));
+    panelBody.appendChild(panelErrorBoxCn("年表里已经没有这条尝试了，可能刚在文件里被改掉。"));
     openPanel();
     return;
   }
   const attrs = record ? (record.attrs || {}) : {};
-  const number = mode === "append" ? defaultNewNumber() : (attrs.number || "");
+  const number = mode === "append" ? defaultNewNumber(attempts) : (attrs.number || "");
   panelTitle.textContent = mode === "append" ? "新增尝试" : "编辑尝试 #" + number;
   panelSubtitle.textContent = "将写入 " + config.file;
 
@@ -2022,7 +2160,7 @@ function openAttemptForm(mode, attemptId) {
       input.className = "form-input" + (def.mono ? " form-mono" : "");
     }
     if (mode === "append") {
-      input.value = def.key === "date" ? defaultDateValue() : "";
+      input.value = def.key === "date" ? defaultDateValue(attempts, new Date()) : "";
     } else {
       input.value = def.key === "verdict" ? (record.verdict || "")
         : def.key === "result" ? (record.result || "")
@@ -2032,7 +2170,7 @@ function openAttemptForm(mode, attemptId) {
     initial[def.key] = input.value;
     const fieldEl = formFieldEl(def.label, input);
     if (def.key === "verdict") {
-      const verdicts = distinctVerdicts();
+      const verdicts = distinctVerdicts(attempts);
       if (verdicts.length) {
         const chips = document.createElement("div");
         chips.className = "verdict-chips";
@@ -2303,8 +2441,14 @@ const SHELL_COMMANDS = {
   "zoom-out": () => shellZoom(-1),
   "zoom-reset": () => shellZoom(0),
   // 适应全部 is a canvas notion; from another view it brings the canvas up
-  // first rather than silently doing nothing.
-  "fit": () => { activateView("canvas"); RCECanvas.fitAll(); },
+  // first rather than silently doing nothing -- and when that starts the
+  // canvas's first load, fits once the cards are there (fitting the empty
+  // canvas was lost: entering the view then restored its saved viewport).
+  "fit": () => {
+    const loading = activateView("canvas");
+    if (loading) loading.then(() => { if (currentView === "canvas" && views.canvas.dataset.loaded) RCECanvas.fitAll(); });
+    else RCECanvas.fitAll();
+  },
   "reveal-project": () => shellOpen(".", true, "无法在 Finder 中显示项目"),
   "open-map": () => shellOpenMap(),
 };
