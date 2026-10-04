@@ -29,7 +29,8 @@ here -- commits are not canvas objects.
   own definition (a dataset some script reads and no script writes),
   evaluated over the links the canvas actually shows: an edge the human
   has rejected is not a writer, so a dataset whose only writer was marked
-  as a wrong extraction gets its clay dot.
+  as a wrong extraction gets its clay dot -- and `rce.lineage` excludes
+  rejected edges the same way, so the 血缘 tab agrees with the dot.
 - `missing` is a fresh filesystem fact: the graph knows the node, the file
   is not on disk now. `ghost` nodes (section 8.1) are the reverse: a file
   an attempt's `step_files` names, on disk, with no graph node yet. A ghost
@@ -95,12 +96,6 @@ SCOPE_ALL = "all"
 # not the attempts config's `active_verdicts` (which also counts 🕒 rows as
 # alive for the dead-variable check -- a different question).
 CURRENT_VERDICT_MARKER = "✅"
-
-# Restoring a rejected link puts it back at the machine status every
-# extractor of a canvas edge type writes (`rce.ingest.dataflow`: always
-# "auto"). Only canvas edges can be rejected/restored from the app, which
-# is what makes this constant the edge's true prior status.
-RESTORED_STATUS = "auto"
 
 # One lock for every read-merge-write of a canvas.json (any project): two
 # handler threads merging at once must not lose either one's ids.
@@ -213,6 +208,10 @@ def link_entry(edge: dict[str, Any]) -> dict[str, Any]:
         "evidence_hint": evidence_hint(edge),
         "date": details.get("date") if human else None,
         "note": details.get("note") if human else None,
+        # Position in .rce/mappings.toml (1-based; new entries are appended),
+        # i.e. the order the researcher asserted the links in -- what the
+        # layout uses to decide which link closed a loop (8.4).
+        "entry": details.get("entry") if human else None,
     }
 
 

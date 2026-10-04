@@ -376,6 +376,18 @@ def test_shell_reads_its_configuration_at_runtime_and_never_enables_devtools():
     assert "developerExtrasEnabled" not in _SHELL and "isInspectable" not in _SHELL
 
 
+def test_shell_quit_names_its_own_child_in_the_shutdown_request():
+    """DESIGN.md 8.9 "an engine the user started from a terminal is left
+    alone": the shutdown carries the spawned child's pid, so an engine
+    that holds the port but is NOT our child refuses it (server side:
+    `_check_shutdown_target`). Adversarial review of the V4 work."""
+    quit_path = _SHELL[_SHELL.index("func applicationShouldTerminate(_ sender"):]
+    quit_path = quit_path[: quit_path.index("\n    }\n")]
+    assert 'guard let process = child, process.isRunning' in quit_path
+    assert '\\"pid\\": \\(process.processIdentifier)' in quit_path
+    assert 'Data("{}".utf8)' not in quit_path
+
+
 def test_shell_placeholder_shows_the_log_only_as_escaped_text():
     assert "正在启动引擎…" in _SHELL and "#F7F2E9" in _SHELL
     page = _SHELL[_SHELL.index("func placeholderPage"):]

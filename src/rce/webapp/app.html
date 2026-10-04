@@ -69,7 +69,9 @@
 
   Three views, switched by the top tab bar (labels per DESIGN.md section
   8.8: 「决策树」「血缘」「画布」; the last one used is remembered in
-  localStorage, wrapped so blocked storage just starts on 决策树):
+  localStorage -- a per-viewer convenience, unlike the canvas scope, which
+  8.7 says defaults to the current attempt -- wrapped so blocked storage
+  just starts on 决策树):
     - 决策树 (default): GET /api/tree. attempt -> step script ->
       read/write data files, all three layers already computed
       server-side from graph edges; this page only renders them.
@@ -485,12 +487,16 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 .cv-link.machine { stroke: var(--ink); stroke-width: 1.5; stroke-opacity: 0.45; }
 .cv-link.pending { stroke-dasharray: 6 4; }
 .cv-link.human { stroke: var(--clay); stroke-width: 2.25; }
-.cv-link.cycle { stroke: var(--clay); stroke-width: 1.5; stroke-dasharray: 6 4; }
+/* A cycle-closing link (8.4): dashed clay. A machine one turns clay at
+   1.5px; a human one stays a human link (2.25px clay + midpoint dot) and
+   only gains the dash -- the two must never be confusable (8.2). */
+.cv-link.machine.cycle { stroke: var(--clay); stroke-opacity: 1; stroke-width: 1.5; stroke-dasharray: 6 4; }
+.cv-link.human.cycle { stroke-dasharray: 6 4; }
 .cv-link-g.lit .cv-link.machine { stroke-opacity: 1; }
 .cv-link-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; vector-effect: non-scaling-stroke; cursor: pointer; }
 .cv-link.optimistic { stroke-opacity: 0.6; }
 .cv-link-g.selected .cv-link.machine { stroke-opacity: 1; stroke-width: 2.25; }
-.cv-link-g.selected .cv-link.human, .cv-link-g.selected .cv-link.cycle { stroke-width: 3; }
+.cv-link-g.selected .cv-link.human, .cv-link-g.selected .cv-link.machine.cycle { stroke-width: 3; }
 .cv-link-dot { fill: var(--clay); }
 .cv-node.dim, .cv-link-g.dim { opacity: 0.22; }
 
@@ -662,11 +668,9 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 // projectState is the degraded-project condition currently on screen
 // ("graph_missing" / "graph_downloading", null when healthy) -- it decides
 // whether the header chip shows and whether the switcher is forced visible.
-// projectPath is the served root as /api/projects reports it -- the key the
-// canvas (canvas.js) files its remembered scope under.
 const state = {
   attemptsById: new Map(), projectLabel: "", panelSubject: null,
-  attemptsConfig: null, projectState: null, projectPath: "",
+  attemptsConfig: null, projectState: null,
 };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
@@ -754,15 +758,22 @@ function escapeHtml(value) {
   ));
 }
 
+// DESIGN.md 8.8: "Raw error strings from the engine remain English and live
+// on hover titles; what the user reads is the Chinese framing". This box is
+// what any view (the canvas included) falls back to for an error that is
+// not one of the project states -- e.g. a legacy graph whose migration
+// failed its integrity check -- so the engine's English goes on the box's
+// title, never into the visible text (adversarial review of the V4 work).
 function renderErrorBox(container, err) {
   container.innerHTML = "";
   const box = document.createElement("div");
   box.className = "error-box";
+  box.title = err instanceof Error ? err.message : String(err);
   const title = document.createElement("div");
   title.className = "error-title";
-  title.textContent = "Something went wrong";
+  title.textContent = "出了点问题";
   const msg = document.createElement("div");
-  msg.textContent = err instanceof Error ? err.message : String(err);
+  msg.textContent = "引擎返回了错误，这一页没能显示（悬停查看原因）。";
   box.append(title, msg);
   container.appendChild(box);
 }
@@ -832,9 +843,11 @@ const views = {
 };
 let currentView = null;
 
-// The last view is remembered per browser (DESIGN.md section 8.7's "remember
-// the last view and scope"): a convenience only, so every storage access is
-// wrapped -- a private window or blocked site data simply starts on 决策树.
+// The last view (tab) is remembered per browser: a per-viewer convenience
+// Section 8 does not decide either way, so every storage access is wrapped
+// -- a private window or blocked site data simply starts on 决策树. The
+// canvas's SCOPE is deliberately NOT remembered: 8.7 decides it defaults to
+// the current attempt (see canvas.js, fetchCanvas).
 const VIEW_STORAGE_KEY = "rce.view";
 
 function storedView() {
@@ -925,9 +938,6 @@ async function loadProjects() {
   }
   const projects = data.projects || [];
   const current = data.current || "";
-  // The served root, so per-project conveniences (the canvas's remembered
-  // scope) never leak from one project into another.
-  state.projectPath = current;
   const currentEntry = projects.find((p) => p.path === current);
   state.projectLabel = currentEntry ? currentEntry.label : basename(current);
   state.projectCount = projects.length;
@@ -993,8 +1003,10 @@ removeMissingBtn.addEventListener("click", async () => {
   try {
     for (const p of dead) await apiPost("/api/projects/remove", { path: p.path });
   } catch (err) {
-    line.textContent = "移除失效项目失败：" + (err instanceof Error ? err.message : String(err));
-    line.title = "";
+    // 8.8: the Chinese framing is what shows; the engine's English is the
+    // hover title.
+    line.textContent = "移除失效项目失败（悬停查看原因）";
+    line.title = err instanceof Error ? err.message : String(err);
   }
   // Re-read the registry either way: a partial failure must leave the list
   // showing what the server actually holds now, not what we hoped it would.
@@ -1449,10 +1461,14 @@ function clickablePath(text) {
   return span;
 }
 
-function scriptRefSpan(scriptPath, line, callee) {
+function scriptRefSpan(scriptPath, line, callee, human) {
   const span = document.createElement("span");
   span.className = "clickable";
-  span.textContent = scriptPath + ":" + line + (callee ? " (" + callee + ")" : "");
+  // A human mapping (rce.lineage) has no call site: it is the researcher's
+  // own assertion from .rce/mappings.toml, said so instead of ":null".
+  span.textContent = human
+    ? scriptPath + " · 人工标注"
+    : scriptPath + ":" + line + (callee ? " (" + callee + ")" : "");
   span.title = "Open " + scriptPath;
   span.addEventListener("click", () => openFilePanel(scriptPath, "script"));
   return span;
@@ -1479,7 +1495,7 @@ function renderOrphanItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.readers && item.readers.length) {
-    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee)));
+    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
   }
   return div;
 }
@@ -1489,10 +1505,10 @@ function renderChainItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.writers && item.writers.length) {
-    div.appendChild(subList("Written by", item.writers, (w) => scriptRefSpan(w.script, w.line, w.callee)));
+    div.appendChild(subList("Written by", item.writers, (w) => scriptRefSpan(w.script, w.line, w.callee, w.human)));
   }
   if (item.readers && item.readers.length) {
-    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee)));
+    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
   }
   return div;
 }

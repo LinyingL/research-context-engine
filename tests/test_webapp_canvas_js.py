@@ -108,6 +108,28 @@ def test_cycle_is_broken_at_its_closing_edge_and_reported():
     assert _column(out, PY16) == 0 and _column(out, MONTHLY) == 1
 
 
+def test_a_human_link_that_closes_a_loop_is_the_one_marked():
+    """Adversarial review of the V4 work: the researcher draws 17.Rmd 写出
+    raw_news.csv, closing raw -> 16 -> monthly -> 17 -> raw. 8.4 breaks a
+    cycle "at the edge that closes them" -- the link just drawn, not the
+    machine read raw -> 16 that a step-order DFS would have blamed."""
+    links = PIPELINE_LINKS + [dict(_link("h", RMD17, RAW), human=True, entry=1)]
+    out = _layout(PIPELINE_NODES, links)
+    assert out["cycle"] == ["h"]
+    assert _column(out, RAW) == 0 and _column(out, RMD17) == 3  # the pipeline keeps its shape
+
+
+def test_human_links_close_loops_in_the_order_they_were_asserted():
+    """Two human links that only form a loop together: the later entry in
+    .rce/mappings.toml is the closing one, and an optimistic link (no entry
+    yet) is newer than every written one."""
+    a = dict(_link("a", PY16, MONTHLY), human=True, entry=2)
+    b = dict(_link("b", MONTHLY, PY16), human=True, entry=1)
+    assert _layout([MONTHLY, PY16], [a, b])["cycle"] == ["a"]
+    b_new = dict(_link("b", MONTHLY, PY16), human=True)
+    assert _layout([MONTHLY, PY16], [a, b_new])["cycle"] == ["b"]
+
+
 def test_unlinked_ghost_sits_beside_its_frame_not_in_column_zero():
     """The knitted .pdf of 8.1 (no links yet) goes one column right of its
     attempt's linked script -- where the link the researcher is about to
@@ -247,3 +269,46 @@ def test_socket_hit_test_picks_the_nearest_socket_within_the_radius():
     hit = _call("socketAt", nodes=nodes, positions=positions, side="in", x=101, y=out0_y, radius=12)
     assert (hit["id"], hit["index"]) == (PY16, 0)
     assert _call("socketAt", nodes=nodes, positions=positions, side="in", x=320, y=out0_y, radius=12) is None
+
+
+# -- Adversarial review of the V4 work: static pins on canvas.js / app.html ------
+
+_CANVAS_SRC = CANVAS_JS.read_text(encoding="utf-8")
+_APP_SRC = (CANVAS_JS.parent / "app.html").read_text(encoding="utf-8")
+
+
+def test_scope_is_never_restored_from_browser_storage():
+    """8.7: the selector defaults to the current attempt. A remembered
+    scope replaced that default for good."""
+    assert "localStorage" not in _CANVAS_SRC
+
+
+def test_layout_runs_on_the_whole_graph_so_positions_are_global():
+    """8.7 "positions are global": the auto layout is computed from the
+    scope-all payload whenever the view is narrower."""
+    fetch = _CANVAS_SRC[_CANVAS_SRC.index("async function fetchCanvas"):]
+    fetch = fetch[: fetch.index("\n  }\n")]
+    assert "apiGet(canvasUrl(SCOPE_ALL))" in fetch
+    apply = _CANVAS_SRC[_CANVAS_SRC.index("function applyPayload"):]
+    apply = apply[: apply.index("\n  }\n")]
+    assert "computeLayout(whole.nodes, layoutLinks, whole.frames)" in apply
+
+
+def test_a_cycle_link_keeps_its_human_or_machine_class_and_its_dot():
+    link_class = _CANVAS_SRC[_CANVAS_SRC.index("function linkClass"):]
+    link_class = link_class[: link_class.index("\n  }\n")]
+    assert '["cv-link", link.human ? "human" : "machine"]' in link_class
+    render = _CANVAS_SRC[_CANVAS_SRC.index("function renderLink("):]
+    render = render[: render.index("\n  }\n")]
+    assert "if (link.human) {" in render and "cv.cycle" not in render
+    assert ".cv-link.human.cycle { stroke-dasharray: 6 4; }" in _APP_SRC
+
+
+def test_engine_errors_are_hover_titles_not_visible_english():
+    """8.8: the visible text is the Chinese framing; the engine's English
+    lives on the hover title."""
+    assert "Something went wrong" not in _APP_SRC
+    box = _APP_SRC[_APP_SRC.index("function renderErrorBox"):]
+    box = box[: box.index("\n}\n")]
+    assert "box.title = " in box and "出了点问题" in box
+    assert '"移除失效项目失败（悬停查看原因）"' in _APP_SRC

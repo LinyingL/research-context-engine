@@ -258,7 +258,7 @@ def test_migration_refuses_and_keeps_everything_when_the_copy_is_corrupt(tmp_pat
     assert str(legacy) in str(excinfo.value)
     assert legacy.exists() and _node_ids(legacy)  # untouched, rows intact
     assert not paths.graph_db_path(project).exists()
-    assert list(paths.graph_dir(project).glob("*.migrating")) == []
+    assert list(paths.graph_dir(project).glob("*.migrating*")) == []
 
 
 def test_migration_refuses_when_the_legacy_file_is_not_a_database(tmp_path):
@@ -435,3 +435,192 @@ def test_project_rce_dir_stays_inside_the_project(tmp_path):
     project.mkdir()
     assert paths.project_rce_dir(project) == project / ".rce"
     assert os.path.commonpath([project, paths.project_rce_dir(project)]) == str(project)
+
+
+# -- Adversarial review of the V4 work: concurrency, dataless, spelling, log ---
+
+
+def _migrate_in_subprocess(project: str, rce_home: str, out: str) -> None:
+    """Child-process body for the cross-process race below (module-level so
+    `multiprocessing`'s spawn start method can import it)."""
+    os.environ[paths.HOME_ENV_VAR] = rce_home
+    try:
+        result = paths.migrate_legacy_graph(project)
+        Path(out).write_text("migrated" if result else "none", encoding="utf-8")
+    except BaseException as exc:  # noqa: BLE001 -- the test wants every outcome
+        Path(out).write_text(f"error:{type(exc).__name__}:{exc}", encoding="utf-8")
+
+
+def test_concurrent_migrations_in_threads_install_one_verified_copy(tmp_path):
+    """Several first touches at once (the server's own handler threads):
+    exactly one migrates, the others see nothing left to do -- no raw
+    FileNotFoundError from a rename of another migrator's staging file, no
+    orphaned staging sidecars, and the installed graph has every row."""
+    import threading
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = _mk_legacy_graph(project, rows=2000)
+    before = _node_ids(legacy)
+    outcomes: list[object] = []
+    barrier = threading.Barrier(4)
+
+    def touch() -> None:
+        barrier.wait()
+        try:
+            outcomes.append(paths.migrate_legacy_graph(project))
+        except BaseException as exc:  # noqa: BLE001
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=touch) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert [o for o in outcomes if isinstance(o, BaseException)] == []
+    assert sum(1 for o in outcomes if o is not None) == 1
+    assert _node_ids(paths.graph_db_path(project)) == before
+    assert not legacy.exists()
+    assert list(paths.graph_dir(project).glob("*.migrating*")) == []
+
+
+def test_concurrent_migrations_in_processes_install_one_verified_copy(tmp_path, isolated_rce_home):
+    """The cross-process case the review reproduced (RCE.app's `rce serve`
+    and an MCP client's `rce mcp`, or two CLI commands): the `flock` makes
+    them take turns, so one migrates and the others find the work done."""
+    import multiprocessing
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = _mk_legacy_graph(project, rows=3000)
+    before = _node_ids(legacy)
+    ctx = multiprocessing.get_context("spawn")
+    outs = [tmp_path / f"out{i}.txt" for i in range(3)]
+    procs = [
+        ctx.Process(target=_migrate_in_subprocess, args=(str(project), str(isolated_rce_home), str(o)))
+        for o in outs
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+
+    results = sorted(o.read_text(encoding="utf-8") for o in outs)
+    assert results == ["migrated", "none", "none"], results
+    assert _node_ids(paths.graph_db_path(project)) == before
+    assert not legacy.exists()
+    assert list(paths.graph_dir(project).glob("*.migrating*")) == []
+
+
+def test_migration_wraps_a_failed_rename_as_a_migration_error(tmp_path, monkeypatch):
+    """`os.replace` failing must not escape as a raw OSError: callers turn
+    only `GraphMigrationError` into their user-facing error, and the legacy
+    graph must still be there."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = _mk_legacy_graph(project)
+
+    def boom(src, dst):
+        raise FileNotFoundError(src)
+
+    monkeypatch.setattr(paths.os, "replace", boom)
+    with pytest.raises(paths.GraphMigrationError) as excinfo:
+        paths.migrate_legacy_graph(project)
+    assert "Nothing was deleted" in str(excinfo.value)
+    assert legacy.exists() and _node_ids(legacy)
+    assert list(paths.graph_dir(project).glob("*.migrating*")) == []
+
+
+def test_migration_refuses_a_dataless_legacy_graph_without_opening_it(tmp_path, monkeypatch):
+    """Section 8.10 rule 1 applies to the migration too: the legacy graph is
+    the file that lives in the iCloud-synced project. A dataless one must be
+    refused before any `sqlite3.connect`, its download requested in the
+    background, and nothing moved."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = _mk_legacy_graph(project)
+    requested: list[Path] = []
+    monkeypatch.setattr(paths, "is_dataless", lambda p: Path(p) == legacy)
+    monkeypatch.setattr(paths, "_request_download", requested.append)
+
+    def must_not_open(src, dst):
+        raise AssertionError("the dataless legacy graph was opened")
+
+    monkeypatch.setattr(paths, "_backup_database", must_not_open)
+    with pytest.raises(paths.LegacyGraphDatalessError) as excinfo:
+        paths.migrate_legacy_graph(project)
+    assert isinstance(excinfo.value, paths.GraphMigrationError)  # every caller still handles it
+    assert requested == [legacy]
+    assert legacy.exists()
+    assert not paths.graph_db_path(project).exists()
+
+
+def test_migration_refuses_when_only_the_wal_is_dataless(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    legacy = _mk_legacy_graph(project)
+    wal = legacy.with_name(legacy.name + "-wal")
+    monkeypatch.setattr(paths, "is_dataless", lambda p: Path(p) == wal)
+    monkeypatch.setattr(paths, "_request_download", lambda p: None)
+    with pytest.raises(paths.LegacyGraphDatalessError):
+        paths.migrate_legacy_graph(project)
+    assert legacy.exists()
+
+
+def test_request_download_materializes_in_the_background_once(tmp_path):
+    """The download request never blocks the caller and is not repeated
+    for a file whose request is still in flight."""
+    target = tmp_path / "evicted.db"
+    target.write_bytes(b"x")
+    paths._request_download(target)
+    for _ in range(200):
+        if str(target) not in paths._DOWNLOADS_REQUESTED:
+            break
+        import time
+
+        time.sleep(0.01)
+    assert str(target) not in paths._DOWNLOADS_REQUESTED
+
+
+def test_migration_log_line_is_visible_without_verbose(tmp_path, caplog):
+    """Section 8.10's "one log line": at WARNING, the lowest level an
+    unconfigured `rce` (no `-v`) prints, so the move is never silent."""
+    import logging
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    _mk_legacy_graph(project)
+    with caplog.at_level(logging.WARNING, logger="rce.paths"):
+        paths.migrate_legacy_graph(project)
+    moved = [r for r in caplog.records if "moved this project's graph" in r.getMessage()]
+    assert len(moved) == 1 and moved[0].levelno == logging.WARNING
+
+
+@pytest.mark.skipif(os.uname().sysname != "Darwin", reason="APFS case/normalization folding is macOS-only")
+def test_graph_id_is_shared_by_case_and_normalization_spellings_on_macos(tmp_path):
+    """Two spellings of one directory on the case- and normalization-
+    insensitive APFS volume are one project and must share one graph --
+    otherwise a migration under one spelling strands the graph for the
+    other, which is then told to `rce init` a second, empty one."""
+    import unicodedata
+
+    project = tmp_path / "CaseProj"
+    project.mkdir()
+    if not (tmp_path / "caseproj").exists():
+        pytest.skip("this volume is case-sensitive")
+    assert paths.project_graph_id(tmp_path / "caseproj") == paths.project_graph_id(project)
+    assert paths.project_graph_id(tmp_path / "CASEPROJ" / "..") == paths.project_graph_id(tmp_path)
+
+    nfc = unicodedata.normalize("NFC", "é默认安全锚")
+    nfd = unicodedata.normalize("NFD", "é默认安全锚")
+    (tmp_path / nfc).mkdir()
+    assert paths.project_graph_id(tmp_path / nfd) == paths.project_graph_id(tmp_path / nfc)
+
+
+def test_graph_id_of_a_not_yet_existing_path_is_still_stable(tmp_path):
+    """The canonicalization falls back to `resolve()` when the directory
+    cannot be opened, so asking about a path that does not exist yet still
+    gives one id."""
+    ghost = tmp_path / "not-yet"
+    assert paths.project_graph_id(ghost) == paths.project_graph_id(str(ghost) + "/")

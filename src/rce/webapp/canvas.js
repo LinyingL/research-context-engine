@@ -121,13 +121,14 @@ window.RCECanvas = (function () {
   const SOCKET_HIT_PX = 12;
   const NOTICE_MS = 5000;     // a refusal or a done-notice fades on its own
   const UNDO_MS = 10000;      // 「撤销」 stays offered this long
+  const SCOPE_ALL = "all";    // rce.webapp.canvas.SCOPE_ALL
 
-  const STORAGE_SCOPE_PREFIX = "rce.canvas.scope:";
 
   // -- State --------------------------------------------------------------------
   // positions: saved positions (server canvas.json ∪ this page's unsaved
-  // moves) -- the ones that always win. auto: the 8.4 layout for every
-  // visible card, used only where no saved position exists. pending: what
+  // moves) -- the ones that always win. auto: the 8.4 layout of the WHOLE
+  // graph (so a card sits in the same place in every scope, 8.7), used
+  // only where no saved position exists. pending: what
   // the next debounced POST will send (null = forget that saved position).
   const cv = {
     dom: null, container: null, data: null, scope: null,
@@ -164,23 +165,6 @@ window.RCECanvas = (function () {
   function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
   function errText(err) { return err instanceof Error ? err.message : String(err); }
-
-  function storageGet(key) {
-    try { return window.localStorage.getItem(key); } catch (e) { return null; }
-  }
-
-  function storageSet(key, value) {
-    try {
-      if (value === null) window.localStorage.removeItem(key);
-      else window.localStorage.setItem(key, value);
-    } catch (e) { /* private window / blocked storage: a convenience, not state */ }
-  }
-
-  // The scope is remembered per project (attempt ids are only meaningful
-  // within one), keyed by the served root app.html's loadProjects() saw.
-  function scopeKey() {
-    return STORAGE_SCOPE_PREFIX + ((typeof state !== "undefined" && state.projectPath) || "");
-  }
 
   // The numeric step prefix of a path's basename ("16-构建指标.py" -> 16),
   // the tie-break that keeps step order (8.4 step 2).
@@ -369,8 +353,16 @@ window.RCECanvas = (function () {
   // 读取, script -> dataset/figure for 写出/生成): a card nothing flows into
   // is layer 0, anything else is 1 + the max layer of what flows into it --
   // exactly 8.4's three rules in one. A cycle is broken at the edge that
-  // closes it (found by a deterministic DFS in step order) and that edge is
-  // reported back so it can be drawn dashed in clay.
+  // closes it and that edge is reported back so it can be drawn dashed in
+  // clay. "The edge that closes it" is decided in two passes (adversarial
+  // review of the V4 work): machine links first, by a deterministic DFS in
+  // step order (the only order a machine extraction has); then the human
+  // mappings in the order they were asserted (`entry`, their position in
+  // .rce/mappings.toml -- new entries are appended), each one that would
+  // close a loop over what is already accepted being the closing edge.
+  // So when the researcher draws the link that makes a loop, THAT link is
+  // the one marked -- not an older machine edge the DFS happened to visit
+  // last.
 
   function flowGraph(nodes, links) {
     const ids = new Set(nodes.map((n) => n.id));
@@ -384,12 +376,19 @@ window.RCECanvas = (function () {
     return { outs, ins };
   }
 
+  // Assertion order of a human link: its entry index in the mappings file;
+  // an optimistic link (no entry yet) is the newest of all.
+  function assertionRank(l) {
+    return Number.isFinite(l.entry) ? l.entry : Infinity;
+  }
+
   function findCycleLinks(order, graph, byId) {
     const cycle = new Set();
     const color = new Map(); // 1 = on the DFS stack, 2 = done
     function visit(id) {
       color.set(id, 1);
-      const next = graph.outs.get(id).slice().sort((a, b) => compareByStep(byId.get(a.to), byId.get(b.to)));
+      const next = graph.outs.get(id).filter((l) => !l.human)
+        .sort((a, b) => compareByStep(byId.get(a.to), byId.get(b.to)));
       for (const l of next) {
         const c = color.get(l.to) || 0;
         if (c === 1) cycle.add(l.id);
@@ -398,6 +397,33 @@ window.RCECanvas = (function () {
       color.set(id, 2);
     }
     order.forEach((n) => { if (!color.get(n.id)) visit(n.id); });
+
+    // Accepted (acyclic so far) adjacency: machine links minus their own
+    // closing edges, then each human link in assertion order.
+    const accepted = new Map();
+    order.forEach((n) => accepted.set(n.id, []));
+    const human = [];
+    graph.outs.forEach((links) => links.forEach((l) => {
+      if (l.human) human.push(l);
+      else if (!cycle.has(l.id)) accepted.get(l.from).push(l.to);
+    }));
+    function reaches(from, to) {
+      const seen = new Set([from]);
+      const stack = [from];
+      while (stack.length) {
+        const id = stack.pop();
+        if (id === to) return true;
+        for (const next of accepted.get(id)) {
+          if (!seen.has(next)) { seen.add(next); stack.push(next); }
+        }
+      }
+      return false;
+    }
+    human.sort((a, b) => assertionRank(a) - assertionRank(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    human.forEach((l) => {
+      if (reaches(l.to, l.from)) cycle.add(l.id);
+      else accepted.get(l.from).push(l.to);
+    });
     return cycle;
   }
 
@@ -666,10 +692,13 @@ window.RCECanvas = (function () {
     g.setAttribute("transform", `translate(${x},${y})`);
   }
 
+  // A cycle-closing link KEEPS its human/machine class and only adds
+  // "cycle" (dashed): a human mapping on a loop must still be a human link
+  // at a glance -- thick clay, midpoint dot -- never a copy of the machine
+  // style (8.2's one rule that may not bend; adversarial review of V4).
   function linkClass(link) {
-    const cls = ["cv-link"];
+    const cls = ["cv-link", link.human ? "human" : "machine"];
     if (cv.cycle.has(link.id)) cls.push("cycle");
-    else cls.push(link.human ? "human" : "machine");
     if (!link.human && link.status === "pending") cls.push("pending");
     if (link.optimistic) cls.push("optimistic");
     return cls.join(" ");
@@ -682,7 +711,7 @@ window.RCECanvas = (function () {
     const d = linkPathD(ends);
     g.appendChild(svgEl("path", { d }, linkClass(link)));
     g.appendChild(svgEl("path", { d }, "cv-link-hit"));
-    if (link.human && !cv.cycle.has(link.id)) {
+    if (link.human) {
       const m = linkMidpoint(ends);
       g.appendChild(svgEl("circle", { cx: m.x, cy: m.y, r: 3 }, "cv-link-dot"));
     }
@@ -765,7 +794,7 @@ window.RCECanvas = (function () {
     const empty = !(cv.data.nodes || []).length;
     cv.dom.empty.classList.toggle("hidden", !empty);
     if (empty) {
-      cv.dom.empty.textContent = cv.scope === "all"
+      cv.dom.empty.textContent = cv.scope === SCOPE_ALL
         ? "图谱里还没有数据集、脚本或图表。运行 rce ingest 之后，这里会画出它们。"
         : "这个尝试还没有可画的文件。可以在上方把范围切换到「全部」。";
     }
@@ -794,7 +823,7 @@ window.RCECanvas = (function () {
     const sel = cv.dom.scope;
     sel.innerHTML = "";
     const all = document.createElement("option");
-    all.value = "all";
+    all.value = SCOPE_ALL;
     all.textContent = "全部";
     sel.appendChild(all);
     (cv.data.scopes || []).forEach((s) => {
@@ -1284,7 +1313,17 @@ window.RCECanvas = (function () {
       return;
     }
     if (res && res.ingest_error) {
-      showStatus("已写入映射文件，但图谱没能更新（悬停查看原因）", res.ingest_error, { kind: "write" });
+      // The FILE holds the entry (the truth, 8.5); only the graph lags. The
+      // server leaves the change visible to the watcher, whose next poll
+      // re-runs the mappings ingest -- so the link stays drawn (optimistic,
+      // marked as waiting) until mergeOptimistic swaps in the real one,
+      // instead of vanishing and inviting a redraw that 「这条映射已存在」
+      // would refuse. One message for the one cause: this chip, not also
+      // the header's 重扫失败 (adversarial review of the V4 work).
+      link.syncing = true;
+      showStatus("已写入映射文件，图谱稍后自动同步（悬停查看原因）", res.ingest_error, { kind: "write" });
+      rerenderLinks();
+      return;
     }
     await refresh();
     dropOptimistic(key); // reconciled by now; never let it outlive its write
@@ -1355,7 +1394,7 @@ window.RCECanvas = (function () {
     card.classList.toggle("human", !!link.human);
     card.appendChild(htmlEl("div", "cv-linkcard-assert", linkAssertion(link)));
     card.appendChild(htmlEl("div", "cv-linkcard-hint", linkTipText(link)));
-    if (link.optimistic) card.appendChild(htmlEl("div", "cv-linkcard-hint", "正在写入…"));
+    if (link.optimistic) card.appendChild(htmlEl("div", "cv-linkcard-hint", link.syncing ? "已写入映射文件，等待图谱同步…" : "正在写入…"));
     const actions = linkActions(link);
     if (actions.length) {
       const row = htmlEl("div", "cv-linkcard-actions");
@@ -1431,7 +1470,7 @@ window.RCECanvas = (function () {
     }
     selectLink(null);
     if (res && res.ingest_error) {
-      showStatus("已从映射文件删去，但图谱没能更新（悬停查看原因）", res.ingest_error, { kind: "write" });
+      showStatus("已从映射文件删去，图谱稍后自动同步（悬停查看原因）", res.ingest_error, { kind: "write" });
     }
     await refresh();
   }
@@ -1748,27 +1787,43 @@ window.RCECanvas = (function () {
     return "/api/canvas" + (scope ? "?scope=" + encodeURIComponent(scope) : "");
   }
 
-  // A remembered scope that no longer exists (the row was deleted from
-  // the map, or the remembered one belongs to another project) falls back
-  // to the server's default scope rather than to an error box.
+  // The scope is NOT remembered across page loads: 8.7 says the selector
+  // "defaults to the current attempt", and a scope restored from
+  // browser storage replaced that default for good -- pick 全部 once and every
+  // later launch opened on the whole-graph hairball 8.7 exists to avoid,
+  // and kept opening on an old attempt after a new row was marked ✅
+  // (adversarial review of the V4 work). A first load therefore asks the
+  // server for its default; within one page the chosen scope survives
+  // re-fetches (cv.scope). A chosen scope that no longer exists (the row
+  // was deleted from the map) falls back to the default, not to an error.
+  //
+  // 8.7 also says "positions are global (a node keeps its place across
+  // scopes)". A card without a saved position is placed by the 8.4 layout,
+  // so that layout is computed over the WHOLE graph, never the scope's
+  // slice -- otherwise every scope switch re-shuffled every card the
+  // researcher had not dragged (same review). Hence the second request
+  // for scope "all" whenever the view is narrower; `whole` is what the
+  // layout (and the cycle marking, a property of the graph) is run on.
   async function fetchCanvas() {
-    const scope = cv.scope || storageGet(scopeKey());
+    const scope = cv.scope;
+    let payload;
     try {
-      return await apiGet(canvasUrl(scope));
+      payload = await apiGet(canvasUrl(scope));
     } catch (err) {
       if (!scope || (typeof projectStateOf === "function" && projectStateOf(err))) throw err;
-      storageSet(scopeKey(), null);
       cv.scope = null;
-      return await apiGet(canvasUrl(null));
+      payload = await apiGet(canvasUrl(null));
     }
+    const whole = payload.scope.id === SCOPE_ALL ? payload : await apiGet(canvasUrl(SCOPE_ALL));
+    return { payload, whole };
   }
 
-  function applyPayload(payload, opts) {
+  function applyPayload(fetched, opts) {
+    const payload = fetched.payload, whole = fetched.whole;
     const first = !cv.data;
     cv.data = payload;
     mergeOptimistic(payload);
     cv.scope = payload.scope.id;
-    storageSet(scopeKey(), cv.scope);
     cv.nodes = new Map(payload.nodes.map((n) => [n.id, n]));
     // Saved positions win over the layout (8.4); this page's own unsaved
     // moves win over what the server last stored.
@@ -1777,7 +1832,8 @@ window.RCECanvas = (function () {
       if (p === null) delete cv.positions[id];
       else cv.positions[id] = p;
     });
-    const layout = computeLayout(payload.nodes, payload.links, payload.frames);
+    const layoutLinks = whole === payload ? payload.links : whole.links.concat([...cv.optimistic.values()]);
+    const layout = computeLayout(whole.nodes, layoutLinks, whole.frames);
     cv.auto = layout.positions;
     cv.cycle = layout.cycle;
     if (cv.selected && !cv.nodes.has(cv.selected)) cv.selected = null;
@@ -1800,9 +1856,9 @@ window.RCECanvas = (function () {
     opts = opts || {};
     const seq = ++cv.loadSeq;
     ensureDom(container);
-    let payload;
+    let fetched;
     try {
-      payload = await fetchCanvas();
+      fetched = await fetchCanvas();
     } catch (err) {
       if (seq !== cv.loadSeq) return;
       cv.dom = null;
@@ -1814,12 +1870,11 @@ window.RCECanvas = (function () {
     if (typeof clearProjectState === "function") clearProjectState();
     ensureDom(container);
     container.dataset.loaded = "1";
-    applyPayload(payload, opts);
+    applyPayload(fetched, opts);
   }
 
   function changeScope(scope) {
     cv.scope = scope;
-    storageSet(scopeKey(), scope);
     if (cv.container) load(cv.container, { fit: true });
   }
 

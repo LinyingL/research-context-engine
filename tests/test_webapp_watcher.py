@@ -778,3 +778,75 @@ def test_bump_generation_touches_neither_baseline_nor_error(tmp_path):
     assert w.status_payload()["last_error"] == error
     assert w.poll_once() is True
     assert _attempt_numbers(tmp_path) == ["1", "2"]
+
+
+# -- first-sight mappings sync (adversarial review of the V4 work) --------------
+
+
+def _ingest_mappings_now(project_root: Path) -> None:
+    conn = db.connect(paths.graph_db_path(project_root))
+    try:
+        from rce.ingest import mappings as mappings_ingest
+
+        mappings_ingest.ingest_mappings(conn, project_root)
+    finally:
+        conn.close()
+
+
+def test_first_poll_syncs_mappings_edited_while_the_app_was_closed(tmp_path):
+    """The mappings file is the only truth for hand-drawn links and `rce
+    ingest` does not read it: an entry removed (or added) while nothing was
+    running must reach the graph on the first poll, not wait for the file
+    to be touched again."""
+    _init_project(tmp_path)
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    _ingest_mappings_now(tmp_path)  # the graph as the last session left it
+    # ... then, app closed, the researcher swaps the entry by hand / git pull
+    (tmp_path / ".rce" / "mappings.toml").write_text(
+        '[[mapping]]\nfrom = "b.py"\nto = "g.png"\ntype = "generates"\n'
+    )
+    w = _mk_watcher(tmp_path)
+
+    assert w.poll_once() is True
+    assert [(e["src"], e["dst"]) for e in _mapping_edges(tmp_path)] == [("script:b.py", "figure:g.png")]
+    assert w.status_payload() == {"generation": 2, "refreshing": False, "last_error": None}
+    assert w.poll_once() is False  # synced once; later polls are ordinary
+
+
+def test_first_poll_sync_of_an_up_to_date_graph_costs_no_generation(tmp_path):
+    _init_project(tmp_path)
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    _ingest_mappings_now(tmp_path)
+    w = _mk_watcher(tmp_path)
+    assert w.poll_once() is False
+    assert w.status_payload()["generation"] == 1
+
+
+def test_first_poll_sync_failure_is_contained_and_retried(tmp_path):
+    _init_project(tmp_path)
+    (tmp_path / ".rce" / "mappings.toml").write_text("[[mapping]\nfrom = ")
+    w = _mk_watcher(tmp_path)
+    assert w.poll_once() is False
+    status = w.status_payload()
+    assert "not valid TOML" in (status["last_error"] or "") and status["generation"] == 2
+    w.poll_once()
+    assert w.status_payload()["generation"] == 2  # a still-failing retry bumps nothing more
+
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    assert w.poll_once() is True
+    assert w.status_payload()["last_error"] is None
+    assert len(_mapping_edges(tmp_path)) == 1
+
+
+def test_switching_back_resyncs_the_mappings_of_the_new_root(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    for root in (a, b):
+        _init_project(root)
+    root = {"now": a}
+    w = watcher.ProjectWatcher(lambda: root["now"], interval=0.01)
+    w.poll_once()
+    root["now"] = b
+    w.retarget()
+    (b / ".rce" / "mappings.toml").write_text(_MAPPING)
+    w.poll_once()
+    assert len(_mapping_edges(b)) == 1

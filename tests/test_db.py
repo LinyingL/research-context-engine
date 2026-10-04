@@ -943,6 +943,44 @@ def test_set_edge_status_lets_human_move_between_any_status(conn):
         assert edge["status"] == status
 
 
+def _reject_restore_fixture(conn, status: str) -> tuple[str, str, str, str]:
+    db.upsert_node(conn, "script:s.py", "script")
+    db.upsert_node(conn, "dataset:d.csv", "dataset")
+    db.upsert_edge(conn, "script:s.py", "dataset:d.csv", "writes", "dataflow", {"line": 3}, 1.0)
+    if status != "auto":
+        db.set_edge_status(conn, "script:s.py", "dataset:d.csv", "writes", "dataflow", status)
+    return ("script:s.py", "dataset:d.csv", "writes", "dataflow")
+
+
+@pytest.mark.parametrize("prior", ["auto", "pending", "confirmed"])
+def test_reject_then_restore_returns_the_exact_prior_status(conn, prior):
+    """The canvas's 标记为错误提取 + 撤销 (adversarial review of the V4
+    work): a confirmed link must come back confirmed, not "auto"."""
+    key = _reject_restore_fixture(conn, prior)
+    assert db.reject_edge_remembering(conn, *key) == "rejected"
+    assert db.reject_edge_remembering(conn, *key) == "rejected"  # idempotent, memory kept
+    assert db.restore_rejected_edge(conn, *key) == prior
+    edge = db.query_edges(conn, src=key[0], dst=key[1], type=key[2])[0]
+    assert edge["status"] == prior
+    assert db.STATUS_BEFORE_REJECT_KEY not in edge["evidence"]
+    assert edge["evidence"]["occurrences"] == [{"line": 3}]
+
+
+def test_restore_without_memory_falls_back_to_auto_and_refuses_live_edges(conn):
+    key = _reject_restore_fixture(conn, "auto")
+    assert db.restore_rejected_edge(conn, *key) is None  # not rejected: nothing to restore
+    db.set_edge_status(conn, *key, "rejected")  # `rce reject` keeps no memory
+    assert db.restore_rejected_edge(conn, *key) == "auto"
+    assert db.reject_edge_remembering(conn, "script:s.py", "dataset:nope.csv", "writes", "dataflow") is None
+
+
+def test_reject_memory_survives_a_machine_reingest(conn):
+    key = _reject_restore_fixture(conn, "confirmed")
+    db.reject_edge_remembering(conn, *key)
+    db.upsert_edge(conn, "script:s.py", "dataset:d.csv", "writes", "dataflow", {"line": 4}, 1.0)
+    assert db.restore_rejected_edge(conn, *key) == "confirmed"
+
+
 def test_set_edge_status_rejects_illegal_status(conn):
     db.upsert_node(conn, "claim:paper.tex#xyz", "claim")
     db.upsert_node(conn, "experiment:run9", "experiment")

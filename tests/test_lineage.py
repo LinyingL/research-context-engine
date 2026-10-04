@@ -187,3 +187,50 @@ def test_scanned_counts_reflect_scripts_and_edges(conn, tmp_path):
     assert report["scanned"] == {
         "scripts": 2, "reads_edges": 1, "writes_edges": 2, "targets": 2,
     }
+
+
+# ---------------------------------------------------------------------------
+# Agreement with the canvas (adversarial review of the V4 work)
+# ---------------------------------------------------------------------------
+
+
+def test_a_rejected_writer_is_not_a_writer(conn, tmp_path):
+    """标记为错误提取 on the only writer makes the dataset an orphan input
+    here exactly as the canvas's clay dot says -- the two surfaces share
+    one definition (DESIGN.md section 8.2)."""
+    target = _add(conn, "s16.py", "data/monthly.csv", "dataset", "writes", 3, "to_csv")
+    _add(conn, "s17.R", "data/monthly.csv", "dataset", "reads", 5, "read.csv")
+    db.set_edge_status(conn, "script:s16.py", target, "writes", "dataflow", "rejected")
+    report = lineage.build_lineage_report(conn, tmp_path)
+    assert [o["path"] for o in report["orphans"]] == ["data/monthly.csv"]
+    assert report["chains"] == []
+    assert report["scanned"]["writes_edges"] == 0
+
+
+def test_a_rejected_edge_is_not_a_broken_link(conn, tmp_path):
+    target = _add(conn, "s.py", "gone.csv", "dataset", "reads", 1, "open", missing=True)
+    db.set_edge_status(conn, "script:s.py", target, "reads", "dataflow", "rejected")
+    assert lineage.build_lineage_report(conn, tmp_path)["broken_links"] == []
+
+
+def test_a_human_mapping_names_its_script_not_the_mappings_file(conn, tmp_path):
+    """A mapping edge's evidence points at `.rce/mappings.toml`; the report
+    must name the script the researcher linked, flagged as human."""
+    _add(conn, "s16.py", "data/raw.csv", "dataset", "reads", 2, "read_csv")
+    db.upsert_node(conn, "script:s17.Rmd", "script", title="s17.Rmd")
+    db.upsert_edge(
+        conn, "script:s17.Rmd", "dataset:data/raw.csv", "writes", "mapping",
+        evidence={"file": ".rce/mappings.toml", "source": "human"}, confidence=1.0,
+        status="auto", human_source=True,
+    )
+    report = lineage.build_lineage_report(conn, tmp_path)
+    chain = next(c for c in report["chains"] if c["path"] == "data/raw.csv")
+    assert chain["writers"] == [{"script": "s17.Rmd", "line": None, "callee": None, "human": True}]
+    assert report["orphans"] == []
+
+
+def test_cli_prints_a_human_writer_without_a_fake_line_number():
+    from rce import cli
+
+    text = cli._format_lineage_entry({"script": "s17.Rmd", "line": None, "callee": None, "human": True})
+    assert text == "s17.Rmd (human mapping, .rce/mappings.toml)"

@@ -836,6 +836,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
 
 
 def _format_lineage_entry(entry: dict[str, Any]) -> str:
+    if entry.get("human"):
+        # A human mapping (rce.lineage): no call site to cite, and the
+        # assertion's source is the mappings file the researcher wrote.
+        return f"{entry['script']} (human mapping, .rce/mappings.toml)"
     return f"{entry['script']}:{entry['line']} ({entry['callee']})"
 
 

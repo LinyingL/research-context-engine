@@ -27,8 +27,15 @@
 //   at once if the child exits, the placeholder shows the log's tail AS
 //   TEXT: every character is HTML-escaped, so a log line can never become
 //   markup. On quit, and only if THIS app spawned the engine and it is
-//   still running, POST /api/shutdown and wait for it to exit (terminate
-//   it after a grace period). SIGTERM/SIGINT take the same quit path.
+//   still running, POST /api/shutdown with body {"pid": <child's pid>} and
+//   wait for it to exit (terminate it after a grace period). The pid is
+//   what keeps a terminal-started engine safe: the child may still be
+//   alive WITHOUT having bound the port (blocked in a slow first-touch
+//   migration) while an engine the researcher started by hand holds it --
+//   the server answers 409 to a pid that is not its own and keeps
+//   serving, and our own child is then stopped by signal alone (8.9: an
+//   engine the user started is left alone). SIGTERM/SIGINT take the same
+//   quit path.
 // - Bridge, native -> page: every menu command runs the fixed string
 //   `window.RCE && RCE.command('<name>')`, the name taken from the
 //   compiled-in whitelist `shellCommands` below and checked again right
@@ -363,7 +370,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
         var request = URLRequest(url: baseURL.appendingPathComponent("api/shutdown"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data("{}".utf8)
+        // Only the engine whose pid this is may act on it (header comment).
+        request.httpBody = Data("{\"pid\": \(process.processIdentifier)}".utf8)
         session.dataTask(with: request) { _, _, _ in }.resume()
 
         let deadline = Date().addingTimeInterval(3)

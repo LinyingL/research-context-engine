@@ -97,6 +97,19 @@ fresh state -- the switch's own generation bump already told the frontend
 to re-fetch, and the next poll re-baselines against the new root without
 ingesting (switching projects is not evidence anything in the new project
 changed).
+
+One exception to "serving is not evidence anything changed": the mappings
+file. `.rce/mappings.toml` is the ONLY truth for hand-drawn links, `rce
+ingest` does not read it, and nothing else ingests it while the app is
+closed -- so an edit made then (by hand, by `git pull`, by another
+checkout) would otherwise stay invisible until the file happened to be
+touched again: removed entries still drawn as human links (whose
+「删除标注」 then 404s, because the file no longer has them), new entries
+never drawn (adversarial review of the V4 work). So the first poll that
+sees a root also runs the mappings ingest once (`_sync_mappings_on_first_
+sight`) -- cheap, idempotent, and a no-op for the generation when the
+graph already matched. A failure there is contained like any other, shown
+as `last_error`, and retried on the next poll until it lands.
 """
 
 from __future__ import annotations
@@ -282,6 +295,12 @@ class ProjectWatcher:
         # once instead of once per poll, while still firing again for a
         # different project whose graph is also gone.
         self._graph_missing_root: Path | None = None
+        # The root whose mappings file has been ingested since this watcher
+        # first saw it (module docstring, the mappings exception), and
+        # whether the last such attempt failed (so its error is logged once
+        # and cleared by the attempt that finally lands).
+        self._mappings_synced_root: Path | None = None
+        self._mappings_sync_failed = False
         self._epoch = 0  # bumped by retarget(); lets a mid-ingest poll notice a switch
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -381,6 +400,9 @@ class ProjectWatcher:
             # clear it, so a new project whose graph is also gone gets its
             # own (single) log line rather than being silenced by the old.
             self._graph_missing_root = None
+            # The new root's mappings file has not been synced by us yet.
+            self._mappings_synced_root = None
+            self._mappings_sync_failed = False
             self._generation += 1
 
     # -- the poll cycle --------------------------------------------------------
@@ -403,13 +425,17 @@ class ProjectWatcher:
             self._note_graph_missing(root)
             return False
         self._note_graph_present()
+        # Snapshot BEFORE the first-sight sync reads the mappings file: an
+        # edit landing between the two is then a visible difference for the
+        # next poll (one redundant idempotent ingest), never absorbed unseen.
         snapshot = take_snapshot(root)
+        synced = self._sync_mappings_on_first_sight(root)
         with self._state_lock:
             epoch = self._epoch
             baseline, baseline_root = self._baseline, self._baseline_root
             if baseline is None or baseline_root != root:
                 self._baseline, self._baseline_root = snapshot, root
-                return False
+                return synced
             if snapshot.files == baseline.files:
                 return False
             self._refreshing = True
@@ -445,6 +471,62 @@ class ProjectWatcher:
             self._last_error = error
             self._generation += 1
         return True
+
+    def _sync_mappings_on_first_sight(self, root: Path) -> bool:
+        """Ingest `.rce/mappings.toml` once per root this watcher serves
+        (module docstring, the mappings exception), so edits made while
+        the app was closed reach the graph without the file having to be
+        touched again. Under the ingest lock like every other ingest;
+        bumps the generation only when the graph actually changed (an
+        entry added, confirmed or removed), so serving an up-to-date
+        project still costs open pages nothing. Returns whether it changed
+        the graph.
+
+        Failure is contained exactly like a poll's: logged once, reported
+        as `last_error`, and retried on every later poll -- the root is
+        only marked synced once an ingest has landed, which then also
+        clears the error it had reported. A switch mid-sync (epoch moved)
+        discards the result for the old root."""
+        with self._state_lock:
+            if self._mappings_synced_root == root:
+                return False
+            epoch = self._epoch
+            already_failed = self._mappings_sync_failed
+        try:
+            with self._ingest_lock:
+                conn = db.connect(paths.graph_db_path(root))
+                try:
+                    report = mappings_ingest.ingest_mappings(conn, root)
+                finally:
+                    conn.close()
+        except Exception as exc:  # noqa: BLE001 -- containment, same as poll_once's
+            if not already_failed:
+                logger.exception("startup sync of %s for %s failed -- retrying each poll",
+                                 mappings_ingest.MAPPINGS_RELATIVE_PATH, root)
+            with self._state_lock:
+                if self._epoch == epoch:
+                    if not self._mappings_sync_failed:
+                        self._generation += 1  # once: let open pages show the chip
+                    self._mappings_sync_failed = True
+                    self._last_error = str(exc)
+            return False
+        counts = report.counts
+        changed = any(
+            counts.get(key, 0) for key in ("nodes_created", "edges_confirmed", "edges_removed", "nodes_removed")
+        )
+        if changed:
+            logger.info("startup sync of mappings for %s: %s", root, counts)
+        with self._state_lock:
+            if self._epoch != epoch:
+                return False
+            self._mappings_synced_root = root
+            if self._mappings_sync_failed:
+                self._mappings_sync_failed = False
+                self._last_error = None
+                changed = True  # the error chip must clear on open pages
+            if changed:
+                self._generation += 1
+        return changed
 
     def _note_graph_missing(self, root: Path) -> None:
         """First poll to find `root`'s graph gone: one log line (a warning,

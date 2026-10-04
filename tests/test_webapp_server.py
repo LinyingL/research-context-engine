@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
 import threading
 import urllib.error
@@ -1420,6 +1421,38 @@ def test_http_shutdown_actually_stops_serve_forever(tmp_path):
         thread.join(timeout=5)
 
 
+def test_http_shutdown_with_another_pid_keeps_serving(live_server):
+    """RCE.app's quit names its own child's pid (adversarial review of the
+    V4 work): an engine the researcher started from a terminal, which is
+    what may actually hold the port, must answer 409 and keep serving
+    (DESIGN.md 8.9: "left alone")."""
+    base_url, _ = live_server
+    status, payload = _post(base_url, "/api/shutdown", {"pid": os.getpid() + 1})
+    assert status == 409 and "not shutting down" in payload["error"]
+    assert _get(base_url, "/api/projects")[0] == 200
+    assert _post(base_url, "/api/shutdown", {"pid": "1"})[0] == 400
+    assert _post(base_url, "/api/shutdown", {"pid": True})[0] == 400
+    assert _get(base_url, "/api/projects")[0] == 200
+
+
+def test_http_shutdown_with_its_own_pid_stops(tmp_path):
+    project = tmp_path / "proj"
+    _init_project(project)
+    httpd = server.build_server(project, 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        status, payload = _post(base_url, "/api/shutdown", {"pid": os.getpid()})
+        assert status == 200 and payload == {"ok": True}
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
 def test_http_shutdown_get_is_rejected_and_server_keeps_serving(live_server):
     """POST-only: a plain GET of the path (e.g. a link, a prefetch) must
     never stop the server -- it falls through to the ordinary
@@ -1587,6 +1620,88 @@ def test_dataless_check_is_not_asked_of_a_graph_that_is_not_there(tmp_path, monk
 
     with pytest.raises(server.ProjectNotInitializedError):
         server._require_db(project)
+
+
+def _mk_legacy(project: Path) -> Path:
+    project.mkdir(parents=True, exist_ok=True)
+    legacy = paths.legacy_graph_db_path(project)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(legacy)
+    try:
+        db.migrate(conn)
+    finally:
+        conn.close()
+    return legacy
+
+
+def test_require_db_answers_downloading_for_a_dataless_legacy_graph(tmp_path, monkeypatch):
+    """Rule 1 covers the migration too (adversarial review of the V4 work):
+    the legacy graph is the file inside the iCloud-synced project, and the
+    migration's own `sqlite3.connect` on it was the blocking open the rule
+    forbids. It must become the same 503 header state, untouched."""
+    project = tmp_path / "proj"
+    legacy = _mk_legacy(project)
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: Path(path) == legacy)
+    monkeypatch.setattr(server.paths, "_request_download", lambda path: None)
+    monkeypatch.setattr(
+        server.paths, "_backup_database",
+        lambda src, dst: (_ for _ in ()).throw(AssertionError("opened a dataless file")),
+    )
+
+    with pytest.raises(server.GraphDownloadingError) as excinfo:
+        server._require_db(project)
+
+    assert excinfo.value.state == "graph_downloading"
+    assert legacy.exists() and not paths.graph_db_path(project).exists()
+
+
+def test_switch_to_a_project_with_a_dataless_legacy_graph_does_not_block(live_server, fake_home, tmp_path, monkeypatch):
+    """The switch succeeds at once (the project is real and registered);
+    its first read then reports 「图谱文件正在从云端下载…」 instead of the
+    handler thread hanging on the download."""
+    base_url, project = live_server
+    registry.register(project)
+    legacy = _mk_legacy(tmp_path / "legacy")
+    registry.register(tmp_path / "legacy")
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: Path(path) == legacy)
+    monkeypatch.setattr(server.paths, "_request_download", lambda path: None)
+
+    status, _ = _post(base_url, "/api/projects/switch", {"path": _registered_path("legacy")})
+    assert status == 200
+    status, payload = _get(base_url, "/api/summary")
+    assert status == 503 and payload["state"] == "graph_downloading"
+    assert legacy.exists()
+
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: False)  # the download landed
+    status, _ = _get(base_url, "/api/summary")
+    assert status == 200 and not legacy.exists()
+
+
+def test_serve_starts_even_while_the_graph_is_downloading(tmp_path, monkeypatch):
+    """A transient iCloud state must not become RCE.app's 「引擎没有在 10 秒内
+    启动」: `serve` reports it on stderr and serves anyway."""
+    project = tmp_path / "proj"
+    _init_project(project)
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+    started = []
+
+    class _Stub:
+        server_address = ("127.0.0.1", 1)
+
+        class watcher:  # noqa: N801 -- mimics the attribute
+            @staticmethod
+            def start():
+                started.append("watcher")
+
+        def serve_forever(self):
+            started.append("serving")
+
+        def server_close(self):
+            started.append("closed")
+
+    monkeypatch.setattr(server, "build_server", lambda root, port: _Stub())
+    server.serve(project, 0, open_browser=False)
+    assert started == ["watcher", "serving", "closed"]
 
 
 # -- rule 2: a vanished graph degrades, it does not deadlock ------------------

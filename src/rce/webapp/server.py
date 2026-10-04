@@ -107,11 +107,15 @@ Endpoints (all GET unless noted):
                             human-only path (8.3). A human mapping is
                             refused: deleting the entry is how it goes.
     POST /api/edges/restore -- same body: undo the above, `rejected` ->
-                            `auto` (see `edge_status_payload`).
+                            the status recorded at reject time (see
+                            `edge_status_payload`).
     POST /api/shutdown  -- respond `{"ok": true}`, then stop this server's
                             `serve_forever` loop from a separate thread
                             (task V3 phase 4) -- the app's 停止服务 button;
-                            see "Shutdown defense" below.
+                            see "Shutdown defense" below. Optional body
+                            `{"pid": int}`: 409 and keep serving unless it
+                            is this process (RCE.app's quit; see
+                            `_check_shutdown_target`).
     GET  /             -- the single-page app (task V2), served verbatim from
                             `src/rce/webapp/app.html`: inline CSS/JS, zero
                             external resources, zero build step -- it reads
@@ -290,6 +294,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -448,6 +453,14 @@ class EdgeStatusError(ApiError):
     status = 409
 
 
+class NotThisEngineError(ApiError):
+    """`POST /api/shutdown` named a process id that is not this server's
+    (see `_check_shutdown_target`). 409: the request is well-formed, but
+    the engine listening on the port is not the one it meant to stop."""
+
+    status = 409
+
+
 class UnknownProjectError(ApiError):
     """`POST /api/projects/switch` asked for a path that is not a registry
     member -- 403, same as the traversal/origin rejections, because whatever
@@ -455,6 +468,30 @@ class UnknownProjectError(ApiError):
     registered (see module docstring's "Switch-target defense")."""
 
     status = 403
+
+
+def _check_shutdown_target(body: dict[str, Any]) -> None:
+    """`POST /api/shutdown`'s optional `{"pid": int}`: when present, stop
+    only if it is THIS process.
+
+    Why (adversarial review of the V4 work): RCE.app sends the shutdown on
+    quit whenever the engine it spawned is still running -- but that child
+    may never have bound the port (e.g. blocked in a slow first-touch
+    migration) while an engine the researcher started from a terminal
+    did, and DESIGN.md 8.9 says such an engine is left alone. The shell
+    now sends its child's pid, so the check happens here, atomically, in
+    the only process that knows the answer; a mismatch is a 409 and this
+    server keeps serving (the shell then stops its own child by signal).
+    No `pid` (the page's own 停止服务 button) keeps the original contract."""
+    if "pid" not in body:
+        return
+    pid = body["pid"]
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        raise MissingParamError("request body 'pid' must be an integer when present")
+    if pid != os.getpid():
+        raise NotThisEngineError(
+            f"this engine is process {os.getpid()}, not {pid} -- not shutting down"
+        )
 
 
 def _require_db(project_root: Path) -> Path:
@@ -473,6 +510,12 @@ def _require_db(project_root: Path) -> Path:
     """
     try:
         path = paths.resolve_graph_db(project_root)
+    except paths.LegacyGraphDatalessError as exc:
+        # The legacy in-project graph is the one most likely to be evicted
+        # (it lives in the synced folder); the migration refused to open it
+        # and asked for its download -- the same transient header state as
+        # an evicted external graph, never a hung thread or a 500.
+        raise GraphDownloadingError(str(exc)) from exc
     except paths.GraphMigrationError as exc:
         raise GraphMigrationError(str(exc)) from exc
     if not path.exists():
@@ -846,6 +889,14 @@ def switch_project_payload(requested: str) -> tuple[Path, dict[str, Any]]:
         # would otherwise find no graph at the new location while a
         # perfectly good legacy one sat unmigrated in the project.
         paths.migrate_legacy_graph(new_root)
+    except paths.LegacyGraphDatalessError:
+        # Section 8.10 rule 1: an evicted legacy graph is not opened here
+        # (that was a minute-long hang inside this handler thread). The
+        # switch itself still succeeds -- the project is real and
+        # registered -- and the new project's first read answers with the
+        # 「图谱文件正在从云端下载…」 header state, retrying the migration on
+        # every touch until the requested download has landed.
+        pass
     except paths.GraphMigrationError as exc:
         raise GraphMigrationError(str(exc)) from exc
     project_registry.register(new_root)  # most-recently-served bump
@@ -1035,7 +1086,25 @@ def _write_mapping(
     docstring, "Canvas write defense"): graph checked first; the file write
     and the mappings re-ingest under the watcher's ingest lock; the
     re-ingest's failure contained and reported, never hiding that the file
-    was written; only the mappings file re-baselined; generation bumped."""
+    was written; only the mappings file re-baselined; generation bumped.
+
+    When the re-ingest FAILED, the mappings file is deliberately not
+    absorbed into the watcher's baseline and the failure is not written
+    into the watcher's `last_error` (adversarial review of the V4 work):
+
+    - absorbing it made the watcher believe the change had been ingested,
+      so it never retried -- the file held the entry, the graph did not,
+      and redrawing the link was refused with 「这条映射已存在」. Left
+      un-absorbed, the change stays a visible difference and the next poll
+      re-runs the mappings ingest by itself;
+    - one cause deserves one message (section 8.10 rule 2's principle):
+      the response's `ingest_error` already becomes the canvas's chip, so
+      also setting `last_error` put the same failure on screen twice (the
+      header's 「重扫失败…」 as well). If the watcher's own retry fails too,
+      THAT is reported through `last_error`, as any poll failure is.
+
+    Nothing in the graph changed on that path, so no generation bump
+    either; the response carries the current one."""
     _require_db(project_root)
     with watcher.ingest_lock:
         try:
@@ -1048,8 +1117,10 @@ def _write_mapping(
         except Exception as exc:  # noqa: BLE001 -- containment, same as apply_edit's
             logger.exception("post-write mappings re-ingest of %s failed -- file written", project_root)
             ingest_error = str(exc)
+    if ingest_error is not None:
+        return result, ingest_error, int(watcher.status_payload()["generation"])  # type: ignore[call-overload]
     generation = watcher.record_external_change(
-        ingest_error, absorb={str(mappings_ingest.mappings_path(project_root))},
+        None, absorb={str(mappings_ingest.mappings_path(project_root))},
     )
     return result, ingest_error, generation
 
@@ -1110,9 +1181,12 @@ def edge_status_payload(conn: Connection, body: dict[str, Any], action: str) -> 
     edge exists, the answer is the same -- delete the entry), then a link
     that does not exist or is not one the canvas draws (404: the app can
     only change statuses it shows), then for restore a link that is not
-    rejected (409). Restore returns the link to `canvas.RESTORED_STATUS`
-    ("auto"), the status every extractor of a canvas edge type writes, so
-    the mis-click is undone exactly. Reject is idempotent."""
+    rejected (409). Reject records the link's current status beside its
+    evidence (`db.reject_edge_remembering`) and restore puts exactly that
+    status back (`db.restore_rejected_edge`), so the mis-click is undone
+    exactly -- including for a link the researcher had *confirmed*, which
+    the previous fixed "auto" silently demoted to a machine status. Reject
+    is idempotent."""
     src, dst, edge_type, extractor = _string_fields(body, ("src", "dst", "type", "extractor"))
     if extractor == mappings_ingest.EXTRACTOR:
         raise HumanLinkError(
@@ -1124,14 +1198,15 @@ def edge_status_payload(conn: Connection, body: dict[str, Any], action: str) -> 
         raise NotFoundError(f"no canvas link {src} --{edge_type}--> {dst} (extractor {extractor!r})")
     edge = matches[0]
     if action == "reject":
-        new_status = "rejected"
+        new_status = db.reject_edge_remembering(conn, src, dst, edge_type, extractor)
     else:
-        if edge["status"] != "rejected":
+        new_status = db.restore_rejected_edge(conn, src, dst, edge_type, extractor)
+        if new_status is None:
             raise EdgeStatusError(
                 f"link {src} --{edge_type}--> {dst} is {edge['status']!r}, not rejected -- nothing to restore"
             )
-        new_status = canvas.RESTORED_STATUS
-    db.set_edge_status(conn, src, dst, edge_type, extractor, new_status)
+    if new_status is None:  # the edge vanished between the query and the write
+        raise NotFoundError(f"no canvas link {src} --{edge_type}--> {dst} (extractor {extractor!r})")
     edge["status"] = new_status
     return {"ok": True, "link": canvas.link_entry(edge)}
 
@@ -1447,6 +1522,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # must never be awaited from a handler, and why socket/
                 # watcher cleanup deliberately stays in serve()'s own
                 # finally-block server_close.
+                _check_shutdown_target(self._read_json_object())
                 self._send_json(200, {"ok": True})
                 threading.Thread(
                     target=self.server.shutdown, name="rce-shutdown", daemon=True
@@ -1489,7 +1565,15 @@ def serve(project_root: Path, port: int, open_browser: bool = True) -> None:
     re-ingestion, so build_server callers that never serve (the test
     suite's routing fixtures) never pay for a background thread. The
     `finally` block's `server_close` stops it again."""
-    _require_db(project_root)
+    try:
+        _require_db(project_root)
+    except GraphDownloadingError as exc:
+        # Not fatal at startup (section 8.10 rule 1): the graph exists, it is
+        # just in iCloud right now and its download has been requested.
+        # Refusing to start would turn a transient state into RCE.app's
+        # 「引擎没有在 10 秒内启动」; serving lets the page show the honest
+        # header state and pick the graph up by itself once it is local.
+        print(f"RCE: {exc}", file=sys.stderr)
     httpd = build_server(project_root, port)
     bound_port = httpd.server_address[1]
     url = f"http://127.0.0.1:{bound_port}"

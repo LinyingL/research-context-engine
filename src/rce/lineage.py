@@ -27,6 +27,21 @@ raises:
    the same reason as orphans: "which of the 4 copies of theme_counts.csv did
    the script actually read" is a data-provenance question, not a figure one.
 
+Two kinds of edge are treated specially, so this report and the canvas
+(DESIGN.md section 8.2's clay orphan dot is "the lineage report's own
+definition") can never disagree about the same file:
+
+- an edge a human has `rejected` (`rce reject`, the canvas's 标记为错误提取)
+  is not a reader or writer at all -- the human said the extraction is
+  wrong, and the 血缘 tab listing it as "Written by" anyway while the canvas
+  showed the dataset as an orphan was exactly that disagreement
+  (adversarial review of the V4 work);
+- a human mapping (`.rce/mappings.toml`, extractor in
+  `db.HUMAN_EXTRACTORS`) names its script as the reader/writer, with no
+  line and `human: true` -- its evidence points at the mappings file, and
+  reporting `.rce/mappings.toml` as "the script that wrote this dataset"
+  was simply wrong.
+
 Never guesses which occurrence, script, or file is "the" answer -- every
 finding lists every matching occurrence/path it actually found, sorted for
 stable, diffable output, and an empty block is simply the true, honest
@@ -87,7 +102,24 @@ def _target_path_and_type(conn: Connection, target_id: str) -> tuple[str, str | 
     return path or target_id, None
 
 
-def _collect_by_target(edges: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _edge_occurrences(conn: Connection, edge: dict[str, Any]) -> list[dict[str, Any]]:
+    """One edge's occurrences as this report lists them. A human mapping's
+    evidence is `{file: .rce/mappings.toml, source: human}` -- naming the
+    mappings file, not a script -- so its single occurrence is rebuilt from
+    the edge's own script endpoint (`src`: every `reads`/`writes` edge is
+    stored `script --> target`), with no line and `human: True`."""
+    if edge["extractor"] in db.HUMAN_EXTRACTORS:
+        script_path, _ = _target_path_and_type(conn, edge["src"])
+        return [{"file": script_path, "line": None, "callee": None, "human": True}]
+    return _occurrences(edge["evidence"])
+
+
+def _live_edges(conn: Connection, edge_type: str) -> list[dict[str, Any]]:
+    """Every `edge_type` edge a human has not rejected (module docstring)."""
+    return [e for e in db.query_edges(conn, type=edge_type) if e["status"] != "rejected"]
+
+
+def _collect_by_target(conn: Connection, edges: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Every `(file, line, callee, ...)` occurrence across a list of edges,
     grouped by the edge's `dst` (the target node id) -- one edge per distinct
     script, so a target read/written by several scripts spans several edges
@@ -95,7 +127,7 @@ def _collect_by_target(edges: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     sites in that one script)."""
     by_target: dict[str, list[dict[str, Any]]] = {}
     for edge in edges:
-        by_target.setdefault(edge["dst"], []).extend(_occurrences(edge["evidence"]))
+        by_target.setdefault(edge["dst"], []).extend(_edge_occurrences(conn, edge))
     return by_target
 
 
@@ -104,7 +136,10 @@ def _sorted_occurrences(occurrences: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _reader_entry(occ: dict[str, Any]) -> dict[str, Any]:
-    return {"script": occ.get("file"), "line": occ.get("line"), "callee": occ.get("callee")}
+    entry = {"script": occ.get("file"), "line": occ.get("line"), "callee": occ.get("callee")}
+    if occ.get("human"):
+        entry["human"] = True  # a human mapping: no line, the researcher's own assertion
+    return entry
 
 
 def is_orphan_input(node_type: str | None, has_readers: bool, has_writers: bool) -> bool:
@@ -164,10 +199,10 @@ def build_lineage_report(conn: Connection, project_root: str | Path) -> dict[str
     stated, not silently indistinguishable from "nothing was checked").
     """
     project_root = Path(project_root)
-    reads_edges = db.query_edges(conn, type="reads")
-    writes_edges = db.query_edges(conn, type="writes")
-    readers_by_target = _collect_by_target(reads_edges)
-    writers_by_target = _collect_by_target(writes_edges)
+    reads_edges = _live_edges(conn, "reads")
+    writes_edges = _live_edges(conn, "writes")
+    readers_by_target = _collect_by_target(conn, reads_edges)
+    writers_by_target = _collect_by_target(conn, writes_edges)
     all_targets = sorted(set(readers_by_target) | set(writers_by_target))
 
     orphans: list[dict[str, Any]] = []
@@ -211,7 +246,7 @@ def build_lineage_report(conn: Connection, project_root: str | Path) -> dict[str
     for edges, kind in ((reads_edges, "reads"), (writes_edges, "writes")):
         for edge in edges:
             target_path, _ = _target_path_and_type(conn, edge["dst"])
-            for occ in _occurrences(edge["evidence"]):
+            for occ in _edge_occurrences(conn, edge):
                 if occ.get("missing"):
                     broken_links.append({
                         "script": occ.get("file"), "line": occ.get("line"),

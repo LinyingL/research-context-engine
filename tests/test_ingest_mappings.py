@@ -473,3 +473,67 @@ def test_add_refuses_when_the_planned_text_would_not_round_trip(tmp_path):
     assert exc.value.code == "unsafe_edit"
     assert path.read_bytes() == before
     assert not (tmp_path / ".rce" / "backups").exists()
+
+
+# -- the file itself is confined too (adversarial review of the V4 work) ----------
+
+
+def _symlinked_rce_project(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "proj"
+    (root / "data").mkdir(parents=True)
+    (root / "data" / "a.csv").write_text("x\n", encoding="utf-8")
+    (root / "s.py").write_text("print(1)\n", encoding="utf-8")
+    outside = tmp_path / "outside" / "victim"
+    outside.mkdir(parents=True)
+    (root / ".rce").symlink_to(outside, target_is_directory=True)
+    return root, outside
+
+
+def test_add_refuses_a_symlinked_rce_dir_that_leaves_the_project(tmp_path):
+    """Section 8.5: the write path is never less confined than the read
+    path. A `.rce` that is a symlink out of the project must not let 确认标注
+    create (or replace) a mappings.toml somewhere else."""
+    root, outside = _symlinked_rce_project(tmp_path)
+    with pytest.raises(mappings.MappingsWriteError) as excinfo:
+        mappings.add_mapping(root, "data/a.csv", "s.py", "reads")
+    assert excinfo.value.code == "escapes_root"
+    assert list(outside.iterdir()) == []
+
+
+def test_add_refuses_to_replace_an_outside_mappings_file_and_backs_up_nothing(tmp_path):
+    root, outside = _symlinked_rce_project(tmp_path)
+    (outside / "mappings.toml").write_text(mappings.FILE_HEADER, encoding="utf-8")
+    with pytest.raises(mappings.MappingsWriteError):
+        mappings.add_mapping(root, "data/a.csv", "s.py", "reads")
+    assert (outside / "mappings.toml").read_text(encoding="utf-8") == mappings.FILE_HEADER
+    assert not (outside / "backups").exists()
+
+
+def test_add_and_delete_refuse_a_symlinked_mappings_file(tmp_path):
+    """Replacing the link would silently turn it into a regular file, and
+    the backup would carry the link target's bytes under this name."""
+    root = tmp_path / "proj"
+    (root / ".rce").mkdir(parents=True)
+    (root / "data").mkdir()
+    (root / "data" / "a.csv").write_text("x\n", encoding="utf-8")
+    (root / "s.py").write_text("print(1)\n", encoding="utf-8")
+    secret = tmp_path / "secret.toml"
+    secret.write_text(mappings.FILE_HEADER + _entry("data/a.csv", "s.py", "reads"), encoding="utf-8")
+    (root / ".rce" / "mappings.toml").symlink_to(secret)
+    for call in (
+        lambda: mappings.add_mapping(root, "data/a.csv", "s.py", "reads", note="n"),
+        lambda: mappings.delete_mapping(root, "data/a.csv", "s.py", "reads"),
+    ):
+        with pytest.raises(mappings.MappingsWriteError) as excinfo:
+            call()
+        assert excinfo.value.code == "escapes_root"
+    assert (root / ".rce" / "mappings.toml").is_symlink()
+    assert not (root / ".rce" / "backups").exists()
+
+
+def test_ingest_refuses_a_mappings_file_that_resolves_outside_the_project(conn, tmp_path):
+    root, outside = _symlinked_rce_project(tmp_path)
+    (outside / "mappings.toml").write_text(_entry("data/a.csv", "s.py", "reads"), encoding="utf-8")
+    with pytest.raises(mappings.MappingsFileError):
+        mappings.ingest_mappings(conn, root)
+    assert _mapping_edges(conn) == []

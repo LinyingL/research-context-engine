@@ -75,11 +75,16 @@ handler thread. Guarded for non-macOS, where `st_flags` does not exist.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
 import sqlite3
 import sys
+import tempfile
+import threading
+import unicodedata
+from collections.abc import Iterator
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -117,6 +122,17 @@ class GraphMigrationError(Exception):
     re-raise this as their own user-facing error type."""
 
 
+class LegacyGraphDatalessError(GraphMigrationError):
+    """The legacy in-project graph (or one of its `-wal`/`-shm` companions)
+    is dataless -- macOS has evicted its content to iCloud -- so the
+    migration refused to open it rather than block on the download
+    (section 8.10 rule 1: the check comes *before* opening). Nothing was
+    copied, moved or deleted. A subclass of `GraphMigrationError` so every
+    existing caller still handles it; the web server catches it first and
+    answers with the transient 「图谱文件正在从云端下载…」 header state
+    instead of the 500 a failed verification deserves."""
+
+
 # -- Home + per-project locations ---------------------------------------------
 
 
@@ -131,13 +147,61 @@ def rce_home() -> Path:
     return Path.home() / RCE_DIRNAME
 
 
+def _canonical_path(project_root: str | Path) -> str:
+    """The one spelling of `project_root` the id is hashed from.
+
+    `Path.resolve()` collapses `..`, a relative path, a trailing slash and
+    symlinks -- but on macOS it does NOT canonicalize letter case or
+    Unicode normalization, and the default APFS volume is insensitive to
+    both: `~/Documents/RMB` and `~/documents/rmb`, or an NFC and an NFD
+    spelling of `默认安全锚_论文流水线`/`é`, name ONE directory. Hashing
+    `resolve()` alone gave them two ids, so whichever spelling touched a
+    legacy graph first migrated it under its own id, and every other
+    spelling then found "no RCE project" and was told to `rce init` a
+    second, empty graph (adversarial review of the V4 work). Before the
+    graph left the project the spelling never mattered, so this is a
+    regression the move itself introduced.
+
+    The fix asks the filesystem rather than guessing a folding rule:
+    macOS's `fcntl(F_GETPATH)` on an open descriptor returns the path *as
+    stored on disk* -- stored case, stored normalization, symlinks already
+    resolved -- whichever spelling was used to open it. Opened with
+    `O_EVTONLY` (the descriptor Finder uses for watching: no read access
+    needed and it does not keep the volume busy), on the directory itself,
+    never a file in it, so nothing is materialized. Anywhere this cannot
+    run (not macOS, a path that does not exist yet, a permission error)
+    the result is `resolve()`, exactly what the id was before -- and on
+    macOS that fallback is NFC-normalized so it is at least stable across
+    normalization forms. Linux is left byte-exact: its filesystems are
+    case- and normalization-sensitive, so two spellings there really are
+    two directories."""
+    resolved = Path(project_root).resolve()
+    if sys.platform != "darwin":
+        return str(resolved)
+    try:
+        import fcntl  # noqa: PLC0415 -- POSIX-only; this branch is macOS-only
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_EVTONLY", 0))
+        try:
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+        finally:
+            os.close(fd)
+        on_disk = raw.split(b"\0", 1)[0].decode("utf-8")
+        if on_disk:
+            return on_disk
+    except (OSError, AttributeError, UnicodeDecodeError):
+        pass
+    return unicodedata.normalize("NFC", str(resolved))
+
+
 def project_graph_id(project_root: str | Path) -> str:
     """The stable `<id>` for `project_root`: a truncated SHA-256 of its
-    *resolved* absolute path. Resolution is what makes two spellings of one
-    project (a relative path, a symlinked `/tmp` on macOS, a trailing
-    slash) share one graph instead of quietly forking into two."""
-    resolved = str(Path(project_root).resolve())
-    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:_ID_LENGTH]
+    canonical absolute path (`_canonical_path`). Canonicalization is what
+    makes two spellings of one project (a relative path, a symlinked `/tmp`
+    on macOS, a trailing slash, a different letter case or Unicode
+    normalization on a case-insensitive volume) share one graph instead of
+    quietly forking into two."""
+    canonical = _canonical_path(project_root)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:_ID_LENGTH]
 
 
 def graph_dir(project_root: str | Path) -> Path:
@@ -265,6 +329,120 @@ def _backup_database(source: Path, destination: Path) -> str:
     return row[0] if row else "no result"
 
 
+# Name of the per-graph-directory lock file every migrator takes (below).
+_MIGRATION_LOCK_FILENAME = ".migrate.lock"
+# Prefix of the per-attempt staging file; the random suffix comes from
+# `tempfile.mkstemp`, so no two migrators can ever share one.
+_STAGING_PREFIX = DB_FILENAME + ".migrating"
+
+# One in-process lock beside the cross-process `flock`: on every platform
+# `flock` excludes other open file descriptions, but a platform without
+# `fcntl` (Windows) would otherwise get no exclusion at all between the
+# server's own handler threads.
+_THREAD_MIGRATION_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _migration_lock(directory: Path) -> Iterator[None]:
+    """Exclusive, blocking lock around one project's migration -- across
+    threads of this process AND across processes (the RCE.app-spawned `rce
+    serve`, an MCP client's `rce mcp`, a terminal `rce status` can all
+    first-touch the same project at once).
+
+    Why it must exist (adversarial review of the V4 work): without it,
+    concurrent migrators raced on one fixed staging name -- each deleted
+    "a previous attempt's leftover" that was really another migrator's
+    in-flight copy, and whichever reached `os.replace` first installed
+    *whatever* file had the staging name at that instant, possibly a
+    half-written copy that never passed `integrity_check`, then deleted
+    the legacy graph. A lock plus a unique staging name restores the one
+    guarantee that matters: the file renamed into place is the very file
+    that was verified, and the legacy graph is deleted only after that.
+
+    `fcntl.flock` on a dedicated lock file in the graph directory (which
+    lives in `~/.rce`, never in a synced folder). The lock is released
+    when the descriptor closes, including when the process dies, so a
+    crashed migrator can never wedge the next one."""
+    lock_path = directory / _MIGRATION_LOCK_FILENAME
+    with _THREAD_MIGRATION_LOCK:
+        try:
+            import fcntl  # noqa: PLC0415 -- POSIX-only
+        except ImportError:  # pragma: no cover -- not a platform RCE ships on
+            yield
+            return
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _remove_staging_leftovers(directory: Path) -> None:
+    """Delete every staging file (and its sidecars) in `directory`. Only
+    ever called while holding `_migration_lock`, so anything matching is a
+    crashed attempt's leftover, never another migrator's live copy."""
+    for leftover in directory.glob(_STAGING_PREFIX + "*"):
+        _unlink_quietly(leftover)
+
+
+# Paths whose download a background thread has already been asked to start
+# (see `_request_download`), so a page polling every 2s does not spawn a
+# thread per poll for the same file.
+_DOWNLOADS_REQUESTED: set[str] = set()
+_DOWNLOADS_LOCK = threading.Lock()
+
+
+def _request_download(path: Path) -> None:
+    """Ask macOS to bring a dataless file back from iCloud WITHOUT blocking
+    the caller: a daemon thread does the one `open()` + 1-byte read that
+    materializes it (the same thing that hung the handler thread in V3,
+    moved off it). Without this nothing would ever open the evicted legacy
+    graph, the download would never start, and 「图谱文件正在从云端下载…」
+    would stay true forever. At most one such thread per path at a time;
+    a failure is logged, never raised -- the next first-touch simply asks
+    again."""
+    key = str(path)
+    with _DOWNLOADS_LOCK:
+        if key in _DOWNLOADS_REQUESTED:
+            return
+        _DOWNLOADS_REQUESTED.add(key)
+
+    def _materialize() -> None:
+        try:
+            with open(path, "rb") as handle:
+                handle.read(1)
+        except OSError as exc:
+            logger.warning("could not download %s from iCloud (%s)", path, exc)
+        finally:
+            with _DOWNLOADS_LOCK:
+                _DOWNLOADS_REQUESTED.discard(key)
+
+    threading.Thread(target=_materialize, name=f"rce-download:{path.name}", daemon=True).start()
+
+
+def _refuse_if_dataless(legacy: Path) -> None:
+    """Section 8.10 rule 1 applied to the migration itself: the legacy graph
+    is the one file that DOES live in the cloud-synced project, so it is
+    the one most likely to be evicted -- and the backup API's
+    `sqlite3.connect` on it is exactly the blocking `open()` the rule
+    forbids. Checked on the main file and both sidecars (a WAL-mode
+    graph's recent commits may live only in `-wal`)."""
+    evicted = [p for p in (legacy, *_sidecars(legacy)) if is_dataless(p)]
+    if not evicted:
+        return
+    for path in evicted:
+        _request_download(path)
+    raise LegacyGraphDatalessError(
+        f"the graph at {legacy} is not on this disk right now (macOS has evicted it to iCloud); "
+        f"its download has been requested and the move out of the project will happen on the "
+        f"next touch. Nothing was moved or deleted."
+    )
+
+
 def migrate_legacy_graph(project_root: str | Path) -> Path | None:
     """Move `<project>/.rce/graph.db` to `~/.rce/graphs/<id>/graph.db`, once.
 
@@ -275,41 +453,78 @@ def migrate_legacy_graph(project_root: str | Path) -> Path | None:
     silent overwrite in either direction).
 
     Order is copy -> verify -> delete, never delete-before-verify: the copy
-    lands on a `.migrating` staging name, `PRAGMA integrity_check` must
-    answer `ok`, and only then is the staging file renamed into place and
-    the legacy file (with its `-wal`/`-shm`) removed. Any failure raises
-    `GraphMigrationError` with everything still where it was.
+    lands on a staging file unique to this attempt, `PRAGMA
+    integrity_check` must answer `ok`, and only then is that same staging
+    file renamed into place and the legacy file (with its `-wal`/`-shm`)
+    removed. Any failure raises `GraphMigrationError` with the legacy
+    graph still where it was.
+
+    Concurrency: the whole check-copy-verify-rename-delete runs under
+    `_migration_lock`, and the "is there still anything to do?" test is
+    repeated once the lock is held -- so of N concurrent first touches
+    exactly one migrates and the rest return None and use its result.
+
+    A dataless legacy graph is refused before anything opens it
+    (`LegacyGraphDatalessError`, with its download requested in the
+    background) -- see `_refuse_if_dataless`.
     """
     legacy = legacy_graph_db_path(project_root)
     target = graph_db_path(project_root)
     if target.exists() or not legacy.exists():
         return None
+    _refuse_if_dataless(legacy)
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.with_name(target.name + ".migrating")
-    _unlink_quietly(staging)  # a previous crashed attempt's leftover
-    try:
-        verdict = _backup_database(legacy, staging)
-    except (sqlite3.Error, OSError) as exc:
-        _unlink_quietly(staging)
-        raise GraphMigrationError(
-            f"could not copy the graph out of {legacy} to {target}: {exc}. "
-            f"Nothing was deleted -- the original graph is still at {legacy}."
-        ) from exc
-    if verdict != "ok":
-        _unlink_quietly(staging)
-        raise GraphMigrationError(
-            f"the copy of {legacy} failed PRAGMA integrity_check ({verdict!r}), so it was "
-            f"discarded. Nothing was deleted -- the original graph is still at {legacy}."
-        )
+    with _migration_lock(target.parent):
+        if target.exists() or not legacy.exists():
+            return None  # another migrator finished while we waited
+        _remove_staging_leftovers(target.parent)  # a previous crashed attempt's
+        fd, staging_name = tempfile.mkstemp(prefix=_STAGING_PREFIX + "-", dir=target.parent)
+        os.close(fd)
+        staging = Path(staging_name)
 
-    os.replace(staging, target)
-    _unlink_quietly(legacy)
-    for sidecar in _sidecars(legacy):
-        _unlink_quietly(sidecar)
+        def _discard_staging() -> None:
+            _unlink_quietly(staging)
+            for sidecar in _sidecars(staging):
+                _unlink_quietly(sidecar)
+
+        try:
+            verdict = _backup_database(legacy, staging)
+        except (sqlite3.Error, OSError) as exc:
+            _discard_staging()
+            raise GraphMigrationError(
+                f"could not copy the graph out of {legacy} to {target}: {exc}. "
+                f"Nothing was deleted -- the original graph is still at {legacy}."
+            ) from exc
+        if verdict != "ok":
+            _discard_staging()
+            raise GraphMigrationError(
+                f"the copy of {legacy} failed PRAGMA integrity_check ({verdict!r}), so it was "
+                f"discarded. Nothing was deleted -- the original graph is still at {legacy}."
+            )
+
+        try:
+            os.replace(staging, target)
+        except OSError as exc:
+            _discard_staging()
+            raise GraphMigrationError(
+                f"could not move the verified copy of {legacy} into place at {target}: {exc}. "
+                f"Nothing was deleted -- the original graph is still at {legacy}."
+            ) from exc
+        for sidecar in _sidecars(staging):
+            _unlink_quietly(sidecar)
+        _unlink_quietly(legacy)
+        for sidecar in _sidecars(legacy):
+            _unlink_quietly(sidecar)
     # One line, not one per file moved: this happens once in a project's
-    # life and the user needs exactly one fact from it.
-    logger.info("moved graph out of the project: %s -> %s", legacy, target)
+    # life and the user needs exactly one fact from it. WARNING, not INFO,
+    # because WARNING is the lowest level an unconfigured `rce` (no `-v`)
+    # prints at all -- through `logging`'s last-resort stderr handler, which
+    # is also what lands in RCE.app's `serve.log`. At INFO the move of the
+    # researcher's graph out of their project was completely silent
+    # (adversarial review of the V4 work), which section 8.10's "one log
+    # line ... so nothing is hidden" rules out.
+    logger.warning("RCE moved this project's graph out of the project: %s -> %s", legacy, target)
     return target
 
 

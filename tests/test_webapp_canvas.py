@@ -571,6 +571,30 @@ def test_http_mapping_write_absorbs_only_the_mappings_file(live):
     assert "attempt:map.md#19" in {s["id"] for s in view["scopes"]}
 
 
+def test_http_mapping_write_with_a_failed_reingest_is_retried_by_the_watcher(live, monkeypatch):
+    """Adversarial review of the V4 work: when the post-write re-ingest
+    fails (e.g. 'database is locked' under a CLI ingest), the file change
+    must NOT be absorbed into the watcher's baseline -- the next poll
+    retries it and the link lands -- and the failure is reported once (the
+    response's ingest_error, the canvas chip), not also as the watcher's
+    last_error (the header chip)."""
+    base, root, httpd = live
+    httpd.watcher.poll_once()  # baseline
+    real = server._reingest_mappings
+    monkeypatch.setattr(server, "_reingest_mappings", lambda r: (_ for _ in ()).throw(RuntimeError("database is locked")))
+    generation = httpd.watcher.status_payload()["generation"]
+    status, payload = _call(base, "POST", "/api/mappings/add", _PDF_MAPPING)
+    assert status == 200 and payload["ingest_error"] == "database is locked"
+    assert payload["generation"] == generation  # nothing in the graph changed
+    assert httpd.watcher.status_payload()["last_error"] is None  # one message, not two
+
+    monkeypatch.setattr(server, "_reingest_mappings", real)
+    assert httpd.watcher.poll_once() is True  # the change was left visible
+    _, view = _call(base, "GET", "/api/canvas")
+    assert any(l["human"] and (l["from"], l["to"]) == (RMD17, PDF17) for l in view["links"])
+    assert _call(base, "POST", "/api/mappings/add", _PDF_MAPPING)[1]["state"] == "mapping_exists"
+
+
 def _edge_body(src: str, dst: str, edge_type: str, extractor: str = "dataflow") -> dict[str, str]:
     return {"src": src, "dst": dst, "type": edge_type, "extractor": extractor}
 
@@ -590,6 +614,33 @@ def test_http_reject_then_restore_round_trip(live):
     assert status == 200 and payload["link"]["status"] == "auto"
     _, view = _call(base, "GET", "/api/canvas?scope=all")
     assert (RMD18, MONTHLY, "reads", "dataflow") in _link_keys(view)
+
+
+def test_http_restore_puts_back_a_human_confirmation(live):
+    """Adversarial review of the V4 work: undoing 标记为错误提取 on a link
+    the researcher had confirmed (`rce confirm`) must restore `confirmed`,
+    not demote the human's judgement to the machine status `auto`. The
+    recorded prior status survives a re-ingest in between."""
+    base, root, httpd = live
+    body = _edge_body(RMD18, MONTHLY, "reads")
+    conn = db.connect(paths.graph_db_path(root))
+    try:
+        db.set_edge_status(conn, RMD18, MONTHLY, "reads", "dataflow", "confirmed")
+    finally:
+        conn.close()
+    assert _call(base, "POST", "/api/edges/reject", body)[1]["link"]["status"] == "rejected"
+    assert _call(base, "POST", "/api/edges/reject", body)[0] == 200  # second click keeps the memory
+    httpd.watcher._reingest(root, steps_changed=True)  # a machine re-ingest in between
+
+    status, payload = _call(base, "POST", "/api/edges/restore", body)
+    assert status == 200 and payload["link"]["status"] == "confirmed"
+    conn = db.connect(paths.graph_db_path(root))
+    try:
+        edge = next(e for e in db.query_edges(conn, src=RMD18, dst=MONTHLY, type="reads"))
+        assert edge["status"] == "confirmed"
+        assert db.STATUS_BEFORE_REJECT_KEY not in edge["evidence"]
+    finally:
+        conn.close()
 
 
 def test_http_restore_of_a_live_link_is_409(live):

@@ -290,6 +290,50 @@ def mappings_path(project_root: str | Path) -> Path:
     return Path(project_root) / MAPPINGS_RELATIVE_PATH
 
 
+def _confined_mappings_path(project_root: Path, *, for_write: bool) -> Path:
+    """`mappings_path`, refused (`MappingsFileError`) unless it -- and, for a
+    write, the `.rce/backups/` directory the writer puts its backup in --
+    resolves inside the project root: the same resolve-then-`relative_to`
+    check every entry's `from`/`to` takes (`_confine`).
+
+    Why (adversarial review of the V4 work): the entries were confined but
+    the file itself was not, so a project whose `.rce` is a symlink out of
+    the project (git carries symlinks, and section 8.10 now invites
+    committing `.rce/`) had the canvas's 确认标注 create -- or atomically
+    replace -- a `mappings.toml` in some other directory, with backups
+    beside it: the write path less confined than the read path, which 8.5
+    says must never happen. A read through such a link is refused too, so
+    the graph never ingests a file from outside the project.
+
+    For a write, `mappings.toml` being a symlink at all (even to a file
+    inside the project) is refused as well: the atomic replace would
+    silently turn the link into a regular file, and the backup would hold
+    the link target's bytes under this file's name. Hand-edit such a setup;
+    the app will not guess which of the two files was meant."""
+    path = mappings_path(project_root)
+    root = project_root.resolve()
+    candidates = [path]
+    if for_write:
+        from rce.webapp import mapedit  # local import, exactly as `_commit` does
+
+        candidates.append(path.parent / mapedit.BACKUPS_DIRNAME)
+    for candidate in candidates:
+        try:
+            candidate.resolve().relative_to(root)
+        except (ValueError, OSError):
+            raise MappingsFileError(
+                f"{candidate.relative_to(project_root).as_posix()} resolves outside the project root "
+                f"(to {candidate.resolve()}) -- a symlinked .rce? refusing to "
+                f"{'write' if for_write else 'read'} it"
+            ) from None
+    if for_write and path.is_symlink():
+        raise MappingsFileError(
+            f"{MAPPINGS_RELATIVE_PATH} is a symlink -- the app will not replace a link with a "
+            "regular file; edit it by hand"
+        )
+    return path
+
+
 # -- validation ------------------------------------------------------------------
 
 
@@ -444,7 +488,7 @@ def load_mappings(project_root: str | Path) -> LoadResult:
     be observed raises `MappingsFileError`; bad entries are refused
     individually into `problems` while the good ones are kept."""
     project_root = Path(project_root)
-    text = _read_text(mappings_path(project_root))
+    text = _read_text(_confined_mappings_path(project_root, for_write=False))
     if text is None:
         return LoadResult(file_present=False)
     return _validate_entries(project_root, _parse_text(text), text)
@@ -597,7 +641,10 @@ def _validate_for_write(project_root: Path, entry: dict[str, Any]) -> tuple[str,
 
 
 def _load_for_write(project_root: Path) -> tuple[str | None, list[Any], LoadResult]:
-    path = mappings_path(project_root)
+    try:
+        path = _confined_mappings_path(project_root, for_write=True)
+    except MappingsFileError as exc:
+        raise MappingsWriteError("escapes_root", str(exc)) from exc
     try:
         text = _read_text(path)
         if text is None:

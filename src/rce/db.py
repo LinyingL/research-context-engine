@@ -586,6 +586,124 @@ def set_edge_status(
     conn.commit()
 
 
+# Sibling key (next to `occurrences`) in a rejected edge's evidence: the
+# status it had at the moment a human rejected it, so undoing the reject
+# restores exactly that -- see `reject_edge_remembering`. A sibling key, not
+# an occurrence, so `_merge_edge_evidence` carries it through any re-ingest.
+STATUS_BEFORE_REJECT_KEY = "status_before_reject"
+# What a restore falls back to when no prior status was recorded (an edge
+# rejected by `rce reject`, which keeps no memory): the status every
+# machine extractor writes.
+DEFAULT_RESTORED_STATUS = "auto"
+
+
+def _edge_status_txn(
+    conn: sqlite3.Connection,
+    src: str,
+    dst: str,
+    type: str,
+    extractor: str,
+    decide: Any,
+) -> str | None:
+    """Run `decide(status, evidence_dict) -> (new_status, new_evidence) |
+    None` for one edge inside a single `BEGIN IMMEDIATE` transaction (same
+    shape and retry loop as `set_edge_semantic_review`), so the read of the
+    current status/evidence and the write of the new ones cannot be split
+    by a concurrent re-ingest's `upsert_edge`. Returns the new status, or
+    None when the edge does not exist or `decide` declined."""
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(_UPSERT_EDGE_MAX_ATTEMPTS):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        try:
+            row = conn.execute(
+                "SELECT status, evidence FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                (src, dst, type, extractor),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            evidence = json.loads(row["evidence"]) if row["evidence"] else {}
+            if not isinstance(evidence, dict) or not isinstance(evidence.get("occurrences"), list):
+                evidence = {"occurrences": [evidence] if evidence else []}  # legacy bare row
+            decision = decide(row["status"], evidence)
+            if decision is None:
+                conn.rollback()
+                return None
+            new_status, new_evidence = decision
+            if new_status not in EDGE_STATUSES:
+                raise ValueError(f"unknown edge status: {new_status!r}")
+            conn.execute(
+                "UPDATE edges SET status = ?, evidence = ?, updated_at = ? "
+                "WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                (new_status, json.dumps(new_evidence), _now(), src, dst, type, extractor),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            last_error = exc
+            time.sleep(_UPSERT_EDGE_RETRY_DELAY_SECONDS * (attempt + 1))
+            continue
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            return new_status
+    assert last_error is not None
+    raise last_error
+
+
+def reject_edge_remembering(
+    conn: sqlite3.Connection, src: str, dst: str, type: str, extractor: str
+) -> str | None:
+    """Human-only: mark an edge `rejected`, recording the status it had
+    (`STATUS_BEFORE_REJECT_KEY`) so `restore_rejected_edge` can undo the
+    reject exactly -- the canvas's 「标记为错误提取」 and its 「撤销」.
+
+    Why the memory (adversarial review of the V4 work): restore used to put
+    every link back at "auto". A machine link the researcher had confirmed
+    (`rce confirm`, MCP `confirm_edge`) lost that confirmation to a mis-
+    click plus undo -- a human judgement silently replaced by a machine
+    status, which Section 4 forbids and no re-ingest would ever repair.
+
+    Idempotent: rejecting an already-rejected edge changes nothing and
+    keeps the original memory (a second click must not record "rejected"
+    as the prior status). Same human-only standing as `set_edge_status`;
+    returns the new status, or None for an unknown edge."""
+
+    def decide(status: str, evidence: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        if status == "rejected":
+            return status, evidence
+        return "rejected", {**evidence, STATUS_BEFORE_REJECT_KEY: status}
+
+    return _edge_status_txn(conn, src, dst, type, extractor, decide)
+
+
+def restore_rejected_edge(
+    conn: sqlite3.Connection, src: str, dst: str, type: str, extractor: str
+) -> str | None:
+    """Human-only undo of `reject_edge_remembering`: put a rejected edge
+    back at the status recorded when it was rejected (`confirmed` stays
+    confirmed), or `DEFAULT_RESTORED_STATUS` when none was recorded, and
+    drop the memory. Returns the restored status; None when the edge does
+    not exist or is not currently rejected (the caller's 409)."""
+
+    def decide(status: str, evidence: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        if status != "rejected":
+            return None
+        remaining = dict(evidence)
+        prior = remaining.pop(STATUS_BEFORE_REJECT_KEY, DEFAULT_RESTORED_STATUS)
+        if prior not in EDGE_STATUSES or prior == "rejected":
+            prior = DEFAULT_RESTORED_STATUS
+        return prior, remaining
+
+    return _edge_status_txn(conn, src, dst, type, extractor, decide)
+
+
 def _apply_semantic_review(existing_evidence_json: str, semantic_review: dict[str, Any]) -> str:
     """Fold `semantic_review` into an edge's evidence as a sibling key next to
     `occurrences`, returning the encoded JSON.
