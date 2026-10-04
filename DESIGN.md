@@ -41,6 +41,18 @@ an exception at all.)
 deterministic code over a model, a smaller model over a larger one, a single
 file over a service. Abstract on the third repetition, not the first.
 
+**Kept material is not a relation.** An old copy of a script, the hash of a
+file, a confirmation the researcher made: each is material that can be
+checked. That two pieces of material sit side by side — the same folder,
+the same day, the same name — says nothing about how they are related. A
+relation between them is recorded only when it has a basis of its own:
+something the machine read, or something the researcher stated. "This
+file existed when the definition was confirmed" and "this file was built
+by that definition" are different sentences, and RCE never writes the
+second because the first is true. (Adopted 2026-10-05 from the external
+review of Section 9; it is the rule the result-provenance phase starts
+from.)
+
 ## Section 2 — Architecture decisions
 
 Three layers, only the first of which is mandatory:
@@ -1270,10 +1282,15 @@ and adopted as design:
 
 ## Section 9 — Human records outlive the index (task V5)
 
-*Status: DRAFT 2 for the researcher's review (revised after three
-adversarial design reviews; 46 findings, 5 of them blocking, all ruled on).
-Nothing in this section is implemented, and nothing in it may be
-implemented, until it is approved.*
+*Status: APPROVED FOR IMPLEMENTATION, 2026-10-05. Drafted from a
+four-reader inventory of the code, revised against five adversarial
+design reviews (73 findings, 8 of them blocking), then reviewed by the
+researcher's external reviewer at commit 976059a: "the main design can
+pass; five conventions must change first". All five are adopted below
+(9.3 ordering; 9.11 what a fingerprint proves, references, coverage of a
+comparison, crash order). The researcher then delegated the remaining
+decisions to the design lead ("你自行决定") and asked for a complete,
+working app to try; 9.10 records what was decided.*
 
 **The goal, in the researcher's words: a judgment the user has made is kept
 for the long term, independently of the machine index, which can always be
@@ -1369,7 +1386,8 @@ re-emitted. History is therefore not a feature to build — it is the file.
 # 你对机器提取结果的判断。RCE 只追加、不改写；图谱里的确认/否决从这里派生。
 [[judgement]]
 id       = "j-0b6f3c1e9a4d4f7ea2c5d8e1f0a3b6c9"   # random, unique
-at       = "2026-10-04T21:15:03+02:00"
+seq      = 41                            # assigned under the lock: the order of appending
+at       = "2026-10-04T21:15:03+02:00"   # for display only — never decides anything
 verdict  = "rejected"       # confirmed | rejected | withdrawn | undone
 src      = "script:复现包_分步/17-叙事更替与汇率波动.Rmd"
 dst      = "dataset:复现包_分步/Data/panel_pricing.csv"
@@ -1392,9 +1410,22 @@ calls = ["read.csv"]
   link confirmed, then rejected by a mis-click, then undone, is confirmed
   again (8.12's rule, kept). 「撤回」 takes back the *judgment*: a
   `withdrawn` entry, after which the link is whatever the machine says.
-- **The state of a link** is its entry with the latest `at` among entries
-  not cancelled by an `undone` (equal times go by file order; a file whose
-  order disagrees with its times is reported, never reordered).
+- **The state of a link** is its last entry *in the order of appending*,
+  among entries not cancelled by an `undone`. That order is the file's
+  order, and each entry RCE writes carries `seq`, one more than the
+  highest in the file, assigned while the project lock is held. **A
+  clock never decides.** `at` is there to be read by a person: a clock
+  that is corrected, or another machine's clock running behind, must not
+  be able to put a withdrawal before the confirmation it withdrew. (An
+  earlier draft ordered by `at`; the external review caught it.)
+- **Two histories are a conflict, not a race.** If `seq` repeats or runs
+  backwards, two machines appended to different copies of the file and
+  something merged them. RCE does not pick a winner — not by time, not by
+  position. Every link that has an entry at or after the first anomaly is
+  shown as 「记录冲突，待处理」 at the machine's status, with both
+  histories, until the researcher writes a new entry for it; that entry,
+  appended last and by them, settles it. A hand-written entry without
+  `seq` takes its place by position and is not an anomaly.
 - **`basis`** is the heart of 9.6: the substantive facts the link rested on
   when the researcher judged it. It is stored readable, so that in a year
   the researcher can see *what* they confirmed, not merely *that* they did.
@@ -1760,7 +1791,11 @@ all six, each readable through the app and through `rce records`.
 12. **History.** Confirm; reject; undo — the link is confirmed; confirm
     again with a note; withdraw — the link is the machine's. The ledger
     holds five entries in order, the app shows the last state, and the
-    others as its history.
+    others as its history. **Set the system clock back an hour between two
+    of them: the later act still wins.** Merge two copies of the ledger
+    that each appended after the same entry: the links they touch show
+    「记录冲突，待处理」, nothing is decided by time, and a new entry by
+    the researcher settles each.
 
 ### 9.10 Not in V5, said plainly
 
@@ -1779,17 +1814,34 @@ renaming or moving the file (every claim in it); and, in Chinese prose
 written one paragraph per line, *any* edit in the paragraph, because 。！？
 are not yet treated as sentence ends. V5 guarantees such a judgment is
 kept, shown under review with its original sentence, and offered against
-the candidates that replaced it — not that it stays attached. Splitting
-Chinese sentences properly is extractor work and comes after.
+the candidates that replaced it — not that it stays attached. **Decided
+2026-10-05:** the sentence splitter is fixed in this phase (。！？ become
+sentence ends), because the cheapest moment to change how a claim is
+identified is now, while the researcher's project holds no judgment on any
+claim. Reviews on claims are computed from the start; the external
+reviewer's condition — no reminders at volume while unrelated edits still
+raise them — is met by fixing the cause first.
 
-**Suggested order of building**, each stage shippable: (a) the record,
-identity, migration, rebuild and locking — 9.2–9.5, 9.7, 9.8, acceptance
-1–7 and 9–12 — with every new judgment already recording its basis; (c)
-variable cards — 9.11, acceptance 13–16; then (b) the scan reports and
-the review list — 9.6, acceptance 8 and 17. After (a) nothing the
-researcher has judged can be lost; after (c) neither can what a variable
-meant when it was used; (b) is what stops an old judgment, or an old
-definition, from vouching for evidence that has since changed.
+**Decided 2026-10-05, under the researcher's delegation.**
+
+- A project from before V5 is read-only for human records until it is
+  migrated; RCE writes a human record only after the migration's tally
+  has balanced.
+- V5 is built in stages, each with its own acceptance run, and delivered
+  to the researcher as one working app: the record and the lock; project
+  identity; scan reports and per-scan basis; the ledger driving the
+  index, with review states; migration; `records` / `rebuild` / `verify`;
+  the app's review list, history and blocking states; variable cards.
+  The order of entries, immutable references and the snapshot-before-entry
+  rule are fixed from the first stage — a format written to the
+  researcher's disk is the one thing that cannot be changed cheaply later.
+- Cards are written in their files; the app shows them and offers the
+  actions RCE records. The cost of filling a card is measured on a real
+  one before a form is considered.
+- The first card is one variable taken end to end — `TopicShift` — before
+  `RV` and `NetBuyRate`. RCE's maintainers may draft a card from the
+  source with the evidence attached; it stays a draft until the researcher
+  has read the meaning and written the reason.
 
 ### 9.11 Variable definition cards
 
@@ -1886,10 +1938,13 @@ may rely on. RCE appends one entry:
 
 ```toml
 [[entry]]
-id      = "v-5e0c…"
-at      = "2026-10-05T10:12:00+02:00"      # RCE's clock — never typed
+id      = "v-5e0c…"                         # this entry is the version's immutable identity
+seq     = 7                                 # order of appending (9.3) — the clock decides nothing
+at      = "2026-10-05T10:12:00+02:00"      # RCE's clock, for display — never typed
 act     = "confirmed"
 version = 1
+attested = "unknown"   # the researcher's own statement, asked at confirmation:
+                       # was the output file as it stands built with THIS definition? yes | no | unknown
 content = "sha256:9c1f…"       # of the version file's parsed content; comments and layout are free
 frozen  = "frozen/9c1f….toml"
 [entry.checked]                 # read from disk now; each item is 已核对, 不符, or 未核对 with its reason
@@ -1897,6 +1952,7 @@ script  = { result = "已核对", sha256 = "71ab…", copy = "_code/71ab….py" 
 writes  = { result = "已核对", call = "to_csv" }     # this parse of the script writes the output
 reads   = [{ dataset = "…theme_counts_2017_2024.csv", result = "已核对", call = "read_csv" }]
 field   = { result = "已核对" }                      # found in the CSV header
+[entry.observed]                # what was on disk at that moment — an observation, nothing more
 output  = { sha256 = "0d4e…", size = 18230 }
 inputs  = [{ dataset = "…theme_counts_2017_2024.csv", sha256 = "44ab…", size = 912004 }]
 ```
@@ -1910,15 +1966,24 @@ inputs  = [{ dataset = "…theme_counts_2017_2024.csv", sha256 = "44ab…", size
   researcher's own hand-drawn mapping, which is their statement and not a
   check). No outcome blocks confirmation: a variable computed in an Rmd
   chunk and never written to a file is still a variable.
-- **The output file's fingerprint and RCE's own timestamp are recorded
-  now, because the next phase will need them.** "Old results keep pointing
-  at the old version" can only be honoured later if something recorded
-  today lets a result be tied to a version without guessing: an output
-  whose fingerprint equals the one recorded at confirmation belongs to
-  that version. `adopted_on` is the researcher's statement and may be
-  backdated — a card written in October for a definition adopted in July
-  should say July; RCE's `at` is when the statement was made. Both are
-  kept and never merged.
+- **What each thing proves, and no more** (Section 0, "kept material is
+  not a relation"). *Confirming* means the researcher endorses this
+  definition. `observed` means a file with this hash was on disk when
+  they did. Neither says the file was built by the definition: the script
+  may already compute the new definition while the output on disk is last
+  month's — and the design lets a version be confirmed when the checks
+  say `不符`. So RCE never infers "this output belongs to this version"
+  from a matching hash. What can carry that weight is a statement or
+  evidence of its own: at confirmation the researcher is asked, once,
+  whether the output as it stands was built with this definition — 是 /
+  否 / 不确定 — and the answer is recorded as theirs (`attested`). They
+  know it at that moment and will not in two months. RCE does not run
+  scripts, so it has no run evidence to offer; if it ever records runs,
+  that will be a second kind of basis. A `yes` standing beside a `不符` is
+  shown as exactly that, not resolved. `adopted_on` is the researcher's
+  statement of when the definition was adopted and may predate the card;
+  `at` is when the statement was made. The next phase attributes results
+  from these items one by one.
 - **The implementing script is copied** to `_code/`, named by its hash.
   The researcher's project is not a git repository; a hash can be compared
   in a year but not read. With the copy, the card can show 「查看当时的代码」.
@@ -1942,10 +2007,21 @@ inputs  = [{ dataset = "…theme_counts_2017_2024.csv", sha256 = "44ab…", size
   next number as a draft, and refuses while a draft is open. When the new
   one is confirmed, the old one is *shown* as superseded from that
   entry's time; its file is not touched.
-- **A result points at a version, never at a name**: `topicshift@v2`. A
-  number is never reused — a version removed by a restore leaves a
-  `removed` entry, and the next number is one past the highest ever
-  seen — so a reference written today cannot come to mean something else.
+- **A result points at one confirmed text, not at a name and not at a
+  number.** `v2` is the label a person reads. What a reference stores is
+  the variable's id, that label, the id of the log entry it relies on (the
+  `confirmed` entry, or the `corrected` entry current when the reference
+  was made) and the content hash that entry carries; it is written
+  `topicshift@v2·9c1f2a3b`. A reference resolves only when the log holds
+  that entry with that hash. If it does not — the project was restored
+  from a backup older than the version; the card was rebuilt — it shows
+  「引用暂不可解析」 and stays that way: it is **never** re-pointed at
+  whatever is called `v2` now. This is why a correction does not rewrite
+  history (the result keeps the hash it was made against, and both
+  wordings can be read), and why "numbers are not reused" — which RCE
+  still does its best to keep, leaving a `removed` entry behind a version
+  that a restore took away — no longer has to be true for a reference to
+  be safe. Only a confirmed version can be referred to.
 - In use = the highest confirmed version. `abandoned` and `revived` are
   entries about the whole variable, each with the researcher's reason;
   while abandoned no version is in use, and every version still resolves.
@@ -1979,9 +2055,28 @@ are one item, 「此脚本的改动涉及 N 个变量」, answerable together (�
 未变」) or one by one: 「口径未变」 appends `reaffirmed` with the new
 fingerprints and, after an input change, the researcher's new
 `data_version` note; 「口径已变」 opens the next draft. An input that
-cannot be read (still in the cloud) raises nothing. A file above 50 MB is
-compared by size, and a change of modification time alone is shown as
-「修改时间变化，内容未比对」, not as a change.
+cannot be read (still in the cloud) raises nothing.
+
+**"Nothing changed" always says how far it looked.** Narrowing to a chunk
+or a function does not see a parameter defined outside it or a function it
+calls; a file above 50 MB is compared by size, and content can change at
+the same size. Both are legitimate ways to keep a scan cheap, and both are
+blind spots, so every comparison carries its coverage and the view words
+it: 「全文未变」; 「指定范围未变（范围外未比对）」; 「大小未变（内容未比对）」;
+「修改时间变化，内容未比对」. The bare phrase "实现及数据未变化" is never
+shown. A `reaffirmed` entry records the coverage it was made under, and
+「完整比对」 hashes the large files on request.
+
+**A confirmation is written snapshot first, entry last.** Confirming (and
+correcting) touches several files; the log entry is the commit point. In
+order: the code copy and the frozen copy are written and synced to disk;
+both are read back and their hashes checked; only then is the entry that
+names them appended. A crash at any point leaves at worst copies no entry
+refers to — harmless, and `rce records --clean` removes them — and never
+an entry that refers to a copy which is not there. On reading, an entry
+whose copy is missing anyway (a sync that has not delivered it) is shown
+as 「确认记录引用的副本缺失」: the hash in the entry still detects an edit,
+but the version cannot be restored from it until the copy returns.
 
 **Safety, as for the ledger.** `log.toml` is a 9.3 ledger and gets 9.3's
 protections: while it is missing, in the cloud or unreadable, the card is
@@ -2019,14 +2114,23 @@ data columns; replacing the dead-variable list; renaming a variable's id.
     and their reasons, the script copied to `_code/`, the output
     fingerprinted. Revise and confirm: `v2` in use, `v1` shown superseded
     from the entry's time, `v1.toml` byte-identical. `revise` with a draft
-    open is refused.
+    open is refused. **Kill the process between each pair of writes of a
+    confirmation and start again**: there is never an entry whose frozen
+    or code copy is missing; leftover copies are removed by `rce records
+    --clean`. The confirmation asks the attestation question, and a
+    matching output hash alone never makes the view say the output was
+    built with the version.
 14. **History is not overwritten — with or without an index.** Edit a
     confirmed version's formula by hand: nothing is applied and the
     question is asked. 「另存为新版本」: the edit becomes draft `v3` and
     `v2.toml` is byte-identical to its frozen copy. 「这是更正」: a
     `corrected` entry, and both wordings can be read. **Repeat with
     `~/.rce/graphs/<id>/` deleted before the edit is seen: the question is
-    still asked.** Change only a comment: no question.
+    still asked.** Change only a comment: no question. **A reference
+    made before a correction still shows the wording it was made
+    against; with the card restored from a backup that predates the
+    version, the reference shows 「引用暂不可解析」 and a newly written
+    `v2` does not capture it.**
 15. **Survival.** Scenarios 1–7 and 10–11 of 9.9 with two cards added to
     the fixture (one with two versions, a correction and an `abandoned`
     entry): after a move, a rename, a copy with each answer, a rebuild, a
@@ -2046,4 +2150,7 @@ data columns; replacing the dead-variable list; renaming a variable's id.
     `reaffirmed` per card; 「口径已变」 on one of them opens its next draft.
     With `chunk` named, a change outside the chunk raises nothing and a
     removed chunk raises 「找不到该代码块」. Make the script unreadable:
-    nothing comes under review.
+    nothing comes under review. The view says 「指定范围未变（范围外未比对）」
+    for the narrowed card and 「大小未变（内容未比对）」 for an input above
+    50 MB whose bytes changed at the same size — never an unqualified
+    "unchanged" — and 「完整比对」 then finds the change.
