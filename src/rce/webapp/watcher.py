@@ -105,7 +105,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Collection
 
 from rce import db, paths
 from rce.ingest import attempts as attempts_ingest
@@ -233,6 +233,23 @@ def _absorb_non_steps_only(old: WatchSnapshot, fresh: WatchSnapshot) -> WatchSna
     return WatchSnapshot(files=files, steps_paths=frozenset(steps))
 
 
+def _absorb_only(old: WatchSnapshot, fresh: WatchSnapshot, absorb: frozenset[str]) -> WatchSnapshot:
+    """The narrower baseline a write that re-ingested only SOME of the
+    watch set commits (the canvas's mapping writes, DESIGN.md section 8.5,
+    which run the mappings ingest and nothing else): the fresh state of the
+    `absorb` paths, the OLD baseline's state of every other path. The same
+    missed-ingest reasoning as `_absorb_non_steps_only`, one step further:
+    an attempts-map save that landed just before a mapping write has not
+    been attempts-ingested by that write, so it must stay a visible
+    difference for the next poll."""
+    files: dict[str, tuple[int, int]] = {}
+    for path in set(old.files) | set(fresh.files):
+        source = fresh if path in absorb else old
+        if path in source.files:
+            files[path] = source.files[path]
+    return WatchSnapshot(files=files, steps_paths=old.steps_paths | fresh.steps_paths)
+
+
 class ProjectWatcher:
     """The polling watcher itself. Owned by `RceHTTPServer` (one per server
     process); `get_project_root` is the server's own locked accessor, read
@@ -281,7 +298,21 @@ class ProjectWatcher:
         interleave, and two locks could only ever drift apart."""
         return self._ingest_lock
 
-    def record_external_change(self, error: str | None = None) -> int:
+    def bump_generation(self) -> int:
+        """The graph changed without any watched FILE changing (a human
+        marked a link as a wrong extraction, or restored one -- a status
+        written straight through `db.set_edge_status`): bump the generation
+        so every open page re-fetches, and touch nothing else -- no
+        baseline is re-taken (nothing on disk was ingested) and
+        `last_error` is left as it is (nothing was re-ingested to clear
+        it). Returns the new generation."""
+        with self._state_lock:
+            self._generation += 1
+            return self._generation
+
+    def record_external_change(
+        self, error: str | None = None, absorb: Collection[str] | None = None,
+    ) -> int:
         """A UI write (task V3 phase 3) just edited a watched file and ran
         its own re-ingest in-process: re-baseline the map/config half of
         the watch set to what is on disk NOW, so the next poll does not
@@ -304,12 +335,20 @@ class ProjectWatcher:
         idempotent and serialized by `ingest_lock`, so the cost is one
         redundant re-ingest and generation bump, never corruption -- the
         same shape as `poll_once`'s own epoch note, without needing the
-        epoch machinery (nothing here must *discard* anything)."""
+        epoch machinery (nothing here must *discard* anything).
+
+        `absorb` (DESIGN.md section 8.5's mapping writes): when given, ONLY
+        these watched paths are re-baselined -- for a write whose own
+        re-ingest covered just those files -- via `_absorb_only`. None
+        keeps the attempts write's behaviour above."""
         root = self._get_project_root()
         snapshot = take_snapshot(root)
         with self._state_lock:
             if self._baseline is not None and self._baseline_root == root:
-                snapshot = _absorb_non_steps_only(self._baseline, snapshot)
+                if absorb is not None:
+                    snapshot = _absorb_only(self._baseline, snapshot, frozenset(absorb))
+                else:
+                    snapshot = _absorb_non_steps_only(self._baseline, snapshot)
             self._baseline, self._baseline_root = snapshot, root
             self._last_error = error
             self._generation += 1

@@ -107,6 +107,15 @@ def _reader_entry(occ: dict[str, Any]) -> dict[str, Any]:
     return {"script": occ.get("file"), "line": occ.get("line"), "callee": occ.get("callee")}
 
 
+def is_orphan_input(node_type: str | None, has_readers: bool, has_writers: bool) -> bool:
+    """THE orphan-input definition (block 1 below): a `dataset` that some
+    script reads and no script writes. Public because the canvas (DESIGN.md
+    section 8.2, "the lineage report's own definition") flags the same
+    files with a clay dot and must never drift from this report; scoped to
+    `dataset` for the reason given in the module docstring."""
+    return node_type == "dataset" and has_readers and not has_writers
+
+
 def _scan_basenames(project_root: Path) -> dict[str, list[str]]:
     """Every real (non-symlink) file under `project_root`, grouped by
     basename -> sorted repo-relative paths -- the input to duplicate-copy
@@ -177,7 +186,7 @@ def build_lineage_report(conn: Connection, project_root: str | Path) -> dict[str
                 "writers": [_reader_entry(o) for o in writers],
                 "readers": [_reader_entry(o) for o in readers],
             })
-        elif readers and not writers and node_type == "dataset":
+        elif is_orphan_input(node_type, bool(readers), bool(writers)):
             # Orphan inputs are scoped to `dataset` only -- a `figure` read
             # back by a script but never written by one is not the
             # "unexplained input data" finding this block exists for; see

@@ -721,3 +721,60 @@ def test_refused_mapping_entries_are_not_a_watcher_error(tmp_path):
     assert w.poll_once() is True
     assert w.status_payload()["last_error"] is None
     assert len(_mapping_edges(tmp_path)) == 1
+
+
+# -- canvas writes (DESIGN.md section 8.5): absorb= and bump_generation -------
+
+
+def test_record_external_change_absorb_keeps_a_pending_map_save_visible(tmp_path):
+    """A canvas mapping write re-ingests ONLY the mappings file. An
+    attempts-map save that landed after the last poll but before that
+    write has not been attempts-ingested, so absorbing it into the baseline
+    would lose it for good; with `absorb={mappings file}` the next poll
+    still sees it and ingests the new row."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    _write_map(tmp_path, [_row("1"), _row("2")])  # not ingested by anyone yet
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)  # the "write"
+
+    w.record_external_change(absorb={str(tmp_path / ".rce" / "mappings.toml")})
+
+    assert _attempt_numbers(tmp_path) == []
+    assert w.poll_once() is True
+    assert _attempt_numbers(tmp_path) == ["1", "2"]
+
+
+def test_record_external_change_absorb_does_absorb_the_named_file(tmp_path):
+    """The absorbed file itself is NOT re-detected: the write already
+    ingested it, so the next poll has nothing to do."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+
+    w.record_external_change(absorb={str(tmp_path / ".rce" / "mappings.toml")})
+
+    assert w.poll_once() is False
+
+
+def test_bump_generation_touches_neither_baseline_nor_error(tmp_path):
+    """An edge-status change (标记为错误提取 / restore) re-ingests nothing:
+    the generation moves so pages re-fetch, a pending file change stays
+    pending, and an earlier ingest error is not silently cleared."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    broken = (tmp_path / "map.md").read_text().replace("## H", "## renamed")
+    (tmp_path / "map.md").write_text(broken)
+    w.poll_once()
+    error = w.status_payload()["last_error"]
+    assert error
+    _write_map(tmp_path, [_row("1"), _row("2")])
+    generation = w.status_payload()["generation"]
+
+    assert w.bump_generation() == generation + 1
+
+    assert w.status_payload()["last_error"] == error
+    assert w.poll_once() is True
+    assert _attempt_numbers(tmp_path) == ["1", "2"]

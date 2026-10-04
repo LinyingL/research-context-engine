@@ -86,6 +86,28 @@ Endpoints (all GET unless noted):
                             "last_error": str|null}`. The frontend polls
                             this and re-fetches its views whenever the
                             generation moved -- see "Auto-refresh" below.
+    GET  /api/canvas    -- `?scope=all|<attempt id>` (default: the current
+                            attempt): the node canvas's datasets/scripts/
+                            figures, links, attempt frames, saved positions
+                            and scope list (DESIGN.md 8.1/8.7; see
+                            `rce.webapp.canvas.build_canvas`).
+    POST /api/canvas/layout -- body `{"positions"?: {id: [x, y] | null},
+                            "viewport"?: {x, y, zoom} | null}`: merge into
+                            the UI-state file beside the graph (8.6; see
+                            `canvas_layout_payload`).
+    POST /api/mappings/add -- body `{"from", "to", "type", "note"?}`: append
+                            one human mapping to `.rce/mappings.toml` and
+                            re-ingest it; returns the resulting link (8.5;
+                            see "Canvas write defense" below).
+    POST /api/mappings/delete -- body `{"from", "to", "type"}`: remove that
+                            entry from the file and re-ingest.
+    POST /api/edges/reject -- body `{"src", "dst", "type", "extractor"}`:
+                            标记为错误提取 -- a machine link's status to
+                            `rejected` through `db.set_edge_status`, the
+                            human-only path (8.3). A human mapping is
+                            refused: deleting the entry is how it goes.
+    POST /api/edges/restore -- same body: undo the above, `rejected` ->
+                            `auto` (see `edge_status_payload`).
     POST /api/shutdown  -- respond `{"ok": true}`, then stop this server's
                             `serve_forever` loop from a separate thread
                             (task V3 phase 4) -- the app's 停止服务 button;
@@ -164,6 +186,29 @@ never ingest concurrently (`ProjectWatcher.ingest_lock`,
 content, and it writes only what DESIGN.md declares the single source of
 truth -- the map file -- letting re-ingest mirror it into the graph, never
 the graph directly ("resync from source", DESIGN.md section 4).
+
+Canvas write defense (DESIGN.md section 8.5/8.6, task V4 phase 1b): the
+canvas adds the second researcher-owned file the app writes,
+`.rce/mappings.toml`, and the same layers apply in the same order.
+`_check_local_origin` first. The file written is never named by the
+request -- it is always `rce.ingest.mappings.mappings_path(root)`; the
+request names only the entry's `from`/`to`, which the phase-1a validator
+(`rce.ingest.mappings`, never a second copy of its grammar) confines to the
+project root with the same resolve-then-`relative_to` check every read path
+takes, before anything is written. The write itself is that module's
+fixed-schema writer (backup to `.rce/backups/`, durable atomic replace),
+run under the watcher's ingest lock together with the re-ingest of the
+mappings file alone, after which the watcher re-baselines ONLY that file
+(`record_external_change(absorb=...)`) so an unrelated save it has not
+ingested yet is never swallowed. `_require_db` runs before the write, so a
+project whose graph is missing or still in iCloud refuses cleanly instead
+of writing a file it then cannot ingest (or blocking on a dataless open).
+`canvas.json` is written to a path computed from the served root alone,
+outside the project. The edge-status endpoints write the graph directly --
+by design: a status is the human's verdict on a MACHINE edge, and
+`db.set_edge_status` is the one path Section 4 allows for it -- and only
+for links the canvas actually draws (`canvas.is_canvas_edge`), never for a
+mapping edge (whose truth is the file).
 
 Shutdown defense (`POST /api/shutdown`, task V3 phase 4): the one endpoint
 whose side effect is the server itself, so `_check_local_origin` runs first
@@ -248,7 +293,9 @@ from typing import Any, Callable
 
 from rce import db, lineage, paths
 from rce.ingest import attempts as attempts_ingest
-from rce.webapp import mapedit
+from rce.ingest import dataflow as dataflow_ingest
+from rce.ingest import mappings as mappings_ingest
+from rce.webapp import canvas, mapedit
 from rce.webapp import registry as project_registry
 from rce.webapp import watcher as project_watcher
 
@@ -274,8 +321,11 @@ class ApiError(Exception):
     (DESIGN.md section 8.10 rule 2). It exists because the alternative is
     the page pattern-matching English engine prose to decide what to
     render, which would break the first time a message is reworded. Only
-    the two states the design names carry one; every other error stays a
-    plain message the page shows in its error box."""
+    the two degraded-project states the design names, plus the canvas's
+    two refusals that have their own product-language sentence
+    (`mapping_exists` -> 「这条映射已存在」, `human_link` -> delete the
+    标注 instead), carry one; every other error stays a plain message the
+    page shows in its error box."""
 
     status = 400
     state: str | None = None
@@ -349,6 +399,43 @@ class AttemptEditError(ApiError):
     intact, since those already say precisely what was wrong."""
 
     status = 400
+
+
+class MappingEditError(ApiError):
+    """`POST /api/mappings/add`/`.../delete` asked for an entry the
+    phase-1a writer refuses (grammar, confinement, unknown extension, line
+    breaks, an unreadable file) -- 400, its English message intact for the
+    hover title; the page frames it as 「无法标注：…」 (section 8.8)."""
+
+    status = 400
+
+
+class MappingExistsError(ApiError):
+    """Section 8.5: a duplicate assertion (same from/to/type) is refused at
+    write time. 409 -- the request is well-formed, the file's current state
+    is what conflicts -- with a `state` so the page says 「这条映射已存在」
+    without pattern-matching the English message."""
+
+    status = 409
+    state = "mapping_exists"
+
+
+class HumanLinkError(ApiError):
+    """`POST /api/edges/reject`/`.../restore` named a human mapping. Its
+    truth is `.rce/mappings.toml`, so the way to remove it is deleting the
+    entry (「删除标注」), never a status write the next ingest would undo.
+    The `state` lets the page offer exactly that instead of an error box."""
+
+    status = 400
+    state = "human_link"
+
+
+class EdgeStatusError(ApiError):
+    """A restore of a link that is not currently rejected -- 409, the
+    graph's current state conflicts with the request (a second click, or
+    another window already restored it)."""
+
+    status = 409
 
 
 class UnknownProjectError(ApiError):
@@ -846,6 +933,199 @@ def attempts_write_payload(
     }
 
 
+# -- The node canvas (DESIGN.md section 8, task V4 phase 1b) -----------------
+
+
+def canvas_payload(conn: Connection, project_root: Path, scope: str | None) -> dict[str, Any]:
+    """`rce.webapp.canvas.build_canvas`, with an unknown scope as a 404."""
+    try:
+        return canvas.build_canvas(conn, project_root, scope)
+    except canvas.UnknownScopeError as exc:
+        raise NotFoundError(str(exc)) from exc
+
+
+def canvas_layout_payload(project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Merge a layout body into `canvas.json` (section 8.6). `_require_db`
+    first: the file lives in the graph's own directory, which exists only
+    for an initialized project -- and a layout for a project with no graph
+    has nothing to lay out."""
+    _require_db(project_root)
+    try:
+        layout = canvas.save_layout(project_root, body)
+    except canvas.LayoutShapeError as exc:
+        raise MissingParamError(str(exc)) from exc
+    return {"ok": True, "positions": len(layout["positions"]), "viewport": layout["viewport"]}
+
+
+def _string_fields(body: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    values = [body.get(k) for k in keys]
+    if not all(isinstance(v, str) and v for v in values):
+        quoted = ", ".join(f"'{k}'" for k in keys)
+        raise MissingParamError(f"request body must carry non-empty string keys {quoted}")
+    return values  # type: ignore[return-value]
+
+
+def _mapping_write_error(exc: mappings_ingest.MappingsWriteError) -> ApiError:
+    if exc.code == "duplicate":
+        return MappingExistsError(str(exc))
+    if exc.code == "not_found":
+        return NotFoundError(str(exc))
+    return MappingEditError(str(exc))
+
+
+def _reingest_mappings(project_root: Path) -> None:
+    """Exactly `rce mappings`' call, on its own connection, with the same
+    never-conjure-a-graph refusal as `mapedit._reingest_attempts` (the
+    graph could vanish between `_require_db` and here)."""
+    db_path = paths.graph_db_path(project_root)
+    if not db_path.exists():
+        raise RuntimeError(
+            f"no RCE project at {project_root} (missing its graph at {db_path}); "
+            "the mappings file was written and backed up, but the graph could not be re-ingested"
+        )
+    conn = db.connect(db_path)
+    try:
+        report = mappings_ingest.ingest_mappings(conn, project_root)
+        logger.info("canvas write re-ingested mappings for %s: %s", project_root, report.counts)
+    finally:
+        conn.close()
+
+
+def _mapping_link(project_root: Path, entry: dict[str, Any]) -> dict[str, Any] | None:
+    """The link the just-written entry became, read back from the graph --
+    so the response is what the canvas will draw, not an echo of the
+    request. None if the re-ingest did not land it."""
+    from_type = dataflow_ingest.node_type_for_path(entry["from"])
+    to_type = dataflow_ingest.node_type_for_path(entry["to"])
+    if from_type is None or to_type is None:
+        return None
+    mapping = mappings_ingest.Mapping(
+        from_path=entry["from"], to_path=entry["to"], type=entry["type"],
+        from_type=from_type, to_type=to_type,
+    )
+    db_path = paths.graph_db_path(project_root)
+    if not db_path.exists():
+        return None
+    conn = db.connect(db_path)
+    try:
+        for edge in db.query_edges(conn, src=mapping.src_id, dst=mapping.dst_id, type=mapping.type):
+            if edge["extractor"] == mappings_ingest.EXTRACTOR:
+                return canvas.link_entry(edge)
+    finally:
+        conn.close()
+    return None
+
+
+def _write_mapping(
+    project_root: Path,
+    watcher: project_watcher.ProjectWatcher,
+    write: Callable[[], dict[str, Any]],
+) -> tuple[dict[str, Any], str | None, int]:
+    """The shared write discipline of both mapping endpoints (module
+    docstring, "Canvas write defense"): graph checked first; the file write
+    and the mappings re-ingest under the watcher's ingest lock; the
+    re-ingest's failure contained and reported, never hiding that the file
+    was written; only the mappings file re-baselined; generation bumped."""
+    _require_db(project_root)
+    with watcher.ingest_lock:
+        try:
+            result = write()
+        except mappings_ingest.MappingsWriteError as exc:
+            raise _mapping_write_error(exc) from exc
+        ingest_error: str | None = None
+        try:
+            _reingest_mappings(project_root)
+        except Exception as exc:  # noqa: BLE001 -- containment, same as apply_edit's
+            logger.exception("post-write mappings re-ingest of %s failed -- file written", project_root)
+            ingest_error = str(exc)
+    generation = watcher.record_external_change(
+        ingest_error, absorb={str(mappings_ingest.mappings_path(project_root))},
+    )
+    return result, ingest_error, generation
+
+
+def mappings_add_payload(
+    project_root: Path, body: dict[str, Any], watcher: project_watcher.ProjectWatcher
+) -> dict[str, Any]:
+    """Append one human mapping (section 8.5) and return the link it became.
+    `note` is optional; an empty or whitespace-only note is no note (the
+    popover's 备注 field left blank)."""
+    from_path, to_path, edge_type = _string_fields(body, ("from", "to", "type"))
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        raise MissingParamError("request body 'note' must be a string when present")
+    if note is not None and not note.strip():
+        note = None
+    result, ingest_error, generation = _write_mapping(
+        project_root, watcher,
+        lambda: mappings_ingest.add_mapping(project_root, from_path, to_path, edge_type, note=note),
+    )
+    return {
+        "ok": True,
+        "file": result["file"],
+        "backup": result["backup"],
+        "entry": result["entry"],
+        "link": _mapping_link(project_root, result["entry"]),
+        "generation": generation,
+        "ingest_error": ingest_error,
+    }
+
+
+def mappings_delete_payload(
+    project_root: Path, body: dict[str, Any], watcher: project_watcher.ProjectWatcher
+) -> dict[str, Any]:
+    """Remove one human mapping (「删除标注」); the re-ingest then drops its
+    edge -- the only way a mapping edge ever leaves the graph (8.5)."""
+    from_path, to_path, edge_type = _string_fields(body, ("from", "to", "type"))
+    result, ingest_error, generation = _write_mapping(
+        project_root, watcher,
+        lambda: mappings_ingest.delete_mapping(project_root, from_path, to_path, edge_type),
+    )
+    return {
+        "ok": True,
+        "file": result["file"],
+        "backup": result["backup"],
+        "removed": result["removed"],
+        "generation": generation,
+        "ingest_error": ingest_error,
+    }
+
+
+def edge_status_payload(conn: Connection, body: dict[str, Any], action: str) -> dict[str, Any]:
+    """`action` "reject" (标记为错误提取) or "restore" (its undo) on one
+    canvas link, through `db.set_edge_status` -- Section 4's human-only
+    status path, reused rather than a second mechanism (8.3).
+
+    Order of refusals: a `mapping` extractor first (whether or not such an
+    edge exists, the answer is the same -- delete the entry), then a link
+    that does not exist or is not one the canvas draws (404: the app can
+    only change statuses it shows), then for restore a link that is not
+    rejected (409). Restore returns the link to `canvas.RESTORED_STATUS`
+    ("auto"), the status every extractor of a canvas edge type writes, so
+    the mis-click is undone exactly. Reject is idempotent."""
+    src, dst, edge_type, extractor = _string_fields(body, ("src", "dst", "type", "extractor"))
+    if extractor == mappings_ingest.EXTRACTOR:
+        raise HumanLinkError(
+            "this link is a human mapping from .rce/mappings.toml -- delete the mapping "
+            "instead of marking it as a wrong extraction"
+        )
+    matches = [e for e in db.query_edges(conn, src=src, dst=dst, type=edge_type) if e["extractor"] == extractor]
+    if not matches or not canvas.is_canvas_edge(conn, matches[0]):
+        raise NotFoundError(f"no canvas link {src} --{edge_type}--> {dst} (extractor {extractor!r})")
+    edge = matches[0]
+    if action == "reject":
+        new_status = "rejected"
+    else:
+        if edge["status"] != "rejected":
+            raise EdgeStatusError(
+                f"link {src} --{edge_type}--> {dst} is {edge['status']!r}, not rejected -- nothing to restore"
+            )
+        new_status = canvas.RESTORED_STATUS
+    db.set_edge_status(conn, src, dst, edge_type, extractor, new_status)
+    edge["status"] = new_status
+    return {"ok": True, "link": canvas.link_entry(edge)}
+
+
 # -- The single-page app (task V2) -------------------------------------------
 
 _APP_HTML_PATH = Path(__file__).parent / "app.html"
@@ -1024,6 +1304,9 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # has gone missing mid-serve (that failure surfaces as the
                 # watcher's last_error, not as this endpoint erroring).
                 self._send_json(200, self.server.watcher.status_payload())
+            elif path == "/api/canvas":
+                scope = (query.get("scope") or [None])[0]
+                self._json_from_conn(lambda conn: canvas_payload(conn, self._project_root(), scope))
             elif path == "/api/file":
                 values = query.get("path")
                 if not values:
@@ -1106,6 +1389,30 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     200, attempts_write_payload(self._project_root(), body, self.server.watcher)
                 )
+            elif parsed.path in ("/api/mappings/add", "/api/mappings/delete"):
+                # The canvas's one write dialog (section 8.3/8.5): writes
+                # .rce/mappings.toml, never a request-named path -- see
+                # module docstring's "Canvas write defense".
+                body = self._read_json_object()
+                fn = mappings_add_payload if parsed.path.endswith("/add") else mappings_delete_payload
+                self._send_json(200, fn(self._project_root(), body, self.server.watcher))
+            elif parsed.path in ("/api/edges/reject", "/api/edges/restore"):
+                body = self._read_json_object()
+                action = "reject" if parsed.path.endswith("/reject") else "restore"
+                conn = self._open_conn()
+                try:
+                    payload = edge_status_payload(conn, body, action)
+                finally:
+                    conn.close()
+                # A graph change with no file change: pages re-fetch, the
+                # watcher's baseline and error stay exactly as they were.
+                payload["generation"] = self.server.watcher.bump_generation()
+                self._send_json(200, payload)
+            elif parsed.path == "/api/canvas/layout":
+                # UI state beside the graph (8.6) -- origin-checked like
+                # every POST: a drive-by page must not scramble the canvas.
+                body = self._read_json_object()
+                self._send_json(200, canvas_layout_payload(self._project_root(), body))
             elif parsed.path == "/api/shutdown":
                 # Stops this whole server (task V3 phase 4). Respond first,
                 # then stop the serve loop from a separate thread -- see
