@@ -84,6 +84,13 @@
       same-origin and served by this same process -- still zero external
       resources.
 
+  Native shell (DESIGN.md 8.9, task V4 phase 3): RCE.app shows this same
+  page in a WKWebView. Its menus call window.RCE.command(name) -- one
+  dispatcher over a fixed command table, see "Native shell bridge" in the
+  script -- and the page posts {type: "title", text} to
+  webkit.messageHandlers.rce after every project load. Without the shell
+  both are inert; the page behaves exactly as in any browser.
+
   Section 8.10 rule 2's one-message rule: while a project state chip is
   showing, the refresh-failure chip is suppressed (hideRefreshChip).
 
@@ -913,6 +920,7 @@ async function loadProjects() {
     state.projectLabel = "";
     state.projectCount = 0;
     state.deadProjects = [];
+    postShellTitle();
     return;
   }
   const projects = data.projects || [];
@@ -953,6 +961,7 @@ async function loadProjects() {
   removeMissingBtn.classList.toggle("hidden", state.deadProjects.length === 0);
   removeMissingBtn.disabled = false;
   updateSwitcherVisibility();
+  postShellTitle(); // on load and after every switch (reloadAllViews)
 }
 
 // Normally the switcher only earns its place when there is something to
@@ -2094,6 +2103,119 @@ document.getElementById("shutdown-btn").addEventListener("click", async () => {
   }
   renderStoppedState();
 });
+
+// -- Native shell bridge (DESIGN.md section 8.9, task V4 phase 3) ----------
+// RCE.app is a native window around this same page. Its menus reach the
+// page through ONE entry point, window.RCE.command(name), which the shell
+// calls as the fixed string `window.RCE && RCE.command('<name>')` with a
+// name from its own compiled-in whitelist; this table is the page's side
+// of that whitelist. Anything not in it returns false and does nothing.
+// In a plain browser nobody calls it and nothing is lost: every command
+// here is something the page can already do from its own controls.
+//
+// The two Finder commands go through the existing POST /api/open, never a
+// new endpoint: the project root is the path "." (which the server's
+// resolve-then-relative_to check maps to the served root itself), and the
+// map file is the one the server's own /api/summary echoes from
+// .rce/attempts.toml -- fetched fresh at command time so a project switch
+// can never open the previous project's map. The server confines both
+// exactly as it confines every other /api/open path.
+//
+// The page reports the current project's label to the shell (window
+// title 「RCE — <label>」) over webkit.messageHandlers.rce -- the only
+// message shape the shell accepts -- after every loadProjects(), i.e. on
+// load and on every project switch. Absent bridge: a silent no-op.
+
+const TEXT_ZOOM_STEPS = [0.8, 0.9, 1, 1.1, 1.25, 1.5];
+let textZoomIndex = TEXT_ZOOM_STEPS.indexOf(1);
+
+// 放大/缩小/实际大小: the canvas zooms its own camera; the two reading
+// views scale their own sections (never the canvas section, whose pointer
+// geometry must stay in unscaled CSS pixels).
+function shellZoom(step) {
+  if (currentView === "canvas") {
+    if (step > 0) RCECanvas.zoomIn();
+    else if (step < 0) RCECanvas.zoomOut();
+    else RCECanvas.zoomReset();
+    return;
+  }
+  textZoomIndex = step === 0 ? TEXT_ZOOM_STEPS.indexOf(1)
+    : Math.max(0, Math.min(TEXT_ZOOM_STEPS.length - 1, textZoomIndex + step));
+  const z = TEXT_ZOOM_STEPS[textZoomIndex];
+  views.tree.style.zoom = z === 1 ? "" : String(z);
+  views.lineage.style.zoom = z === 1 ? "" : String(z);
+}
+
+// A failed Finder command reports in the header line, the same spot a
+// failed project switch uses; the engine's own text stays on the hover.
+function shellReport(message, detail) {
+  const line = document.getElementById("project-line");
+  if (!line) return;
+  line.textContent = message;
+  line.title = detail || "";
+}
+
+async function shellOpen(path, reveal, failure) {
+  try {
+    await apiPost("/api/open", { path: path, reveal: reveal });
+  } catch (err) {
+    shellReport(failure, err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function shellOpenMap() {
+  let config = null;
+  try {
+    config = (await apiGet("/api/summary")).attempts_config;
+  } catch (err) {
+    shellReport("无法打开项目地图", err instanceof Error ? err.message : String(err));
+    return;
+  }
+  if (!config || !config.file) {
+    shellReport("这个项目还没有配置项目地图（.rce/attempts.toml）", "");
+    return;
+  }
+  await shellOpen(config.file, false, "无法打开项目地图");
+}
+
+const SHELL_COMMANDS = {
+  "tree": () => activateView("tree"),
+  "lineage": () => activateView("lineage"),
+  "canvas": () => activateView("canvas"),
+  "new-attempt": () => openAttemptForm("append"),
+  "reload": () => window.location.reload(),
+  "zoom-in": () => shellZoom(1),
+  "zoom-out": () => shellZoom(-1),
+  "zoom-reset": () => shellZoom(0),
+  // 适应全部 is a canvas notion; from another view it brings the canvas up
+  // first rather than silently doing nothing.
+  "fit": () => { activateView("canvas"); RCECanvas.fitAll(); },
+  "reveal-project": () => shellOpen(".", true, "无法在 Finder 中显示项目"),
+  "open-map": () => shellOpenMap(),
+};
+
+window.RCE = Object.freeze({
+  command(name) {
+    if (typeof name !== "string" || !Object.prototype.hasOwnProperty.call(SHELL_COMMANDS, name)) return false;
+    // After 停止服务 the page is a static note; a menu click must not throw.
+    if (!document.getElementById("view-tree")) return false;
+    try {
+      SHELL_COMMANDS[name]();
+    } catch (err) {
+      return false;
+    }
+    return true;
+  },
+});
+
+function postShellTitle() {
+  try {
+    const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.rce;
+    if (bridge) bridge.postMessage({ type: "title", text: String(state.projectLabel || "") });
+  } catch (err) {
+    /* no shell, or the shell went away: the page works the same */
+  }
+}
 
 // -- Init -------------------------------------------------------------------
 // loadProjects() first (awaited): it fills state.projectLabel, which the

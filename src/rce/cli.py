@@ -1042,19 +1042,23 @@ def cmd_projects_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_app(args: argparse.Namespace) -> int:
-    """`rce app` (task V3 phase 4): generate the double-clickable RCE.app
-    launcher bundle (rce.webapp.macapp) -- a bash launcher that opens the
-    already-running server's page or starts `rce serve` first; see that
-    module's docstring for the bundle's exact shape and why the rce path
-    is baked in absolute.
+    """`rce app` (task V4 phase 3, DESIGN.md 8.9; first shipped in V3
+    phase 4): build RCE.app with rce.webapp.macapp.build_app -- the native
+    shell compiled by the system swiftc, or, when that toolchain is
+    missing, the V3 launcher-script bundle plus a one-line notice saying
+    so. Either replaces an existing RCE.app in place. See that module's
+    docstring for the bundle's exact shape and why the rce path is a
+    runtime sidecar rather than baked into source.
 
-    `--dir` generates into any directory on any platform (this is what
-    the tests use, and how a user targets /Applications instead). Only
-    the *default* location, ~/Applications, is macOS-gated: on another
+    `--dir` builds into any directory on any platform (the tests use it,
+    and it is how a user targets /Applications instead). Only the
+    *default* location, ~/Applications, is macOS-gated: on another
     platform there is no `open`, no .app double-click, and no
     ~/Applications convention, so defaulting there would generate a
     bundle nothing can launch -- the error says to pass --dir instead of
-    guessing at a per-platform equivalent."""
+    guessing at a per-platform equivalent. The hidden `--port` (default
+    7357) exists for tests and trial builds only, so a trial app never
+    probes or stops the researcher's own engine."""
     if args.dir is not None:
         target_dir = Path(args.dir).expanduser().resolve()
     else:
@@ -1066,12 +1070,28 @@ def cmd_app(args: argparse.Namespace) -> int:
             )
         target_dir = Path.home() / "Applications"
     try:
-        bundle = macapp.generate_bundle(target_dir)
+        result = macapp.build_app(target_dir, port=args.port)
     except macapp.MacAppError as exc:
         raise CliError(str(exc)) from exc
-    print(f"RCE.app written to {bundle}")
-    print("双击 RCE.app 即可打开研究地图；服务已在运行时会直接打开页面。")
+    for notice in result.notices:
+        print(notice)
+    print(f"RCE.app written to {result.bundle}")
+    if result.native:
+        print("双击 RCE.app 即可打开研究地图；引擎没在运行时会自动启动。")
+    else:
+        print("双击 RCE.app 即可打开研究地图；服务已在运行时会直接打开页面。")
     return 0
+
+
+def _tcp_port(value: str) -> int:
+    """argparse `type=` for `rce app --port`: an integer in 1..65535."""
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {value!r}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be between 1 and 65535, got {port}")
+    return port
 
 
 def _import_mcp_server():
@@ -1247,8 +1267,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "app",
         help=(
-            "Generate the double-clickable RCE.app launcher bundle (task V3 phase 4): "
-            "opens the running server's page, or starts 'rce serve' first (default: "
+            "Build RCE.app, the native macOS window around the web app (compiled with "
+            "the system swiftc; falls back to the browser launcher bundle without it). "
+            "Starts 'rce serve' itself when no engine is running (default: "
             "~/Applications, macOS only; --dir works anywhere)"
         ),
     )
@@ -1259,6 +1280,9 @@ def build_parser() -> argparse.ArgumentParser:
             "(e.g. /Applications); works on any platform"
         ),
     )
+    # Hidden: for tests and trial builds, never for the researcher's own
+    # install (one fixed port is how every app finds the one engine).
+    p.add_argument("--port", type=_tcp_port, default=macapp.DEFAULT_PORT, help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_app)
 
     p = sub.add_parser(

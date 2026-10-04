@@ -1779,3 +1779,84 @@ def test_switch_migrates_a_legacy_graph_in_the_project_switched_to(live_server, 
     assert status == 200
     assert not legacy.exists()
     assert paths.graph_db_path(legacy_project).exists()
+
+
+# -- Native shell bridge (DESIGN.md section 8.9, task V4 phase 3) ------------
+
+_SHELL_SWIFT_FILE = Path(server.__file__).parent / "shell" / "RCEShell.swift"
+
+
+def _page_shell_commands(html: str) -> set[str]:
+    block = html[html.index("const SHELL_COMMANDS = {"):]
+    block = block[: block.index("\n};")]
+    return set(re.findall(r'^\s*"([a-z-]+)":', block, re.M))
+
+
+def test_served_page_exposes_the_shell_dispatcher_and_title_message(live_server):
+    """The page's half of the bridge is in what the server actually serves:
+    one frozen window.RCE with a `command` entry point, and the one message
+    shape the shell accepts, posted from loadProjects (load and switch)."""
+    _, body = _get_raw(live_server[0], "/")
+    html = body.decode("utf-8")
+    assert "window.RCE = Object.freeze({" in html and "command(name)" in html
+    assert 'window.webkit.messageHandlers.rce' in html
+    assert 'postMessage({ type: "title", text:' in html
+    load_projects = html[html.index("async function loadProjects()"):html.index("function updateSwitcherVisibility()")]
+    assert load_projects.count("postShellTitle();") == 2  # success and failure paths alike
+
+
+def test_page_dispatcher_and_shell_whitelist_name_the_same_commands():
+    """The shell's compiled-in whitelist (Swift) and the page's command
+    table must agree exactly: a name only one side knows is a menu item
+    that silently does nothing, or a page command no menu can reach."""
+    html = server._APP_HTML_PATH.read_text(encoding="utf-8")
+    swift = _SHELL_SWIFT_FILE.read_text(encoding="utf-8")
+    whitelist_src = swift[swift.index("let shellCommands: Set<String> = ["):]
+    whitelist_src = whitelist_src[: whitelist_src.index("]")]
+    swift_names = set(re.findall(r'"([a-z-]+)"', whitelist_src))
+    expected = {
+        "tree", "lineage", "canvas", "new-attempt", "reload", "zoom-in", "zoom-out",
+        "zoom-reset", "fit", "reveal-project", "open-map",
+    }
+    assert _page_shell_commands(html) == expected
+    assert swift_names == expected
+
+
+def test_page_finder_commands_use_only_the_existing_open_endpoint():
+    """reveal-project / open-map add no endpoint: the project root is "."
+    and the map file is the server's own summary echo, both through the
+    origin-checked, root-confined POST /api/open."""
+    html = server._APP_HTML_PATH.read_text(encoding="utf-8")
+    bridge = html[html.index("// -- Native shell bridge"):html.index("// -- Init ---")]
+    assert set(re.findall(r'apiPost\("(/api/[\w/]+)"', bridge)) == {"/api/open"}
+    assert 'shellOpen(".", true,' in bridge
+    assert 'apiGet("/api/summary")' in bridge
+
+
+def test_http_open_dot_reveals_the_project_root_itself(live_server, monkeypatch):
+    """The 在 Finder 中显示项目 command's request: "." resolves to the served
+    root, which the confinement check accepts (it is not outside itself)."""
+    base_url, project = live_server
+    monkeypatch.setattr(server, "_is_macos", lambda: True)
+    calls = []
+    monkeypatch.setattr(server.subprocess, "run", lambda args, **kw: calls.append((args, kw)))
+
+    status, payload = _post(base_url, "/api/open", {"path": ".", "reveal": True})
+
+    assert status == 200
+    assert calls == [(["open", "-R", str(project.resolve())], {"check": False})]
+
+
+def test_http_open_from_the_shell_with_portless_origin_is_accepted(live_server, monkeypatch):
+    """WebKit's same-origin POST carries the portless Origin (8.9 "Origin"):
+    the shell adds no new origin shape, and the existing check accepts it."""
+    base_url, _ = live_server
+    port = urllib.parse.urlsplit(base_url).port
+    monkeypatch.setattr(server, "_is_macos", lambda: True)
+    monkeypatch.setattr(server.subprocess, "run", lambda args, **kw: None)
+    status, _ = _request_with_headers(
+        base_url, "POST", "/api/open",
+        {"Origin": "http://127.0.0.1", "Host": f"127.0.0.1:{port}", "Content-Type": "application/json"},
+        json.dumps({"path": ".", "reveal": True}).encode("utf-8"),
+    )
+    assert status == 200
