@@ -67,12 +67,25 @@
   so continuing to poll would only spray connection errors). A failure
   leaves the page fully usable and says so in the header line.
 
-  Two views, switched by the top tab bar:
-    - Decision Tree (default): GET /api/tree. attempt -> step script ->
+  Three views, switched by the top tab bar (labels per DESIGN.md section
+  8.8: 「决策树」「血缘」「画布」; the last one used is remembered in
+  localStorage, wrapped so blocked storage just starts on 决策树):
+    - 决策树 (default): GET /api/tree. attempt -> step script ->
       read/write data files, all three layers already computed
       server-side from graph edges; this page only renders them.
-    - Lineage: GET /api/lineage. Four fixed blocks in report order --
+    - 血缘: GET /api/lineage. Four fixed blocks in report order --
       orphan inputs, chains, broken links, duplicate copies.
+    - 画布 (task V4 phase 2a): GET /api/canvas, drawn by the second served
+      file, /canvas.js (window.RCECanvas; see its own top comment). This
+      page owns only the tab, the full-window "canvas-mode" layout, the
+      canvas CSS (kept here with every other style, on the same tokens),
+      and the hooks: generation refresh and project switch call
+      RCECanvas.load / RCECanvas.reset. The one external <script src> is
+      same-origin and served by this same process -- still zero external
+      resources.
+
+  Section 8.10 rule 2's one-message rule: while a project state chip is
+  showing, the refresh-failure chip is suppressed (hideRefreshChip).
 
   Clicking any file path anywhere in either view opens the right-hand
   slide-out panel (GET /api/file for a preview, POST /api/open to reveal
@@ -420,6 +433,109 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 .stopped-note p { margin: 0.4rem 0; color: var(--ink-soft); }
 .stopped-note code { font-family: var(--font-mono); font-size: 0.85em; background: var(--paper); border: 1px solid var(--line); padding: 0.05em 0.35em; }
 
+/* -- 画布 (DESIGN.md section 8.2; drawn by canvas.js) ------------------------
+   Only the existing tokens: paper/ink for the ground and text, ochre /
+   olive / ink as the three type colors (数据集 / 脚本 / 图表), clay kept for
+   "a human did this" or "something is wrong" -- never a type color. */
+body.canvas-mode #app { height: 100vh; min-height: 0; }
+body.canvas-mode main#main { max-width: none; padding: 0; display: flex; flex-direction: column; min-height: 0; }
+body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 1px solid var(--line); }
+#view-canvas { flex: 1; min-height: 0; position: relative; }
+.cv-root { position: absolute; inset: 0; overflow: hidden; background: var(--paper); user-select: none; -webkit-user-select: none; }
+.cv-svg { display: block; width: 100%; height: 100%; touch-action: none; }
+.cv-root.space .cv-svg, .cv-root.space .cv-node { cursor: grab; }
+.cv-root.panning .cv-svg { cursor: grabbing; }
+.cv-dot { fill: var(--line); }
+
+.cv-node { cursor: grab; }
+.cv-node.dragging { cursor: grabbing; filter: drop-shadow(0 6px 10px rgba(38, 34, 27, 0.18)); }
+.cv-card { fill: var(--paper-alt); stroke: var(--line-strong); stroke-width: 1; }
+.cv-node.hover .cv-card { stroke: var(--ink-soft); }
+.cv-node.match .cv-card { stroke: var(--ink); stroke-width: 1.5; }
+.cv-node.missing .cv-card, .cv-node.ghost .cv-card { stroke-dasharray: 5 3; }
+.cv-node.selected .cv-card { stroke: var(--clay); stroke-width: 2; }
+.cv-title-sep { stroke: var(--line); stroke-width: 1; }
+.cv-node.t-dataset .cv-rule { fill: var(--ochre); }
+.cv-node.t-script .cv-rule { fill: var(--olive); }
+.cv-node.t-figure .cv-rule { fill: var(--ink); }
+.cv-type { font-family: var(--font-mono); font-size: 11px; }
+.cv-node.t-dataset .cv-type { fill: var(--ochre); }
+.cv-node.t-script .cv-type { fill: var(--olive); }
+.cv-node.t-figure .cv-type { fill: var(--ink); }
+.cv-tag { font-family: var(--font-sans); font-size: 11px; }
+.cv-tag-missing { fill: var(--clay); }
+.cv-tag-ghost { fill: var(--ink-soft); }
+.cv-name { font-family: var(--font-sans); font-size: 13px; fill: var(--ink); }
+.cv-dir { font-family: var(--font-mono); font-size: 11px; fill: var(--ink-soft); }
+.cv-node.ghost .cv-name, .cv-node.ghost .cv-type, .cv-node.ghost .cv-rule { fill: var(--ink-soft); }
+.cv-socket { stroke-width: 1.25; }
+.cv-socket.sock-data { fill: var(--ochre-soft); stroke: var(--ochre); }
+.cv-socket.sock-figure { fill: var(--paper); stroke: var(--ink); }
+.cv-socket.orphan { fill: var(--clay); stroke: var(--clay); }
+.cv-socket-label { font-family: var(--font-mono); font-size: 11px; fill: var(--ink-soft); }
+
+.cv-link { fill: none; }
+.cv-link.machine { stroke: var(--ink); stroke-width: 1.5; stroke-opacity: 0.45; }
+.cv-link.pending { stroke-dasharray: 6 4; }
+.cv-link.human { stroke: var(--clay); stroke-width: 2.25; }
+.cv-link.cycle { stroke: var(--clay); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.cv-link-g.lit .cv-link.machine { stroke-opacity: 1; }
+.cv-link-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; }
+.cv-link-dot { fill: var(--clay); }
+.cv-node.dim, .cv-link-g.dim { opacity: 0.22; }
+
+.cv-frames { pointer-events: none; }
+.cv-frame-rect { stroke-width: 1.25; stroke-dasharray: 6 4; fill-opacity: 0.4; }
+.cv-frame-title { font-family: var(--font-sans); font-size: 12px; font-weight: 600; }
+.cv-frame.tone-olive .cv-frame-rect { stroke: var(--olive); fill: var(--olive-soft); }
+.cv-frame.tone-olive .cv-frame-title { fill: var(--olive); }
+.cv-frame.tone-ochre .cv-frame-rect { stroke: var(--ochre); fill: var(--ochre-soft); }
+.cv-frame.tone-ochre .cv-frame-title { fill: var(--ochre); }
+.cv-frame.tone-clay .cv-frame-rect { stroke: var(--clay); fill: var(--clay-soft); }
+.cv-frame.tone-clay .cv-frame-title { fill: var(--clay); }
+.cv-frame.tone-gray .cv-frame-rect { stroke: var(--gray); fill: var(--gray-soft); }
+.cv-frame.tone-gray .cv-frame-title { fill: var(--gray); }
+.cv-frame.tone-plain .cv-frame-rect { stroke: var(--line-strong); fill: var(--paper-alt); }
+.cv-frame.tone-plain .cv-frame-title { fill: var(--ink-soft); }
+
+.cv-toolbar {
+  position: absolute; top: 12px; left: 12px; z-index: 2;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  max-width: calc(100% - 24px);
+  background: var(--paper); border: 1px solid var(--line-strong); padding: 6px;
+  box-shadow: 0 2px 8px rgba(38, 34, 27, 0.08);
+}
+.cv-btn, .cv-scope, .cv-search {
+  font: inherit; font-size: 0.8rem; color: var(--ink);
+  background: var(--paper-alt); border: 1px solid var(--line-strong); border-radius: 0;
+  padding: 0.22rem 0.55rem; line-height: 1.4;
+}
+.cv-btn { cursor: pointer; }
+.cv-btn:hover, .cv-scope:hover { border-color: var(--ink); }
+.cv-scope { max-width: 16rem; cursor: pointer; }
+.cv-search { width: 10rem; }
+.cv-scope:focus, .cv-search:focus, .cv-btn:focus-visible { outline: 1px solid var(--clay); outline-offset: 1px; }
+.cv-more { position: relative; }
+.cv-menu { position: absolute; top: calc(100% + 4px); right: 0; background: var(--paper); border: 1px solid var(--line-strong); box-shadow: 0 2px 8px rgba(38, 34, 27, 0.1); min-width: 7rem; }
+.cv-menu-item { display: block; width: 100%; text-align: left; font: inherit; font-size: 0.8rem; color: var(--ink); background: none; border: none; padding: 0.4rem 0.7rem; cursor: pointer; white-space: nowrap; }
+.cv-menu-item:hover { background: var(--paper-alt); }
+.cv-zoom {
+  position: absolute; left: 12px; bottom: 12px; z-index: 2;
+  font-family: var(--font-mono); font-size: 0.74rem; color: var(--ink-soft);
+  background: var(--paper); border: 1px solid var(--line); padding: 0.1rem 0.45rem;
+}
+.cv-status {
+  position: absolute; left: 72px; bottom: 12px; z-index: 2; cursor: help;
+  font-size: 0.76rem; color: var(--clay); background: var(--clay-soft); border: 1px solid var(--clay); padding: 0.1rem 0.55rem;
+}
+.cv-tip {
+  position: absolute; z-index: 3; pointer-events: none; max-width: 22rem;
+  font-size: 0.76rem; color: var(--ink); background: var(--paper); border: 1px solid var(--line-strong);
+  padding: 0.25rem 0.55rem; box-shadow: 0 2px 8px rgba(38, 34, 27, 0.1);
+}
+.cv-tip.human { border-color: var(--clay); }
+.cv-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 2rem; text-align: center; color: var(--ink-soft); font-size: 0.88rem; pointer-events: none; }
+
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
   .topbar { padding: 1rem 1rem 0.75rem; }
@@ -440,14 +556,16 @@ details.script-node > summary::-webkit-details-marker { display: none; }
     <span id="refresh-chip" class="refresh-chip hidden" role="status"></span>
     <button id="new-attempt-btn" class="btn new-attempt-btn" type="button">＋ 新增尝试</button>
     <nav class="tabs" role="tablist">
-      <button class="tab active" data-view="tree" role="tab" aria-selected="true">Decision Tree</button>
-      <button class="tab" data-view="lineage" role="tab" aria-selected="false">Lineage</button>
+      <button class="tab active" data-view="tree" role="tab" aria-selected="true">决策树</button>
+      <button class="tab" data-view="lineage" role="tab" aria-selected="false">血缘</button>
+      <button class="tab" data-view="canvas" role="tab" aria-selected="false">画布</button>
     </nav>
     <div class="project-line" id="project-line"></div>
   </header>
   <main id="main">
     <section id="view-tree" class="view"></section>
     <section id="view-lineage" class="view hidden"></section>
+    <section id="view-canvas" class="view hidden"></section>
   </main>
   <footer class="pagefoot">
     <button id="shutdown-btn" class="shutdown-btn" type="button" title="停止本地服务进程">停止服务</button>
@@ -466,6 +584,9 @@ details.script-node > summary::-webkit-details-marker { display: none; }
   <div class="panel-body" id="panel-body"></div>
 </aside>
 
+<!-- The 画布 view (DESIGN.md section 8): defines window.RCECanvas only; it
+     calls this page's helpers below at run time, never at load time. -->
+<script src="/canvas.js"></script>
 <script>
 "use strict";
 
@@ -491,9 +612,11 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 // projectState is the degraded-project condition currently on screen
 // ("graph_missing" / "graph_downloading", null when healthy) -- it decides
 // whether the header chip shows and whether the switcher is forced visible.
+// projectPath is the served root as /api/projects reports it -- the key the
+// canvas (canvas.js) files its remembered scope under.
 const state = {
   attemptsById: new Map(), projectLabel: "", panelSubject: null,
-  attemptsConfig: null, projectState: null,
+  attemptsConfig: null, projectState: null, projectPath: "",
 };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
@@ -611,6 +734,10 @@ function setProjectState(err) {
   projectStateChip.textContent = PROJECT_STATES[name].chip;
   projectStateChip.title = err.message;
   projectStateChip.classList.remove("hidden");
+  // Rule 2's one-message rule, applied the moment the state appears rather
+  // than on the next poll tick (refreshChip is declared further down; this
+  // only ever runs after the whole script has loaded).
+  if (refreshChip.classList.contains("err")) hideRefreshChip();
   updateSwitcherVisibility();
   return true;
 }
@@ -648,20 +775,46 @@ function renderViewFailure(container, err) {
 
 // -- Tabs ---------------------------------------------------------------------
 
-const views = { tree: document.getElementById("view-tree"), lineage: document.getElementById("view-lineage") };
+const views = {
+  tree: document.getElementById("view-tree"),
+  lineage: document.getElementById("view-lineage"),
+  canvas: document.getElementById("view-canvas"),
+};
 let currentView = null;
+
+// The last view is remembered per browser (DESIGN.md section 8.7's "remember
+// the last view and scope"): a convenience only, so every storage access is
+// wrapped -- a private window or blocked site data simply starts on 决策树.
+const VIEW_STORAGE_KEY = "rce.view";
+
+function storedView() {
+  try {
+    const v = window.localStorage.getItem(VIEW_STORAGE_KEY);
+    return v && Object.prototype.hasOwnProperty.call(views, v) ? v : null;
+  } catch (err) {
+    return null;
+  }
+}
 
 function activateView(name) {
   if (currentView === name) return;
   currentView = name;
+  try { window.localStorage.setItem(VIEW_STORAGE_KEY, name); } catch (err) { /* convenience only */ }
   document.querySelectorAll(".tab").forEach((btn) => {
     const active = btn.dataset.view === name;
     btn.classList.toggle("active", active);
     btn.setAttribute("aria-selected", String(active));
   });
   Object.entries(views).forEach(([key, node]) => node.classList.toggle("hidden", key !== name));
+  // The canvas wants the whole window below the header, not the reading
+  // column the two text views use.
+  document.body.classList.toggle("canvas-mode", name === "canvas");
   if (name === "tree" && !views.tree.dataset.loaded) loadTreeView();
   if (name === "lineage" && !views.lineage.dataset.loaded) loadLineageView();
+  if (name === "canvas") {
+    if (!views.canvas.dataset.loaded) RCECanvas.load(views.canvas);
+    else RCECanvas.activate();
+  }
 }
 
 document.querySelectorAll(".tab").forEach((btn) => {
@@ -721,6 +874,9 @@ async function loadProjects() {
   }
   const projects = data.projects || [];
   const current = data.current || "";
+  // The served root, so per-project conveniences (the canvas's remembered
+  // scope) never leak from one project into another.
+  state.projectPath = current;
   const currentEntry = projects.find((p) => p.path === current);
   state.projectLabel = currentEntry ? currentEntry.label : basename(current);
   state.projectCount = projects.length;
@@ -801,6 +957,8 @@ async function reloadAllViews() {
   state.attemptsById = new Map();
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
+  delete views.canvas.dataset.loaded;
+  RCECanvas.reset();
   closePanel();
   // The switch itself bumped the server's generation (watcher.retarget);
   // resync the poller's notion of "current" so the next tick doesn't
@@ -810,6 +968,7 @@ async function reloadAllViews() {
   loadProjectSummary();
   if (currentView === "tree") loadTreeView();
   else if (currentView === "lineage") loadLineageView();
+  else if (currentView === "canvas") RCECanvas.load(views.canvas);
 }
 
 projectSwitcher.addEventListener("change", async () => {
@@ -860,8 +1019,19 @@ function showRefreshingChip() {
   refreshChip.title = "";
 }
 
+// DESIGN.md section 8.10 rule 2: while a project state chip is showing,
+// the refresh-failure chip is suppressed -- both are true, but one cause
+// deserves one message, and the project state is the cause.
+function hideRefreshChip() {
+  refreshChip.classList.add("hidden");
+  refreshChip.classList.remove("err");
+  refreshChip.title = "";
+}
+
 function updateChipFromStatus(status) {
-  if (status.last_error) {
+  if (status.last_error && state.projectState) {
+    hideRefreshChip();
+  } else if (status.last_error) {
     refreshChip.classList.remove("hidden");
     refreshChip.classList.add("err");
     refreshChip.textContent = "重扫失败，最新改动尚未同步";
@@ -869,9 +1039,7 @@ function updateChipFromStatus(status) {
   } else if (status.refreshing) {
     showRefreshingChip();
   } else {
-    refreshChip.classList.add("hidden");
-    refreshChip.classList.remove("err");
-    refreshChip.title = "";
+    hideRefreshChip();
   }
 }
 
@@ -890,11 +1058,16 @@ async function refreshCurrentView() {
   // re-fetches now, the other is marked stale for its next activation.
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
+  delete views.canvas.dataset.loaded;
   if (currentView === "tree") {
     await loadTreeView(true);
     revalidatePanel(); // attemptsById was just refreshed by loadTreeView
   } else if (currentView === "lineage") {
     await loadLineageView();
+  } else if (currentView === "canvas") {
+    // Selection, camera, search and positions survive (RCECanvas.load
+    // re-fetches /api/canvas and re-renders in place).
+    await RCECanvas.load(views.canvas);
   }
   loadProjectSummary(); // the pending count may have moved with the graph
 }
@@ -1891,7 +2064,7 @@ document.getElementById("shutdown-btn").addEventListener("click", async () => {
 (async () => {
   await loadProjects();
   loadProjectSummary();
-  activateView("tree");
+  activateView(storedView() || "tree");
   syncGeneration();
   pollTimer = setInterval(pollGeneration, REFRESH_POLL_MS);
 })();

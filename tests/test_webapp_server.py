@@ -576,6 +576,8 @@ def test_http_root_returns_spa_shell_with_key_mount_points(live_server):
         # and the dead-registry-entry cleanup button.
         'id="project-state"', 'id="remove-missing-btn"',
         'data-view="tree"', 'data-view="lineage"',
+        # Task V4 phase 2a: the canvas tab and its view.
+        'data-view="canvas"', 'id="view-canvas"',
     ):
         assert mount_point in html, f"missing mount point in served app.html: {mount_point}"
 
@@ -609,6 +611,107 @@ def test_http_root_has_zero_external_resources(live_server):
     _, body = _get_raw(base_url, "/")
     html = body.decode("utf-8")
     assert re.search(r"https?://", html) is None
+
+
+# -- The canvas's served script (DESIGN.md section 8, task V4 phase 2a) --------
+
+_CANVAS_JS_FILE = Path(server.__file__).parent / "canvas.js"
+
+
+def _get_with_type(base_url: str, path: str) -> tuple[int, str, bytes]:
+    with urllib.request.urlopen(base_url + path) as resp:
+        return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+
+
+def test_http_canvas_js_is_served_verbatim_as_javascript(live_server):
+    """GET /canvas.js serves `src/rce/webapp/canvas.js` byte-for-byte with a
+    JavaScript content type (a browser refuses to execute a script served
+    as anything else under nosniff-style checks, and WebKit warns), and the
+    file defines the one global the page calls -- `window.RCECanvas`."""
+    status, content_type, body = _get_with_type(live_server[0], "/canvas.js")
+    assert status == 200
+    assert content_type.startswith("text/javascript")
+    assert body == _CANVAS_JS_FILE.read_bytes()
+    assert "window.RCECanvas" in body.decode("utf-8")
+
+
+def test_http_canvas_js_is_read_fresh_on_every_request(live_server, monkeypatch, tmp_path):
+    """Same read-fresh discipline as app.html: an edit to the file shows on
+    the next request with no server restart (nothing cached in memory)."""
+    fake = tmp_path / "canvas.js"
+    fake.write_text("// one\n", encoding="utf-8")
+    monkeypatch.setattr(server, "_CANVAS_JS_PATH", fake)
+    assert _get_with_type(live_server[0], "/canvas.js")[2] == b"// one\n"
+    fake.write_text("// two\n", encoding="utf-8")
+    assert _get_with_type(live_server[0], "/canvas.js")[2] == b"// two\n"
+
+
+@pytest.mark.parametrize("headers, word", [
+    ({"Origin": "http://evil.example"}, "Origin"),
+    ({"Host": "attacker.example:1234"}, "Host"),
+])
+def test_http_canvas_js_runs_the_origin_check_first(live_server, headers, word):
+    """The script route sits behind the same `_check_local_origin` as every
+    other route: a foreign page (or a rebound hostname) gets a 403, never
+    the script."""
+    status, payload = _request_with_headers(live_server[0], "GET", "/canvas.js", headers)
+    assert status == 403
+    assert word in payload["error"]
+
+
+def test_served_app_loads_canvas_js_same_origin_before_its_inline_script(live_server):
+    """The page references the canvas script by a same-origin path, and
+    BEFORE its own inline script: canvas.js only defines `window.RCECanvas`,
+    and the inline init (which may restore the 画布 view from localStorage
+    at once) must find it already defined."""
+    html = _get_raw(live_server[0], "/")[1].decode("utf-8")
+    tag = '<script src="/canvas.js"></script>'
+    assert html.count(tag) == 1
+    assert html.index(tag) < html.index("<script>\n")
+
+
+def test_served_app_tabs_read_in_product_language(live_server):
+    """DESIGN.md section 8.8: the tabs read 「决策树」「血缘」「画布」, the brand
+    mark stays RCE, and the old English tab labels are gone."""
+    html = _get_raw(live_server[0], "/")[1].decode("utf-8")
+    tabs = re.findall(r'<button class="tab[^"]*" data-view="(\w+)"[^>]*>([^<]+)</button>', html)
+    assert tabs == [("tree", "决策树"), ("lineage", "血缘"), ("canvas", "画布")]
+    assert '<span class="brand-mark">RCE</span>' in html
+    assert ">Decision Tree<" not in html and ">Lineage<" not in html
+
+
+def test_canvas_js_carries_the_design_copy_in_product_language():
+    """The canvas's binding copy (8.1-8.4, 8.7, 8.8), pinned so it is not
+    casually reworded: type labels, the 8.1 socket names, the toolbar, the
+    relayout confirm, and the state tags."""
+    js = _CANVAS_JS_FILE.read_text(encoding="utf-8")
+    for copy in (
+        "数据集", "脚本", "图表",                          # 8.1 node types
+        "来源", "数据", "读取", "写出", "生成", "生成自",   # 8.1 sockets
+        "查找节点…", "适应全部", "100%", "＋", "－",        # 8.2 toolbar
+        "重新排列", "将丢弃你手动摆放的位置",              # 8.4 relayout
+        "尚未入图", "文件不存在", "检测到循环", "全部",     # 8.1/8.2/8.4/8.7
+    ):
+        assert copy in js, f"missing product-language copy in canvas.js: {copy}"
+
+
+def test_canvas_js_loads_nothing_external():
+    """Zero external resources holds for the second served file too. The
+    only URL-shaped string allowed is the SVG namespace, an identifier that
+    `createElementNS` needs and that no browser ever fetches."""
+    js = _CANVAS_JS_FILE.read_text(encoding="utf-8")
+    without_ns = js.replace('"http://www.w3.org/2000/svg"', "")
+    assert re.search(r"https?://", without_ns) is None
+    assert "import(" not in js and "importScripts" not in js
+
+
+def test_canvas_js_ships_as_package_data():
+    """Like app.html, canvas.js must be in the wheel, not only in this
+    editable checkout -- otherwise an installed `rce serve` 500s on it."""
+    import tomllib
+    pyproject = Path(server.__file__).resolve().parents[3] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert "webapp/canvas.js" in data["tool"]["setuptools"]["package-data"]["rce"]
 
 
 def test_http_summary_endpoint(live_server):

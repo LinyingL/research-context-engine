@@ -117,6 +117,16 @@ Endpoints (all GET unless noted):
                             external resources, zero build step -- it reads
                             this same JSON API entirely client-side (see that
                             file's own top comment for the two-view contract).
+    GET  /canvas.js    -- the node canvas's script (DESIGN.md section 8, task
+                            V4 phase 2a), served verbatim from
+                            `src/rce/webapp/canvas.js` with the same
+                            read-fresh discipline as `/`. The page's one
+                            same-origin `<script src>`: kept out of app.html
+                            so the canvas (and the link editing that builds
+                            on it) stays a file of its own rather than
+                            doubling the page. Same origin check as every
+                            other route -- a foreign page cannot even fetch
+                            the script through a rebound hostname.
 
 Path-traversal defense (`/api/file` and `/api/open` alike, both required by
 task V1): `_resolve_within_root` resolves the requested path -- symlinks
@@ -1142,6 +1152,18 @@ def _app_html() -> str:
     return _APP_HTML_PATH.read_text(encoding="utf-8")
 
 
+_CANVAS_JS_PATH = Path(__file__).parent / "canvas.js"
+
+
+def _canvas_js() -> str:
+    """`src/rce/webapp/canvas.js` verbatim, read fresh per request exactly
+    like `_app_html` (and packaged alongside it as `package-data`). The
+    page loads it with a plain same-origin `<script src="/canvas.js">`, so
+    the app stays zero-build and zero-external-resource: two files served
+    as written instead of one."""
+    return _CANVAS_JS_PATH.read_text(encoding="utf-8")
+
+
 # -- HTTP plumbing -------------------------------------------------------------
 
 
@@ -1227,9 +1249,12 @@ class RceRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_html(self, status: int, html: str) -> None:
-        body = html.encode("utf-8")
+        self._send_text(status, html, "text/html; charset=utf-8")
+
+    def _send_text(self, status: int, text: str, content_type: str) -> None:
+        body = text.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1282,6 +1307,8 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             self._check_local_origin()
             if path == "/":
                 self._send_html(200, _app_html())
+            elif path == "/canvas.js":
+                self._send_text(200, _canvas_js(), "text/javascript; charset=utf-8")
             elif path == "/api/summary":
                 self._json_from_conn(lambda conn: summary_payload(conn, self._project_root()))
             elif path == "/api/attempts":
