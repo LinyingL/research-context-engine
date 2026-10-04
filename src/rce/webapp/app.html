@@ -710,11 +710,21 @@ const PROJECT_STATES = {
     title: "图谱文件正在从云端下载",
     body: "系统把图谱文件收进了 iCloud，正在取回。下载完成后页面会自动恢复，不用重开。",
   },
+  // DESIGN.md 9.4: the identity check found a question to answer first (a
+  // copy, an original that cannot be checked, a lost identity file) or the
+  // project folder is gone. The engine's own sentence for the situation
+  // (body.situation.message) is shown under this one.
+  project_blocked: {
+    chip: "项目需要你先确认",
+    title: "打开这个项目之前，需要你先做一个选择",
+    body: "确认之前 RCE 不会写入任何东西。可以在上方切换到别的项目；也可以在终端里运行 rce status 查看原因和可用的 rce project 命令。",
+  },
 };
 
 function apiError(path, res, body) {
   const err = new Error((body && body.error) ? body.error : ("请求 " + path + " 失败：HTTP " + res.status));
   if (body && typeof body.state === "string") err.state = body.state;
+  if (body && body.situation && typeof body.situation === "object") err.situation = body.situation;
   return err;
 }
 
@@ -795,6 +805,12 @@ const BLOCKING_ERROR_TEXT = {
   // the canvas's refusals, in the wording 8.5 already gave them
   mapping_exists: "这条映射已存在",
   human_link: "这是你的标注：请用「删除标注」移除",
+  // DESIGN.md 9.4 / 9.7 / 9.10: a write that was refused, nothing written
+  project_moved: "项目已移动或已在别处认领，请重新打开",
+  needs_migration: "这个项目来自旧版本：迁移之后才能保存人工记录，现在只能浏览",
+  read_only: "项目当前是只读打开的，不会写入任何东西",
+  project_busy: "另一个 RCE 进程正在写入这个项目，请稍后再试",
+  project_blocked: "这个项目需要你先确认，确认之前不会写入任何东西",
 };
 
 function blockingErrorText(framing, err) {
@@ -897,6 +913,11 @@ function renderStateNote(container, err) {
   const body = document.createElement("p");
   body.textContent = PROJECT_STATES[name].body;
   box.append(title, body);
+  if (err.situation && typeof err.situation.message === "string" && err.situation.message) {
+    const why = document.createElement("p");
+    why.textContent = err.situation.message;
+    box.insertBefore(why, body);
+  }
   container.appendChild(box);
 }
 

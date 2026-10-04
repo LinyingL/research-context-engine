@@ -23,7 +23,7 @@ processes.
   project it is locking.
 - **one file for every spelling of the folder.** The key is the project id
   from `.rce/project.toml`; before a project has one, the canonical-path
-  hash `rce.paths.project_graph_id` computes (letter case, Unicode
+  hash `rce.paths.canonical_path_hash` computes (letter case, Unicode
   normalization and symlinks folded by the filesystem itself). The two
   key shapes cannot collide: an id is `p-` + 32 hex, a path key is
   `path-` + 16 hex.
@@ -91,7 +91,7 @@ def lock_key(project_root: str | Path, project_id: str | None = None) -> str:
         if not isinstance(project_id, str) or not PROJECT_ID_RE.match(project_id):
             raise ProjectLockError(f"not a project id: {project_id!r}")
         return project_id
-    return PATH_KEY_PREFIX + paths.project_graph_id(project_root)
+    return PATH_KEY_PREFIX + paths.canonical_path_hash(project_root)
 
 
 def lock_path(key: str) -> Path:

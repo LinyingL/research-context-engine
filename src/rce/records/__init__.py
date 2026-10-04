@@ -16,4 +16,7 @@ wired to it by later phases, through these modules only:
                 schema (9.3)
 - `trust`    -- the pure trust rules a writer and a reader consult first
                 (9.3)
+- `situation` -- which project a folder is (the 9.4 situation table),
+                `home.json`, and the write-time identity re-check every
+                record and index write makes under the project lock
 """

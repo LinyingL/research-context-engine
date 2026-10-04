@@ -28,6 +28,9 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from rce import db, paths, query
+from rce import project as project_identity
+from rce.records import lock as records_lock
+from rce.records import situation as records_situation
 
 # Kept as module attributes for callers quoting them; the definitions live
 # in rce.paths (DESIGN.md section 8.10 rule 1).
@@ -162,10 +165,30 @@ def confirm_edge(conn: Connection, src: str, dst: str, type: str, extractor: str
 # -- FastMCP server assembly --------------------------------------------------
 
 
-def build_server(project_root: str | Path) -> FastMCP:
+def _guarded_confirm(root: Path, project_id: str | None, *args: str) -> str:
+    """`confirm_edge` as a human write (DESIGN.md 9.4, 9.7, 9.10): under the
+    project lock, with the identity re-checked against the one this server
+    opened, and refused on a pre-V5 project until it is migrated. A
+    refusal is the tool's answer, not an exception: nothing was written."""
+    try:
+        with records_situation.write_guard(root, project_id, human=True):
+            with _connect(root) as conn:
+                return confirm_edge(conn, *args)
+    except records_situation.WriteRefused as exc:
+        return f"Not written: {exc}"
+    except records_lock.ProjectLockError as exc:
+        return f"Not written: could not take the project lock ({exc})"
+
+
+def build_server(project_root: str | Path, project_id: str | None = None) -> FastMCP:
     """Register the four tools against project_root's graph (resolved by
-    rce.paths -- outside the project since DESIGN.md section 8.10 rule 1)."""
+    rce.paths -- outside the project since DESIGN.md section 8.10 rule 1).
+    `project_id` is the id `main` opened the project with (None: read it
+    from the folder now)."""
     root = Path(project_root).resolve()
+    if project_id is None:
+        got = records_situation.read_identity(root)
+        project_id = got.identity.id if got.identity is not None else None
     mcp = FastMCP("rce")
 
     @mcp.tool()
@@ -210,8 +233,7 @@ def build_server(project_root: str | Path) -> FastMCP:
         is backed by run xyz") -- never speculatively or during routine
         tracing. new_status must be one of: confirmed/rejected/pending/auto.
         States explicitly when no matching edge exists."""
-        with _connect(root) as conn:
-            return confirm_edge(conn, src, dst, type, extractor, new_status)
+        return _guarded_confirm(root, project_id, src, dst, type, extractor, new_status)
 
     return mcp
 
@@ -226,8 +248,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     project_root = Path(args.path).resolve()
     try:
+        # The identity check first (DESIGN.md 9.4): a copy, a home that
+        # cannot be checked, a lost or unreadable identity stops here and
+        # nothing is written; a moved project is adopted.
+        if not project_root.is_dir():
+            raise McpServerError(f"{project_root} is not a directory")
+        try:
+            opened = project_identity.open_project(project_root)
+        except (project_identity.ProjectBlocked, project_identity.AnswerRefused) as exc:
+            raise McpServerError(str(exc)) from exc
         _require_db(project_root)
-        server = build_server(project_root)
+        server = build_server(project_root, opened.project_id)
     except McpServerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

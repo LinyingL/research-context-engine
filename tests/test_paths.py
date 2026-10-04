@@ -78,13 +78,18 @@ def test_graph_db_path_is_under_the_rce_home_never_the_project(tmp_path, isolate
     assert str(project) not in str(graph)
 
 
-def test_graph_id_is_stable_and_path_derived(tmp_path):
+def test_legacy_graph_id_is_stable_and_path_derived(tmp_path):
+    """Pre-V5 identity: the path hash. Different paths gave different ids,
+    which is why a moved project lost its graph and a new project at an
+    old path inherited one (DESIGN.md 9.0). Kept because the pre-V5
+    indexes on disk are found by it; a V5 project is keyed by its id
+    (`test_a_project_with_an_id_is_indexed_under_its_id`)."""
     project = tmp_path / "proj"
     project.mkdir()
-    assert paths.project_graph_id(project) == paths.project_graph_id(project)
+    assert paths.legacy_graph_id(project) == paths.legacy_graph_id(project)
     other = tmp_path / "other"
     other.mkdir()
-    assert paths.project_graph_id(project) != paths.project_graph_id(other)
+    assert paths.legacy_graph_id(project) != paths.legacy_graph_id(other)
 
 
 def test_graph_id_is_ascii_and_short_even_for_a_non_ascii_project_name(tmp_path):
@@ -93,7 +98,7 @@ def test_graph_id_is_ascii_and_short_even_for_a_non_ascii_project_name(tmp_path)
     on another volume."""
     project = tmp_path / "默认安全锚_论文流水线"
     project.mkdir()
-    graph_id = paths.project_graph_id(project)
+    graph_id = paths.legacy_graph_id(project)
     assert graph_id.isascii() and graph_id.isalnum() and len(graph_id) == 16
 
 
@@ -104,8 +109,8 @@ def test_graph_id_resolves_the_path_so_spellings_share_one_graph(tmp_path, monke
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.chdir(tmp_path)
-    assert paths.project_graph_id("proj") == paths.project_graph_id(project)
-    assert paths.project_graph_id(str(project) + "/") == paths.project_graph_id(project)
+    assert paths.legacy_graph_id("proj") == paths.legacy_graph_id(project)
+    assert paths.legacy_graph_id(str(project) + "/") == paths.legacy_graph_id(project)
 
 
 def test_canvas_state_path_sits_beside_the_graph(tmp_path):
@@ -658,13 +663,13 @@ def test_graph_id_is_shared_by_case_and_normalization_spellings_on_macos(tmp_pat
     project.mkdir()
     if not (tmp_path / "caseproj").exists():
         pytest.skip("this volume is case-sensitive")
-    assert paths.project_graph_id(tmp_path / "caseproj") == paths.project_graph_id(project)
-    assert paths.project_graph_id(tmp_path / "CASEPROJ" / "..") == paths.project_graph_id(tmp_path)
+    assert paths.legacy_graph_id(tmp_path / "caseproj") == paths.legacy_graph_id(project)
+    assert paths.legacy_graph_id(tmp_path / "CASEPROJ" / "..") == paths.legacy_graph_id(tmp_path)
 
     nfc = unicodedata.normalize("NFC", "é默认安全锚")
     nfd = unicodedata.normalize("NFD", "é默认安全锚")
     (tmp_path / nfc).mkdir()
-    assert paths.project_graph_id(tmp_path / nfd) == paths.project_graph_id(tmp_path / nfc)
+    assert paths.legacy_graph_id(tmp_path / nfd) == paths.legacy_graph_id(tmp_path / nfc)
 
 
 def test_graph_id_of_a_not_yet_existing_path_is_still_stable(tmp_path):
@@ -672,4 +677,66 @@ def test_graph_id_of_a_not_yet_existing_path_is_still_stable(tmp_path):
     cannot be opened, so asking about a path that does not exist yet still
     gives one id."""
     ghost = tmp_path / "not-yet"
-    assert paths.project_graph_id(ghost) == paths.project_graph_id(str(ghost) + "/")
+    assert paths.legacy_graph_id(ghost) == paths.legacy_graph_id(str(ghost) + "/")
+
+
+# -- V5 (DESIGN.md 9.4): the index of a project with an id ---------------------
+
+
+def test_a_project_with_an_id_is_indexed_under_its_id(tmp_path, isolated_rce_home):
+    from rce.records import identity
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    ident = identity.create_identity(project)
+    assert paths.graph_dir(project) == isolated_rce_home / "graphs" / ident.id
+    assert paths.graph_db_path(project) == paths.index_dir(ident.id) / "graph.db"
+    assert paths.canvas_state_path(project).parent == paths.index_dir(ident.id)
+    moved = tmp_path / "moved"
+    project.rename(moved)
+    assert paths.graph_dir(moved) == paths.index_dir(ident.id)  # the id travels; the hash would not
+
+
+def test_a_folder_without_an_id_keeps_the_legacy_location(tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert paths.graph_dir(project) == paths.legacy_graph_dir(project)
+    assert paths.graph_db_path(project) == paths.legacy_index_db_path(project)
+
+
+def test_an_unreadable_identity_never_falls_back_to_the_legacy_index(tmp_path):
+    project = tmp_path / "proj"
+    (project / ".rce").mkdir(parents=True)
+    (project / ".rce" / "project.toml").write_text("id = [\n")
+    with pytest.raises(paths.IdentityUnavailableError):
+        paths.graph_dir(project)
+    assert paths.graph_exists(project) is False
+
+
+def test_an_in_project_graph_inside_a_v5_project_is_not_moved(tmp_path):
+    """Only a pre-V5 folder gets the 8.10 move; inside a folder with an id
+    such a file is a pre-V5 database for `rce migrate` to list (9.5)."""
+    from rce.records import identity
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    identity.create_identity(project)
+    _mk_legacy_graph(project)
+    assert paths.migrate_legacy_graph(project) is None
+    assert paths.legacy_graph_db_path(project).exists()
+
+
+def test_index_dir_refuses_anything_but_a_project_id():
+    for bad in ("../x", "p-123", "", "path-0123456789abcdef"):
+        with pytest.raises(ValueError):
+            paths.index_dir(bad)
+
+
+def test_ensure_project_rce_dir_never_recreates_a_missing_project(tmp_path):
+    gone = tmp_path / "gone"
+    with pytest.raises(FileNotFoundError):
+        paths.ensure_project_rce_dir(gone)
+    assert not gone.exists()
+    with pytest.raises(FileNotFoundError):
+        paths.write_project_readme(gone)
+    assert not gone.exists()

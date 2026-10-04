@@ -67,7 +67,16 @@ Endpoints (all GET unless noted):
                             project and return the new current. The path
                             must be string-equal to a registry entry --
                             see "Switch-target defense" below (see
-                            `switch_project_payload`).
+                            `switch_project_payload`). Optional `"id"`
+                            narrows the match to that entry (V5).
+    POST /api/projects/locate -- body `{"id", "path"}`: 「选择新位置…」 for
+                            an entry whose folder moved; adopts the chosen
+                            folder only if it carries that id (V5, see
+                            `locate_payload`).
+    POST /api/project/resolve -- body `{"answer": "fork"|"claim"|"other"|
+                            "readonly"}`: the answer to a blocked project's
+                            question (V5, DESIGN.md 9.4, see
+                            `resolve_payload`).
     POST /api/attempts/preview -- body `{"op": "append"|"update", "number",
                             "fields"}`: a pure dry run of an attempt-row
                             edit against the researcher's own map file --
@@ -286,6 +295,35 @@ researcher can move to another project. `/api/projects` and
 `/api/generation` still deliberately bypass the database entirely, so a
 degraded project can always be navigated away from.
 
+Project identity (DESIGN.md 9.4, task V5). What the server serves is a
+`ServedProject`: the folder, the id it was opened with (None for a pre-V5
+folder), and -- when the identity check at the entry point (`rce serve`,
+a switch, 「选择新位置…」) found a situation the researcher must answer
+first, or a registry entry whose folder is gone -- the machine-readable
+`blocked` payload. A blocked project is served anyway: every endpoint that
+reads or writes the project answers 409 with `state: "project_blocked"`
+and the situation's data (`situation`), so the app can ask the question;
+`/api/projects` and `/api/generation` keep answering; nothing is written.
+`POST /api/project/resolve {answer: fork|claim|other|readonly}` takes the
+answer (origin-checked like every POST); `POST /api/projects/locate {id,
+path}` re-attaches a registry entry whose folder moved, adopting the
+chosen folder only if it carries that id -- the one endpoint that takes a
+filesystem path from the page, and it reads nothing there but the
+identity file and opens nothing that does not carry an id the researcher
+already registered.
+
+Every write a page can cause -- a human record (attempt rows, mappings,
+link statuses, the canvas arrangement) or an index write (the watcher's
+re-ingest) -- runs inside `RceHTTPServer.write_guard`: the cross-process
+project lock (9.7), then the 9.4 re-check that the served folder still
+exists, still carries the id it was opened with and is still that id's
+home. A folder moved in Finder under a running engine therefore gets
+nothing written at its old path, and the page is told 「项目已移动或已在
+别处认领，请重新打开」 (`state: "project_moved"`). A pre-V5 project refuses
+human records (`needs_migration`); a project opened read-only refuses
+every write (`read_only`); a lock held by another process for too long is
+`project_busy` (503), never a write without it.
+
 Every handler-facing failure is one of the small `ApiError` subclasses below,
 each carrying its own HTTP status; `RceRequestHandler` catches `ApiError`
 once per request and renders `{"error": str(exc)}` -- plus `"state"` when the
@@ -295,6 +333,7 @@ catch in `main()`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -304,12 +343,16 @@ import sys
 import threading
 import urllib.parse
 import webbrowser
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from sqlite3 import Connection
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from rce import db, lineage, paths
+from rce import project as project_identity
+from rce.records import lock as records_lock
+from rce.records import situation as records_situation
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import mappings as mappings_ingest
@@ -349,6 +392,9 @@ class ApiError(Exception):
 
     status = 400
     state: str | None = None
+    # Extra machine-readable keys merged into the error body (the blocked
+    # project's situation, the registry entry a locate was for).
+    extra: dict[str, Any] | None = None
 
 
 class NotFoundError(ApiError):
@@ -491,6 +537,131 @@ class UnknownProjectError(ApiError):
     status = 403
 
 
+class ProjectBlockedError(ApiError):
+    """The served project is in a situation the researcher must answer
+    first (DESIGN.md 9.4: a copy, a home that cannot be checked, a lost or
+    unreadable identity) or its registry entry's folder is gone
+    (`situation: "missing"`). 409, with the situation under `situation`;
+    nothing was read from or written to the index."""
+
+    status = 409
+    state = "project_blocked"
+
+    def __init__(self, blocked: dict[str, Any]) -> None:
+        message = blocked.get("detail") or blocked.get("message") or blocked.get("situation", "blocked")
+        super().__init__(f"this project cannot be opened until a question is answered: {message}")
+        self.extra = {"situation": blocked}
+
+
+class ProjectMovedApiError(ApiError):
+    """9.4's write-time re-check failed: the served folder moved, was
+    removed, or was claimed elsewhere. Nothing was written."""
+
+    status = 409
+    state = "project_moved"
+
+
+class NeedsMigrationApiError(ApiError):
+    """A human record on a pre-V5 project (9.10). Nothing was written."""
+
+    status = 409
+    state = "needs_migration"
+
+
+class ReadOnlyError(ApiError):
+    """The project was opened read-only (「原位置暂时不可用，先只读打开」)."""
+
+    status = 409
+    state = "read_only"
+
+
+class ProjectBusyError(ApiError):
+    """Another process held the project lock for longer than a request
+    waits (9.7). 503: transient; nothing was written."""
+
+    status = 503
+    state = "project_busy"
+
+
+class NotThisProjectError(ApiError):
+    """`POST /api/projects/locate` chose a folder that does not carry the
+    registry entry's id. Nothing was adopted."""
+
+    status = 409
+    state = "not_this_project"
+
+
+class AnswerRefusedError(ApiError):
+    """`POST /api/project/resolve` gave an answer the folder's situation,
+    as it is now, does not take. Nothing was written."""
+
+    status = 409
+    state = "answer_refused"
+
+
+@dataclass(frozen=True)
+class ServedProject:
+    """What this server serves (module docstring, "Project identity")."""
+
+    root: Path
+    project_id: str | None = None
+    needs_migration: bool = False
+    read_only: bool = False
+    blocked: dict[str, Any] | None = None
+    label: str | None = None
+
+
+def _missing(root: Path, project_id: str | None, label: str | None, reason: str) -> dict[str, Any]:
+    return {
+        "situation": "missing",
+        "path": str(root),
+        "project_id": project_id,
+        "label": label or root.name,
+        "reason": reason,
+        "message": "找不到项目文件夹（可能已移动）",
+        "answers": ["locate"],
+        "blocked": True,
+    }
+
+
+def served_for(
+    project_root: Path,
+    *,
+    expected_id: str | None = None,
+    label: str | None = None,
+    register: bool = False,
+    probes: records_situation.Probes | None = None,
+) -> ServedProject:
+    """The identity check of a serving entry point, turned into what the
+    server serves. `expected_id` is the registry entry's id when the
+    folder is reached through the registry: a folder that is gone, or
+    whose path now holds another project (or none), is the entry's
+    "missing" state, and nothing about the folder found there is
+    acted on. `register` records a successfully opened project as most
+    recently served -- never a blocked one."""
+    root = Path(project_root)
+    if not root.is_dir():
+        return ServedProject(root, expected_id, blocked=_missing(root, expected_id, label, "folder_gone"), label=label)
+    if expected_id is not None:
+        try:
+            current = records_situation.classify(root, probes=probes)
+        except NotADirectoryError:
+            return ServedProject(root, expected_id, blocked=_missing(root, expected_id, label, "folder_gone"), label=label)
+        if current.project_id != expected_id and current.situation is not records_situation.Situation.UNREADABLE_ID:
+            return ServedProject(
+                root, expected_id, blocked=_missing(root, expected_id, label, "path_holds_another_project"), label=label,
+            )
+    try:
+        opened = project_identity.open_project(root, register=register, probes=probes)
+    except project_identity.ProjectBlocked as exc:
+        c = exc.classification
+        return ServedProject(root, c.project_id, needs_migration=c.needs_migration, blocked=c.payload(), label=label)
+    except project_identity.AnswerRefused as exc:
+        blocked = {"situation": "changed", "path": str(root), "detail": str(exc), "answers": [], "blocked": True}
+        return ServedProject(root, expected_id, blocked=blocked, label=label)
+    return ServedProject(root, opened.project_id, needs_migration=opened.needs_migration, label=label)
+
+
 def _check_shutdown_target(body: dict[str, Any]) -> None:
     """`POST /api/shutdown`'s optional `{"pid": int}`: when present, stop
     only if it is THIS process.
@@ -552,6 +723,29 @@ def _require_db(project_root: Path) -> Path:
     return path
 
 
+def _served_db(served: ServedProject) -> Path:
+    """The served project's index database, or the error that says why
+    there is none to open: a blocked project (409, its situation), then
+    `_require_db`'s own checks. A project with an id is opened at
+    `~/.rce/graphs/<id>/graph.db` by the id it was opened with -- never by
+    re-reading the folder, which may have moved under the engine."""
+    if served.blocked is not None:
+        raise ProjectBlockedError(served.blocked)
+    if served.project_id is None:
+        return _require_db(served.root)
+    path = records_situation.index_db_path(served.project_id)
+    if not path.exists():
+        raise ProjectNotInitializedError(
+            f"the index of project {served.project_id} is missing ({path}); reopen the project to rebuild it"
+        )
+    if paths.is_dataless(path):
+        raise GraphDownloadingError(
+            f"the graph at {path} is not on this disk right now (macOS has evicted it to "
+            f"iCloud); waiting for the download instead of opening it"
+        )
+    return path
+
+
 # -- Path safety (shared by /api/file and /api/open) -------------------------
 
 
@@ -600,7 +794,7 @@ def _attempts_config_echo(project_root: Path) -> dict[str, Any] | None:
     }
 
 
-def summary_payload(conn: Connection, project_root: Path) -> dict[str, Any]:
+def summary_payload(conn: Connection, project_root: Path, served: ServedProject | None = None) -> dict[str, Any]:
     node_counts = {t: len(db.get_nodes_by_type(conn, t)) for t in sorted(db.NODE_TYPES)}
     edge_counts = {t: 0 for t in sorted(db.EDGE_TYPES)}
     for edge in db.query_edges(conn):
@@ -615,6 +809,10 @@ def summary_payload(conn: Connection, project_root: Path) -> dict[str, Any]:
         "edges": edge_counts,
         "pending": len(db.pending_edges(conn)),
         "attempts_config": _attempts_config_echo(project_root),
+        # 9.4 / 9.10: who this is, and whether human records can be saved.
+        "project_id": served.project_id if served else None,
+        "needs_migration": bool(served and served.needs_migration),
+        "read_only": bool(served and served.read_only),
     }
 
 
@@ -847,49 +1045,86 @@ def open_payload(project_root: Path, rel_path: str, reveal: bool) -> dict[str, A
 # -- /api/projects + POST /api/projects/switch (task V3 phase 1) --------------
 
 
-def projects_payload(current_root: Path) -> dict[str, Any]:
-    """The registry (`rce.webapp.registry.load()`, most-recently-served
-    first) with each entry's `initialized` and `available` state checked
-    fresh per request -- a project can be `rce init`ed, deleted, or its
-    disk unmounted between two calls -- plus which project this server is
-    currently serving. The current root is reported even when it is not
-    (or no longer) a registry member: it is a fact about this server, not
-    about the registry.
+def entry_state(entry: dict[str, Any]) -> dict[str, Any]:
+    """One registry entry, checked fresh: `available` (the folder is
+    there), `initialized` (its index exists), and `missing` -- DESIGN.md
+    9.4's 「找不到项目文件夹（可能已移动）」: the folder is gone, or (for an
+    entry with an id) the folder at that path carries another id or none.
+    An identity file that cannot be read is not "missing": opening it
+    shows its own situation."""
+    root = Path(entry["path"])
+    available = project_registry.is_available(root)
+    project_id = entry.get("id")
+    if project_id is None:
+        return {"available": available, "initialized": project_registry.is_initialized(root), "missing": not available}
+    missing = not available
+    if available:
+        got = records_situation.read_identity(root)
+        if got.state is records_situation.IdentityState.ABSENT or (
+            got.state is records_situation.IdentityState.PRESENT and got.identity and got.identity.id != project_id
+        ):
+            missing = True
+    initialized = records_situation.index_db_path(project_id).exists()
+    return {"available": available and not missing, "initialized": initialized, "missing": missing}
 
-    The two flags answer different questions and the UI treats them
-    differently (DESIGN.md section 8.10 rule 3): `initialized` false means
-    "registered but has no graph yet" -- greyed out, still a real
-    directory; `available` false means the directory itself is gone, which
-    is a dead entry the switcher offers to remove."""
+
+def projects_payload(current: Path | ServedProject) -> dict[str, Any]:
+    """The registry (`rce.webapp.registry.load()`, most-recently-served
+    first), each entry's state checked fresh per request (`entry_state`)
+    -- a project can be `rce init`ed, moved, or its disk unmounted between
+    two calls -- plus which project this server is currently serving and,
+    when it is blocked, why. The current root is reported even when it is
+    not (or no longer) a registry member: it is a fact about this server,
+    not about the registry.
+
+    `initialized` false means "registered but has no index yet"; `missing`
+    (with `available` false) means the folder is gone or no longer this
+    project, which the switcher shows as 「找不到项目文件夹（可能已移动）」
+    with 「选择新位置…」 (`POST /api/projects/locate`) or 「移除失效项目」."""
+    served = current if isinstance(current, ServedProject) else ServedProject(Path(current))
     projects = [
-        {
-            "path": entry["path"],
-            "label": entry["label"],
-            "initialized": project_registry.is_initialized(Path(entry["path"])),
-            "available": project_registry.is_available(Path(entry["path"])),
-        }
+        {"id": entry.get("id"), "path": entry["path"], "label": entry["label"], **entry_state(entry)}
         for entry in project_registry.load()
     ]
-    return {"projects": projects, "current": str(current_root)}
+    return {
+        "projects": projects,
+        "current": str(served.root),
+        "current_id": served.project_id,
+        "blocked": served.blocked,
+        "read_only": served.read_only,
+        "needs_migration": served.needs_migration,
+    }
 
 
-def switch_project_payload(requested: str) -> tuple[Path, dict[str, Any]]:
-    """Validate a switch request and return `(new_root, response_payload)`;
+def switch_project_payload(requested: str, requested_id: str | None = None) -> tuple[ServedProject, dict[str, Any]]:
+    """Validate a switch request and return `(served, response_payload)`;
     the caller (the handler) is the one that actually repoints the server,
-    via `RceHTTPServer.set_project_root` -- this function owns the
-    validation and the registry recency bump, never the server state.
+    via `RceHTTPServer.set_served` -- this function owns the validation,
+    the identity check and the registry recency bump, never the server
+    state.
 
     The requested string is compared *string-equal* against registry
-    entries' stored `"path"` values -- it is never resolved, joined, or
-    otherwise interpreted as a filesystem path, so there is nothing here
-    for a crafted value to traverse or normalize its way past (module
-    docstring, "Switch-target defense"). Not a member: 403
-    (`UnknownProjectError`). A member that is not an initialized project:
-    400 (`ProjectNotInitializedError`) -- registered but unusable, e.g.
-    never `rce init`ed or its disk currently absent. Only a valid switch
-    bumps the entry to most-recently-served in the registry, so a later
-    bare `rce serve` resumes from it (rce.cli.cmd_serve)."""
-    entry = next((e for e in project_registry.load() if e["path"] == requested), None)
+    entries' stored `"path"` values (and, when the page sends one, the
+    entry's `"id"`) -- it is never resolved, joined, or otherwise
+    interpreted as a filesystem path, so there is nothing here for a
+    crafted value to traverse or normalize its way past (module docstring,
+    "Switch-target defense"). Not a member: 403 (`UnknownProjectError`).
+
+    Then the identity check (9.4) runs on the entry's folder before
+    anything is written: a folder that is gone or now holds another
+    project switches to that entry's "missing" state; a folder in a
+    situation to be answered switches to its blocked state -- in both
+    cases the server serves the question, and nothing (registry included)
+    is written. A pre-V5 or never-initialized entry keeps its V3 rules: a
+    member that is not an initialized project is a 400
+    (`ProjectNotInitializedError`), and a legacy in-project graph is moved
+    out here, on the server's first touch. Only a switch that opened the
+    project bumps it to most-recently-served."""
+    entry = next(
+        (e for e in project_registry.load()
+         if e["path"] == requested and (requested_id is None or e.get("id") == requested_id)),
+        None,
+    )
     if entry is None:
         raise UnknownProjectError(
             f"{requested!r} is not a registered project -- only paths already in the "
@@ -897,31 +1132,106 @@ def switch_project_payload(requested: str) -> tuple[Path, dict[str, Any]]:
             f"'rce serve <path>') can be switched to"
         )
     new_root = Path(entry["path"])
-    if not project_registry.is_initialized(new_root):
-        raise ProjectNotInitializedError(
-            f"registered project {entry['path']!r} is not initialized (missing its graph at "
-            f"{paths.graph_db_path(new_root)}); run 'rce init {entry['path']}' first"
+    if entry.get("id") is None and new_root.is_dir():
+        c = records_situation.classify(new_root)
+        if c.situation is records_situation.Situation.NOT_A_PROJECT:
+            raise ProjectNotInitializedError(
+                f"registered project {entry['path']!r} is not initialized (missing its graph at "
+                f"{paths.legacy_index_db_path(new_root)}); run 'rce init {entry['path']}' first"
+            )
+        if c.situation is records_situation.Situation.LEGACY:
+            try:
+                # The server's first touch of a pre-V5 project (section 8.10
+                # rule 1): its in-project graph moves out here, not on the
+                # first read, so a switch followed by a read finds it.
+                paths.migrate_legacy_graph(new_root)
+            except paths.LegacyGraphDatalessError:
+                pass  # its first read answers 「图谱文件正在从云端下载…」 and retries
+            except paths.GraphMigrationError as exc:
+                raise GraphMigrationError(str(exc)) from exc
+    served = served_for(new_root, expected_id=entry.get("id"), label=entry["label"], register=True)
+    return served, {
+        "current": entry["path"],
+        "label": entry["label"],
+        "project_id": served.project_id,
+        "blocked": served.blocked,
+    }
+
+
+def locate_payload(body: dict[str, Any]) -> tuple[ServedProject, dict[str, Any]]:
+    """「选择新位置…」 (DESIGN.md 9.4): re-attach the registry entry `id` to
+    the folder the researcher chose. The folder goes through the same
+    identity check as any open, and is adopted ONLY if it carries that id
+    -- RCE never searches for a folder by itself, and never attaches one
+    that is not this project. The chosen path must be absolute and an
+    existing folder; only its identity file is read before that check."""
+    project_id = body.get("id")
+    chosen = body.get("path")
+    if not isinstance(project_id, str) or not isinstance(chosen, str) or not chosen:
+        raise MissingParamError("request body must carry string 'id' and 'path' keys")
+    entry = project_registry.find(project_id) if records_lock.PROJECT_ID_RE.match(project_id) else None
+    if entry is None:
+        raise UnknownProjectError(f"{project_id!r} is not a registered project")
+    candidate = Path(chosen)
+    if not candidate.is_absolute():
+        raise MissingParamError("'path' must be an absolute folder path")
+    root = candidate.resolve()
+    if not root.is_dir():
+        raise NotFoundError(f"{chosen!r} is not an existing folder")
+    found = records_situation.classify(root)
+    if found.project_id != project_id:
+        err = NotThisProjectError(
+            f"{root} does not carry the project {project_id} (found: {found.situation.value}"
+            f"{' ' + found.project_id if found.project_id else ''}); nothing was attached"
+        )
+        err.extra = {"found": found.payload()}
+        raise err
+    served = served_for(root, expected_id=project_id, label=entry["label"], register=True)
+    return served, {"current": str(root), "label": root.name, "project_id": project_id, "blocked": served.blocked}
+
+
+_ANSWERS = {"fork": project_identity.fork, "claim": project_identity.claim, "other": project_identity.other}
+
+
+def resolve_payload(served: ServedProject, body: dict[str, Any]) -> tuple[ServedProject, dict[str, Any]]:
+    """The researcher's answer to the served project's question (9.4):
+    `fork` (「作为独立分支继续」), `claim` (「这里才是原项目」), `other`
+    (「这是另一个项目」), or `readonly` (「原位置暂时不可用，先只读打开」, for a
+    home that cannot be checked: the index is read, nothing is adopted and
+    nothing is written). Each answer re-checks the folder under the
+    project lock and writes nothing if the question no longer stands."""
+    answer = body.get("answer")
+    if answer not in ("fork", "claim", "other", "readonly"):
+        raise MissingParamError("request body 'answer' must be one of fork, claim, other, readonly")
+    blocked = served.blocked
+    if blocked is None or answer not in blocked.get("answers", ()):
+        raise AnswerRefusedError(
+            f"this project has no open question that '{answer}' answers"
+        )
+    if answer == "readonly":
+        if not served.project_id:
+            raise AnswerRefusedError("there is no index to open read-only")
+        return (
+            ServedProject(served.root, served.project_id, read_only=True, label=served.label),
+            {"ok": True, "answer": answer, "project_id": served.project_id, "read_only": True},
         )
     try:
-        # This IS the server's first touch of the new project (section 8.10
-        # rule 1), and it must happen here rather than on the first read:
-        # the write path (`/api/attempts/write` -> `rce.webapp.mapedit`)
-        # goes nowhere near `_require_db`, so a switch followed by an edit
-        # would otherwise find no graph at the new location while a
-        # perfectly good legacy one sat unmigrated in the project.
-        paths.migrate_legacy_graph(new_root)
-    except paths.LegacyGraphDatalessError:
-        # Section 8.10 rule 1: an evicted legacy graph is not opened here
-        # (that was a minute-long hang inside this handler thread). The
-        # switch itself still succeeds -- the project is real and
-        # registered -- and the new project's first read answers with the
-        # 「图谱文件正在从云端下载…」 header state, retrying the migration on
-        # every touch until the requested download has landed.
-        pass
-    except paths.GraphMigrationError as exc:
-        raise GraphMigrationError(str(exc)) from exc
-    project_registry.register(new_root)  # most-recently-served bump
-    return new_root, {"current": entry["path"], "label": entry["label"]}
+        result = _ANSWERS[answer](served.root)
+    except (project_identity.AnswerRefused, project_identity.ProjectBlocked) as exc:
+        raise AnswerRefusedError(str(exc)) from exc
+    except records_situation.WriteRefused as exc:
+        raise AnswerRefusedError(str(exc)) from exc
+    new_served = served_for(served.root, register=True, label=served.label)
+    return new_served, {
+        "ok": True,
+        "answer": answer,
+        "project_id": result.identity.id,
+        "previous_id": result.previous_id,
+        "moved_aside": list(result.moved_aside),
+        "git_tracked_identity": result.git_tracked_identity,
+        "build_error": result.build_error,
+        "blocked": new_served.blocked,
+    }
 
 
 def remove_project_payload(requested: str) -> dict[str, Any]:
@@ -1296,6 +1606,12 @@ def _canvas_js() -> str:
 # -- HTTP plumbing -------------------------------------------------------------
 
 
+# How long a request waits for another process's hold on the project lock
+# before answering `project_busy` (9.7: writers take turns; a handler thread
+# never waits forever).
+WRITE_LOCK_TIMEOUT_S = 10.0
+
+
 class RceHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1306,33 +1622,73 @@ class RceHTTPServer(ThreadingHTTPServer):
         handler_cls: type,
         project_root: Path,
         watch_interval: float = project_watcher.DEFAULT_INTERVAL_SECONDS,
+        served: ServedProject | None = None,
     ) -> None:
         # Mutable since task V3 phase 1 (POST /api/projects/switch), and
-        # only ever touched through the two accessors below: each request
-        # runs on its own thread (ThreadingHTTPServer), so a bare attribute
-        # would let a switch interleave with another handler's read. Kept
+        # only ever touched through the accessors below: each request runs
+        # on its own thread (ThreadingHTTPServer), so a bare attribute would
+        # let a switch interleave with another handler's read. Kept
         # name-mangled + locked rather than public so no future handler can
-        # accidentally bypass the lock.
-        self.__project_root = project_root
-        self.__project_root_lock = threading.Lock()
+        # accidentally bypass the lock. Since V5 it is the whole
+        # `ServedProject` (root, id, blocked state), computed by the
+        # identity check when the caller did not pass one.
+        self.__served = served if served is not None else served_for(Path(project_root))
+        self.__served_lock = threading.Lock()
         # Task V3 phase 2: the auto-refresh watcher. Created here (so
         # /api/generation always has status to report, and a switch always
         # has something to retarget) but its polling thread is only started
         # by serve() -- build_server alone spawns no background work, which
-        # keeps every routing-only test thread-free. Reads the root through
-        # the same locked accessor handlers use.
+        # keeps every routing-only test thread-free. Its re-ingests run
+        # under this server's write guard (V5: project lock + identity
+        # re-check), and it does not poll a blocked or read-only project.
         self.watcher = project_watcher.ProjectWatcher(
             self.get_project_root, interval=watch_interval,
+            write_guard=lambda: self.write_guard(human=False, timeout=None),
+            active=self._watcher_active,
         )
         super().__init__(server_address, handler_cls)
 
+    def get_served(self) -> ServedProject:
+        with self.__served_lock:
+            return self.__served
+
+    def set_served(self, served: ServedProject) -> None:
+        with self.__served_lock:
+            self.__served = served
+
     def get_project_root(self) -> Path:
-        with self.__project_root_lock:
-            return self.__project_root
+        return self.get_served().root
 
     def set_project_root(self, project_root: Path) -> None:
-        with self.__project_root_lock:
-            self.__project_root = project_root
+        """Serve `project_root` after running the identity check on it."""
+        self.set_served(served_for(Path(project_root)))
+
+    def _watcher_active(self) -> bool:
+        served = self.get_served()
+        return served.blocked is None and not served.read_only
+
+    @contextlib.contextmanager
+    def write_guard(self, *, human: bool, timeout: float | None = WRITE_LOCK_TIMEOUT_S) -> Iterator[None]:
+        """Every write a request (or the watcher) makes: refused for a
+        blocked or read-only project, then the project lock and the 9.4
+        re-check (`rce.records.situation.write_guard`), with each refusal
+        turned into its `state` for the page. Covers refusals raised by
+        the writers inside the block too (they take the same, re-entrant
+        lock themselves)."""
+        served = self.get_served()
+        if served.blocked is not None:
+            raise ProjectBlockedError(served.blocked)
+        if served.read_only:
+            raise ReadOnlyError("this project was opened read-only; nothing is written")
+        try:
+            with records_situation.write_guard(served.root, served.project_id, human=human, timeout=timeout):
+                yield
+        except records_situation.NeedsMigrationError as exc:
+            raise NeedsMigrationApiError(str(exc)) from exc
+        except records_situation.WriteRefused as exc:
+            raise ProjectMovedApiError(str(exc)) from exc
+        except records_lock.ProjectLockTimeout as exc:
+            raise ProjectBusyError(f"another RCE process is writing this project; try again ({exc})") from exc
 
     def server_close(self) -> None:
         # The watcher thread must never outlive its server (it would keep
@@ -1356,8 +1712,24 @@ class RceRequestHandler(BaseHTTPRequestHandler):
         concurrent switch affects the next request, never tears this one."""
         return self.server.get_project_root()
 
+    def _served(self) -> ServedProject:
+        return self.server.get_served()
+
     def _open_conn(self) -> Connection:
-        return db.connect(_require_db(self._project_root()))
+        return db.connect(_served_db(self._served()))
+
+    def _require_unblocked(self) -> ServedProject:
+        served = self._served()
+        if served.blocked is not None:
+            raise ProjectBlockedError(served.blocked)
+        return served
+
+    def _switch_to(self, served: ServedProject) -> None:
+        self.server.set_served(served)
+        # Re-target the auto-refresh watcher (task V3 phase 2): drops the
+        # old root's baseline/error and bumps the generation, so every open
+        # page's next poll re-fetches.
+        self.server.watcher.retarget()
 
     def _send_api_error(self, exc: ApiError) -> None:
         """`{"error": msg}` plus `"state"` when the error names one -- the
@@ -1367,6 +1739,8 @@ class RceRequestHandler(BaseHTTPRequestHandler):
         body: dict[str, Any] = {"error": str(exc)}
         if exc.state is not None:
             body["state"] = exc.state
+        if exc.extra:
+            body.update(exc.extra)
         self._send_json(exc.status, body)
 
     def _send_json(self, status: int, payload: Any) -> None:
@@ -1439,7 +1813,8 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif path == "/canvas.js":
                 self._send_text(200, _canvas_js(), "text/javascript; charset=utf-8")
             elif path == "/api/summary":
-                self._json_from_conn(lambda conn: summary_payload(conn, self._project_root()))
+                served = self._served()
+                self._json_from_conn(lambda conn: summary_payload(conn, served.root, served))
             elif path == "/api/attempts":
                 self._json_from_conn(attempts_payload)
             elif path == "/api/tree":
@@ -1451,7 +1826,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # through _open_conn/_json_from_conn, since listing which
                 # projects exist must keep working even when the *current*
                 # project's own graph.db has gone missing mid-serve.
-                self._send_json(200, projects_payload(self._project_root()))
+                self._send_json(200, projects_payload(self._served()))
             elif path == "/api/generation":
                 # Watcher status only (task V3 phase 2) -- like
                 # /api/projects, deliberately not routed through
@@ -1516,12 +1891,20 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, payload)
             elif parsed.path == "/api/projects/switch":
                 body = self._read_json_body_with_path()
-                new_root, payload = switch_project_payload(body["path"])
-                self.server.set_project_root(new_root)
-                # Re-target the auto-refresh watcher (task V3 phase 2):
-                # drops the old root's baseline/error and bumps the
-                # generation, so every open page's next poll re-fetches.
-                self.server.watcher.retarget()
+                requested_id = body.get("id") if isinstance(body.get("id"), str) else None
+                served, payload = switch_project_payload(body["path"], requested_id)
+                self._switch_to(served)
+                self._send_json(200, payload)
+            elif parsed.path == "/api/projects/locate":
+                # 「选择新位置…」 (9.4): adopts the chosen folder only if it
+                # carries the registry entry's id (see locate_payload).
+                served, payload = locate_payload(self._read_json_object())
+                self._switch_to(served)
+                self._send_json(200, payload)
+            elif parsed.path == "/api/project/resolve":
+                # The answer to a blocked project's question (9.4).
+                served, payload = resolve_payload(self._served(), self._read_json_object())
+                self._switch_to(served)
                 self._send_json(200, payload)
             elif parsed.path == "/api/projects/remove":
                 # Section 8.10 rule 3. POST, and origin-checked above like
@@ -1535,6 +1918,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # a write anyway (above), since its twin below mutates and
                 # the two must never drift apart in what reaches them.
                 body = self._read_json_object()
+                self._require_unblocked()
                 self._send_json(200, attempts_preview_payload(self._project_root(), body))
             elif parsed.path == "/api/attempts/write":
                 # The one endpoint that writes project content: the user's
@@ -1542,24 +1926,27 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # write + re-ingest under the watcher's ingest lock) --
                 # see module docstring's "Write-path defense".
                 body = self._read_json_object()
-                self._send_json(
-                    200, attempts_write_payload(self._project_root(), body, self.server.watcher)
-                )
+                with self.server.write_guard(human=True):
+                    payload = attempts_write_payload(self._project_root(), body, self.server.watcher)
+                self._send_json(200, payload)
             elif parsed.path in ("/api/mappings/add", "/api/mappings/delete"):
                 # The canvas's one write dialog (section 8.3/8.5): writes
                 # .rce/mappings.toml, never a request-named path -- see
                 # module docstring's "Canvas write defense".
                 body = self._read_json_object()
                 fn = mappings_add_payload if parsed.path.endswith("/add") else mappings_delete_payload
-                self._send_json(200, fn(self._project_root(), body, self.server.watcher))
+                with self.server.write_guard(human=True):
+                    payload = fn(self._project_root(), body, self.server.watcher)
+                self._send_json(200, payload)
             elif parsed.path in ("/api/edges/reject", "/api/edges/restore"):
                 body = self._read_json_object()
                 action = "reject" if parsed.path.endswith("/reject") else "restore"
-                conn = self._open_conn()
-                try:
-                    payload = edge_status_payload(conn, body, action)
-                finally:
-                    conn.close()
+                with self.server.write_guard(human=True):
+                    conn = self._open_conn()
+                    try:
+                        payload = edge_status_payload(conn, body, action)
+                    finally:
+                        conn.close()
                 # A graph change with no file change: pages re-fetch, the
                 # watcher's baseline and error stay exactly as they were.
                 payload["generation"] = self.server.watcher.bump_generation()
@@ -1568,7 +1955,8 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # UI state beside the graph (8.6) -- origin-checked like
                 # every POST: a drive-by page must not scramble the canvas.
                 body = self._read_json_object()
-                self._json_from_conn(lambda conn: canvas_layout_payload(conn, self._project_root(), body))
+                with self.server.write_guard(human=True):
+                    self._json_from_conn(lambda conn: canvas_layout_payload(conn, self._project_root(), body))
             elif parsed.path == "/api/shutdown":
                 # Stops this whole server (task V3 phase 4). Respond first,
                 # then stop the serve loop from a separate thread -- see
@@ -1594,6 +1982,7 @@ def build_server(
     project_root: Path,
     port: int,
     watch_interval: float = project_watcher.DEFAULT_INTERVAL_SECONDS,
+    served: ServedProject | None = None,
 ) -> RceHTTPServer:
     """Bound to 127.0.0.1 only -- see module docstring. `port=0` (used by
     the test suite) asks the OS for a free ephemeral port; the caller reads
@@ -1602,11 +1991,11 @@ def build_server(
     run a fast real-thread loop -- the watcher itself is created either
     way but only serve() starts its thread."""
     return RceHTTPServer(
-        ("127.0.0.1", port), RceRequestHandler, project_root, watch_interval=watch_interval,
+        ("127.0.0.1", port), RceRequestHandler, project_root, watch_interval=watch_interval, served=served,
     )
 
 
-def serve(project_root: Path, port: int, open_browser: bool = True) -> None:
+def serve(project_root: Path, port: int, open_browser: bool = True, served: ServedProject | None = None) -> None:
     """`rce serve`'s entry point: validate the project, print the one
     startup line the task spec requires verbatim, optionally open a browser
     tab, then block serving requests until Ctrl+C. `_require_db` runs before
@@ -1618,9 +2007,23 @@ def serve(project_root: Path, port: int, open_browser: bool = True) -> None:
     started (task V3 phase 2) -- a served app is the only consumer of live
     re-ingestion, so build_server callers that never serve (the test
     suite's routing fixtures) never pay for a background thread. The
-    `finally` block's `server_close` stops it again."""
+    `finally` block's `server_close` stops it again.
+
+    V5: `served` is the identity check's result (`served_for`; computed
+    here when not given). A blocked project -- or a registry entry whose
+    folder is gone -- does not stop the server: it serves the question
+    (module docstring, "Project identity") and writes nothing."""
+    if served is None:
+        served = served_for(Path(project_root))
     try:
-        _require_db(project_root)
+        if served.blocked is None:
+            _served_db(served)
+        else:
+            print(
+                f"RCE: {project_root}: {served.blocked.get('situation')} -- the app shows what to do; "
+                f"nothing is written until it is answered",
+                file=sys.stderr,
+            )
     except GraphDownloadingError as exc:
         # Not fatal at startup (section 8.10 rule 1): the graph exists, it is
         # just in iCloud right now and its download has been requested.
@@ -1628,7 +2031,7 @@ def serve(project_root: Path, port: int, open_browser: bool = True) -> None:
         # 「引擎没有在 10 秒内启动」; serving lets the page show the honest
         # header state and pick the graph up by itself once it is local.
         print(f"RCE: {exc}", file=sys.stderr)
-    httpd = build_server(project_root, port)
+    httpd = build_server(served.root, port, served=served)
     bound_port = httpd.server_address[1]
     url = f"http://127.0.0.1:{bound_port}"
     print(f"RCE app: {url}  (Ctrl+C to stop)")

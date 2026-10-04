@@ -81,7 +81,7 @@ def test_load_drops_malformed_entries_keeps_good_ones(fake_home):
         "not even a dict",
         {"path": "", "label": "empty path"},
     ]}))
-    assert registry.load() == [{"path": "/good", "label": "good"}]
+    assert registry.load() == [{"id": None, "path": "/good", "label": "good"}]
 
 
 # -- register: idempotent, MRU-first, atomic ----------------------------------
@@ -91,7 +91,7 @@ def test_register_creates_file_with_basename_label(fake_home, tmp_path):
     project = _mk_project(tmp_path, "myproj")
     registry.register(project)
     entries = registry.load()
-    assert entries == [{"path": str(project.resolve()), "label": "myproj"}]
+    assert entries == [{"id": None, "path": str(project.resolve()), "label": "myproj"}]
     assert _registry_file(fake_home).exists()
 
 
@@ -124,7 +124,7 @@ def test_register_preserves_a_stored_label_on_reregistration(fake_home, tmp_path
 
     registry.register(project)
 
-    assert registry.load() == [{"path": str(project.resolve()), "label": "自定义标签"}]
+    assert registry.load() == [{"id": None, "path": str(project.resolve()), "label": "自定义标签"}]
 
 
 def test_register_stores_resolved_absolute_path(fake_home, tmp_path, monkeypatch):
@@ -151,7 +151,7 @@ def test_register_survives_a_corrupt_existing_file(fake_home, tmp_path):
     _registry_file(fake_home).write_text("{corrupt")
     project = _mk_project(tmp_path, "myproj")
     registry.register(project)
-    assert registry.load() == [{"path": str(project.resolve()), "label": "myproj"}]
+    assert registry.load() == [{"id": None, "path": str(project.resolve()), "label": "myproj"}]
 
 
 def test_register_refuses_to_clobber_an_unreadable_registry(fake_home, tmp_path):
@@ -319,3 +319,100 @@ def test_remove_leaves_no_tmp_file_behind(fake_home, tmp_path):
     registry.remove(str((tmp_path / "aaa").resolve()))
     leftovers = sorted(p.name for p in (fake_home / ".rce").iterdir() if p.is_file())
     assert leftovers == ["projects.json"]
+
+
+# -- V5 (DESIGN.md 9.4): entries keyed by project id ---------------------------
+
+PID = "p-" + "1" * 32
+PID2 = "p-" + "2" * 32
+
+
+def test_old_format_entries_are_read_and_upgraded_on_write(fake_home, tmp_path):
+    """An old `{path, label}` file reads as id-less entries; registering the
+    same folder with its id replaces the id-less entry, and the file is
+    written in the new format."""
+    project = _mk_project(tmp_path, "myproj")
+    other = _mk_project(tmp_path, "other")
+    _registry_file(fake_home).parent.mkdir(parents=True, exist_ok=True)
+    _registry_file(fake_home).write_text(json.dumps({"projects": [
+        {"path": str(project.resolve()), "label": "myproj"},
+        {"path": str(other.resolve()), "label": "other"},
+    ]}))
+    assert registry.load()[0] == {"id": None, "path": str(project.resolve()), "label": "myproj"}
+    registry.register(project, PID)
+    on_disk = json.loads(_registry_file(fake_home).read_text())["projects"]
+    assert on_disk == [
+        {"id": PID, "path": str(project.resolve()), "label": "myproj"},
+        {"id": None, "path": str(other.resolve()), "label": "other"},
+    ]
+
+
+def test_register_by_id_follows_a_moved_folder(fake_home, tmp_path):
+    """9.9 scenario 1: one registry entry, at the new path."""
+    old = _mk_project(tmp_path, "old")
+    registry.register(old, PID)
+    new = tmp_path / "new"
+    old.rename(new)
+    registry.register(new, PID)
+    assert registry.load() == [{"id": PID, "path": str(new.resolve()), "label": "new"}]
+
+
+def test_relocate_updates_in_place_without_recency_bump(fake_home, tmp_path):
+    a, b = _mk_project(tmp_path, "a"), _mk_project(tmp_path, "b")
+    registry.register(a, PID)
+    registry.register(b, PID2)
+    moved = tmp_path / "a-moved"
+    a.rename(moved)
+    assert registry.relocate(PID, moved) is True
+    assert [e["path"] for e in registry.load()] == [str(b.resolve()), str(moved.resolve())]
+    assert registry.find(PID)["label"] == "a-moved"
+    assert registry.relocate(PID, moved) is False  # nothing to change
+    assert registry.relocate("p-" + "9" * 32, moved) is False  # never adds
+
+
+def test_two_ids_at_one_path_are_two_entries(fake_home, tmp_path):
+    """9.9 scenario 4: a new project at an old project's path is another
+    entry, not the old one."""
+    p = _mk_project(tmp_path, "p")
+    registry.register(p, PID)
+    registry.register(p, PID2)
+    assert [e["id"] for e in registry.load()] == [PID2, PID]
+
+
+def test_malformed_id_drops_the_entry(fake_home):
+    _registry_file(fake_home).parent.mkdir(parents=True)
+    _registry_file(fake_home).write_text(json.dumps({"projects": [
+        {"id": "../x", "path": "/a", "label": "a"}, {"id": PID, "path": "/b", "label": "b"},
+    ]}))
+    assert registry.load() == [{"id": PID, "path": "/b", "label": "b"}]
+
+
+_REGISTER_SCRIPT = """
+import sys
+from pathlib import Path
+from rce.webapp import registry
+base, tag, n = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+for i in range(n):
+    p = base / f"{tag}-{i}"
+    p.mkdir()
+    registry.register(p)
+"""
+
+
+def test_two_processes_registering_at_once_lose_nothing(fake_home, tmp_path):
+    """9.9 scenario 10 for the registry: two processes each register 100
+    projects at once; every entry survives and nothing raises."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    procs = [
+        subprocess.Popen([sys.executable, "-c", _REGISTER_SCRIPT, str(tmp_path), tag, "100"], env=env,
+                         stderr=subprocess.PIPE)
+        for tag in ("a", "b")
+    ]
+    for proc in procs:
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err.decode()
+    assert len(registry.load()) == 200

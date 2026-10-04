@@ -442,9 +442,14 @@ def test_delete_unknown_entry_is_not_found(tmp_path):
     with pytest.raises(mappings.MappingsWriteError) as exc:
         mappings.delete_mapping(tmp_path, "b.py", "f.png", "generates")
     assert exc.value.code == "not_found"
-    with pytest.raises(mappings.MappingsWriteError) as exc:
+    # A folder that does not exist is refused before its file is even
+    # looked for (DESIGN.md 9.4: a writer never touches -- or re-creates --
+    # a project folder that is not there).
+    from rce.records import situation
+
+    with pytest.raises(situation.ProjectMovedError):
         mappings.delete_mapping(tmp_path / "nowhere-else", "a.py", "f.png", "generates")
-    assert exc.value.code == "not_found"
+    assert not (tmp_path / "nowhere-else").exists()
 
 
 def test_delete_refuses_a_shape_it_cannot_edit_faithfully(tmp_path):

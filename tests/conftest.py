@@ -18,7 +18,7 @@ def conn() -> sqlite3.Connection:
 
 
 @pytest.fixture(autouse=True)
-def isolated_rce_home(tmp_path: Path, monkeypatch) -> Path:
+def isolated_rce_home(tmp_path_factory, monkeypatch) -> Path:
     """Point `RCE_HOME` at a throwaway directory for EVERY test in the
     suite (DESIGN.md section 8.10 rule 1).
 
@@ -35,7 +35,11 @@ def isolated_rce_home(tmp_path: Path, monkeypatch) -> Path:
     need the registry in a specific place (the `fake_home` fixtures) set
     `RCE_HOME` themselves; their `monkeypatch.setenv` runs after this
     autouse one and wins.
+
+    A sibling of `tmp_path`, never inside it (DESIGN.md 9.7): so many
+    tests use `tmp_path` itself as the project root, and the project
+    lock refuses an `RCE_HOME` that sits inside the project it locks.
     """
-    home = tmp_path / "rce-home"
+    home = tmp_path_factory.mktemp("rce-home")
     monkeypatch.setenv("RCE_HOME", str(home))
     return home

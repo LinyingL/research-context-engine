@@ -666,8 +666,13 @@ def _commit(project_root: Path, old_text: str | None, new_text: str) -> str | No
     backup's project-relative path or None for a newly created file."""
     from rce.webapp import mapedit
 
+    from rce.records import files as records_files
+
     path = mappings_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        records_files.ensure_dir_within(project_root, path.parent)  # never re-creates a moved project
+    except records_files.RecordFileError as exc:
+        raise MappingsWriteError("file_unreadable", str(exc)) from exc
     backup = None
     if old_text is not None:
         backup = mapedit.write_backup_bytes(project_root, path, old_text.encode("utf-8"), ".toml")
@@ -689,6 +694,23 @@ def _check_round_trip(new_text: str, expected: list[Any]) -> None:
 
 
 def add_mapping(
+    project_root: str | Path,
+    from_path: str,
+    to_path: str,
+    type: str,
+    note: str | None = None,
+    date: str | None = None,
+) -> dict[str, Any]:
+    """`_add_mapping` under the project lock with the identity re-checked
+    (DESIGN.md 9.4, 9.7): a human record, so a pre-V5 project refuses it
+    (`NeedsMigrationError`) and two processes take turns."""
+    from rce.records import situation  # noqa: PLC0415 -- records imports nothing from ingest
+
+    with situation.write_guard(project_root, human=True):
+        return _add_mapping(project_root, from_path, to_path, type, note=note, date=date)
+
+
+def _add_mapping(
     project_root: str | Path,
     from_path: str,
     to_path: str,
@@ -751,6 +773,14 @@ def _blocks(lines: list[str]) -> list[tuple[int, int]]:
 
 
 def delete_mapping(project_root: str | Path, from_path: str, to_path: str, type: str) -> dict[str, Any]:
+    """`_delete_mapping` under the project write guard (see `add_mapping`)."""
+    from rce.records import situation  # noqa: PLC0415
+
+    with situation.write_guard(project_root, human=True):
+        return _delete_mapping(project_root, from_path, to_path, type)
+
+
+def _delete_mapping(project_root: str | Path, from_path: str, to_path: str, type: str) -> dict[str, Any]:
     """Remove every entry asserting (from, to, type) -- compared in
     normalized form -- together with the blank lines just above it.
     Everything else is kept byte-for-byte. Raises `MappingsWriteError`

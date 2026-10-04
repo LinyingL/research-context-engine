@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from rce import db, paths
+from rce import project as project_identity
 from rce.ingest import attempts as attempts_ingest
 from rce.webapp import mapedit
 
@@ -63,12 +64,8 @@ def _make_project(root: Path, map_md: str = _MAP_MD) -> Path:
     (root / "00-项目地图.md").write_text(map_md, encoding="utf-8")
     # The graph lives outside the project (DESIGN.md section 8.10 rule 1);
     # `.rce/` here holds only the researcher's own attempts.toml + backups.
-    paths.ensure_graph_dir(root)
-    conn = db.connect(paths.graph_db_path(root))
-    try:
-        db.migrate(conn)
-    finally:
-        conn.close()
+    # V5 (DESIGN.md 9.4): an identity file, and the index under its id.
+    project_identity.init_project(root)
     return root
 
 

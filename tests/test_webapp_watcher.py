@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from rce import db, paths
+from rce import project as project_identity
 from rce.webapp import watcher
 
 
@@ -29,12 +30,8 @@ def _init_project(project_root: Path) -> None:
     rce_dir = project_root / ".rce"
     rce_dir.mkdir(parents=True, exist_ok=True)
     # The graph lives outside the project (DESIGN.md section 8.10 rule 1).
-    paths.ensure_graph_dir(project_root)
-    conn = db.connect(paths.graph_db_path(project_root))
-    try:
-        db.migrate(conn)
-    finally:
-        conn.close()
+    # V5 (DESIGN.md 9.4): an identity file, and the index under its id.
+    project_identity.init_project(project_root)
 
 
 _CONFIG = """\

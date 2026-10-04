@@ -9,11 +9,27 @@ reordered exclusively by RCE itself (`rce serve <path>` registers,
 hand-maintained, so the stdlib `json` round-trip is the right tool and
 comment support would buy nothing.
 
+Since V5 (DESIGN.md 9.4) an entry is `{"id", "path", "label"}`, keyed by
+the project's id: a moved project updates its entry instead of adding
+one, and an entry whose folder is gone -- or whose path now holds another
+project -- is reported as such so the app can offer 「选择新位置…」. A
+pre-V5 project (no id yet) keeps an id-less entry keyed by path, as every
+entry was before; old-format files (no `"id"` key) are read as id-less
+entries and written back in the new format. When a project with an id is
+registered, an id-less entry at the same path is replaced by it.
+
+Writes are serialized across processes by a `flock` on
+`~/.rce/locks/registry.lock` and land through `rce.records.files.
+durable_write`, whose temp names are unique per write: two engines
+registering at once each keep their entry (9.0 measured 104 of 200
+surviving with the old fixed `projects.json.tmp` and no lock).
+
 Contract:
 
   - `load()` returns the registered projects, most-recently-served first,
-    each as `{"path": <absolute path str>, "label": <display name>}`. The
-    label defaults to the directory's basename at registration time. A
+    each as `{"id": <project id or None>, "path": <absolute path str>,
+    "label": <display name>}`. The label is the directory's basename at
+    registration time (and again after a move). A
     missing, unreadable, corrupt, or wrong-shaped registry file degrades
     to `[]` -- the registry is a convenience cache, never something whose
     corruption should take `rce serve` down; individual malformed entries
@@ -60,12 +76,17 @@ reachable through the server's own file endpoints can read or write it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import threading
 from pathlib import Path
+from typing import Iterator
 
 from rce import paths
+from rce.records import files
+from rce.records.lock import PROJECT_ID_RE
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +124,37 @@ def is_available(path: Path) -> bool:
 
 
 def _valid_entry(entry: object) -> bool:
-    return (
+    if not (
         isinstance(entry, dict)
         and isinstance(entry.get("path"), str)
         and isinstance(entry.get("label"), str)
         and bool(entry["path"])
-    )
+    ):
+        return False
+    project_id = entry.get("id")
+    return project_id is None or (isinstance(project_id, str) and bool(PROJECT_ID_RE.match(project_id)))
+
+
+_LOCK_FILENAME = "registry.lock"
+_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _locked() -> Iterator[None]:
+    """Exclusive across threads and processes for one read-modify-write of
+    the registry. The lock file sits under `rce_home()/locks/`, beside the
+    project locks (DESIGN.md 9.7), never in a project."""
+    with _THREAD_LOCK:
+        import fcntl  # noqa: PLC0415 -- POSIX-only, like every RCE lock
+
+        directory = paths.rce_home() / "locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        fd = os.open(directory / _LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing the descriptor releases the flock
 
 
 def _read_entries() -> list[dict[str, str]]:
@@ -140,7 +186,7 @@ def _read_entries() -> list[dict[str, str]]:
         if not _valid_entry(entry):
             logger.warning("%s: dropping malformed registry entry %r", path, entry)
             continue
-        entries.append({"path": entry["path"], "label": entry["label"]})
+        entries.append({"id": entry.get("id"), "path": entry["path"], "label": entry["label"]})
     return entries
 
 
@@ -164,49 +210,92 @@ def load() -> list[dict[str, str]]:
         return []
 
 
-def _write_atomic(entries: list[dict[str, str]]) -> None:
-    """tmp file + `os.replace` in the same directory: a reader (another
-    `rce serve` process, a concurrent request thread) only ever sees the
-    old complete file or the new complete file, never a partial write."""
+def _write_atomic(entries: list[dict[str, str | None]]) -> None:
+    """Through `rce.records.files.durable_write` (unique temp name, fsync,
+    `os.replace`): a reader only ever sees the old complete file or the
+    new complete file. Call inside `_locked()`."""
     path = registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(
-        json.dumps({"projects": entries}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(tmp, path)
+    path.parent.mkdir(parents=True, exist_ok=True)  # rce_home(), never a project
+    data = json.dumps({"projects": entries}, ensure_ascii=False, indent=2) + "\n"
+    files.durable_write(path, data.encode("utf-8"))
 
 
-def register(path: Path) -> None:
+def _update(change) -> bool:
+    """Run `change(entries) -> bool` on the current entries under the lock
+    and write them back if it returned True. A registry that exists but
+    cannot be read is never rewritten (see `_read_entries`)."""
+    with _locked():
+        try:
+            entries = _read_entries()
+        except OSError as exc:
+            logger.warning(
+                "%s exists but cannot be read (%s) -- NOT rewriting it, since writing on top "
+                "of a misread would discard every other registered project",
+                registry_path(), exc,
+            )
+            return False
+        if not change(entries):
+            return False
+        _write_atomic(entries)
+        return True
+
+
+def register(path: Path, project_id: str | None = None) -> None:
     """Record `path` (resolved to absolute) as the most recently served
-    project. Idempotent: an already-registered path is moved to the front,
-    keeping its stored label; a new one is inserted at the front with the
-    directory basename as its default label.
+    project. Keyed by `project_id` when the project has one (an entry with
+    that id is moved to the front and follows the folder: a new path gets
+    the new basename as its label; an id-less entry at the same path is
+    replaced), else by path as before V5. Idempotent.
 
     A registry file that exists but cannot be read makes this a logged
     no-op rather than a rewrite: the entries that may still be in that
-    file outrank recording this one serve, and skipping the registration
-    costs only convenience (serving still works; the project re-registers
-    on the next successful `rce serve`). Corrupt JSON is different --
+    file outrank recording this one serve. Corrupt JSON is different --
     genuinely unrecoverable content -- and still gets rebuilt cleanly."""
     resolved = str(Path(path).resolve())
-    try:
-        entries = _read_entries()
-    except OSError as exc:
-        logger.warning(
-            "%s exists but cannot be read (%s) -- NOT registering %s, since rewriting "
-            "on top of a misread would discard every other registered project",
-            registry_path(), exc, resolved,
-        )
-        return
-    existing = next((e for e in entries if e["path"] == resolved), None)
-    if existing is not None:
-        entries.remove(existing)
-        entries.insert(0, existing)
-    else:
-        entries.insert(0, {"path": resolved, "label": Path(resolved).name})
-    _write_atomic(entries)
+
+    def change(entries: list[dict]) -> bool:
+        if project_id is not None:
+            existing = next((e for e in entries if e.get("id") == project_id), None)
+            stale = [e for e in entries if e.get("id") is None and e["path"] == resolved]
+        else:
+            existing = next((e for e in entries if e.get("id") is None and e["path"] == resolved), None)
+            stale = []
+        for entry in stale + ([existing] if existing is not None else []):
+            entries.remove(entry)
+        if existing is not None and existing["path"] == resolved:
+            entry = existing
+        else:
+            entry = {"id": project_id, "path": resolved, "label": Path(resolved).name}
+        entries.insert(0, entry)
+        return True
+
+    _update(change)
+
+
+def relocate(project_id: str, path: Path) -> bool:
+    """A moved project (9.4, adoption): its entry's path and label follow
+    the folder, in place -- no recency bump, since adoption happens on any
+    entry point, not only on a serve. Returns whether an entry changed.
+    An id-less entry at the new path is replaced by it."""
+    resolved = str(Path(path).resolve())
+
+    def change(entries: list[dict]) -> bool:
+        existing = next((e for e in entries if e.get("id") == project_id), None)
+        if existing is None or existing["path"] == resolved:
+            return False
+        stale = [e for e in entries if e.get("id") is None and e["path"] == resolved]
+        for entry in stale:
+            entries.remove(entry)
+        existing["path"] = resolved
+        existing["label"] = Path(resolved).name
+        return True
+
+    return _update(change)
+
+
+def find(project_id: str) -> dict[str, str | None] | None:
+    """The entry for `project_id`, or None."""
+    return next((e for e in load() if e.get("id") == project_id), None)
 
 
 def remove(path: str | Path) -> bool:
@@ -226,17 +315,12 @@ def remove(path: str | Path) -> bool:
     this a logged no-op rather than a rewrite -- the entries still in that
     file outrank this one removal."""
     requested = str(path)
-    try:
-        entries = _read_entries()
-    except OSError as exc:
-        logger.warning(
-            "%s exists but cannot be read (%s) -- NOT removing %s, since rewriting on top "
-            "of a misread would discard every other registered project",
-            registry_path(), exc, requested,
-        )
-        return False
-    kept = [entry for entry in entries if entry["path"] != requested]
-    if len(kept) == len(entries):
-        return False
-    _write_atomic(kept)
-    return True
+
+    def change(entries: list[dict]) -> bool:
+        kept = [entry for entry in entries if entry["path"] != requested]
+        if len(kept) == len(entries):
+            return False
+        entries[:] = kept
+        return True
+
+    return _update(change)

@@ -114,11 +114,12 @@ as `last_error`, and retried on the next poll until it lands.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Collection
+from typing import Callable, Collection, ContextManager
 
 from rce import db, paths
 from rce.ingest import attempts as attempts_ingest
@@ -263,6 +264,67 @@ def _absorb_only(old: WatchSnapshot, fresh: WatchSnapshot, absorb: frozenset[str
     return WatchSnapshot(files=files, steps_paths=old.steps_paths | fresh.steps_paths)
 
 
+def _graph_location(root: Path) -> str:
+    try:
+        return str(paths.graph_db_path(root))
+    except paths.GraphMigrationError:  # an identity file that cannot be read right now
+        return "(unknown: the project identity file cannot be read)"
+
+
+def _graph_present(root: Path) -> bool:
+    """Whether the served root's graph is there. A folder that moved away
+    or whose identity file cannot be read has, for the watcher, no graph:
+    one log line and silence (section 8.10 rule 2), never a traceback per
+    poll."""
+    try:
+        return paths.graph_db_path(root).exists()
+    except paths.GraphMigrationError:
+        return False
+
+
+class _GuardedLock:
+    """`ProjectWatcher.ingest_lock` as callers see it: the write guard
+    (outer) and the in-process ingest lock (inner), entered and left as
+    one context manager -- so `mapedit.apply_edit(ingest_lock=...)` and
+    `with watcher.ingest_lock:` need no change to take turns across
+    processes too."""
+
+    def __init__(self, lock: threading.Lock, guard: Callable[[], ContextManager[object]]) -> None:
+        self._lock = lock
+        self._guard = guard
+        self._local = threading.local()
+
+    def __enter__(self) -> "_GuardedLock":
+        stack = contextlib.ExitStack()
+        stack.enter_context(self._guard())
+        try:
+            stack.enter_context(self._lock)
+        except BaseException:
+            stack.close()
+            raise
+        frames = getattr(self._local, "frames", None)
+        if frames is None:
+            frames = self._local.frames = []
+        frames.append(stack)
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        stack = self._local.frames.pop()
+        return bool(stack.__exit__(*exc_info))
+
+    def locked(self) -> bool:
+        """Whether the in-process ingest lock is held (as `threading.Lock`)."""
+        return self._lock.locked()
+
+    def acquire(self) -> bool:
+        """`threading.Lock`'s spelling of entering (blocking)."""
+        self.__enter__()
+        return True
+
+    def release(self) -> None:
+        self.__exit__(None, None, None)
+
+
 class ProjectWatcher:
     """The polling watcher itself. Owned by `RceHTTPServer` (one per server
     process); `get_project_root` is the server's own locked accessor, read
@@ -278,6 +340,8 @@ class ProjectWatcher:
         self,
         get_project_root: Callable[[], Path],
         interval: float = DEFAULT_INTERVAL_SECONDS,
+        write_guard: Callable[[], ContextManager[object]] | None = None,
+        active: Callable[[], bool] | None = None,
     ) -> None:
         self._get_project_root = get_project_root
         self._interval = interval
@@ -285,6 +349,16 @@ class ProjectWatcher:
         self._state_lock = threading.Lock()
         # Serializes the re-ingest itself, held only while ingesting.
         self._ingest_lock = threading.Lock()
+        # V5 (DESIGN.md 9.4, 9.7): every ingest is an index write, so it
+        # runs inside the server's write guard (the cross-process project
+        # lock plus the identity re-check), ALWAYS taken before the
+        # in-process ingest lock -- one order for every thread, so a
+        # request holding the guard and the watcher can never deadlock.
+        self._write_guard = write_guard or contextlib.nullcontext
+        # Whether the served project may be polled at all (not while it is
+        # blocked on a question or opened read-only).
+        self._active = active or (lambda: True)
+        self._guarded_ingest_lock = _GuardedLock(self._ingest_lock, self._write_guard)
         self._generation = 1
         self._refreshing = False
         self._last_error: str | None = None
@@ -308,14 +382,16 @@ class ProjectWatcher:
     # -- status / retarget / external writes (called from HTTP handler threads) --
 
     @property
-    def ingest_lock(self) -> threading.Lock:
+    def ingest_lock(self) -> "_GuardedLock":
         """The lock serializing every re-ingest of the served project.
         Exposed (task V3 phase 3) so the UI write path
         (`rce.webapp.mapedit.apply_edit`, via the `/api/attempts/write`
         handler) runs its own write+re-ingest under the SAME lock this
         watcher's `poll_once` ingests under -- the two must never
-        interleave, and two locks could only ever drift apart."""
-        return self._ingest_lock
+        interleave, and two locks could only ever drift apart. Since V5 it
+        is the guarded form (`_GuardedLock`): entering it also takes the
+        project write guard, first."""
+        return self._guarded_ingest_lock
 
     def bump_generation(self) -> int:
         """The graph changed without any watched FILE changing (a human
@@ -420,8 +496,10 @@ class ProjectWatcher:
         that (section 8.10 rule 2): nothing is snapshotted, compared or
         ingested, and the baseline is left exactly as it was so a change
         made during the outage is still pending when the file returns."""
+        if not self._active():
+            return False
         root = self._get_project_root()
-        if not paths.graph_db_path(root).exists():
+        if not _graph_present(root):
             self._note_graph_missing(root)
             return False
         self._note_graph_present()
@@ -447,7 +525,7 @@ class ProjectWatcher:
         attempts_changed = bool(changed - {mappings_file})
         error: str | None = None
         try:
-            with self._ingest_lock:
+            with self._guarded_ingest_lock:
                 self._reingest(
                     root, steps_changed, attempts=attempts_changed, mappings=mappings_changed,
                 )
@@ -493,7 +571,7 @@ class ProjectWatcher:
             epoch = self._epoch
             already_failed = self._mappings_sync_failed
         try:
-            with self._ingest_lock:
+            with self._guarded_ingest_lock:
                 conn = db.connect(paths.graph_db_path(root))
                 try:
                     report = mappings_ingest.ingest_mappings(conn, root)
@@ -541,13 +619,13 @@ class ProjectWatcher:
                 return
             self._graph_missing_root = root
             self._last_error = (
-                f"no RCE project at {root} (missing its graph at {paths.graph_db_path(root)}); "
+                f"no RCE project at {root} (missing its graph at {_graph_location(root)}); "
                 "the graph database disappeared while being served"
             )
             self._generation += 1
         logger.warning(
             "graph for %s is gone (%s) -- auto re-ingest paused for this project until it "
-            "reappears", root, paths.graph_db_path(root),
+            "reappears", root, _graph_location(root),
         )
 
     def _note_graph_present(self) -> None:

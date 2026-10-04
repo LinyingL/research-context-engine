@@ -67,17 +67,15 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import consistency, db, lineage, paths, query
+from rce import project as project_identity
 from rce.ingest import attempts as attempts_ingest
-from rce.ingest import claims as claims_ingest
-from rce.ingest import dataflow as dataflow_ingest
-from rce.ingest import files as files_ingest
-from rce.ingest import git as git_ingest
-from rce.ingest import latex as latex_ingest
+# `git_ingest` stays importable as `rce.cli.git_ingest` (tests patch it);
+# the scan itself is `rce.ingest.pipeline`.
+from rce.ingest import git as git_ingest  # noqa: F401
 from rce.ingest import mappings as mappings_ingest
-from rce.ingest import mdpaper as mdpaper_ingest
-from rce.ingest import mlflow as mlflow_ingest
-from rce.ingest import pyfig as pyfig_ingest
-from rce.ingest import wandb as wandb_ingest
+from rce.ingest import pipeline as ingest_pipeline
+from rce.records import lock as records_lock
+from rce.records import situation as records_situation
 # S2: `rce judge`, the optional semantic layer. Unlike rce.mcp_server
 # (behind a lazy import because it needs the third-party 'mcp' extra),
 # rce.semantic.{backend,judge} use only stdlib urllib -- importing them
@@ -112,34 +110,39 @@ class CliError(Exception):
     """User-facing error; caught once in main() -> "Error: <msg>" on stderr, exit 1."""
 
 
-class _WarningCounter(logging.Handler):
-    """Counts WARNING+ records from the extractors' shared "rce.ingest" logger
-    for one ingest run, giving a skip count without changing those modules."""
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-        self.count = 0
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.count += 1
-
-
-@contextmanager
-def _count_ingest_warnings():
-    counter = _WarningCounter()
-    ingest_logger = logging.getLogger("rce.ingest")
-    ingest_logger.addHandler(counter)
-    try:
-        yield counter
-    finally:
-        ingest_logger.removeHandler(counter)
-
-
-def _resolve_project_root(path_str: str) -> Path:
+def _open(path_str: str, *, register: bool = False) -> project_identity.Opened:
+    """THE identity check (DESIGN.md 9.4), first thing in every subcommand
+    that names a project: before anything is written. A moved project is
+    adopted, a missing index is built empty; a copy, a home that cannot be
+    checked, a lost or unreadable identity stops here with the reason and
+    the exact commands, and nothing is written (not even the registry)."""
     root = Path(path_str).resolve()
     if not root.is_dir():
         raise CliError(f"{root} is not a directory")
-    return root
+    try:
+        return project_identity.open_project(root, register=register)
+    except project_identity.ProjectBlocked as exc:
+        raise CliError(str(exc)) from exc
+    except project_identity.AnswerRefused as exc:
+        raise CliError(str(exc)) from exc
+
+
+def _resolve_project_root(path_str: str) -> Path:
+    return _open(path_str).root
+
+
+@contextmanager
+def _write_guard(opened: project_identity.Opened, *, human: bool):
+    """Hold the project lock and re-check identity for a write (9.4, 9.7):
+    an index write (a scan) or, with `human=True`, a human record -- which
+    a pre-V5 project refuses until it is migrated."""
+    try:
+        with records_situation.write_guard(opened.root, opened.project_id, human=human):
+            yield
+    except records_situation.WriteRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_lock.ProjectLockError as exc:
+        raise CliError(f"could not take the project lock: {exc}") from exc
 
 
 def _require_db(project_root: Path) -> Path:
@@ -256,161 +259,65 @@ def _print_pending_queue(conn: Connection, limit: int | None) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Create the project's graph -- at `~/.rce/graphs/<id>/graph.db`,
-    outside the project (DESIGN.md section 8.10 rule 1) -- plus the two
-    things that keep that from being hidden: the one-line `.rce/README`
-    signpost inside the project, and the graph's path printed here.
+    """Create the project's identity, `.rce/project.toml` (DESIGN.md 9.4,
+    created exclusively, never overwritten), and its index under the id
+    at `~/.rce/graphs/<id>/` -- outside the project (8.10 rule 1) -- plus
+    the one-line `.rce/README` signpost, and print where the index is.
 
-    A project whose graph is still in the old in-project location is
-    migrated first, so `rce init` on an existing project adopts it rather
-    than starting a second, empty graph beside it."""
-    project_root = _resolve_project_root(args.path)
+    Idempotent on a project that already has an id. A folder in a
+    situation that must be answered first (a copy, ...) is refused with
+    the commands that answer it; a pre-V5 project is refused too: its
+    judgments sit in the old index, and giving it an id is what `rce
+    migrate` does once they have been moved into the record (9.5)."""
+    project_root = Path(args.path).resolve()
+    if not project_root.is_dir():
+        raise CliError(f"{project_root} is not a directory")
     try:
-        paths.migrate_legacy_graph(project_root)
-    except paths.GraphMigrationError as exc:
+        result = project_identity.init_project(project_root)
+    except project_identity.ProjectBlocked as exc:
         raise CliError(str(exc)) from exc
-    rce_dir = paths.project_rce_dir(project_root)
-    rce_dir.mkdir(parents=True, exist_ok=True)
-    paths.ensure_graph_dir(project_root)
-    db_path = paths.graph_db_path(project_root)
-    conn = db.connect(db_path)
-    try:
-        applied = db.migrate(conn)
-        project_id = f"project:{project_root.name}"
-        db.upsert_node(
-            conn, project_id, "project", title=project_root.name,
-            attrs={"path": str(project_root)},
-        )
-    finally:
-        conn.close()
-    readme = paths.write_project_readme(project_root)
-    print(f"Initialized RCE project at {project_root} (project node: {project_id})")
-    print(f"Graph: {db_path}")
-    if applied:
-        print(f"Applied migrations: {applied}")
-    # T5.5 review item 5, restated for section 8.10: still a nudge only --
-    # RCE never edits the user's own files (DESIGN.md section 2,
-    # "零习惯改变"). What changed is the advice itself: with the graph out
-    # of the project, `.rce/` holds only files the researcher wrote and may
-    # well want in git, so telling them to ignore it would now be wrong.
+    except (project_identity.AnswerRefused, records_situation.WriteRefused) as exc:
+        raise CliError(str(exc)) from exc
+    node = project_identity.project_node_id(result.identity.id)
+    print(f"Initialized RCE project at {project_root} (project node: {node})")
+    if result.created_identity:
+        print(f"Project id: {result.identity.id} (written to {RCE_DIRNAME}/project.toml)")
+    print(f"Graph: {result.db_path}")
+    if result.applied:
+        print(f"Applied migrations: {result.applied}")
+    # Still a nudge only -- RCE never edits the user's own files (DESIGN.md
+    # section 2, "零习惯改变"): `.rce/` holds only the project's identity
+    # and files the researcher owns, so whether it goes into git is theirs.
     print(
         f"Note: '{RCE_DIRNAME}/' in your project now holds only your own files "
-        f"(attempts.toml, mappings.toml, backups/) -- commit or .gitignore it as you "
-        f"prefer. The derived graph is outside the project; see {readme}."
+        f"(project.toml, attempts.toml, mappings.toml, backups/) -- commit or .gitignore it as you "
+        f"prefer. The derived graph is outside the project; see {result.readme}."
     )
     return 0
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
-    project_root = _resolve_project_root(args.path)
-    conn = db.connect(_require_db(project_root))
-    try:
-        with _count_ingest_warnings() as warnings:
+    """Scan every source into the index (`rce.ingest.pipeline`), under the
+    project lock with the identity re-checked (9.7, 9.4): a scan is an
+    index write like any other."""
+    opened = _open(args.path)
+    project_root = opened.root
+    db_path = _require_db(project_root)
+    with _write_guard(opened, human=False):
+        conn = db.connect(db_path)
+        try:
             print(f"Ingesting {project_root}")
             try:
-                commits = git_ingest.ingest_git_repo(conn, project_root)
-            except git_ingest.NotAGitRepositoryError:
-                # W1: a project root with no git repository at all is a
-                # normal, supported case, not a fatal one -- commit/
-                # contributor nodes are simply unavailable (there is no
-                # commit history to read), so the file inventory falls back
-                # to a plain filesystem walk (rce.ingest.files, no
-                # .gitignore to consult) and every other extractor still
-                # runs against it. pyfig degrades its own `generates` edges
-                # separately (see rce.ingest.pyfig.ingest_pyfig_repo) since
-                # it additionally needs a commit source node per call site.
-                print(
-                    "  git: no git repository -- commit/contributor nodes unavailable; "
-                    "using filesystem scan for the file inventory"
+                skipped = ingest_pipeline.ingest_sources(
+                    conn, project_root, mlruns=args.mlruns, wandb=args.wandb, echo=print,
                 )
-                commits = 0
-                inventory = files_ingest.list_source_files(project_root)
-            except git_ingest.GitIngestError as exc:
-                raise CliError(f"git ingestion failed: {exc}") from exc
-            else:
-                try:
-                    inventory = git_ingest.list_source_files(project_root)
-                except git_ingest.GitIngestError as exc:
-                    raise CliError(f"git ingestion failed: {exc}") from exc
-                print(f"  git: {commits} commit(s) ingested")
-            # inventory["image"] lets the latex ingester reject "ghost figures"
-            # (\includegraphics targets not actually tracked in the repo, T5.5
-            # review item 2) -- this cli entry point always passes it; the
-            # library function itself keeps it optional (None = no validation).
-            latex_counts = latex_ingest.ingest_latex_repo(
-                conn, project_root, inventory["tex"], inventory["bib"],
-                image_paths=inventory["image"],
-            )
-            print(
-                f"  latex: {len(inventory['tex'])} .tex, {len(inventory['bib'])} .bib "
-                f"scanned -> {_format_counts(latex_counts)}"
-            )
-            # W2: data-lineage extractor (script --reads/writes--> dataset/
-            # figure). Needs no git at all -- see rce.ingest.dataflow's
-            # module docstring -- so it runs identically whether or not the
-            # branch above found a real git repository.
-            dataflow_counts = dataflow_ingest.ingest_dataflow_repo(
-                conn, project_root, inventory["py"], inventory["r"], inventory["rmd"],
-            )
-            print(
-                f"  dataflow: {len(inventory['py'])} .py, {len(inventory['r'])} .R, "
-                f"{len(inventory['rmd'])} .Rmd scanned -> {_format_counts(dataflow_counts)}"
-            )
-            # T6: static savefig() analysis; each edge's src commit is
-            # resolved internally via git blame (batch3-fix), not HEAD.
-            pyfig_counts = pyfig_ingest.ingest_pyfig_repo(
-                conn, project_root, inventory["py"], inventory["image"],
-            )
-            print(f"  pyfig: {len(inventory['py'])} .py scanned -> {_format_counts(pyfig_counts)}")
-            if args.mlruns:
-                mlruns_path: Path | None = Path(args.mlruns).resolve()
-            else:
-                default_mlruns = project_root / "mlruns"
-                mlruns_path = default_mlruns if default_mlruns.is_dir() else None
-            if mlruns_path is not None:
-                mlflow_counts = mlflow_ingest.ingest_mlflow_dir(conn, mlruns_path)
-                print(f"  mlflow: {mlruns_path} -> {_format_counts(mlflow_counts)}")
-            else:
-                print("  mlflow: skipped (no --mlruns given and no mlruns/ directory found)")
-            if args.wandb:
-                entity, sep, wandb_project = args.wandb.partition("/")
-                if not sep or not entity or not wandb_project:
-                    raise CliError(f"--wandb expects 'entity/project', got {args.wandb!r}")
-                try:
-                    wandb_counts = wandb_ingest.ingest_wandb_project(conn, entity, wandb_project)
-                except wandb_ingest.WandbError as exc:
-                    raise CliError(f"wandb ingestion failed: {exc}") from exc
-                print(f"  wandb: {args.wandb} -> {_format_counts(wandb_counts)}")
-            else:
-                print("  wandb: skipped (no --wandb given)")
-            # Task W3: Markdown paper support (headings/figures/claims for
-            # .md sources -- a research project is often 88 .md files, not
-            # LaTeX). Runs after mlflow/wandb for the same reason the tex
-            # claims step just below must: it generates its own backed_by
-            # candidates against experiment metrics internally, so those
-            # nodes need to already exist or every markdown claim would
-            # trivially get zero candidates (see rce.ingest.mdpaper).
-            md_counts = mdpaper_ingest.ingest_md_repo(
-                conn, project_root, inventory["md"], image_paths=inventory["image"],
-            )
-            print(
-                f"  mdpaper: {len(inventory['md'])} .md scanned "
-                f"({md_counts['md_skipped_non_paper']} skipped as README/CHANGELOG/LICENSE) "
-                f"-> {_format_counts(md_counts)}"
-            )
-            # Phase B (task B1): claim extraction + deterministic backed_by
-            # candidate generation. Must run last -- it matches claim
-            # numbers against experiment nodes' metrics, so mlflow/wandb
-            # (just above) have to have already written those nodes, or
-            # every claim would trivially get zero candidates.
-            claims_counts = claims_ingest.ingest_claims_repo(conn, project_root, inventory["tex"])
-            print(f"  claims: {_format_counts(claims_counts)}")
-            skipped = warnings.count
-        print("Ingest summary (whole graph):")
-        _print_graph_counts(conn)
-        print(f"  Skipped/unresolved during this run (see logs): {skipped}")
-    finally:
-        conn.close()
+            except ingest_pipeline.IngestFailed as exc:
+                raise CliError(str(exc)) from exc
+            print("Ingest summary (whole graph):")
+            _print_graph_counts(conn)
+            print(f"  Skipped/unresolved during this run (see logs): {skipped}")
+        finally:
+            conn.close()
     return 0
 
 
@@ -550,24 +457,27 @@ def cmd_attempts(args: argparse.Namespace) -> int:
     itself "a problem found"), so this composes into a caller's own CI/
     pre-commit pipeline.
     """
-    project_root = _resolve_project_root(_resolve_attempts_path(args))
-    conn = db.connect(_require_db(project_root))
-    try:
+    opened = _open(_resolve_attempts_path(args))
+    project_root = opened.root
+    db_path = _require_db(project_root)
+    with _write_guard(opened, human=False):
+        conn = db.connect(db_path)
         try:
-            config = attempts_ingest.load_config(project_root)
-            counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
-        except attempts_ingest.AttemptsConfigError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        print(f"Attempts ({config.file}): {_format_counts(counts)}")
+            try:
+                config = attempts_ingest.load_config(project_root)
+                counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
+            except attempts_ingest.AttemptsConfigError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(f"Attempts ({config.file}): {_format_counts(counts)}")
 
-        if args.check:
-            results = consistency.run_checks(conn, project_root, config)
-            _print_consistency_report(results)
-            return 1 if any(r.findings for r in results) else 0
-        _print_attempts_listing(conn, config)
-    finally:
-        conn.close()
+            if args.check:
+                results = consistency.run_checks(conn, project_root, config)
+                _print_consistency_report(results)
+                return 1 if any(r.findings for r in results) else 0
+            _print_attempts_listing(conn, config)
+        finally:
+            conn.close()
     return 0
 
 
@@ -582,16 +492,19 @@ def cmd_mappings(args: argparse.Namespace) -> int:
     evidence its entries were deleted). A missing file is reported, not an
     error: there is simply nothing to ingest, and existing mapping edges
     are left as they are."""
-    project_root = _resolve_project_root(args.path)
-    conn = db.connect(_require_db(project_root))
-    try:
+    opened = _open(args.path)
+    project_root = opened.root
+    db_path = _require_db(project_root)
+    with _write_guard(opened, human=False):
+        conn = db.connect(db_path)
         try:
-            report = mappings_ingest.ingest_mappings(conn, project_root)
-        except mappings_ingest.MappingsFileError as exc:
-            print(f"Error: {exc} -- graph left untouched", file=sys.stderr)
-            return 1
-    finally:
-        conn.close()
+            try:
+                report = mappings_ingest.ingest_mappings(conn, project_root)
+            except mappings_ingest.MappingsFileError as exc:
+                print(f"Error: {exc} -- graph left untouched", file=sys.stderr)
+                return 1
+        finally:
+            conn.close()
     if not report.file_present:
         print(
             f"Mappings: no {mappings_ingest.MAPPINGS_RELATIVE_PATH} -- nothing to ingest "
@@ -607,9 +520,16 @@ def cmd_mappings(args: argparse.Namespace) -> int:
 def cmd_confirm(args: argparse.Namespace) -> int:
     """Thin wrapper over db.set_edge_status, mirroring
     rce.mcp_server.confirm_edge's contract. Identifies the edge by its 4
-    identity columns, or by `--index` into a freshly re-queried queue."""
-    project_root = _resolve_project_root(args.path)
-    conn = db.connect(_require_db(project_root))
+    identity columns, or by `--index` into a freshly re-queried queue.
+    A human write: under the project lock with identity re-checked, and
+    refused on a pre-V5 project until it is migrated (9.10)."""
+    opened = _open(args.path)
+    db_path = _require_db(opened.root)
+    with _write_guard(opened, human=True):
+        return _confirm(args, db.connect(db_path))
+
+
+def _confirm(args: argparse.Namespace, conn: Connection) -> int:
     try:
         positional = (args.src, args.dst, args.type, args.extractor)
         if args.index is not None:
@@ -659,8 +579,13 @@ def cmd_judge(args: argparse.Namespace) -> int:
     touches ingest/status/query/trace/confirm, none of which import
     anything from rce.semantic to begin with.
     """
-    project_root = _resolve_project_root(args.path)
-    conn = db.connect(_require_db(project_root))
+    opened = _open(args.path)
+    db_path = _require_db(opened.root)
+    with _write_guard(opened, human=False):
+        return _judge(args, db.connect(db_path))
+
+
+def _judge(args: argparse.Namespace, conn: Connection) -> int:
     try:
         llm = semantic_backend.LlmBackend()
         try:
@@ -967,9 +892,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     actionable error rather than guessing either meaning.
     """
     if args.path is not None:
-        project_root = _resolve_project_root(args.path)
-        if project_registry.is_initialized(project_root):
-            project_registry.register(project_root)
+        project_root = Path(args.path).resolve()
+        if not project_root.is_dir():
+            raise CliError(f"{project_root} is not a directory")
+        # The identity check first (DESIGN.md 9.4). A project that opens is
+        # registered as most recently served; one in a situation to answer
+        # is served in its blocked state, and nothing is written.
+        served = webapp_server.served_for(project_root, register=True)
     else:
         entries = project_registry.load()
         if not entries:
@@ -979,9 +908,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 "run 'rce serve <path>' once with an explicit project path to register it; "
                 "after that, a bare 'rce serve' reopens the most recently served project"
             )
-        project_root = Path(entries[0]["path"])
+        entry = entries[0]
+        # A bare `rce serve` (how RCE.app starts the engine) whose most
+        # recent entry is gone or no longer this project STARTS ANYWAY and
+        # serves that entry's "missing" state, so the app can offer
+        # 「选择新位置…」 instead of failing to start (9.4).
+        served = webapp_server.served_for(
+            Path(entry["path"]), expected_id=entry.get("id"), label=entry["label"], register=True,
+        )
+        project_root = served.root
     try:
-        webapp_server.serve(project_root, args.port, open_browser=not args.no_browser)
+        webapp_server.serve(project_root, args.port, open_browser=not args.no_browser, served=served)
     except webapp_server.ApiError as exc:
         raise CliError(str(exc)) from exc
     return 0
@@ -994,10 +931,15 @@ def _project_state_note(entry: dict[str, str]) -> str:
     `initialized` pair (DESIGN.md section 8.10 rule 3) -- a directory that
     is gone is a dead entry worth removing; one that was merely never
     `rce init`ed is fine and just needs initializing."""
-    root = Path(entry["path"])
-    if not project_registry.is_available(root):
+    state = webapp_server.entry_state(entry)
+    if state["missing"]:
+        if entry.get("id") and Path(entry["path"]).is_dir():
+            return (
+                "  (this folder no longer carries the project -- it was moved; open it at its new "
+                "path, or 'rce projects remove' to drop this entry)"
+            )
         return "  (directory missing -- 'rce projects remove' to drop this entry)"
-    if not project_registry.is_initialized(root):
+    if not state["initialized"]:
         return f"  (not initialized -- run 'rce init {entry['path']}')"
     return ""
 
@@ -1017,8 +959,65 @@ def cmd_projects_list(args: argparse.Namespace) -> int:
         return 0
     print(f"Registered projects ({len(entries)}, most recently served first):")
     for entry in entries:
-        print(f"  {entry['label']}  {entry['path']}{_project_state_note(entry)}")
+        project_id = f"  [{entry['id']}]" if entry.get("id") else "  [pre-V5]"
+        print(f"  {entry['label']}  {entry['path']}{project_id}{_project_state_note(entry)}")
     return 0
+
+
+def _print_answered(result: project_identity.Answered) -> int:
+    if result.answer == "fork":
+        print(f"{result.root} is now project {result.identity.id}, forked from {result.previous_id}.")
+        if result.git_tracked_identity:
+            print(
+                f"Note: {RCE_DIRNAME}/project.toml is tracked by git -- committing it carries the new "
+                f"identity into whatever branch it is merged to."
+            )
+    elif result.answer == "claim":
+        print(f"{result.root} is now the home of project {result.identity.id}; its index was rebuilt from this folder.")
+        if result.replaced_index is not None:
+            print(f"The previous index was kept at {result.replaced_index}.")
+        print("The other folder carrying this id will be asked how to continue when it is next opened.")
+    else:
+        print(f"{result.root} is now an independent project {result.identity.id}.")
+        if result.moved_aside:
+            print(f"Copied records moved into {RCE_DIRNAME}/backups/: {', '.join(result.moved_aside)}")
+    print(f"Graph: {paths.index_dir(result.identity.id) / paths.DB_FILENAME}")
+    if result.build_error:
+        print(f"Warning: the scan of this folder did not finish ({result.build_error}); run 'rce ingest'.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def _answer(args: argparse.Namespace, fn) -> int:
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        raise CliError(f"{root} is not a directory")
+    try:
+        result = fn(root, echo=print)
+    except (project_identity.AnswerRefused, project_identity.ProjectBlocked) as exc:
+        raise CliError(str(exc)) from exc
+    except (records_situation.WriteRefused, records_lock.ProjectLockError) as exc:
+        raise CliError(str(exc)) from exc
+    return _print_answered(result)
+
+
+def cmd_project_fork(args: argparse.Namespace) -> int:
+    """「作为独立分支继续」 (DESIGN.md 9.4): this copy becomes its own project
+    (new id, `forked_from` the original), with its own index."""
+    return _answer(args, project_identity.fork)
+
+
+def cmd_project_claim(args: argparse.Namespace) -> int:
+    """「这里才是原项目」 (9.4): this folder becomes the home of the id, and
+    the index is rebuilt from it."""
+    return _answer(args, project_identity.claim)
+
+
+def cmd_project_other(args: argparse.Namespace) -> int:
+    """「这是另一个项目」 (9.4): a new id with no `forked_from`; copied record
+    files are moved into `.rce/backups/`."""
+    return _answer(args, project_identity.other)
 
 
 def cmd_projects_remove(args: argparse.Namespace) -> int:
@@ -1152,8 +1151,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "init",
         help=(
-            "Initialize an RCE project at a path: creates its graph under "
-            "~/.rce/graphs/<id>/ (outside the project) and a .rce/README saying so"
+            "Initialize an RCE project at a path: creates its identity file .rce/project.toml, "
+            "its graph under ~/.rce/graphs/<id>/ (outside the project) and a .rce/README saying so"
         ),
     )
     p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
@@ -1267,6 +1266,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     q.add_argument("path", help="the registered project path to drop (as 'rce projects list' prints it)")
     q.set_defaults(func=cmd_projects_remove)
+
+    p = sub.add_parser(
+        "project",
+        help=(
+            "Answer what RCE asks when a project folder is a copy, or its original cannot be "
+            "checked (DESIGN.md 9.4): 'rce project fork|claim|other [path]'"
+        ),
+    )
+    project_sub = p.add_subparsers(dest="project_command", required=True)
+    for name, func, text in (
+        ("fork", cmd_project_fork, "continue this copy as an independent branch: new id, forked_from the original"),
+        ("claim", cmd_project_claim, "this folder is the original: it becomes the id's home and the index is rebuilt from it"),
+        ("other", cmd_project_other, "this is another project that received a copy of .rce/: new id, copied records moved to .rce/backups/"),
+    ):
+        q = project_sub.add_parser(name, help=text)
+        q.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+        q.set_defaults(func=func)
 
     p = sub.add_parser(
         "app",

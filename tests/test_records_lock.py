@@ -29,7 +29,7 @@ def project(tmp_path: Path) -> Path:
 
 def test_key_is_the_project_id_or_the_canonical_path_hash(tmp_path):
     assert lock.lock_key(tmp_path, PID) == PID
-    assert lock.lock_key(tmp_path) == "path-" + paths.project_graph_id(tmp_path)
+    assert lock.lock_key(tmp_path) == "path-" + paths.canonical_path_hash(tmp_path)
 
 
 def test_malformed_ids_are_refused_not_sanitized(tmp_path):

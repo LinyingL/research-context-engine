@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 
 from rce import cli, db, lineage, paths
+from rce import project as project_identity
 from rce.webapp import registry, server
 
 
@@ -95,12 +96,8 @@ def _init_project(project_root: Path) -> None:
     OUTSIDE it under `rce.paths.graph_db_path` (the conftest-wide
     `RCE_HOME` keeps that inside tmp_path)."""
     (project_root / ".rce").mkdir(parents=True, exist_ok=True)
-    paths.ensure_graph_dir(project_root)
-    conn = db.connect(paths.graph_db_path(project_root))
-    try:
-        db.migrate(conn)
-    finally:
-        conn.close()
+    # V5 (DESIGN.md 9.4): an identity file, and the index under its id.
+    project_identity.init_project(project_root)
 
 
 @pytest.fixture
@@ -108,7 +105,7 @@ def fake_home(tmp_path: Path, monkeypatch) -> Path:
     """A throwaway HOME for registry-touching tests (the /api/projects
     endpoints, cmd_serve's registration). The registry itself now lives
     under `rce.paths.rce_home()`, which conftest's autouse
-    `isolated_rce_home` already points inside tmp_path -- so isolation from
+    `isolated_rce_home` already points at a throwaway directory -- so isolation from
     the user's real `~/.rce/projects.json` holds either way; this fixture
     additionally pins HOME for anything still reading it."""
     home = tmp_path / "home"
@@ -508,7 +505,7 @@ def _capture_serve(monkeypatch) -> list[tuple]:
     calls: list[tuple] = []
     monkeypatch.setattr(
         server, "serve",
-        lambda root, port, open_browser=True: calls.append((root, port, open_browser)),
+        lambda root, port, open_browser=True, served=None: calls.append((root, port, open_browser)),
     )
     return calls
 
@@ -1133,7 +1130,8 @@ def test_http_projects_empty_registry_still_reports_current(live_server, fake_ho
     base_url, project = live_server
     status, payload = _get(base_url, "/api/projects")
     assert status == 200
-    assert payload == {"projects": [], "current": str(project)}
+    assert payload["projects"] == [] and payload["current"] == str(project)
+    assert payload["blocked"] is None and payload["current_id"].startswith("p-")
 
 
 def test_http_switch_success_repoints_summary_at_new_root(live_server, fake_home, tmp_path):
@@ -1149,7 +1147,8 @@ def test_http_switch_success_repoints_summary_at_new_root(live_server, fake_home
     status, payload = _post(base_url, "/api/projects/switch", {"path": target})
 
     assert status == 200
-    assert payload == {"current": target, "label": "other"}
+    assert payload["current"] == target and payload["label"] == "other"
+    assert payload["blocked"] is None and payload["project_id"].startswith("p-")
     status, summary = _get(base_url, "/api/summary")
     assert status == 200 and summary["project_root"] == target
     # A successful switch is a "serve" for recency purposes: the registry's
@@ -1765,7 +1764,7 @@ def test_require_db_refuses_to_open_a_dataless_graph(tmp_path, monkeypatch):
     anyone opens it, and it raises rather than waits."""
     project = tmp_path / "proj"
     _init_project(project)
-    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: Path(path).name == "graph.db")  # the graph, not the identity file, is evicted
 
     with pytest.raises(server.GraphDownloadingError) as excinfo:
         server._require_db(project)
@@ -1776,7 +1775,7 @@ def test_require_db_refuses_to_open_a_dataless_graph(tmp_path, monkeypatch):
 
 def test_http_dataless_graph_returns_503_with_its_own_state(live_server, monkeypatch):
     base_url, _ = live_server
-    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: Path(path).name == "graph.db")  # the graph, not the identity file, is evicted
 
     status, payload = _get(base_url, "/api/summary")
 
@@ -1856,7 +1855,7 @@ def test_serve_starts_even_while_the_graph_is_downloading(tmp_path, monkeypatch)
     启动」: `serve` reports it on stderr and serves anyway."""
     project = tmp_path / "proj"
     _init_project(project)
-    monkeypatch.setattr(server.paths, "is_dataless", lambda path: True)
+    monkeypatch.setattr(server.paths, "is_dataless", lambda path: Path(path).name == "graph.db")  # the graph, not the identity file, is evicted
     started = []
 
     class _Stub:
@@ -1873,7 +1872,7 @@ def test_serve_starts_even_while_the_graph_is_downloading(tmp_path, monkeypatch)
         def server_close(self):
             started.append("closed")
 
-    monkeypatch.setattr(server, "build_server", lambda root, port: _Stub())
+    monkeypatch.setattr(server, "build_server", lambda root, port, served=None: _Stub())
     server.serve(project, 0, open_browser=False)
     assert started == ["watcher", "serving", "closed"]
 

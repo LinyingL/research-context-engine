@@ -90,6 +90,7 @@ from rce import db, lineage, paths
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import mappings as mappings_ingest
+from rce.records import situation as records_situation
 from rce.webapp import mapedit
 
 logger = logging.getLogger(__name__)
@@ -534,7 +535,10 @@ def save_layout(conn: Connection, project_root: Path, body: dict[str, Any]) -> d
     if stray:
         logger.info("layout for %s: skipped %d card(s) the view does not show, e.g. %r", scope, len(stray), stray[0])
     positions = {k: v for k, v in positions.items() if v is None or k in visible}
-    with _LAYOUT_LOCK:
+    # V5 (DESIGN.md 9.4, 9.7): the project lock and identity re-check
+    # around the read-merge-write, so two processes' position changes all
+    # land (9.9 scenario 10) and a moved project gets nothing written.
+    with records_situation.write_guard(project_root, human=True), _LAYOUT_LOCK:
         views = load_views(project_root)
         view = views.setdefault(scope, _empty_view())
         if reset:
@@ -549,7 +553,7 @@ def save_layout(conn: Connection, project_root: Path, body: dict[str, Any]) -> d
                 None if viewport is None else {k: float(viewport[k]) for k in ("x", "y", "zoom")}
             )
         path = paths.canvas_state_path(project_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)  # under rce_home(), never the project
         data = json.dumps({"views": views}, ensure_ascii=False, sort_keys=True).encode("utf-8")
         mapedit.atomic_replace_bytes(path, data)
     return view

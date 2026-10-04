@@ -22,19 +22,35 @@ researcher owns and may want under git: `attempts.toml`, `mappings.toml`
 that says where the graph went. `canvas.json` (section 8.6) is derived
 too, so `canvas_state_path` puts it beside the graph, never in the project.
 
-The `<id>` is a stable hash of the project's *resolved* path -- resolved,
-so `/tmp/p` and its `/private/tmp/p` symlink target are one project rather
-than two graphs that silently disagree; hashed rather than path-shaped, so
-a project whose name carries `/`, non-ASCII, or a 300-character directory
-name still gets a short, ASCII, filesystem-safe directory (this codebase
-has already paid once for a non-ASCII path assumption). The id is one-way
-on purpose: `rce status`, `/api/summary` and the project's own `.rce/README`
-are how you go from a project to its graph; nothing needs the reverse.
+Where the index lives: keyed by the project's identity (V5)
+------------------------------------------------------------
 
-A project that moves gets a new id and therefore an empty graph -- correct
-rather than clever: the ingest is deterministic and re-running it is cheap,
-whereas a graph that followed a path it can no longer verify would be a
-graph about a directory that may now hold something else entirely.
+Since DESIGN.md section 9.4 a project is identified by a file it carries,
+`.rce/project.toml`, not by where it sits. The index of a project with an
+id lives at `~/.rce/graphs/<id>/` (`index_dir`), beside a `home.json`
+that remembers which folder is its home (`rce.records.situation`). Moving
+or renaming the folder no longer strands the index, and a new, unrelated
+project created at an old project's path has a different id (or none)
+and inherits nothing.
+
+Before V5 the `<id>` was a truncated hash of the project's *canonical*
+path (`canonical_path_hash`). Those indexes still exist on the
+researcher's disk and still hold judgments, so the functions that find
+them are kept under `legacy_*` names: a folder with no `project.toml`
+whose path-hash index exists is a pre-V5 project, served read-only for
+human records until `rce migrate` (a later phase) moves its judgments
+into the record. `graph_dir(project_root)` -- what every caller asks --
+answers with the id directory when the folder has an id and with the
+legacy directory when it has none, so read paths need not know which
+kind of project they serve. An identity file that exists but cannot be
+read is never answered with the legacy directory
+(`IdentityUnavailableError`): "cannot read who this is" must not become
+"serve whatever index sits at this path's hash".
+
+The canonical path is still what the project *lock* is keyed by before
+an id exists, and the legacy hash is what `rce migrate --list` will look
+for; its spelling rules (letter case, Unicode normalization, symlinks
+folded by asking the filesystem) are unchanged.
 
 `RCE_HOME`
 ----------
@@ -50,7 +66,8 @@ for the same reason.
 Legacy migration
 ----------------
 
-`migrate_legacy_graph` is the one-time move, run on first touch by any
+`migrate_legacy_graph` is the one-time move (for a pre-V5 folder with no
+id only), run on first touch by any
 subcommand or the server (every `_require_db` copy calls `resolve_graph_db`,
 which is `graph_db_path` plus this migration). It copies through SQLite's
 own online-backup API rather than `shutil.copyfile` -- a WAL-mode database
@@ -120,6 +137,17 @@ class GraphMigrationError(Exception):
     `ok`. Nothing was deleted; the legacy file is still exactly where it
     was. Callers (`rce.cli._require_db`, `rce.webapp.server._require_db`)
     re-raise this as their own user-facing error type."""
+
+
+class IdentityUnavailableError(GraphMigrationError):
+    """The folder has a `.rce/project.toml` that cannot be read right now
+    (in the cloud, unparseable, or with a sync conflict copy beside it),
+    so which index belongs to it cannot be said. Raised by `graph_dir`
+    instead of falling back to the legacy path-hash directory. A subclass
+    of `GraphMigrationError` only so every existing `_require_db` copy
+    turns it into its own user-facing error without a new except clause;
+    entry points classify the folder first (`rce.records.situation`) and
+    stop with the situation's own message before ever getting here."""
 
 
 class LegacyGraphDatalessError(GraphMigrationError):
@@ -193,22 +221,73 @@ def _canonical_path(project_root: str | Path) -> str:
     return unicodedata.normalize("NFC", str(resolved))
 
 
-def project_graph_id(project_root: str | Path) -> str:
-    """The stable `<id>` for `project_root`: a truncated SHA-256 of its
-    canonical absolute path (`_canonical_path`). Canonicalization is what
-    makes two spellings of one project (a relative path, a symlinked `/tmp`
-    on macOS, a trailing slash, a different letter case or Unicode
-    normalization on a case-insensitive volume) share one graph instead of
-    quietly forking into two."""
+def canonical_path_hash(project_root: str | Path) -> str:
+    """A truncated SHA-256 of `project_root`'s canonical absolute path
+    (`_canonical_path`): the same value for every spelling of one folder
+    (a relative path, a symlinked `/tmp` on macOS, a trailing slash, a
+    different letter case or Unicode normalization on a case-insensitive
+    volume). Before V5 this WAS the project's id; now it keys only the
+    project lock of a folder that has no id yet (`rce.records.lock`) and
+    the pre-V5 indexes (`legacy_graph_dir`)."""
     canonical = _canonical_path(project_root)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:_ID_LENGTH]
 
 
+# The pre-V5 name of the path hash, kept for what reads pre-V5 state.
+legacy_graph_id = canonical_path_hash
+
+
+def index_dir(project_id: str) -> Path:
+    """`~/.rce/graphs/<project id>` -- the index of a project that has an
+    id (DESIGN.md 9.4): `graph.db`, `home.json`, and (until the record
+    takes it over) `canvas.json`. The id is validated because it becomes
+    a directory name and may have been read from a file the researcher, or
+    a copied folder, supplied."""
+    from rce.records.lock import PROJECT_ID_RE  # noqa: PLC0415 -- records imports this module
+
+    if not isinstance(project_id, str) or not PROJECT_ID_RE.match(project_id):
+        raise ValueError(f"not a project id: {project_id!r}")
+    return rce_home() / GRAPHS_DIRNAME / project_id
+
+
+def _project_id_of(project_root: str | Path) -> str | None:
+    """The id `.rce/project.toml` names; None when the folder has no
+    identity file; `IdentityUnavailableError` when it has one that cannot
+    be read."""
+    from rce.records import identity  # noqa: PLC0415 -- records imports this module
+
+    got = identity.read_identity(project_root)
+    if got.state is identity.IdentityState.ABSENT:
+        return None
+    if got.state is identity.IdentityState.PRESENT and got.identity is not None:
+        return got.identity.id
+    raise IdentityUnavailableError(
+        f"the project identity file {got.path} cannot be read right now ({got.state.value}"
+        f"{': ' + got.error if got.error else ''}); not guessing which index belongs to {project_root}"
+    )
+
+
+def legacy_graph_dir(project_root: str | Path) -> Path:
+    """`~/.rce/graphs/<path hash>` -- where a pre-V5 project's index lives
+    (and where every project's did before V5)."""
+    return rce_home() / GRAPHS_DIRNAME / legacy_graph_id(project_root)
+
+
+def legacy_index_db_path(project_root: str | Path) -> Path:
+    """The pre-V5 index database of the folder at `project_root`'s path."""
+    return legacy_graph_dir(project_root) / DB_FILENAME
+
+
 def graph_dir(project_root: str | Path) -> Path:
-    """`~/.rce/graphs/<id>` -- the directory holding everything RCE derives
-    about this project (the graph now, `canvas.json` from section 8.6).
-    Computing it never creates it; see `ensure_graph_dir`."""
-    return rce_home() / GRAPHS_DIRNAME / project_graph_id(project_root)
+    """The directory holding everything RCE derives about this project:
+    `index_dir(<id>)` when the folder carries an id, else the legacy
+    path-hash directory (module docstring). Computing it never creates
+    it; see `ensure_graph_dir`. Raises `IdentityUnavailableError` for an
+    identity file that exists but cannot be read."""
+    project_id = _project_id_of(project_root)
+    if project_id is not None:
+        return index_dir(project_id)
+    return legacy_graph_dir(project_root)
 
 
 def graph_db_path(project_root: str | Path) -> Path:
@@ -222,41 +301,54 @@ def graph_db_path(project_root: str | Path) -> Path:
 
 def canvas_state_path(project_root: str | Path) -> Path:
     """`canvas.json` (DESIGN.md section 8.6: node positions and last
-    viewport) -- beside the graph, not in the project, because it is
-    derived UI state, safe to delete, and not something the researcher is
-    expected to read or commit. Exposed now so section 8.6's implementer
-    inherits the location instead of re-deciding it."""
+    viewport) -- beside the graph for now; section 9.2 moves it into the
+    project's own `.rce/` in a later phase of V5."""
     return graph_dir(project_root) / CANVAS_FILENAME
 
 
 def project_rce_dir(project_root: str | Path) -> Path:
-    """`<project>/.rce` -- the researcher-owned half: `attempts.toml`,
-    `mappings.toml`, `backups/`, `README`. No database lives here."""
+    """`<project>/.rce` -- the researcher-owned half: `project.toml`,
+    `attempts.toml`, `mappings.toml`, `backups/`, `README`. No database
+    lives here."""
     return Path(project_root) / RCE_DIRNAME
 
 
 def legacy_graph_db_path(project_root: str | Path) -> Path:
-    """Where the graph used to live, before section 8.10 rule 1. Only
-    `migrate_legacy_graph` and `graph_exists` have any business reading
+    """Where the graph lived before section 8.10 rule 1, inside the
+    project. Only `migrate_legacy_graph`, `graph_exists` and the identity
+    situation check (a pre-V5 database, 9.5) have any business reading
     this -- nothing opens a database here anymore."""
     return project_rce_dir(project_root) / DB_FILENAME
 
 
+def has_legacy_index(project_root: str | Path) -> bool:
+    """Whether a pre-V5 database that may hold this folder's judgments
+    exists: the index at this path's hash, or a pre-8.10 in-project
+    `.rce/graph.db` (DESIGN.md 9.5, "What is looked for")."""
+    return legacy_index_db_path(project_root).exists() or legacy_graph_db_path(project_root).exists()
+
+
 def graph_exists(project_root: str | Path) -> bool:
-    """Whether `project_root` is an initialized RCE project -- the external
-    graph exists, OR a legacy in-project one does and has simply not been
-    migrated yet. Both count: a project whose graph is still in the old
-    place is initialized, and refusing to serve it would leave the user
-    unable to trigger the very migration that fixes it."""
-    return graph_db_path(project_root).exists() or legacy_graph_db_path(project_root).exists()
+    """Whether `project_root` is an initialized RCE project -- its index
+    exists, OR (a folder with no id) a legacy in-project one does and has
+    simply not been moved out yet. False for a folder whose identity file
+    cannot be read: whether it is initialized cannot be said, and the
+    callers (the registry's listing) treat it as not servable."""
+    try:
+        if graph_db_path(project_root).exists():
+            return True
+        return _project_id_of(project_root) is None and legacy_graph_db_path(project_root).exists()
+    except IdentityUnavailableError:
+        return False
 
 
 def ensure_graph_dir(project_root: str | Path) -> Path:
-    """Create `~/.rce/graphs/<id>` if needed and return it. Called by
+    """Create `graph_dir(project_root)` if needed and return it. Called by
     `rce init` (and by the migration) -- deliberately NOT by
     `graph_db_path`, so merely asking where a graph would live never
     litters `~/.rce/graphs` with directories for projects that were never
-    initialized."""
+    initialized. Under `rce_home()`, never in the project, so `parents=True`
+    here cannot re-create a project folder."""
     directory = graph_dir(project_root)
     directory.mkdir(parents=True, exist_ok=True)
     return directory
@@ -276,11 +368,24 @@ def write_project_readme(project_root: str | Path) -> Path:
     "so nothing is hidden"). Rewritten on every `rce init` so a project
     that was initialized before the move gets the signpost too, and so a
     stale path from a moved project is corrected rather than left lying."""
-    rce_dir = project_rce_dir(project_root)
-    rce_dir.mkdir(parents=True, exist_ok=True)
+    rce_dir = ensure_project_rce_dir(project_root)
     readme = rce_dir / README_FILENAME
     readme.write_text(_README_TEMPLATE.format(graph_dir=graph_dir(project_root)), encoding="utf-8")
     return readme
+
+
+def ensure_project_rce_dir(project_root: str | Path) -> Path:
+    """`<project>/.rce`, created if needed -- but only inside a folder that
+    exists (DESIGN.md 9.4: record writers never re-create a folder that
+    has gone). `parents=True` here would quietly rebuild a moved project's
+    old path as an empty shell holding one file, which the next open would
+    then mistake for a project."""
+    root = Path(project_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"{root} is not an existing folder; not creating anything in it")
+    rce_dir = root / RCE_DIRNAME
+    rce_dir.mkdir(exist_ok=True)
+    return rce_dir
 
 
 # -- Legacy migration ----------------------------------------------------------
@@ -469,8 +574,15 @@ def migrate_legacy_graph(project_root: str | Path) -> Path | None:
     background) -- see `_refuse_if_dataless`.
     """
     legacy = legacy_graph_db_path(project_root)
-    target = graph_db_path(project_root)
-    if target.exists() or not legacy.exists():
+    if not legacy.exists():
+        return None
+    if _project_id_of(project_root) is not None:
+        # A folder with an id never gets a path-hash index: an in-project
+        # graph inside it is a pre-V5 database for `rce migrate` to list
+        # (DESIGN.md 9.5), never something to move by opening the folder.
+        return None
+    target = legacy_index_db_path(project_root)
+    if target.exists():
         return None
     _refuse_if_dataless(legacy)
 
@@ -547,7 +659,8 @@ def resolve_graph_db(project_root: str | Path) -> Path:
     a status line, an error message, a canvas path) must stay a pure
     computation with no filesystem side effect and no exception to catch.
     Raises `GraphMigrationError` if a legacy graph exists but could not be
-    verified after copying."""
+    verified after copying. The move applies only to a folder with no id
+    (a pre-V5 project); see `migrate_legacy_graph`."""
     migrate_legacy_graph(project_root)
     return graph_db_path(project_root)
 

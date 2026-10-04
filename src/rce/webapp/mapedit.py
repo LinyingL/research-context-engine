@@ -95,6 +95,8 @@ from pathlib import Path
 
 from rce import db, paths
 from rce.ingest import attempts as attempts_ingest
+from rce.records import files as records_files
+from rce.records import situation as records_situation
 
 logger = logging.getLogger(__name__)
 
@@ -515,7 +517,7 @@ def write_backup_bytes(project_root: Path, source_path: Path, raw: bytes, ext: s
     8.5) -- one backup discipline, not two that could drift. Returns the
     backup's project-relative path."""
     backups_dir = project_root / RCE_DIRNAME / BACKUPS_DIRNAME
-    backups_dir.mkdir(parents=True, exist_ok=True)
+    records_files.ensure_dir_within(project_root, backups_dir)  # never re-creates a moved project
     source_name = source_path.name
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     backup_path = backups_dir / f"{source_name}.{stamp}Z{ext}"
@@ -543,21 +545,18 @@ def _write_backup(project_root: Path, plan: EditPlan) -> str:
 
 
 def atomic_replace_bytes(path: Path, data: bytes) -> None:
-    """Full new content to a tmp file in the same directory (same
-    filesystem, so the rename is atomic), fsynced (`_write_bytes_durably`
-    -- the rename must never become durable before the data it renames
-    into place), then `os.replace` over `path`, then a best-effort
-    directory fsync so the rename itself sticks -- a failure at any point
-    before the replace leaves the original untouched, and the tmp file is
-    cleaned up on the way out. Shared with `rce.ingest.mappings`' writer
-    (see `write_backup_bytes`)."""
-    tmp_path = path.parent / f".{path.name}.rce-edit-tmp"
+    """`rce.records.files.durable_write`: full new content to a temp file
+    in the same directory, fsynced, `os.replace`d over `path`, then a
+    directory fsync -- a failure at any point before the replace leaves
+    the original untouched. The temp name is unique per write (pid plus a
+    random token): the fixed `.<name>.rce-edit-tmp` this function used
+    before V5 is exactly what two processes collided on (DESIGN.md 9.0:
+    600 concurrent position writes, 201 survivors, 279 exceptions).
+    Shared with `rce.ingest.mappings`' writer and the canvas writer."""
     try:
-        _write_bytes_durably(tmp_path, data)
-        os.replace(tmp_path, path)
-        _fsync_dir(path.parent)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+        records_files.durable_write(path, data)
+    except records_files.RecordFileError as exc:
+        raise MapEditError(str(exc)) from exc
 
 
 def _atomic_write(plan: EditPlan) -> None:
@@ -607,7 +606,10 @@ def apply_edit(
     raised with the original intact."""
     project_root = Path(project_root)
     lock = ingest_lock if ingest_lock is not None else threading.Lock()
-    with lock:
+    # V5 (DESIGN.md 9.4, 9.7): the project lock and the identity re-check
+    # first (re-entrant when the server already holds them), then the
+    # in-process ingest lock -- the one order every writer uses.
+    with records_situation.write_guard(project_root, human=True), lock:
         plan = _plan_edit(project_root, op, number, fields)
         backup = _write_backup(project_root, plan)
         _atomic_write(plan)

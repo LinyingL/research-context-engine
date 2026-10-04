@@ -271,3 +271,29 @@ def test_no_snapshot_of_a_file_in_the_cloud(project, monkeypatch):
     monkeypatch.setattr(paths, "_request_download", lambda p: None)
     assert files.snapshot_if_first_change_today(project, target) is None
     assert files.snapshot_now(project, target) is None
+
+
+def test_ensure_dir_within_creates_below_the_root_only(tmp_path):
+    """DESIGN.md 9.4: record writers create `.rce/` only inside a folder
+    that exists; they never re-create a folder that has gone."""
+    root = tmp_path / "p"
+    root.mkdir()
+    target = root / ".rce" / "backups" / "variables" / "x"
+    assert files.ensure_dir_within(root, target) == target and target.is_dir()
+    gone = tmp_path / "gone"
+    with pytest.raises(files.RecordFileError):
+        files.ensure_dir_within(gone, gone / ".rce" / "backups")
+    assert not gone.exists()
+    with pytest.raises(files.RecordFileError):
+        files.ensure_dir_within(root, tmp_path / "elsewhere")
+
+
+def test_a_snapshot_of_a_moved_project_recreates_nothing(tmp_path):
+    root = tmp_path / "p"
+    (root / ".rce").mkdir(parents=True)
+    record = root / ".rce" / "j.toml"
+    record.write_text("x")
+    (tmp_path / "moved").mkdir()
+    os.rename(root, tmp_path / "moved" / "p")
+    assert files.snapshot_now(root, record) is None  # unreadable: nothing to copy
+    assert not root.exists()

@@ -205,6 +205,32 @@ def append_bytes(
     return result
 
 
+def ensure_dir_within(project_root: str | Path, directory: str | Path) -> Path:
+    """Create `directory` -- which must lie inside `project_root` -- one
+    component at a time below the root, never the root itself: a record
+    writer creates `.rce/` and what is under it only inside a folder that
+    exists, and never re-creates a project folder that has been moved
+    away (DESIGN.md 9.4). Raises `RecordFileError` otherwise."""
+    root, directory = Path(project_root), Path(directory)
+    if not root.is_dir():
+        raise RecordFileError(f"{root} is not an existing folder; not creating anything in it")
+    try:
+        rel = directory.relative_to(root)
+    except ValueError as exc:
+        raise RecordFileError(f"{directory} is not inside {root}") from exc
+    current = root
+    for part in rel.parts:
+        current = current / part
+        try:
+            current.mkdir()
+        except FileExistsError:
+            if not current.is_dir():
+                raise RecordFileError(f"{current} exists and is not a folder") from None
+        except FileNotFoundError as exc:
+            raise RecordFileError(f"{current.parent} vanished; not re-creating it") from exc
+    return directory
+
+
 # -- reading -------------------------------------------------------------------
 
 
@@ -323,8 +349,8 @@ def _snapshots_of(backups: Path, name: str, suffix: str) -> list[tuple[datetime,
     return found
 
 
-def _write_snapshot(backups: Path, path: Path, data: bytes, now: datetime) -> Path:
-    backups.mkdir(parents=True, exist_ok=True)
+def _write_snapshot(project_root: Path, backups: Path, path: Path, data: bytes, now: datetime) -> Path:
+    ensure_dir_within(project_root, backups)
     stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     target = backups / f"{path.name}.{stamp}Z{path.suffix}"
     counter = 0
@@ -369,7 +395,7 @@ def snapshot_if_first_change_today(
                 return None
         except OSError:
             pass
-    return _write_snapshot(backups, path, current.data or b"", moment)
+    return _write_snapshot(project_root, backups, path, current.data or b"", moment)
 
 
 def snapshot_now(
@@ -387,7 +413,7 @@ def snapshot_now(
     if current.state is not RecordState.PRESENT:
         return None
     moment = (now or _local_now)()
-    return _write_snapshot(_backups_dir(project_root, subdir), path, current.data or b"", moment)
+    return _write_snapshot(project_root, _backups_dir(project_root, subdir), path, current.data or b"", moment)
 
 
 def newest_snapshot(project_root: str | Path, path: str | Path, subdir: str | None = None) -> Path | None:

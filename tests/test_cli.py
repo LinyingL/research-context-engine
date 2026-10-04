@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from rce import cli, db, paths
+from rce.records import identity
 from rce.webapp import registry as project_registry
 
 
@@ -81,7 +82,10 @@ def test_init_creates_db_and_project_node_idempotently(tmp_path, capsys):
 
     conn = db.connect(paths.graph_db_path(project))
     try:
-        node = db.get_node(conn, f"project:{project.name}")
+        # V5 (DESIGN.md 9.4): the project node is project:<id>, not the
+        # folder's name -- a rename no longer forks it into a second node.
+        project_id = identity.read_identity(project).identity.id
+        node = db.get_node(conn, f"project:{project_id}")
         assert node is not None and node["type"] == "project"
         count = conn.execute("SELECT COUNT(*) FROM nodes WHERE type='project'").fetchone()[0]
         assert count == 1
@@ -285,10 +289,7 @@ def test_init_leaves_a_readme_saying_where_the_graph_went(tmp_path):
     assert str(paths.graph_dir(project)) in readme
 
 
-def test_init_migrates_a_legacy_in_project_graph_instead_of_starting_a_second_one(tmp_path, capsys):
-    """`rce init` on a project from before the move must adopt the existing
-    graph, not quietly build an empty one beside it."""
-    project = tmp_path / "proj"
+def _pre_v5_in_project_graph(project: Path) -> Path:
     legacy = project / ".rce" / "graph.db"
     legacy.parent.mkdir(parents=True)
     conn = db.connect(legacy)
@@ -297,32 +298,41 @@ def test_init_migrates_a_legacy_in_project_graph_instead_of_starting_a_second_on
         db.upsert_node(conn, "figure:kept.png", "figure", title="kept.png")
     finally:
         conn.close()
+    return legacy
 
-    assert cli.main(["init", str(project)]) == 0
 
-    assert not legacy.exists()
-    conn = db.connect(paths.graph_db_path(project))
-    try:
-        assert db.get_node(conn, "figure:kept.png") is not None
-    finally:
-        conn.close()
+def test_init_refuses_a_pre_v5_project_and_starts_no_second_index(tmp_path, capsys):
+    """Was: `rce init` adopted a pre-8.10 in-project graph. Since V5 a
+    project from before V5 is not given an identity by `rce init` (its
+    judgments sit in the old store; `rce migrate` moves them into the
+    record and creates the identity, DESIGN.md 9.5): init refuses, writes
+    no project.toml, and builds no second, empty index beside the old
+    one -- which stays readable."""
+    project = tmp_path / "proj"
+    _pre_v5_in_project_graph(project)
+
+    assert cli.main(["init", str(project)]) == 1
+    assert "before V5" in capsys.readouterr().err
+    assert not (project / ".rce" / "project.toml").exists()
+    assert not list(paths.rce_home().glob("graphs/p-*"))
+
+    assert cli.main(["status", "--path", str(project)]) == 0  # still readable
+    assert "figure=1" in capsys.readouterr().out
 
 
 def test_any_subcommand_migrates_a_legacy_graph_on_first_touch(tmp_path, capsys):
-    """"Migrated on first touch by ANY subcommand": `rce status` is not a
-    write command, but it is a touch, and it must not report an
-    uninitialized project just because the graph has not moved yet."""
+    """"Migrated on first touch by ANY subcommand" (8.10): a pre-V5
+    project's in-project graph still moves out to its (legacy) external
+    location on the first `rce status` -- a pre-V5 folder is served from
+    there, read-only for human records, until it is migrated."""
     project = tmp_path / "proj"
-    project.mkdir()
-    assert cli.main(["init", str(project)]) == 0
-    # Put it back the old way, as an upgrade from an older RCE would leave it.
-    legacy = project / ".rce" / "graph.db"
-    paths.graph_db_path(project).rename(legacy)
+    legacy = _pre_v5_in_project_graph(project)
 
     assert cli.main(["status", "--path", str(project)]) == 0
 
     assert not legacy.exists()
-    assert paths.graph_db_path(project).exists()
+    assert paths.legacy_index_db_path(project).exists()
+    assert paths.graph_db_path(project) == paths.legacy_index_db_path(project)
 
 
 def test_a_legacy_graph_that_fails_verification_is_a_clean_error_not_a_traceback(tmp_path, capsys):
@@ -614,7 +624,8 @@ def test_trace_node_with_no_edges_says_so_not_fabricated(paper_repo, monkeypatch
     capsys.readouterr()
     monkeypatch.chdir(repo)
 
-    assert cli.main(["trace", f"project:{repo.name}"]) == 0
+    project_id = identity.read_identity(repo).identity.id
+    assert cli.main(["trace", f"project:{project_id}"]) == 0
     assert "no provenance edges recorded" in capsys.readouterr().out
 
 

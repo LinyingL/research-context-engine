@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from rce import db, paths
+from rce import project as project_identity
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
@@ -100,12 +101,8 @@ def _make_pipeline(root: Path, verdicts: tuple[str, str, str] = ("☠️", "✅"
     (steps / "17-叙事更替与汇率波动.pdf").write_bytes(b"%PDF-1.4\n")
     (steps / "数据" / "raw_news.csv").write_text("a\n")
     (steps / "数据" / "topicshift_monthly.csv").write_text("a\n")
-    paths.ensure_graph_dir(root)
-    conn = db.connect(paths.graph_db_path(root))
-    try:
-        db.migrate(conn)
-    finally:
-        conn.close()
+    # V5 (DESIGN.md 9.4): an identity file, and the index under its id.
+    project_identity.init_project(root)
     _ingest(root)
 
 
