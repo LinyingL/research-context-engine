@@ -29,9 +29,10 @@
       machine annotation vs. human judgement, made visible);
     - attempt frames behind their step files, titled in the decision
       tree's own verdict colors, never interactive;
-    - the 8.4 layered layout for every card without a saved position (a
-      saved position always wins), positions persisted debounced 400ms
-      through POST /api/canvas/layout, which also keeps the viewport.
+    - the 8.4 layered layout for every card the view has not pinned; each
+      view (scope) keeps its own arrangement and viewport, pinned whole on
+      the first move and persisted debounced 400ms through POST
+      /api/canvas/layout, which names the view it writes.
 
   What phase 2b adds (8.1 grammar, 8.2 link states, 8.3, 8.5) -- editing:
 
@@ -78,7 +79,7 @@ window.RCECanvas = (function () {
   // output sockets would sit exactly on the next one's input sockets.
   const SUBCOL_MAX = 12;
   const SUBCOL_PITCH = NODE_W + 220;
-  const LOOSE_COLS = 4;       // 8.4 step 4: the 「未连线」 block is 4 columns wide
+  const LOOSE_MIN_COLS = 4;   // 8.4 step 4: the 「未连线」 block is at least 4 columns wide
   const LOOSE_GAP = 24;       // ...its cards 24px apart, like the rows
   // Room above the block for its caption, clear of the title band an
   // attempt frame draws above the same cards (FRAME_PAD + FRAME_TITLE_H):
@@ -92,6 +93,7 @@ window.RCECanvas = (function () {
   const ZOOM_MIN = 0.25;
   const ZOOM_MAX = 2.5;
   const SAVE_DEBOUNCE_MS = 400;
+  const RESIZE_DEBOUNCE_MS = 150;
   const CLICK_DELAY_MS = 280; // a second click inside this window is a double-click
   const DRAG_THRESHOLD = 3;
   const FIT_PAD = 48;
@@ -140,18 +142,21 @@ window.RCECanvas = (function () {
 
 
   // -- State --------------------------------------------------------------------
-  // positions: saved positions (server canvas.json ∪ this page's unsaved
-  // moves) -- global, the ones that always win. auto: the 8.4 layout of
-  // the cards of THIS view without a saved position (layout belongs to
-  // the view, memory to the card); loose: the 「未连线」 block's rect;
-  // layoutKey: what auto was computed for. pending: what the next
-  // debounced POST will send (null = forget that saved position).
+  // positions: THIS view's arrangement (8.4: each view keeps its own) --
+  // what canvas.json holds for the scope, plus this page's writes not yet
+  // sent for it; pinned: the view has an arrangement, so the layout never
+  // moves its cards again. auto: the 8.4 layout of the cards the
+  // arrangement does not hold yet; loose: the 「未连线」 cards' rect;
+  // layoutKey: what auto was computed for. save: what the next debounced
+  // POST sends, for the ONE view it was made in (emptySave). autoFit: the
+  // camera is a fit the researcher has not touched since, so a resize
+  // re-fits it (8.4).
   const cv = {
     dom: null, container: null, data: null, scope: null,
-    nodes: new Map(), positions: {}, auto: {}, cycle: new Set(), loose: null, looseIds: [], layoutKey: null,
-    camera: { x: 0, y: 0, zoom: 1 }, needsFit: false,
+    nodes: new Map(), positions: {}, pinned: false, auto: {}, cycle: new Set(), loose: null, looseIds: [], layoutKey: null,
+    camera: { x: 0, y: 0, zoom: 1 }, needsFit: false, autoFit: true, resizeObs: null, resizeTimer: null,
     selected: null, hovered: null, query: "",
-    pending: {}, viewportDirty: false, saveTimer: null,
+    save: emptySave(), saveTimer: null,
     space: false, drag: null, clickTimer: null, lastClick: null,
     loadSeq: 0, nodeEls: new Map(), linkEls: new Map(), listenersBound: false,
     // Editing (phase 2b): the selected link (its hover card pinned), the
@@ -166,6 +171,15 @@ window.RCECanvas = (function () {
   };
 
   // -- Small helpers ----------------------------------------------------------
+
+  // A layout write for one view (8.6): its positions (null = forget one),
+  // its viewport (undefined = unchanged, null = forget it), and whether it
+  // first forgets the view's whole arrangement (「重新排列」).
+  function emptySave() {
+    return { scope: null, positions: {}, viewport: undefined, reset: false };
+  }
+
+  function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
 
   function svgEl(tag, attrs, cls) {
     const el = document.createElementNS(SVG_NS, tag);
@@ -616,9 +630,27 @@ window.RCECanvas = (function () {
     return { positions, w: x1 - x0, h: y1 - y0 };
   }
 
-  // 8.4 step 4: loose cards in one grid block, LOOSE_COLS wide, ordered by
-  // type then path, under the 「未连线」 caption (whose height the block
-  // includes, so packing leaves it room).
+  // 8.4 step 4's shape: "at least 4 columns, more when needed to bring
+  // the block toward 1.6:1" -- a page, not a strip. Of the column counts
+  // from 4 up to one row, the one whose block (caption included, every row
+  // `cardH` tall) is closest to PAGE_ASPECT; the narrowest on a tie. Pure.
+  function looseColumns(count, cardH) {
+    if (count <= LOOSE_MIN_COLS) return LOOSE_MIN_COLS;
+    let best = LOOSE_MIN_COLS, bestMiss = Infinity;
+    for (let c = LOOSE_MIN_COLS; c <= count; c++) {
+      const rows = Math.ceil(count / c);
+      const w = c * (NODE_W + LOOSE_GAP) - LOOSE_GAP;
+      const h = LOOSE_CAPTION_H + rows * (cardH + ROW_GAP) - ROW_GAP;
+      const miss = Math.abs(Math.log(w / h / PAGE_ASPECT));
+      if (miss < bestMiss - 1e-9) { best = c; bestMiss = miss; }
+      if (w / h > PAGE_ASPECT) break; // only wider from here
+    }
+    return best;
+  }
+
+  // 8.4 step 4: loose cards in one grid block shaped by looseColumns,
+  // ordered by type then path, under the 「未连线」 caption (whose height
+  // the block includes, so packing leaves it room).
   const TYPE_ORDER = { dataset: 0, script: 1, figure: 2 };
 
   function layoutLoose(cards) {
@@ -628,10 +660,11 @@ window.RCECanvas = (function () {
       if (ta !== tb) return ta - tb;
       return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
     });
+    const cols = looseColumns(sorted.length, Math.max(...sorted.map((n) => nodeHeight(n.type))));
     const positions = {};
     let y = LOOSE_CAPTION_H, w = 0;
-    for (let r = 0; r * LOOSE_COLS < sorted.length; r++) {
-      const row = sorted.slice(r * LOOSE_COLS, (r + 1) * LOOSE_COLS);
+    for (let r = 0; r * cols < sorted.length; r++) {
+      const row = sorted.slice(r * cols, (r + 1) * cols);
       let rowH = 0;
       row.forEach((n, c) => {
         positions[n.id] = [c * (NODE_W + LOOSE_GAP), y];
@@ -699,17 +732,26 @@ window.RCECanvas = (function () {
   //
   //   nodes  -- the visible cards ({id, type, path, ghost?})
   //   links  -- the visible links ({id, from, to, human?, entry?})
-  //   frames -- the view's attempt frames ({attempt_id?, node_ids})
-  //   opts   -- {fixed: {id: [x, y]} saved positions (they always win and
-  //             are never moved), current: the current attempt's id}
+  //   frames -- the view's DRAWN attempt frames ({attempt_id?, node_ids}),
+  //             for frame-title spacing
+  //   opts   -- {fixed: {id: [x, y]} the view's pinned positions (never
+  //             moved), current: the current attempt's id, groups: every
+  //             attempt's step files in this view ({attempt_id, node_ids};
+  //             default `frames`) -- 8.4 step 1's step-prefix companion
+  //             and step 5's current-attempt-first order need them in 全部
+  //             too, where no frame is drawn (8.7)}
   //
-  // Returns {positions} for the UNSAVED cards only, {cycle} (link ids that
-  // close a loop -- over every visible link, saved ends or not), {loose}
-  // (the 「未连线」 block's world rect, caption included, or null) and
-  // {islands} (card ids per island, in packing order).
+  // Returns {positions} for the UNPINNED cards only, {cycle} (link ids that
+  // close a loop -- over every visible link, pinned ends or not), {loose}
+  // (the world rect, caption included, of the 「未连线」 cards -- pinned or
+  // not, so the caption stays over them once the view is pinned -- or
+  // null), {looseIds} (every loose card, pinned or not: a frame is drawn
+  // around its members outside them) and {islands} (card ids per island,
+  // in packing order).
   function computeLayout(nodes, links, frames, opts) {
     opts = opts || {};
     frames = frames || [];
+    const groups = opts.groups || frames;
     const fixed = opts.fixed || {};
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const order = nodes.slice().sort(compareByStep);
@@ -719,7 +761,7 @@ window.RCECanvas = (function () {
     const visibleLinks = links.filter((l) => byId.has(l.from) && byId.has(l.to));
     const linkedIds = new Set();
     visibleLinks.forEach((l) => { linkedIds.add(l.from); linkedIds.add(l.to); });
-    const anchors = stepAnchorLinks(nodes, linkedIds, frames, byId);
+    const anchors = stepAnchorLinks(nodes, linkedIds, groups, byId);
     anchors.forEach((l) => { linkedIds.add(l.from); linkedIds.add(l.to); });
 
     // Saved cards take no part in steps 1-5: islands, layers and packing
@@ -741,7 +783,7 @@ window.RCECanvas = (function () {
 
     const loose = free.filter((n) => !linkedIds.has(n.id));
     const linkedFree = free.filter((n) => linkedIds.has(n.id));
-    const currentFrame = frames.find((f) => opts.current && f.attempt_id === opts.current);
+    const currentFrame = groups.find((f) => opts.current && f.attempt_id === opts.current);
     const currentScripts = new Set(currentFrame
       ? currentFrame.node_ids.filter((id) => byId.has(id) && byId.get(id).type === "script") : []);
     const frameOf = frameOfNode(frames);
@@ -781,10 +823,23 @@ window.RCECanvas = (function () {
       b.x = x; b.y = y;
       b.cards.forEach((n) => { positions[n.id] = [x + b.positions[n.id][0], y + b.positions[n.id][1]]; });
     });
+    // Loose over EVERY card: a pinned loose card is still loose (its
+    // frame must not stretch to it; the caption still names it).
+    const looseAll = order.filter((n) => !linkedIds.has(n.id));
+    let looseRect = null;
+    if (looseAll.length) {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      looseAll.forEach((n) => {
+        const [x, y] = isFixed(n.id) ? fixed[n.id] : positions[n.id];
+        x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+        x1 = Math.max(x1, x + NODE_W); y1 = Math.max(y1, y + nodeHeight(n.type));
+      });
+      looseRect = { x: x0, y: y0 - LOOSE_CAPTION_H, w: x1 - x0, h: y1 - y0 + LOOSE_CAPTION_H };
+    }
     return {
       positions, cycle,
-      loose: looseBlock ? { x: looseBlock.x, y: looseBlock.y, w: looseBlock.w, h: looseBlock.h } : null,
-      looseIds: loose.map((n) => n.id),
+      loose: looseRect,
+      looseIds: looseAll.map((n) => n.id),
       islands: islands.map((b) => b.cards.map((n) => n.id)),
     };
   }
@@ -877,6 +932,11 @@ window.RCECanvas = (function () {
     status.addEventListener("click", () => { if (!status.querySelector(".cv-status-action")) hideStatus(); });
     bindSvgEvents(s.svg);
     bindGlobalEvents();
+    if (typeof ResizeObserver === "function") {
+      if (cv.resizeObs) cv.resizeObs.disconnect();
+      cv.resizeObs = new ResizeObserver(onResize);
+      cv.resizeObs.observe(root);
+    }
     applyCamera();
     return cv.dom;
   }
@@ -1079,6 +1139,7 @@ window.RCECanvas = (function () {
   }
 
   function render() {
+    if (!cv.dom) return; // nothing drawn yet (and the node tests run without a DOM)
     renderFrames();
     renderLinks();
     renderNodes();
@@ -1186,7 +1247,7 @@ window.RCECanvas = (function () {
     const wx = (sx - cv.camera.x) / z0, wy = (sy - cv.camera.y) / z0;
     cv.camera = { x: sx - wx * z, y: sy - wy * z, zoom: z };
     applyCamera();
-    queueViewport();
+    userCamera();
   }
 
   function zoomAboutCenter(zoom) {
@@ -1230,6 +1291,8 @@ window.RCECanvas = (function () {
     };
   }
 
+  // Camera only: a fit is not a viewport the researcher chose, so it is
+  // not saved -- the view stays "fitted" and re-fits on resize (8.4).
   function fitTo(ids) {
     if (!cv.dom) return;
     const v = viewSize();
@@ -1237,69 +1300,135 @@ window.RCECanvas = (function () {
     cv.needsFit = false;
     cv.camera = fitCamera(ids) || { x: FIT_PAD, y: FIT_PAD + 40, zoom: 1 };
     applyCamera();
-    queueViewport();
   }
 
-  function fitAll() {
+  // The automatic fit: entering a view with no saved viewport, a resize
+  // while that fit is untouched, 「重新排列」.
+  function autoFitAll() {
+    cv.autoFit = true;
     fitTo([...cv.nodes.keys()]);
+  }
+
+  // 适应全部 (button, F, menu): the researcher asks for the fit, so the
+  // view's camera is "fitted" again -- its saved viewport is forgotten and
+  // a resize re-fits it, exactly as on first entering the view.
+  function fitAll() {
+    autoFitAll();
+    queueViewport(true);
   }
 
   function fitToMatches() {
     const m = matchingIds();
-    if (m && m.size) fitTo([...m]);
+    if (m && m.size) { fitTo([...m]); userCamera(); }
   }
 
-  // -- Persistence (8.6) --------------------------------------------------------
+  // The researcher panned or zoomed: from now on the camera is theirs --
+  // saved for this view, and no longer re-fitted on resize.
+  function userCamera() {
+    cv.autoFit = false;
+    queueViewport();
+  }
+
+  // 8.4: "until they pan or zoom, it re-fits when the window is resized".
+  // Debounced: a window drag fires many resizes and one fit is enough.
+  function onResize() {
+    clearTimeout(cv.resizeTimer);
+    cv.resizeTimer = setTimeout(() => {
+      cv.resizeTimer = null;
+      if (cv.autoFit && cv.dom && cv.data && !cv.drag) fitTo([...cv.nodes.keys()]);
+    }, RESIZE_DEBOUNCE_MS);
+  }
+
+  // -- Persistence (8.4, 8.6) ---------------------------------------------------
+  // Every write names the view it was made in. A write queued in one view
+  // and still unsent when the scope changes goes out first, for that view.
 
   function scheduleSave() {
     clearTimeout(cv.saveTimer);
     cv.saveTimer = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
   }
 
+  function saveSlot() {
+    if (cv.save.scope !== null && cv.save.scope !== cv.scope) flushSave();
+    cv.save.scope = cv.scope;
+    return cv.save;
+  }
+
   function queuePosition(id, pos) {
     if (pos === null) delete cv.positions[id];
     else cv.positions[id] = pos;
-    cv.pending[id] = pos;
+    saveSlot().positions[id] = pos;
     scheduleSave();
   }
 
-  function queueViewport() {
-    if (!cv.data) return;
-    cv.viewportDirty = true;
+  // The current camera as this view's viewport, or (forget) none.
+  function queueViewport(forget) {
+    if (!cv.data || !cv.scope) return;
+    saveSlot().viewport = forget ? null : { x: cv.camera.x, y: cv.camera.y, zoom: cv.camera.zoom };
     scheduleSave();
+  }
+
+  // 8.4's pin on first move: a card drag just ended. The moved card and
+  // every visible card this view has no position for yet are saved -- in
+  // a view not yet pinned that is every card (the whole arrangement is
+  // pinned in one POST, so nudging one card can never pull it out of its
+  // pipeline on the next layout); in a pinned view it is the moved card
+  // plus any card that appeared since and was placed by the layout.
+  function cardMoved(id) {
+    cv.pinned = true;
+    cv.nodes.forEach((n, nid) => {
+      if (nid === id || !hasOwn(cv.positions, nid)) queuePosition(nid, posOf(nid).slice());
+    });
   }
 
   async function flushSave() {
+    clearTimeout(cv.saveTimer);
     cv.saveTimer = null;
-    const body = {};
-    const sent = cv.pending;
-    if (Object.keys(sent).length) body.positions = sent;
-    if (cv.viewportDirty) body.viewport = { x: cv.camera.x, y: cv.camera.y, zoom: cv.camera.zoom };
-    if (!Object.keys(body).length) return;
-    cv.pending = {};
-    cv.viewportDirty = false;
+    const slot = cv.save;
+    cv.save = emptySave();
+    if (!slot.scope) return;
+    const body = { scope: slot.scope };
+    if (slot.reset) body.reset = true;
+    if (Object.keys(slot.positions).length) body.positions = slot.positions;
+    if (slot.viewport !== undefined) body.viewport = slot.viewport;
+    if (Object.keys(body).length === 1) return;
     try {
       await apiPost("/api/canvas/layout", body);
       hideStatus("save");
     } catch (err) {
-      // Keep what failed for the next save, unless a newer move replaced it.
-      Object.entries(sent).forEach(([id, p]) => { if (!(id in cv.pending)) cv.pending[id] = p; });
-      if (body.viewport) cv.viewportDirty = true;
+      // Keep what failed for the next save of the same view, under anything
+      // newer: its reset first, then its positions unless a newer write
+      // replaced them. A failed write for a view already left is dropped.
+      const now = cv.save;
+      if (now.scope === null || now.scope === slot.scope) {
+        now.scope = slot.scope;
+        if (!now.reset) {
+          now.reset = slot.reset;
+          Object.entries(slot.positions).forEach(([id, p]) => { if (!hasOwn(now.positions, id)) now.positions[id] = p; });
+        }
+        if (now.viewport === undefined) now.viewport = slot.viewport;
+      }
       showStatus("位置未能保存，下次移动时会重试", err);
     }
   }
 
-  // 「重新排列」(8.4): forget the saved positions of the VISIBLE cards only
-  // (a card placed by hand in another scope keeps its place there), after
-  // asking -- it discards hand placement, which is the user's work -- then
-  // lay the view out afresh.
+  // 「重新排列」(8.4): forget THIS view's arrangement (other views keep
+  // theirs), after asking -- it discards the researcher's own placement --
+  // then lay the view out afresh and fit. The camera goes back to a fit
+  // too: the view is as it was before anything was moved in it.
   function relayout() {
     if (!cv.data) return;
-    if (!window.confirm("重新排列当前画布？\n\n将丢弃你手动摆放的位置。")) return;
-    cv.nodes.forEach((n, id) => { if (id in cv.positions) queuePosition(id, null); });
+    if (!window.confirm("重新排列当前视图？\n\n将丢弃你在这个视图里摆放的位置。")) return;
+    const slot = saveSlot();
+    slot.reset = true;
+    slot.positions = {};
+    slot.viewport = null;
+    scheduleSave();
+    cv.positions = {};
+    cv.pinned = false;
     layoutView(true);
     render();
-    fitAll();
+    autoFitAll();
   }
 
   // -- Status chip (product language; engine English on hover, 8.8) ---------
@@ -1822,7 +1951,10 @@ window.RCECanvas = (function () {
     const nodeEl = e.target.closest(".cv-node");
     if (nodeEl && !cv.space) {
       const id = nodeEl.getAttribute("data-id");
-      cv.drag = { kind: "node", id, el: nodeEl, sx: e.clientX, sy: e.clientY, start: posOf(id).slice(), moved: false };
+      cv.drag = {
+        kind: "node", id, el: nodeEl, sx: e.clientX, sy: e.clientY, start: posOf(id).slice(), moved: false,
+        hadPosition: hasOwn(cv.positions, id),
+      };
     } else {
       const linkEl = cv.space ? null : e.target.closest(".cv-link-g");
       cv.drag = {
@@ -1881,7 +2013,7 @@ window.RCECanvas = (function () {
     cv.dom.root.classList.remove("panning");
     try { cv.dom.svg.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
     if (d.kind === "pan") {
-      if (d.moved) queueViewport();
+      if (d.moved) userCamera();
       else if (d.linkId && cv.linkEls.has(d.linkId)) selectLink(d.linkId);
       else { // a click on empty canvas clears the selection
         if (cv.selected) select(null);
@@ -1890,7 +2022,7 @@ window.RCECanvas = (function () {
       return;
     }
     d.el.classList.remove("dragging");
-    if (d.moved) queuePosition(d.id, cv.positions[d.id]);
+    if (d.moved) cardMoved(d.id);
     else onNodeClick(d.id);
   }
 
@@ -1937,7 +2069,7 @@ window.RCECanvas = (function () {
     }
     cv.camera = { x: cv.camera.x - e.deltaX * unit, y: cv.camera.y - e.deltaY * unit, zoom: cv.camera.zoom };
     applyCamera();
-    queueViewport();
+    userCamera();
   }
 
   // WebKit (Safari, and the native shell's WKWebView) reports a trackpad
@@ -2025,6 +2157,8 @@ window.RCECanvas = (function () {
       if (cv.drag && cv.drag.kind === "link") { endLinkDrag(false); return; }
       if (cv.drag && cv.drag.kind === "node") {
         moveNodeTo(cv.drag.id, cv.drag.el, cv.drag.start);
+        // Back where the layout had it: not a position this view holds.
+        if (!cv.drag.hadPosition) delete cv.positions[cv.drag.id];
         cv.drag.el.classList.remove("dragging");
         cv.drag = null;
       }
@@ -2069,6 +2203,7 @@ window.RCECanvas = (function () {
     document.addEventListener("keyup", onKeyUp);
     document.addEventListener("click", onDocumentClick);
     window.addEventListener("blur", () => { cv.space = false; if (cv.dom) cv.dom.root.classList.remove("space"); });
+    if (typeof ResizeObserver !== "function") window.addEventListener("resize", onResize);
   }
 
   // -- Loading ------------------------------------------------------------------
@@ -2108,17 +2243,22 @@ window.RCECanvas = (function () {
     return cur ? cur.id : null;
   }
 
-  // Lay the view out (8.4) over its own cards, saved ones fixed. Re-run
-  // only when what is drawn changes -- the scope, the cards or the links --
-  // or when 「重新排列」 asks: a card the researcher just dragged gains a
-  // saved position, and re-packing the rest around it on the next poll
-  // would make every other card jump under their hand.
+  // Lay the view out (8.4) over its own cards, the arrangement's fixed.
+  // Re-run only when what is drawn changes -- the scope, the cards, the
+  // links or which cards the arrangement holds -- or when 「重新排列」 asks.
+  // In a pinned view that places only cards the arrangement lacks, clear
+  // of the pinned ones; nothing pinned ever moves.
   function layoutView(force) {
     const d = cv.data;
-    const key = [d.scope.id, d.nodes.map((n) => n.id).join("\n"), d.links.map((l) => l.id).join("\n")].join("\f");
+    const key = [
+      d.scope.id, d.nodes.map((n) => n.id).join("\n"), d.links.map((l) => l.id).join("\n"),
+      Object.keys(cv.positions).sort().join("\n"),
+    ].join("\f");
     if (!force && key === cv.layoutKey) return false;
     cv.layoutKey = key;
-    const layout = computeLayout(d.nodes, d.links, d.frames, { fixed: cv.positions, current: currentAttemptId(d) });
+    const layout = computeLayout(d.nodes, d.links, d.frames, {
+      fixed: cv.positions, current: currentAttemptId(d), groups: d.step_groups,
+    });
     cv.auto = layout.positions;
     cv.cycle = layout.cycle;
     cv.loose = layout.loose;
@@ -2172,47 +2312,33 @@ window.RCECanvas = (function () {
     return ids;
   }
 
-  // 8.4: on entering a view with no saved viewport the camera fits all.
-  // canvas.json keeps ONE viewport (8.6), saved in whatever scope was last
-  // shown, and the scope itself is not remembered -- so the saved camera
-  // is restored only when it plausibly belongs to this view: it must show
-  // at least one of this view's cards (never open onto empty paper), and
-  // it must not be zoomed out further than fitting this view would be (a
-  // camera from 全部 at 25% would open the ten cards of the current attempt
-  // as dust, where fitting shows all of them larger).
-  function savedViewportFits(vp) {
-    const v = viewSize();
-    if (!v.w || !v.h) return true; // hidden: nothing to judge; activate() fits if asked
-    const z = clamp(vp.zoom, ZOOM_MIN, ZOOM_MAX);
-    const ids = [...cv.nodes.keys()];
-    const fit = fitCamera(ids);
-    if (fit && z < fit.zoom - 1e-6) return false;
-    const wx0 = -vp.x / z, wy0 = -vp.y / z, wx1 = (v.w - vp.x) / z, wy1 = (v.h - vp.y) / z;
-    return ids.some((id) => {
-      const [x, y] = posOf(id);
-      const h = nodeHeight(cv.nodes.get(id).type);
-      return x < wx1 && x + NODE_W > wx0 && y < wy1 && y + h > wy0;
-    });
-  }
-
-  function applyPayload(payload, opts) {
-    const first = !cv.data;
+  // A payload for the view on screen (a re-fetch) or for one being
+  // entered (first load, scope switch, project switch, a stale scope that
+  // fell back to the default). Entering: the view's own saved viewport
+  // (8.6), else fit all (8.4). Staying: the camera holds unless an
+  // UNPINNED view re-laid itself out because its links changed -- then
+  // keepCamera holds the card being worked on in place.
+  function applyPayload(payload) {
+    const entering = !cv.data || cv.data.scope.id !== payload.scope.id;
     // Where the camera's anchor cards sit now, before a re-layout moves them.
     const before = {};
-    if (!first && !opts.fit) cameraAnchors().forEach((id) => { before[id] = posOf(id).slice(); });
+    if (!entering) cameraAnchors().forEach((id) => { before[id] = posOf(id).slice(); });
     cv.data = payload;
     mergeOptimistic(payload);
     cv.scope = payload.scope.id;
     cv.nodes = new Map(payload.nodes.map((n) => [n.id, n]));
-    // Saved positions win over the layout (8.4); this page's own unsaved
-    // moves win over what the server last stored.
-    cv.positions = Object.assign({}, payload.positions);
-    Object.entries(cv.pending).forEach(([id, p]) => {
+    // This view's arrangement: what canvas.json keeps for it, then this
+    // page's own writes for it not sent yet.
+    const slot = cv.save.scope === cv.scope ? cv.save : emptySave();
+    cv.positions = slot.reset ? {} : Object.assign({}, payload.positions);
+    Object.entries(slot.positions).forEach(([id, p]) => {
       if (p === null) delete cv.positions[id];
       else cv.positions[id] = p;
     });
-    const relaid = layoutView(false);
-    if (relaid && !first && !opts.fit) {
+    cv.pinned = Object.keys(cv.positions).length > 0;
+    const relaid = layoutView(entering);
+    if (relaid && !entering && !cv.pinned) {
+      // An unpinned view re-laid out under the researcher's hand.
       const ids = Object.keys(before).filter((id) => cv.nodes.has(id));
       const after = {};
       ids.forEach((id) => { after[id] = posOf(id); });
@@ -2221,30 +2347,29 @@ window.RCECanvas = (function () {
         return [x, y, x + NODE_W, y + nodeHeight(cv.nodes.get(id).type)];
       });
       cv.camera = keepCamera(cv.camera, viewSize(), before, after, ids, show);
-      cv.focus = null;
       applyCamera();
-      queueViewport();
+      if (!cv.autoFit) queueViewport();
     }
+    if (relaid || entering) cv.focus = null;
     if (cv.selected && !cv.nodes.has(cv.selected)) cv.selected = null;
     if (cv.hovered && !cv.nodes.has(cv.hovered)) cv.hovered = null;
     if (cv.selectedLink && !payload.links.some((l) => l.id === cv.selectedLink)) cv.selectedLink = null;
     renderScopeSelect();
     render();
-    if (opts.fit) fitAll();
-    else if (first) {
-      const vp = payload.viewport;
-      if (vp && savedViewportFits(vp)) {
+    if (entering) {
+      const vp = slot.viewport !== undefined ? slot.viewport : payload.viewport;
+      if (vp) {
+        cv.autoFit = false;
         cv.camera = { x: vp.x, y: vp.y, zoom: clamp(vp.zoom, ZOOM_MIN, ZOOM_MAX) };
         applyCamera();
-      } else fitAll();
+      } else autoFitAll();
     }
   }
 
   // Load (or, on a generation bump, re-load) the canvas into `container`.
-  // A re-load keeps selection, camera, search and positions; only a scope
-  // change or the first load moves the camera.
-  async function load(container, opts) {
-    opts = opts || {};
+  // A re-load keeps selection, camera, search and positions; only entering
+  // a view (first load, scope change) moves the camera.
+  async function load(container) {
     const seq = ++cv.loadSeq;
     ensureDom(container);
     let payload;
@@ -2261,7 +2386,7 @@ window.RCECanvas = (function () {
     if (typeof clearProjectState === "function") clearProjectState();
     ensureDom(container);
     container.dataset.loaded = "1";
-    applyPayload(payload, opts);
+    applyPayload(payload);
   }
 
   // 8.7: the selection and a pinned link card belong to the view that was
@@ -2277,14 +2402,15 @@ window.RCECanvas = (function () {
     cv.hovered = null;
     cv.focus = null;
     selectLink(null);
+    flushSave(); // what was moved or panned in the view being left is that view's
     cv.scope = scope;
-    if (cv.container) load(cv.container, { fit: true });
+    if (cv.container) load(cv.container);
   }
 
   // Called by app.html when the tab is shown: a fit requested while the
   // view was hidden (zero size) happens now.
   function activate() {
-    if (cv.needsFit && cv.dom && cv.data) fitAll();
+    if (cv.needsFit && cv.dom && cv.data) fitTo([...cv.nodes.keys()]);
   }
 
   // A project switch: everything here belonged to the previous project.
@@ -2293,6 +2419,7 @@ window.RCECanvas = (function () {
   function reset() {
     clearTimeout(cv.saveTimer);
     clearTimeout(cv.clickTimer);
+    clearTimeout(cv.resizeTimer);
     cv.loadSeq++;
     // Nothing being drawn, asked or offered belongs to the next project:
     // an open popover's entry, an optimistic link, an undo for a link
@@ -2302,8 +2429,9 @@ window.RCECanvas = (function () {
     closeCtxMenu();
     hideStatus();
     Object.assign(cv, {
-      data: null, scope: null, nodes: new Map(), positions: {}, auto: {}, cycle: new Set(),
-      loose: null, looseIds: [], layoutKey: null, selected: null, hovered: null, pending: {}, viewportDirty: false, saveTimer: null,
+      data: null, scope: null, nodes: new Map(), positions: {}, pinned: false, auto: {}, cycle: new Set(),
+      loose: null, looseIds: [], layoutKey: null, selected: null, hovered: null, save: emptySave(), saveTimer: null,
+      autoFit: true, resizeTimer: null,
       drag: null, lastClick: null, nodeEls: new Map(), linkEls: new Map(),
       selectedLink: null, optimistic: new Map(), focus: null,
     });
@@ -2322,6 +2450,11 @@ window.RCECanvas = (function () {
     // Exposed for the next phase (link editing) and for inspection; not
     // part of any server contract.
     _computeLayout: computeLayout,
+    _looseColumns: looseColumns,
+    _layoutView: layoutView,
+    _cardMoved: cardMoved,
+    _flushSave: flushSave,
+    _relayout: relayout,
     _keepCamera: keepCamera,
     _frameMembers: frameMembers,
     _checkConnection: checkConnection,

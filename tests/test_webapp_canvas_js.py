@@ -15,6 +15,7 @@ dependencies stay empty): these tests skip where node is absent.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -533,7 +534,8 @@ def test_layout_runs_on_the_view_alone():
     assert "SCOPE_ALL" not in fetch and fetch.count("apiGet(") == 2  # the scope, or the default after a stale scope
     view = _CANVAS_SRC[_CANVAS_SRC.index("function layoutView"):]
     view = view[: view.index("\n  }\n")]
-    assert "computeLayout(d.nodes, d.links, d.frames, { fixed: cv.positions" in view
+    assert "computeLayout(d.nodes, d.links, d.frames, {" in view
+    assert "fixed: cv.positions, current: currentAttemptId(d), groups: d.step_groups" in view
 
 
 def test_scope_switch_clears_selection_and_the_pinned_link_card():
@@ -545,21 +547,14 @@ def test_scope_switch_clears_selection_and_the_pinned_link_card():
     assert "cv.selected = null" in change and "closePopover()" in change
 
 
-def test_relayout_forgets_only_the_visible_cards_and_still_asks():
-    relayout = _CANVAS_SRC[_CANVAS_SRC.index("function relayout"):]
-    relayout = relayout[: relayout.index("\n  }\n")]
-    assert "window.confirm(" in relayout and "将丢弃你手动摆放的位置" in relayout
-    assert "cv.nodes.forEach((n, id) => { if (id in cv.positions) queuePosition(id, null); });" in relayout
-    assert relayout.index("queuePosition(id, null)") < relayout.index("layoutView(true)") < relayout.index("fitAll()")
-
-
-def test_a_saved_viewport_is_restored_only_if_it_shows_this_view():
+def test_each_view_restores_its_own_viewport_with_no_cross_view_heuristic():
+    """8.4/8.6 as amended: each view keeps its own viewport, so the camera
+    restores it on entering the view, else fits -- the old "restore only if
+    it shows a card of this view" guess is gone."""
+    assert "savedViewportFits" not in _CANVAS_SRC
     apply = _CANVAS_SRC[_CANVAS_SRC.index("function applyPayload"):]
     apply = apply[: apply.index("\n  }\n")]
-    assert "vp && savedViewportFits(vp)" in apply
-    check = _CANVAS_SRC[_CANVAS_SRC.index("function savedViewportFits"):]
-    check = check[: check.index("\n  }\n")]
-    assert "ids.some(" in check and "fit.zoom" in check
+    assert "if (vp) {" in apply and "} else autoFitAll();" in apply
 
 
 def test_a_cycle_link_keeps_its_human_or_machine_class_and_its_dot():
@@ -622,7 +617,8 @@ def test_confirming_a_link_focuses_its_two_cards_for_the_relayout():
     assert confirm.index("cv.focus = [p.toId, p.fromId];") < confirm.index("await refresh()")
     apply = _CANVAS_SRC[_CANVAS_SRC.index("function applyPayload"):]
     apply = apply[: apply.index("\n  }\n")]
-    assert "const relaid = layoutView(false);" in apply
+    assert "const relaid = layoutView(entering);" in apply
+    assert "if (relaid && !entering && !cv.pinned) {" in apply  # unpinned views only (8.4)
     assert apply.index("cameraAnchors()") < apply.index("cv.positions = ") < apply.index("keepCamera(")
 
 
@@ -650,3 +646,205 @@ def test_a_frame_is_not_stretched_out_to_its_member_in_the_loose_block():
     # An attempt whose every visible member is loose keeps its frame.
     assert _call("frameMembers", args=[[clean], [clean, unused]]) == [clean]
     assert _call("frameMembers", args=[[a, b], []]) == [a, b]
+
+
+# -- 8.4 / 8.6 as amended: each view keeps its own arrangement ---------------
+#
+# The pin-on-first-move flow is state, not a pure function, but it needs no
+# DOM: the real file runs under node with `apiPost` and `window.confirm`
+# stubbed, a view's payload put in place through the exposed state, and the
+# writes it would POST recorded.
+
+_SCENARIO_RUNNER = """
+global.window = { confirm: () => { global.asked = (global.asked || 0) + 1; return true; } };
+global.posts = [];
+global.apiPost = async (url, body) => { posts.push({ url, body: JSON.parse(JSON.stringify(body)) }); return { ok: true }; };
+require(process.argv[1]);
+const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const C = window.RCECanvas, S = C._state;
+function enter(payload) {
+  S.data = payload;
+  S.scope = payload.scope.id;
+  S.nodes = new Map(payload.nodes.map((n) => [n.id, n]));
+  S.positions = Object.assign({}, payload.positions || {});
+  S.pinned = Object.keys(S.positions).length > 0;
+  C._layoutView(true);
+}
+function drag(id, to) { S.positions[id] = to; C._cardMoved(id); }
+(async () => {
+  const out = await (new Function("C", "S", "enter", "drag", "input", "return (async () => {" + input.script + "})();"))(C, S, enter, drag, input);
+  process.stdout.write(JSON.stringify({ out: out === undefined ? null : out, posts, asked: global.asked || 0 }));
+})();
+"""
+
+
+def _scenario(script: str, **payload: Any) -> dict[str, Any]:
+    result = subprocess.run(
+        [NODE, "-e", _SCENARIO_RUNNER, str(CANVAS_JS)],
+        input=json.dumps({"script": script, **payload}), capture_output=True, text=True, check=True, timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+def _view(scope: str, nodes: list[str], links: list[dict[str, Any]], positions: dict[str, list[int]] | None = None):
+    return {
+        "scope": {"id": scope}, "nodes": [_node(n) for n in nodes], "links": links,
+        "frames": [], "step_groups": [], "positions": positions or {}, "scopes": [],
+    }
+
+
+def test_the_first_move_pins_every_visible_card_in_one_post():
+    """8.4: the first time a card is moved in a view, every visible card's
+    position at that moment is saved for that view -- one POST naming the
+    scope -- and the cards not moved are saved exactly where the layout had
+    them. A later move saves only the moved card."""
+    view = _view("attempt:map.md#17", PIPELINE_NODES, PIPELINE_LINKS)
+    run = _scenario("""
+      enter(input.view);
+      const auto = JSON.parse(JSON.stringify(S.auto));
+      drag(input.first, [5, 7]);
+      await C._flushSave();
+      drag(input.second, [900, 40]);
+      await C._flushSave();
+      return { auto, pinned: S.pinned };
+    """, view=view, first=PY16, second=RMD18)
+    assert run["out"]["pinned"] is True
+    first, second = run["posts"]
+    assert first["url"] == second["url"] == "/api/canvas/layout"
+    assert first["body"]["scope"] == "attempt:map.md#17"
+    expected = {i: run["out"]["auto"][i] for i in PIPELINE_NODES if i != PY16}
+    expected[PY16] = [5, 7]
+    assert first["body"]["positions"] == expected
+    assert "reset" not in first["body"]
+    assert second["body"] == {"scope": "attempt:map.md#17", "positions": {RMD18: [900, 40]}}
+
+
+def test_a_move_in_a_pinned_view_also_saves_cards_that_appeared_since():
+    """8.4: a card that appears in a pinned view is placed by the layout
+    clear of the pinned cards, and joins the arrangement at the next move."""
+    pinned = {RAW: [0, 0], PY16: [320, 0], MONTHLY: [640, 0], RMD17: [960, 0]}
+    view = _view("all", PIPELINE_NODES, PIPELINE_LINKS, positions=pinned)
+    run = _scenario("""
+      enter(input.view);
+      const placed = S.auto[input.fresh];
+      drag(input.moved, [10, 500]);
+      await C._flushSave();
+      return { placed, auto: Object.keys(S.auto) };
+    """, view=view, fresh=RMD18, moved=RAW)
+    assert run["out"]["auto"] == [RMD18]  # only the new card is laid out
+    x, y = run["out"]["placed"]
+    for sid, (sx, sy) in pinned.items():
+        apart_x = max(x - (sx + 220), sx - (x + 220))
+        apart_y = max(y - (sy + _height(sid)), sy - (y + _height(RMD18)))
+        assert max(apart_x, apart_y) >= 96, sid
+    (post,) = run["posts"]
+    assert post["body"] == {"scope": "all", "positions": {RAW: [10, 500], RMD18: run["out"]["placed"]}}
+
+
+def test_writes_go_to_the_view_they_were_made_in():
+    """A move queued in one view and unsent when the scope changes is sent
+    for THAT view, never for the next one."""
+    run = _scenario("""
+      enter(input.a);
+      drag(input.id, [1, 2]);
+      enter(input.b);
+      drag(input.id, [3, 4]);
+      await C._flushSave();
+      await new Promise((r) => setTimeout(r, 0));
+    """, a=_view("attempt:map.md#17", [PY16], []), b=_view("all", [PY16], []), id=PY16)
+    assert [p["body"] for p in run["posts"]] == [
+        {"scope": "attempt:map.md#17", "positions": {PY16: [1, 2]}},
+        {"scope": "all", "positions": {PY16: [3, 4]}},
+    ]
+
+
+def test_relayout_asks_then_forgets_this_views_arrangement():
+    """「重新排列」 asks 「将丢弃你在这个视图里摆放的位置」, then sends the reset
+    for this view (its viewport forgotten too: it fits again) and lays the
+    view out afresh -- every card back to the automatic layout."""
+    fresh = _scenario("enter(input.view); return S.auto;", view=_view("all", PIPELINE_NODES, PIPELINE_LINKS))["out"]
+    pinned = {i: [k * 1000, 3000] for k, i in enumerate(PIPELINE_NODES)}
+    run = _scenario("""
+      enter(input.view);
+      C._relayout();
+      await C._flushSave();
+      return { pinned: S.pinned, positions: S.positions, auto: S.auto };
+    """, view=_view("all", PIPELINE_NODES, PIPELINE_LINKS, positions=pinned))
+    assert run["asked"] == 1
+    assert run["out"]["pinned"] is False and run["out"]["positions"] == {}
+    assert run["out"]["auto"] == fresh
+    (post,) = run["posts"]
+    assert post["body"] == {"scope": "all", "reset": True, "viewport": None}
+    relayout = _CANVAS_SRC[_CANVAS_SRC.index("function relayout"):]
+    relayout = relayout[: relayout.index("\n  }\n")]
+    assert "将丢弃你在这个视图里摆放的位置" in relayout
+
+
+@pytest.mark.parametrize("count, cols", [(3, 4), (10, 4), (60, 7), (200, 13)])
+def test_the_loose_block_is_page_shaped(count, cols):
+    """8.4 step 4: at least 4 columns, more when needed to bring the block
+    toward 1.6:1 (rows of dataset cards, the caption included)."""
+    assert _call("looseColumns", args=[count, DATASET_H]) == cols
+    rows = -(-count // cols)
+    w = cols * 244 - 24
+    h = 64 + rows * (DATASET_H + 24) - 24
+    if count >= 60:
+        assert 1.3 <= w / h <= 2.0, w / h
+        for other in (cols - 1, cols + 1):  # its neighbours are further from 1.6
+            r = -(-count // other)
+            ow, oh = other * 244 - 24, 64 + r * (DATASET_H + 24) - 24
+            assert abs(math.log(ow / oh / 1.6)) >= abs(math.log(w / h / 1.6))
+
+
+def test_a_large_loose_block_is_laid_out_wide():
+    loose = [f"dataset:散/z{k:03d}.csv" for k in range(60)]
+    out = _layout(loose, [])
+    assert len({out["positions"][i][0] for i in loose}) == 7
+    assert _overlap(out) == []
+
+
+def test_pinned_loose_cards_stay_loose_and_keep_their_caption():
+    """Once a view is pinned its loose cards are fixed, but they are still
+    「未连线」: the caption stays over them and frames do not stretch to them."""
+    loose = [f"dataset:散/z{k}.csv" for k in range(3)]
+    fresh = _layout(PIPELINE_NODES + loose, PIPELINE_LINKS)
+    pinned = _layout(PIPELINE_NODES + loose, PIPELINE_LINKS, fixed=fresh["positions"])
+    assert pinned["positions"] == {}
+    assert set(pinned["looseIds"]) == set(loose)
+    assert pinned["loose"] == fresh["loose"]
+
+
+def test_step_groups_place_companions_in_a_view_without_frames():
+    """全部 draws no frame (8.7) but its layout still sits a ghost beside its
+    step-prefix script and packs the current attempt first (step_groups)."""
+    out = _layout(PIPELINE_NODES + [PDF17], PIPELINE_LINKS, frames=[], ghosts={PDF17})
+    assert PDF17 in out["looseIds"]
+    payload = {
+        "nodes": [_node(n) for n in PIPELINE_NODES + [PDF17]], "links": PIPELINE_LINKS, "frames": [],
+        "opts": {"fixed": {}, "current": None, "groups": [{"attempt_id": "a17", "node_ids": [RMD17, PDF17]}]},
+    }
+    result = subprocess.run(
+        [NODE, "-e", _RUNNER, str(CANVAS_JS)], input=json.dumps(payload),
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    out = json.loads(result.stdout)
+    assert out["looseIds"] == [] and _column(out, PDF17) == _column(out, RMD17) + 1
+
+
+def test_resize_refits_only_until_the_researcher_moves_the_camera():
+    """8.4: until they pan or zoom, the camera re-fits on resize; fits are
+    not saved as the view's viewport, pans and zooms are."""
+    resize = _CANVAS_SRC[_CANVAS_SRC.index("function onResize"):]
+    resize = resize[: resize.index("\n  }\n")]
+    assert "cv.autoFit &&" in resize and "RESIZE_DEBOUNCE_MS" in resize
+    assert "new ResizeObserver(onResize)" in _CANVAS_SRC
+    user = _CANVAS_SRC[_CANVAS_SRC.index("function userCamera"):]
+    user = user[: user.index("\n  }\n")]
+    assert "cv.autoFit = false;" in user and "queueViewport();" in user
+    fit = _CANVAS_SRC[_CANVAS_SRC.index("function fitTo("):]
+    fit = fit[: fit.index("\n  }\n")]
+    assert "queueViewport" not in fit
+    for handler in ("function onWheel", "function setZoomAbout", "function onPointerUp"):
+        body = _CANVAS_SRC[_CANVAS_SRC.index(handler):]
+        body = body[: body.index("\n  }\n")]
+        assert "userCamera()" in body, handler

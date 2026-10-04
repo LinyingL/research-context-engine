@@ -204,12 +204,22 @@ def test_scope_shows_steps_touched_files_and_one_hop_upstream(project):
     }]
 
 
-def test_scope_all_shows_every_node_and_every_frame(project):
+def test_scope_all_shows_every_node_and_draws_no_frame(project):
+    """8.7 as amended: frames are drawn in attempt views only. The layout
+    still learns every attempt's step files (step_groups) for 8.4's
+    step-prefix placement and current-attempt-first order."""
     payload = _canvas(project, "all")
     assert set(_nodes(payload)) == {PY16, RMD17, RMD18, PDF17, RAW, MONTHLY}
     assert len(payload["links"]) == 4
-    assert [f["attempt_id"] for f in payload["frames"]] == [A16, A17, A18]
+    assert payload["frames"] == []
+    assert [g["attempt_id"] for g in payload["step_groups"]] == [A16, A17, A18]
+    assert payload["step_groups"][1] == {"attempt_id": A17, "node_ids": [RMD17, PDF17]}
     assert payload["scope"] == {"id": "all"}
+
+
+def test_an_attempt_scope_groups_exactly_its_frame(project):
+    payload = _canvas(project, A17)
+    assert payload["step_groups"] == [{"attempt_id": A17, "node_ids": [RMD17, PDF17]}]
 
 
 def test_node_fields_split_label_and_cjk_directory(project):
@@ -287,7 +297,7 @@ def test_ghost_never_stats_a_step_path_outside_the_root(tmp_path):
 def test_ghost_becomes_real_after_a_mapping_is_added(project):
     """8.1's transition: the mapping ingest upserts the node under the very
     id the ghost carried, so the saved position follows it."""
-    canvas.save_layout(project, {"positions": {PDF17: [640, 80]}})
+    _save(project, {"scope": A17, "positions": {PDF17: [640, 80]}})
     mappings_ingest.add_mapping(
         project, f"{STEPS}/17-叙事更替与汇率波动.Rmd", f"{STEPS}/17-叙事更替与汇率波动.pdf",
         "generates", note="knitr 渲染产出", date="2026-09-06",
@@ -348,83 +358,167 @@ def test_rejected_upstream_writer_drops_out_of_the_scope(project):
 # -- canvas.json (8.6) -------------------------------------------------------------
 
 
+def _save(root: Path, body: dict[str, Any]) -> dict[str, Any]:
+    conn = db.connect(paths.graph_db_path(root))
+    try:
+        return canvas.save_layout(conn, root, body)
+    finally:
+        conn.close()
+
+
+def _write_state(root: Path, data: Any) -> Path:
+    path = paths.canvas_state_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+    return path
+
+
+EMPTY = {"positions": {}, "viewport": None}
+
+
 def test_layout_missing_file_is_empty(tmp_path):
-    assert canvas.load_layout(tmp_path) == {"positions": {}, "viewport": None}
+    assert canvas.load_views(tmp_path) == {}
+    assert canvas.load_layout(tmp_path, "all") == EMPTY
 
 
 def test_layout_corrupt_file_degrades_to_empty(tmp_path):
-    path = paths.canvas_state_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text("{not json")
-    assert canvas.load_layout(tmp_path) == {"positions": {}, "viewport": None}
+    path = _write_state(tmp_path, "{not json")
+    assert canvas.load_layout(tmp_path, "all") == EMPTY
     path.write_bytes(b"\xff\xfe")
-    assert canvas.load_layout(tmp_path) == {"positions": {}, "viewport": None}
-    path.write_text("[1, 2]")
-    assert canvas.load_layout(tmp_path) == {"positions": {}, "viewport": None}
+    assert canvas.load_layout(tmp_path, "all") == EMPTY
+    for data in ([1, 2], {"views": [1]}, {"views": {"all": "x"}}):
+        _write_state(tmp_path, data)
+        assert canvas.load_views(tmp_path) == {}
+
+
+def test_layout_legacy_flat_file_is_nothing_saved(project):
+    """8.6: the first canvas's flat file held GLOBAL positions; read as any
+    one view's arrangement it would pin that view to another view's
+    picture. An older-format file is nothing saved, and the next write
+    replaces it with the per-view shape."""
+    path = _write_state(project, {"positions": {PY16: [1, 2]}, "viewport": {"x": 0, "y": 0, "zoom": 1}})
+    assert canvas.load_views(project) == {}
+    payload = _canvas(project, A17)
+    assert payload["positions"] == {} and payload["viewport"] is None
+    _save(project, {"scope": A17, "positions": {RMD17: [5, 6]}})
+    assert json.loads(path.read_text()) == {"views": {A17: {"positions": {RMD17: [5.0, 6.0]}, "viewport": None}}}
 
 
 def test_layout_corrupt_entries_drop_individually(tmp_path):
-    path = paths.canvas_state_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({
-        "positions": {"a": [1, 2], "b": [1], "c": "x", "d": [True, 2], "e": [3.5, -4]},
-        "viewport": {"x": 1, "y": 2, "zoom": 0},
-    }))
-    assert canvas.load_layout(tmp_path) == {"positions": {"a": [1.0, 2.0], "e": [3.5, -4.0]}, "viewport": None}
+    _write_state(tmp_path, {"views": {
+        "all": {
+            "positions": {"a": [1, 2], "b": [1], "c": "x", "d": [True, 2], "e": [3.5, -4]},
+            "viewport": {"x": 1, "y": 2, "zoom": 0},
+        },
+        "attempt:x#1": [1],
+        "": {"positions": {"a": [1, 2]}},
+    }})
+    assert canvas.load_views(tmp_path) == {
+        "all": {"positions": {"a": [1.0, 2.0], "e": [3.5, -4.0]}, "viewport": None},
+    }
 
 
-def test_layout_merge_changes_only_named_ids_and_null_deletes(tmp_path):
-    canvas.save_layout(tmp_path, {"positions": {"a": [1, 2], "b": [3, 4]}, "viewport": {"x": 0, "y": 0, "zoom": 1}})
-    canvas.save_layout(tmp_path, {"positions": {"b": None, "c": [5, 6]}})
-    assert canvas.load_layout(tmp_path) == {
-        "positions": {"a": [1.0, 2.0], "c": [5.0, 6.0]},
+def test_layout_merge_changes_only_named_ids_and_null_deletes(project):
+    _save(project, {"scope": "all", "positions": {PY16: [1, 2], RAW: [3, 4]}, "viewport": {"x": 0, "y": 0, "zoom": 1}})
+    view = _save(project, {"scope": "all", "positions": {RAW: None, MONTHLY: [5, 6]}})
+    assert view == canvas.load_layout(project, "all") == {
+        "positions": {PY16: [1.0, 2.0], MONTHLY: [5.0, 6.0]},
         "viewport": {"x": 0.0, "y": 0.0, "zoom": 1.0},
     }
-    canvas.save_layout(tmp_path, {"viewport": None})
-    assert canvas.load_layout(tmp_path)["viewport"] is None
-    assert canvas.load_layout(tmp_path)["positions"] == {"a": [1.0, 2.0], "c": [5.0, 6.0]}
+    _save(project, {"scope": "all", "viewport": None})
+    assert canvas.load_layout(project, "all") == {"positions": {PY16: [1.0, 2.0], MONTHLY: [5.0, 6.0]}, "viewport": None}
 
 
-def test_layout_save_recovers_a_corrupt_file(tmp_path):
-    path = paths.canvas_state_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text("garbage")
-    canvas.save_layout(tmp_path, {"positions": {"a": [1, 2]}})
-    assert json.loads(path.read_text()) == {"positions": {"a": [1.0, 2.0]}, "viewport": None}
+def test_each_view_keeps_its_own_arrangement_and_viewport(project):
+    """8.4 as amended: the same card may sit in different places in two
+    views; saving in one never shows in another."""
+    _save(project, {"scope": A17, "positions": {RMD17: [10, 20], PY16: [30, 40]}, "viewport": {"x": 1, "y": 2, "zoom": 0.5}})
+    _save(project, {"scope": "all", "positions": {RMD17: [900, 900]}})
+    in_17, in_all, in_18 = _canvas(project, A17), _canvas(project, "all"), _canvas(project, A18)
+    assert in_17["positions"] == {RMD17: [10.0, 20.0], PY16: [30.0, 40.0]}
+    assert in_17["viewport"] == {"x": 1.0, "y": 2.0, "zoom": 0.5}
+    assert in_all["positions"] == {RMD17: [900.0, 900.0]} and in_all["viewport"] is None
+    assert in_18["positions"] == {} and in_18["viewport"] is None
+
+
+def test_reset_forgets_one_views_arrangement_only(project):
+    _save(project, {"scope": A17, "positions": {RMD17: [10, 20], PY16: [30, 40]}, "viewport": {"x": 1, "y": 2, "zoom": 1}})
+    _save(project, {"scope": "all", "positions": {RMD17: [900, 900]}})
+    view = _save(project, {"scope": A17, "reset": True})
+    assert view["positions"] == {} and view["viewport"] == {"x": 1.0, "y": 2.0, "zoom": 1.0}
+    assert canvas.load_layout(project, "all")["positions"] == {RMD17: [900.0, 900.0]}
+    # Reset first, then the body's own positions: a pin right after a reset.
+    view = _save(project, {"scope": A17, "reset": True, "positions": {PY16: [7, 8]}, "viewport": None})
+    assert view == {"positions": {PY16: [7.0, 8.0]}, "viewport": None}
+
+
+def test_a_write_is_bounded_by_the_graph(project):
+    """8.6: a scope the project does not have is refused, and a view only
+    takes positions for cards it shows, so the file cannot grow keys a
+    page invents. Deleting (null) any id only shrinks it."""
+    with pytest.raises(canvas.UnknownScopeError):
+        _save(project, {"scope": "attempt:map.md#99", "positions": {PY16: [1, 2]}})
+    with pytest.raises(canvas.LayoutShapeError):
+        _save(project, {"scope": A17, "positions": {RMD18: [1, 2]}})  # 18 is not in #17's view
+    with pytest.raises(canvas.LayoutShapeError):
+        _save(project, {"scope": "all", "positions": {"dataset:invented.csv": [1, 2]}})
+    assert not paths.canvas_state_path(project).exists()
+    _save(project, {"scope": A17, "positions": {"dataset:gone.csv": None, PDF17: [1, 2]}})  # a ghost is a card
+    assert canvas.load_layout(project, A17)["positions"] == {PDF17: [1.0, 2.0]}
+
+
+def test_views_of_attempts_the_graph_lost_are_dropped_on_write(project):
+    _write_state(project, {"views": {"attempt:map.md#99": {"positions": {"x": [1, 2]}}, A18: {"positions": {RMD18: [1, 2]}}}})
+    _save(project, {"scope": "all", "positions": {RAW: [3, 4]}})
+    assert set(canvas.load_views(project)) == {"all", A18}
+
+
+def test_layout_save_recovers_a_corrupt_file(project):
+    path = _write_state(project, "garbage")
+    _save(project, {"scope": "all", "positions": {RAW: [1, 2]}})
+    assert json.loads(path.read_text()) == {"views": {"all": {"positions": {RAW: [1.0, 2.0]}, "viewport": None}}}
 
 
 def test_layout_is_never_backed_up_and_never_in_the_project(project):
-    canvas.save_layout(project, {"positions": {PY16: [1, 2]}})
+    _save(project, {"scope": "all", "positions": {PY16: [1, 2]}})
     assert not (project / ".rce" / "backups").exists()
     assert not (project / ".rce" / "canvas.json").exists()
     assert paths.canvas_state_path(project).exists()
 
 
 @pytest.mark.parametrize("body", [
-    {"positions": []},
-    {"positions": {"a": [1, 2, 3]}},
-    {"positions": {"a": [1, float("nan")]}},
-    {"positions": {"a": [1, float("inf")]}},
-    {"positions": {"a": [True, 2]}},
-    {"positions": {"a": ["1", 2]}},
-    {"positions": {"": [1, 2]}},
-    {"viewport": {"x": 0, "y": 0}},
-    {"viewport": {"x": 0, "y": 0, "zoom": 0}},
-    {"viewport": {"x": 0, "y": 0, "zoom": 1, "extra": 1}},
-    {"viewport": [0, 0, 1]},
-    {"something": 1},
+    {"positions": {PY16: [1, 2]}},
+    {"scope": "", "positions": {PY16: [1, 2]}},
+    {"scope": 3},
+    {"scope": "all", "reset": "yes"},
+    {"scope": "all", "positions": []},
+    {"scope": "all", "positions": {PY16: [1, 2, 3]}},
+    {"scope": "all", "positions": {PY16: [1, float("nan")]}},
+    {"scope": "all", "positions": {PY16: [1, float("inf")]}},
+    {"scope": "all", "positions": {PY16: [True, 2]}},
+    {"scope": "all", "positions": {PY16: ["1", 2]}},
+    {"scope": "all", "positions": {"": [1, 2]}},
+    {"scope": "all", "viewport": {"x": 0, "y": 0}},
+    {"scope": "all", "viewport": {"x": 0, "y": 0, "zoom": 0}},
+    {"scope": "all", "viewport": {"x": 0, "y": 0, "zoom": 1, "extra": 1}},
+    {"scope": "all", "viewport": [0, 0, 1]},
+    {"scope": "all", "something": 1},
 ])
-def test_layout_rejects_bad_shapes(tmp_path, body):
+def test_layout_rejects_bad_shapes(project, body):
     with pytest.raises(canvas.LayoutShapeError):
-        canvas.save_layout(tmp_path, body)
-    assert not paths.canvas_state_path(tmp_path).exists()
+        _save(project, body)
+    assert not paths.canvas_state_path(project).exists()
 
 
 def test_positions_in_payload_are_only_the_visible_ones(project):
-    canvas.save_layout(project, {"positions": {RMD17: [1, 2], RMD18: [3, 4]}, "viewport": {"x": 1, "y": 2, "zoom": 0.5}})
-    payload = _canvas(project, A17)
-    assert payload["positions"] == {RMD17: [1.0, 2.0]}
-    assert payload["viewport"] == {"x": 1.0, "y": 2.0, "zoom": 0.5}
+    _save(project, {"scope": A17, "positions": {RMD17: [1, 2], PY16: [3, 4]}})
+    # PY16 is in #17's view only one hop upstream; scoped to 16 it is a step.
+    conn = db.connect(paths.graph_db_path(project))
+    try:
+        db.set_edge_status(conn, PY16, MONTHLY, "writes", "dataflow", "rejected")
+    finally:
+        conn.close()
+    assert _canvas(project, A17)["positions"] == {RMD17: [1.0, 2.0]}
 
 
 # -- HTTP: the six endpoints -------------------------------------------------------
@@ -680,17 +774,46 @@ def test_http_edge_body_must_be_four_strings(live):
     assert status == 400 and "extractor" in payload["error"]
 
 
-def test_http_layout_merge_and_bad_body(live):
+def test_http_layout_merge_per_view_and_bad_body(live):
     base, root, _ = live
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"positions": {PY16: [10, 20], RMD17: [30, 40]}})
-    assert status == 200 and payload["positions"] == 2
-    status, _ = _call(base, "POST", "/api/canvas/layout", {"positions": {PY16: None}, "viewport": {"x": 1, "y": 2, "zoom": 1.5}})
+    q17 = "/api/canvas?scope=" + urllib.parse.quote(A17)
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {PY16: [10, 20], RMD17: [30, 40]}})
+    assert status == 200 and payload["positions"] == 2 and payload["scope"] == A17
+    status, _ = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {PY16: None}, "viewport": {"x": 1, "y": 2, "zoom": 1.5}})
     assert status == 200
-    _, view = _call(base, "GET", "/api/canvas")
+    _, view = _call(base, "GET", q17)
     assert view["positions"] == {RMD17: [30.0, 40.0]}
     assert view["viewport"] == {"x": 1.0, "y": 2.0, "zoom": 1.5}
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"positions": {PY16: [1, "x"]}})
+    # The default scope is #17: same view, same arrangement.
+    _, default = _call(base, "GET", "/api/canvas")
+    assert default["positions"] == view["positions"]
+    # 全部 is a different view: nothing of #17's arrangement shows there.
+    _, whole = _call(base, "GET", "/api/canvas?scope=all")
+    assert whole["positions"] == {} and whole["viewport"] is None and whole["frames"] == []
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {PY16: [1, "x"]}})
     assert status == 400 and "finite" in payload["error"]
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"positions": {PY16: [1, 2]}})
+    assert status == 400 and "scope" in payload["error"]
+
+
+def test_http_layout_reset_forgets_the_view(live):
+    base, _, _ = live
+    _call(base, "POST", "/api/canvas/layout", {"scope": "all", "positions": {RAW: [1, 2], PY16: [3, 4]}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": "all", "reset": True})
+    assert status == 200 and payload["positions"] == 0
+    _, whole = _call(base, "GET", "/api/canvas?scope=all")
+    assert whole["positions"] == {}
+
+
+def test_http_layout_refuses_an_invented_scope_or_card(live):
+    base, root, _ = live
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": "attempt:map.md#99", "positions": {PY16: [1, 2]}})
+    assert status == 404 and "#99" in payload["error"]
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": "anything", "viewport": {"x": 0, "y": 0, "zoom": 1}})
+    assert status == 404
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {RMD18: [1, 2]}})
+    assert status == 400 and "does not show" in payload["error"]
+    assert not paths.canvas_state_path(root).exists()
 
 
 def test_http_layout_corrupt_file_degrades_on_read(live):
@@ -705,7 +828,7 @@ def test_http_layout_corrupt_file_degrades_on_read(live):
 
 _ENDPOINTS = [
     ("GET", "/api/canvas", None),
-    ("POST", "/api/canvas/layout", {"positions": {PY16: [1, 2]}}),
+    ("POST", "/api/canvas/layout", {"scope": "all", "positions": {PY16: [1, 2]}}),
     ("POST", "/api/mappings/add", _PDF_MAPPING),
     ("POST", "/api/mappings/delete", _PDF_MAPPING),
     ("POST", "/api/edges/reject", _edge_body(RMD18, MONTHLY, "reads")),

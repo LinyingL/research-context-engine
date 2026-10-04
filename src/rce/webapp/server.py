@@ -91,10 +91,12 @@ Endpoints (all GET unless noted):
                             figures, links, attempt frames, saved positions
                             and scope list (DESIGN.md 8.1/8.7; see
                             `rce.webapp.canvas.build_canvas`).
-    POST /api/canvas/layout -- body `{"positions"?: {id: [x, y] | null},
-                            "viewport"?: {x, y, zoom} | null}`: merge into
-                            the UI-state file beside the graph (8.6; see
-                            `canvas_layout_payload`).
+    POST /api/canvas/layout -- body `{"scope": "all"|<attempt id>,
+                            "positions"?: {id: [x, y] | null},
+                            "viewport"?: {x, y, zoom} | null,
+                            "reset"?: bool}`: merge into THAT view's entry
+                            of the UI-state file beside the graph (8.4,
+                            8.6; see `canvas_layout_payload`).
     POST /api/mappings/add -- body `{"from", "to", "type", "note"?}`: append
                             one human mapping to `.rce/mappings.toml` and
                             re-ingest it; returns the resulting link (8.5;
@@ -1005,17 +1007,20 @@ def canvas_payload(conn: Connection, project_root: Path, scope: str | None) -> d
         raise NotFoundError(str(exc)) from exc
 
 
-def canvas_layout_payload(project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
-    """Merge a layout body into `canvas.json` (section 8.6). `_require_db`
-    first: the file lives in the graph's own directory, which exists only
-    for an initialized project -- and a layout for a project with no graph
-    has nothing to lay out."""
-    _require_db(project_root)
+def canvas_layout_payload(conn: Connection, project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Merge a layout body into its view of `canvas.json` (sections 8.4,
+    8.6). Opened through `_open_conn`, so `_require_db` runs first: the
+    file lives in the graph's own directory, which exists only for an
+    initialized project, and the graph is what bounds the write -- a scope
+    the project does not have is a 404 (as `GET /api/canvas`), a position
+    for a card that view does not show is a 400."""
     try:
-        layout = canvas.save_layout(project_root, body)
+        view = canvas.save_layout(conn, project_root, body)
+    except canvas.UnknownScopeError as exc:
+        raise NotFoundError(str(exc)) from exc
     except canvas.LayoutShapeError as exc:
         raise MissingParamError(str(exc)) from exc
-    return {"ok": True, "positions": len(layout["positions"]), "viewport": layout["viewport"]}
+    return {"ok": True, "scope": body["scope"], "positions": len(view["positions"]), "viewport": view["viewport"]}
 
 
 def _string_fields(body: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
@@ -1514,7 +1519,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # UI state beside the graph (8.6) -- origin-checked like
                 # every POST: a drive-by page must not scramble the canvas.
                 body = self._read_json_object()
-                self._send_json(200, canvas_layout_payload(self._project_root(), body))
+                self._json_from_conn(lambda conn: canvas_layout_payload(conn, self._project_root(), body))
             elif parsed.path == "/api/shutdown":
                 # Stops this whole server (task V3 phase 4). Respond first,
                 # then stop the serve loop from a separate thread -- see

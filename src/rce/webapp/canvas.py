@@ -62,12 +62,17 @@ Layout state (section 8.6)
 --------------------------
 
 `canvas.json` lives at `rce.paths.canvas_state_path` -- beside the graph,
-outside the project, path never influenced by a request. It is derived UI
-state: a missing or corrupt file (or a corrupt entry inside it) degrades
-to "no saved position", never to an error; writes are atomic but never
-backed up. A merge changes only the ids a request names, and `null`
-deletes one, so two pages (or the debounced drag and a later one) can
-never wipe each other's unrelated positions.
+outside the project, path never influenced by a request. It holds one
+arrangement and one viewport PER VIEW (8.4 as amended: "each view keeps
+its own"), `{"views": {<scope id>: {"positions", "viewport"}}}`, the scope
+id being `all` or an attempt node id. It is derived UI state: a missing,
+corrupt or older-format file (or a corrupt entry inside it) degrades to
+"nothing saved", never to an error; writes are atomic but never backed up.
+A write names its view, which must exist in the graph, and may set
+positions only for cards that view shows, so the file's keys are bounded
+by the graph rather than by what a page sends. A merge changes only the
+ids a request names, and `null` deletes one; `reset` forgets the view's
+whole arrangement (「重新排列」).
 """
 
 from __future__ import annotations
@@ -281,11 +286,12 @@ def _scope_summary(attempt: dict[str, Any]) -> dict[str, Any]:
 # -- GET /api/canvas -------------------------------------------------------------
 
 
-def build_canvas(conn: Connection, project_root: Path, scope: str | None = None) -> dict[str, Any]:
-    """The whole `GET /api/canvas` body (module docstring). `scope` is
-    `"all"`, an attempt node id, or None for the default scope; anything
-    else raises `UnknownScopeError`."""
-    root = Path(project_root).resolve()
+def _view(conn: Connection, root: Path, scope: str | None) -> dict[str, Any]:
+    """What one view shows (module docstring, "Scope"): the resolved scope
+    id, the visible card ids, and what `build_canvas` needs to describe
+    them. Shared by the GET and by the layout POST, which may only write
+    positions for the cards of the view it names. `UnknownScopeError` for
+    a scope that is neither `all` nor an attempt in the graph."""
     nodes = {n["id"]: n for t in CANVAS_NODE_TYPES for n in db.get_nodes_by_type(conn, t)}
     edges = [
         e for t in CANVAS_EDGE_TYPES for e in db.query_edges(conn, type=t)
@@ -319,7 +325,7 @@ def build_canvas(conn: Connection, project_root: Path, scope: str | None = None)
 
     if scope == SCOPE_ALL:
         visible = set(nodes) | set(ghosts)
-        framed = attempts
+        grouped = attempts
     else:
         own = set(step_ids[scope])
         scripts = {i for i in own if i in nodes and nodes[i]["type"] == "script"}
@@ -327,7 +333,27 @@ def build_canvas(conn: Connection, project_root: Path, scope: str | None = None)
         read = {e["dst"] for e in edges if e["src"] in scripts and e["type"] == "reads"}
         upstream = {e["src"] for e in edges if e["type"] == "writes" and e["dst"] in read}
         visible = own | touched | upstream
-        framed = [by_id[scope]]
+        grouped = [by_id[scope]]
+    return {
+        "scope": scope, "nodes": nodes, "edges": edges, "attempts": attempts, "by_id": by_id,
+        "default": default, "step_ids": step_ids, "ghosts": ghosts, "visible": visible, "grouped": grouped,
+    }
+
+
+def view_card_ids(conn: Connection, project_root: Path, scope: str) -> set[str]:
+    """The card ids `scope` shows -- the only ids a layout POST for that
+    view may give a position. `UnknownScopeError` as `build_canvas`."""
+    return _view(conn, Path(project_root).resolve(), scope)["visible"]
+
+
+def build_canvas(conn: Connection, project_root: Path, scope: str | None = None) -> dict[str, Any]:
+    """The whole `GET /api/canvas` body (module docstring). `scope` is
+    `"all"`, an attempt node id, or None for the default scope; anything
+    else raises `UnknownScopeError`."""
+    root = Path(project_root).resolve()
+    view = _view(conn, root, scope)
+    scope, nodes, edges, visible = view["scope"], view["nodes"], view["edges"], view["visible"]
+    by_id, step_ids, ghosts, default = view["by_id"], view["step_ids"], view["ghosts"], view["default"]
 
     links = [e for e in edges if e["src"] in visible and e["dst"] in visible]
     readers = {e["dst"] for e in edges if e["type"] == "reads"}
@@ -347,26 +373,33 @@ def build_canvas(conn: Connection, project_root: Path, scope: str | None = None)
             node_type, path = ghosts[node_id]
             node_entries.append(_node_entry(node_id, node_type, path, ghost=True, missing=False, orphan=False))
 
-    frames = []
-    for attempt in framed:
+    # Each attempt's visible step files. `step_groups` is for the layout
+    # only (8.4 step 1's step-prefix companion, step 5's current-attempt-
+    # first order), in every scope; `frames` are what is DRAWN, and 8.7
+    # draws them in attempt views only -- in 全部 an attempt's scripts are
+    # spread through a larger pipeline and a bounding frame would swallow
+    # cards that are not its own.
+    groups = []
+    for attempt in view["grouped"]:
         members = [i for i in step_ids[attempt["id"]] if i in visible]
         if members or scope != SCOPE_ALL:
             summary = _scope_summary(attempt)
-            frames.append({
+            groups.append({
                 "attempt_id": summary["id"], "number": summary["number"],
                 "title": summary["title"], "verdict": summary["verdict"], "node_ids": members,
             })
 
-    layout = load_layout(project_root)
+    saved = load_layout(project_root, scope)
     default_id = default["id"] if default is not None else None
     return {
         "nodes": node_entries,
         "links": sorted((link_entry(e) for e in links), key=lambda link: link["id"]),
-        "frames": frames,
-        "positions": {k: v for k, v in layout["positions"].items() if k in visible},
-        "viewport": layout["viewport"],
+        "frames": [] if scope == SCOPE_ALL else groups,
+        "step_groups": [{"attempt_id": g["attempt_id"], "node_ids": g["node_ids"]} for g in groups],
+        "positions": {k: v for k, v in saved["positions"].items() if k in visible},
+        "viewport": saved["viewport"],
         "scope": {"id": SCOPE_ALL} if scope == SCOPE_ALL else _scope_summary(by_id[scope]),
-        "scopes": [dict(_scope_summary(a), current=a["id"] == default_id) for a in attempts],
+        "scopes": [dict(_scope_summary(a), current=a["id"] == default_id) for a in view["attempts"]],
     }
 
 
@@ -389,81 +422,129 @@ def _valid_viewport(value: Any) -> bool:
     )
 
 
-def load_layout(project_root: Path) -> dict[str, Any]:
-    """`{"positions": {id: [x, y]}, "viewport": {x, y, zoom} | None}` from
-    canvas.json. Missing, unreadable, non-JSON or wrongly shaped content
-    degrades to empty (section 8.6), entry by entry: one bad position
-    drops only itself."""
-    empty: dict[str, Any] = {"positions": {}, "viewport": None}
-    path = paths.canvas_state_path(project_root)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return empty
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        logger.info("ignoring unreadable canvas state %s (%s) -- no saved positions", path, exc)
-        return empty
-    if not isinstance(data, dict):
-        return empty
-    raw_positions = data.get("positions")
+def _empty_view() -> dict[str, Any]:
+    return {"positions": {}, "viewport": None}
+
+
+def _clean_view(raw: Any) -> dict[str, Any] | None:
+    """One `views` entry, validated entry by entry (one bad position drops
+    only itself); None when it is not an object at all."""
+    if not isinstance(raw, dict):
+        return None
+    raw_positions = raw.get("positions")
     positions = {
         k: [float(v[0]), float(v[1])]
         for k, v in (raw_positions.items() if isinstance(raw_positions, dict) else ())
         if isinstance(k, str) and k and _valid_position(v)
     }
-    viewport = data.get("viewport")
-    if _valid_viewport(viewport):
-        viewport = {k: float(viewport[k]) for k in ("x", "y", "zoom")}
-    else:
-        viewport = None
+    viewport = raw.get("viewport")
+    viewport = {k: float(viewport[k]) for k in ("x", "y", "zoom")} if _valid_viewport(viewport) else None
     return {"positions": positions, "viewport": viewport}
 
 
-def parse_layout_body(body: dict[str, Any]) -> tuple[dict[str, list[float] | None] | None, Any]:
-    """Validate a layout POST body; returns `(positions or None, viewport)`
-    where `viewport` is the sentinel `...` when absent. Every number must be
-    finite (NaN/Infinity would poison the JSON file for every later read),
-    a position is exactly `[x, y]` or `null` (delete), and a viewport is
-    `{x, y, zoom}` with `zoom > 0`, or `null` (forget it)."""
-    unknown = set(body) - {"positions", "viewport"}
+def load_views(project_root: Path) -> dict[str, dict[str, Any]]:
+    """Every view's `{"positions": {id: [x, y]}, "viewport": {x, y, zoom} |
+    None}` from canvas.json, keyed by scope id. Missing, unreadable,
+    non-JSON, older-format (the flat `{"positions", "viewport"}` of the
+    first canvas, whose positions were global) or wrongly shaped content
+    degrades to nothing saved (section 8.6)."""
+    path = paths.canvas_state_path(project_root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.info("ignoring unreadable canvas state %s (%s) -- nothing saved", path, exc)
+        return {}
+    raw_views = data.get("views") if isinstance(data, dict) else None
+    if not isinstance(raw_views, dict):
+        return {}
+    views = {}
+    for scope, raw in raw_views.items():
+        view = _clean_view(raw) if isinstance(scope, str) and scope else None
+        if view is not None:
+            views[scope] = view
+    return views
+
+
+def load_layout(project_root: Path, scope: str) -> dict[str, Any]:
+    """The saved arrangement and viewport of ONE view (8.4: each view keeps
+    its own), or nothing saved."""
+    return load_views(project_root).get(scope) or _empty_view()
+
+
+def parse_layout_body(body: dict[str, Any]) -> tuple[str, dict[str, list[float] | None], Any, bool]:
+    """Validate a layout POST body; returns `(scope, positions, viewport,
+    reset)` where `viewport` is the sentinel `...` when absent. `scope` is
+    required. Every number must be finite (NaN/Infinity would poison the
+    JSON file for every later read), a position is exactly `[x, y]` or
+    `null` (delete), a viewport is `{x, y, zoom}` with `zoom > 0`, or `null`
+    (forget it), and `reset: true` forgets the view's whole arrangement
+    before the body's own positions are merged (「重新排列」)."""
+    unknown = set(body) - {"scope", "positions", "viewport", "reset"}
     if unknown:
         raise LayoutShapeError(f"unknown key(s) in layout body: {', '.join(sorted(unknown))}")
+    scope = body.get("scope")
+    if not isinstance(scope, str) or not scope:
+        raise LayoutShapeError("layout body must name its view: 'scope' is 'all' or an attempt id")
+    reset = body.get("reset", False)
+    if not isinstance(reset, bool):
+        raise LayoutShapeError("'reset' must be true or false")
     positions = body.get("positions")
-    if positions is not None:
-        if not isinstance(positions, dict):
-            raise LayoutShapeError("'positions' must be an object of node id -> [x, y] or null")
-        for key, value in positions.items():
-            if not key:
-                raise LayoutShapeError("a position's node id must be a non-empty string")
-            if value is not None and not _valid_position(value):
-                raise LayoutShapeError(f"position for {key!r} must be [x, y] (finite numbers) or null")
+    if positions is None:
+        positions = {}
+    elif not isinstance(positions, dict):
+        raise LayoutShapeError("'positions' must be an object of node id -> [x, y] or null")
+    for key, value in positions.items():
+        if not key:
+            raise LayoutShapeError("a position's node id must be a non-empty string")
+        if value is not None and not _valid_position(value):
+            raise LayoutShapeError(f"position for {key!r} must be [x, y] (finite numbers) or null")
     viewport: Any = ...
     if "viewport" in body:
         viewport = body["viewport"]
         if viewport is not None:
             if not _valid_viewport(viewport) or set(viewport) - {"x", "y", "zoom"}:
                 raise LayoutShapeError("'viewport' must be {x, y, zoom} with finite numbers and zoom > 0, or null")
-    return positions, viewport
+    return scope, positions, viewport, reset
 
 
-def save_layout(project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
-    """Merge a validated layout body into canvas.json and write it
-    atomically (no backup -- section 8.6). Only ids named in `positions`
-    change; `null` deletes that id. Returns the merged layout."""
-    positions, viewport = parse_layout_body(body)
+def save_layout(conn: Connection, project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Merge a validated layout body into ITS view of canvas.json and write
+    the file atomically (no backup -- section 8.6). Returns that view.
+
+    The graph bounds what the file can hold, so a page cannot grow it with
+    keys it invents: the scope must be `all` or an attempt in the graph
+    (`UnknownScopeError`), a position may be SET only for a card that view
+    shows (`LayoutShapeError` otherwise -- `null` may delete any id, which
+    only shrinks the file), and views of attempts the graph no longer has
+    are dropped on the way out. Within the view only the ids a request
+    names change, so two pages (or the debounced drag and a later one)
+    never wipe each other's unrelated positions."""
+    scope, positions, viewport, reset = parse_layout_body(body)
+    visible = view_card_ids(conn, project_root, scope)
+    stray = sorted(k for k, v in positions.items() if v is not None and k not in visible)
+    if stray:
+        raise LayoutShapeError(
+            f"{len(stray)} position(s) name a card scope {scope!r} does not show, e.g. {stray[0]!r}"
+        )
+    live = {SCOPE_ALL} | {a["id"] for a in db.get_nodes_by_type(conn, "attempt")}
     with _LAYOUT_LOCK:
-        layout = load_layout(project_root)
-        for key, value in (positions or {}).items():
+        views = {k: v for k, v in load_views(project_root).items() if k in live}
+        view = views.setdefault(scope, _empty_view())
+        if reset:
+            view["positions"] = {}
+        for key, value in positions.items():
             if value is None:
-                layout["positions"].pop(key, None)
+                view["positions"].pop(key, None)
             else:
-                layout["positions"][key] = [float(value[0]), float(value[1])]
+                view["positions"][key] = [float(value[0]), float(value[1])]
         if viewport is not ...:
-            layout["viewport"] = (
+            view["viewport"] = (
                 None if viewport is None else {k: float(viewport[k]) for k in ("x", "y", "zoom")}
             )
         path = paths.canvas_state_path(project_root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(layout, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        data = json.dumps({"views": views}, ensure_ascii=False, sort_keys=True).encode("utf-8")
         mapedit.atomic_replace_bytes(path, data)
-    return layout
+    return view
