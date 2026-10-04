@@ -932,30 +932,39 @@ confirm → file write → graph follows" shape as writing an attempt row.
 
 ### 8.4 Layout
 
-**Auto-layout is a property of the view; memory is a property of the
-card.** A card the researcher has moved has a saved position, and that
-position is global — it is where the card is, in every scope. A card with
-no saved position has no position at all: it is laid out fresh, among the
-cards *visible in the current view only*, every time the view is drawn.
-(The first implementation laid unsaved cards out over the whole graph so
-that they would "keep their place across scopes"; on the researcher's real
-project that scattered the ten cards of the current attempt across 4,000px
-and the default view opened as dust at 25% zoom. A suggestion is not a
-memory; the default view must open compact and legible.)
+**Auto-layout is a suggestion; an arrangement is a memory, and each view
+keeps its own.** Until the researcher moves something, a view (a scope,
+8.7) is laid out fresh each time it is drawn, among the cards visible in
+that view only. The first time they move a card in a view, the whole view
+is *pinned*: every visible card's position at that moment is saved for
+that view, and from then on nothing in it moves unless they move it — the
+ComfyUI contract. A card that appears later in a pinned view (a new script
+after a re-ingest, a ghost) is placed by the steps below, clear of the
+pinned cards, and joins the arrangement the next time anything is moved.
+The same card may sit in different places in two views — an attempt's view
+and 全部 are two pictures of one project, like two diagrams of one model.
 
-The layout, client-side and with no library, in five steps:
+(Two earlier rules failed on the researcher's real project and are
+recorded so they are not tried again. *Global positions with a global
+layout* scattered the ten cards of the current attempt across 4,000px, and
+the default view opened as dust at 25% zoom. *Global positions with a
+per-view layout, only moved cards saved* meant that nudging one card pulled
+it out of its pipeline: on the next layout its neighbours re-packed without
+it and the pipeline came apart.)
 
-1. **Islands.** Split the visible cards into connected components (links
-   taken as undirected). A research project is many small pipelines, not
-   one deep graph; each pipeline is laid out on its own. For this purpose
-   only, a ghost (8.1) counts as linked to the step script of its own
+The layout of unpinned cards, client-side and with no library:
+
+1. **Islands.** Split the cards into connected components (links taken as
+   undirected). A research project is many small pipelines, not one deep
+   graph; each pipeline is laid out on its own. For this purpose only, a
+   card with no links counts as linked to the step script of its own
    attempt that shares its numeric step prefix (`17-….pdf` with
    `17-….Rmd`), so an output waiting to be connected sits beside the
    script that most plausibly made it — placement, never an asserted edge.
 2. **Layer** within an island = longest path from a source. A dataset
    nobody writes is layer 0; a script is 1 + max(layer of the datasets it
    reads); a dataset or figure some script writes is that script's layer +
-   1; a ghost sits one layer right of its step-prefix script. (This is
+   1; a step-prefix companion sits one layer right of its script. (This is
    what makes the researcher's own pipeline read correctly: `16.py` writes
    `topicshift_monthly.csv`, which `17.Rmd` and `18.Rmd` read, so 17/18
    sit two columns right of 16 rather than beside it.) Cycles, should a
@@ -964,29 +973,32 @@ The layout, client-side and with no library, in five steps:
 3. **Order within a layer** by one barycenter pass (mean y of already
    placed neighbors), ties broken by the numeric step prefix of the path
    so step order survives. Columns 320px apart, rows packed with 24px
-   gaps. A layer taller than 12 cards wraps into side-by-side sub-columns
-   of at most 12 (220px apart, inside the same layer band, which widens to
-   hold them) so no island becomes a tower.
-4. **Loose cards** — visible cards with no links and no step-prefix
-   script — are not islands of one. They are gathered into a single grid
-   block titled 「未连线」 (quiet mono caption, `--ink-soft`), 4 columns
-   wide, ordered by type then path.
-5. **Packing.** Islands are placed in rows, left to right, wrapping to a
-   new row when the row would exceed the target width W = max(widest
-   island, √(1.6 × total island area)) — a page shaped like the window
-   rather than a strip — with 96px between islands. Order: the island
-   holding the current attempt's scripts first, then by card count
-   descending, ties by the smallest step prefix; 「未连线」 last.
+   gaps. A layer taller than 12 cards wraps into balanced side-by-side
+   sub-columns of at most 12 (a 220px gap between them, inside the same
+   layer band, which widens to hold them) so no island becomes a tower.
+4. **Loose cards** — cards with no links and no step-prefix script — are
+   not islands of one. They are gathered into a single grid block titled
+   「未连线」 (quiet mono caption, `--ink-soft`), ordered by type then path,
+   and shaped like the page rather than a strip: at least 4 columns, more
+   when needed to bring the block toward 1.6:1.
+5. **Packing.** Islands are placed in rows, left to right, 96px apart,
+   wrapping to a new row at a target width. The target is at least W =
+   max(widest island, √(1.6 × total island area)); the packer tries wider
+   targets up to 2.5 × W and keeps the page closest to 1.6:1 (W alone
+   leaves ragged rows and a page taller than it is wide). Order: the
+   island holding the current attempt's scripts first, then by card count
+   descending, ties by the smallest step prefix; 「未连线」 last. Blocks
+   are packed clear of any pinned card.
 
-Saved positions always win: a saved card is drawn where it was put and
-takes no part in steps 1–5 except as a fixed neighbor for the barycenter
-of unsaved cards linked to it. Frames (8.1) are drawn around each
-attempt's scripts after placement and never move cards. 「重新排列」 in the
-toolbar overflow discards the saved positions of the *visible* cards and
-therefore asks first (「将丢弃你手动摆放的位置」). Fit-all never moves
-cards; it moves the camera, and on entering a view with no saved viewport
-the camera fits all — the scope the researcher opens on must be readable
-without touching anything.
+「重新排列」 in the toolbar overflow forgets *this view's* arrangement and
+therefore asks first (「将丢弃你在这个视图里摆放的位置」). The camera: on
+entering a view with no saved viewport it fits all — the scope the
+researcher opens on must be readable without touching anything — and until
+they pan or zoom, it re-fits when the window is resized. Fit-all never
+moves cards. When an unpinned view re-lays itself out because its links
+changed (a link was just confirmed), the camera holds the card the
+researcher was working on at the same point on screen, so the canvas moves
+under their hand rather than away from it.
 
 ### 8.5 Human mappings are a file: `.rce/mappings.toml`
 
@@ -1036,15 +1048,18 @@ Rules:
   *allowed* — the human is asserting the machine missed nothing/was wrong,
   and both lines will show, distinguishable by style.
 
-### 8.6 Layout state is not truth: `.rce/canvas.json`
+### 8.6 Layout state is not truth: `canvas.json`
 
-Node positions and the last viewport are UI state — machine-managed JSON,
-safe to delete (everything re-lays out), not something the researcher is
-expected to read: `{"positions": {"script:复现包_分步/16-….py": [x, y], …},
-"viewport": {"x": …, "y": …, "zoom": …}}`. Written atomically by a
-debounced `POST /api/canvas/layout`; never backed up (there is nothing
-irreplaceable in it). A missing or corrupt file degrades to "no saved
-positions", never to an error the user sees.
+Arrangements and viewports are UI state — machine-managed JSON kept beside
+the graph (8.10), safe to delete (everything re-lays out), not something
+the researcher is expected to read. One entry per view:
+`{"views": {"all": {"positions": {"script:复现包_分步/16-….py": [x, y], …},
+"viewport": {"x": …, "y": …, "zoom": …}}, "attempt:…#16": {…}}}`. Written
+atomically by a debounced `POST /api/canvas/layout` that names its scope;
+a scope the project does not have is refused, so the file cannot grow keys
+a page invents. Never backed up (there is nothing irreplaceable in it). A
+missing, corrupt, or older-format file degrades to "nothing saved", never
+to an error the user sees.
 
 ### 8.7 Scope and search
 
@@ -1055,8 +1070,10 @@ most recent) and offers 全部 plus every attempt. Scoping to an attempt
 shows its step scripts, every dataset/figure they touch, and one hop
 further along `writes → reads` chains so upstream generators stay visible;
 its frame is drawn; other attempts' nodes are simply absent, not dimmed.
-A position the researcher has *set* is global (8.4); unsaved cards are laid
-out per view. Switching scope clears the selection and any pinned link
+Each view keeps its own arrangement and viewport (8.4, 8.6). Frames are
+drawn in attempt views only: in 全部 an attempt's scripts are spread
+through a larger pipeline and a bounding frame would swallow cards that
+are not its own. Switching scope clears the selection and any pinned link
 card — they belong to the view that was left. Search
 (「查找节点…」) highlights matching nodes and dims the rest without
 changing scope; Enter fits the camera to the matches.
@@ -1080,7 +1097,7 @@ Binding glossary (one term per concept, everywhere it appears):
 |---|---|
 | Reads / READS | 读取 |
 | Writes / WRITES | 写出 |
-| No recorded reads or writes. | RCE 没有读到这个文件的读写。 |
+| No recorded reads or writes. | 没有读到读写记录。 |
 | Orphan inputs | 无来源输入 |
 | READ BY | 被这些脚本读取 |
 | WRITTEN BY | 由这些脚本写出 |
@@ -1096,7 +1113,19 @@ Binding glossary (one term per concept, everywhere it appears):
 
 Anything not in the table is translated in the same register — short,
 concrete, no jargon — and the same English source always gets the same
-Chinese. The command line stays English (it is a developer surface, and
+Chinese.
+
+**Errors.** A hover title is acceptable for a passive chip; it is not
+acceptable as the only place an error lives when that error has just
+blocked something the researcher tried to do (saving an attempt row,
+confirming a link, switching project, opening a file, stopping the
+service). Those show, in order: a specific Chinese sentence when the
+engine names the cause with a machine-readable code (the attempt form's
+own cases — a number that already exists, a number that is not in the
+table, an invisible line-break character in a cell, a table that can no
+longer be found — each get one); otherwise the Chinese framing; and in
+both cases a 「详情」 toggle that reveals the engine's raw text inline, in
+small mono `--ink-soft`. One click, never a hover. The command line stays English (it is a developer surface, and
 its messages are quoted in docs and tests).
 
 ### 8.9 The native shell: `RCE.app`
@@ -1235,4 +1264,7 @@ and adopted as design:
   refuses and keeps serving.
 - **The last tab is remembered; the scope is not.** Reopening the app
   returns to the view last used, always on the current attempt.
+- **A frame holds its own.** A frame is drawn around its members outside
+  the 「未连线」 block, so one stray step file cannot stretch it across the
+  page.
 
