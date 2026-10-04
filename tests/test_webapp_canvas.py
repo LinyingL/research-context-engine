@@ -458,19 +458,30 @@ def test_a_write_is_bounded_by_the_graph(project):
     page invents. Deleting (null) any id only shrinks it."""
     with pytest.raises(canvas.UnknownScopeError):
         _save(project, {"scope": "attempt:map.md#99", "positions": {PY16: [1, 2]}})
-    with pytest.raises(canvas.LayoutShapeError):
-        _save(project, {"scope": A17, "positions": {RMD18: [1, 2]}})  # 18 is not in #17's view
-    with pytest.raises(canvas.LayoutShapeError):
-        _save(project, {"scope": "all", "positions": {"dataset:invented.csv": [1, 2]}})
     assert not paths.canvas_state_path(project).exists()
     _save(project, {"scope": A17, "positions": {"dataset:gone.csv": None, PDF17: [1, 2]}})  # a ghost is a card
     assert canvas.load_layout(project, A17)["positions"] == {PDF17: [1.0, 2.0]}
 
 
-def test_views_of_attempts_the_graph_lost_are_dropped_on_write(project):
+def test_a_card_the_view_no_longer_shows_is_skipped_not_refused(project):
+    """A card can leave the view between the page's fetch and its save (an
+    output deleted while the canvas is open). Its position is skipped; the
+    rest of the write -- the researcher's move -- lands (verifier finding:
+    refusing the whole write made every later save of the view fail)."""
+    view = _save(project, {"scope": A17, "positions": {RMD18: [1, 2], RMD17: [3, 4]}})  # 18 is not in #17's view
+    assert view["positions"] == {RMD17: [3.0, 4.0]}
+    _save(project, {"scope": "all", "positions": {"dataset:invented.csv": [1, 2]}, "viewport": {"x": 0, "y": 0, "zoom": 1}})
+    assert canvas.load_layout(project, "all") == {"positions": {}, "viewport": {"x": 0.0, "y": 0.0, "zoom": 1.0}}
+
+
+def test_a_write_keeps_views_of_attempts_the_graph_lacks_right_now(project):
+    """A row cut and pasted back in the map (an autosaving editor) removes
+    its attempt for a moment; an unrelated write meanwhile (a pan in 全部)
+    must not forget that attempt's pinned arrangement (verifier finding)."""
     _write_state(project, {"views": {"attempt:map.md#99": {"positions": {"x": [1, 2]}}, A18: {"positions": {RMD18: [1, 2]}}}})
     _save(project, {"scope": "all", "positions": {RAW: [3, 4]}})
-    assert set(canvas.load_views(project)) == {"all", A18}
+    assert set(canvas.load_views(project)) == {"all", A18, "attempt:map.md#99"}
+    assert canvas.load_layout(project, "attempt:map.md#99")["positions"] == {"x": [1.0, 2.0]}
 
 
 def test_layout_save_recovers_a_corrupt_file(project):
@@ -774,12 +785,16 @@ def test_http_edge_body_must_be_four_strings(live):
     assert status == 400 and "extractor" in payload["error"]
 
 
+def _proj(root: Path) -> str:
+    return str(Path(root).resolve())
+
+
 def test_http_layout_merge_per_view_and_bad_body(live):
     base, root, _ = live
     q17 = "/api/canvas?scope=" + urllib.parse.quote(A17)
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {PY16: [10, 20], RMD17: [30, 40]}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": A17, "positions": {PY16: [10, 20], RMD17: [30, 40]}})
     assert status == 200 and payload["positions"] == 2 and payload["scope"] == A17
-    status, _ = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {PY16: None}, "viewport": {"x": 1, "y": 2, "zoom": 1.5}})
+    status, _ = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": A17, "positions": {PY16: None}, "viewport": {"x": 1, "y": 2, "zoom": 1.5}})
     assert status == 200
     _, view = _call(base, "GET", q17)
     assert view["positions"] == {RMD17: [30.0, 40.0]}
@@ -790,16 +805,16 @@ def test_http_layout_merge_per_view_and_bad_body(live):
     # 全部 is a different view: nothing of #17's arrangement shows there.
     _, whole = _call(base, "GET", "/api/canvas?scope=all")
     assert whole["positions"] == {} and whole["viewport"] is None and whole["frames"] == []
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {PY16: [1, "x"]}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": A17, "positions": {PY16: [1, "x"]}})
     assert status == 400 and "finite" in payload["error"]
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"positions": {PY16: [1, 2]}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "positions": {PY16: [1, 2]}})
     assert status == 400 and "scope" in payload["error"]
 
 
 def test_http_layout_reset_forgets_the_view(live):
-    base, _, _ = live
-    _call(base, "POST", "/api/canvas/layout", {"scope": "all", "positions": {RAW: [1, 2], PY16: [3, 4]}})
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": "all", "reset": True})
+    base, root, _ = live
+    _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": "all", "positions": {RAW: [1, 2], PY16: [3, 4]}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": "all", "reset": True})
     assert status == 200 and payload["positions"] == 0
     _, whole = _call(base, "GET", "/api/canvas?scope=all")
     assert whole["positions"] == {}
@@ -807,13 +822,31 @@ def test_http_layout_reset_forgets_the_view(live):
 
 def test_http_layout_refuses_an_invented_scope_or_card(live):
     base, root, _ = live
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": "attempt:map.md#99", "positions": {PY16: [1, 2]}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": "attempt:map.md#99", "positions": {PY16: [1, 2]}})
     assert status == 404 and "#99" in payload["error"]
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": "anything", "viewport": {"x": 0, "y": 0, "zoom": 1}})
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": "anything", "viewport": {"x": 0, "y": 0, "zoom": 1}})
     assert status == 404
-    status, payload = _call(base, "POST", "/api/canvas/layout", {"scope": A17, "positions": {RMD18: [1, 2]}})
-    assert status == 400 and "does not show" in payload["error"]
     assert not paths.canvas_state_path(root).exists()
+    status, payload = _call(base, "POST", "/api/canvas/layout", {"project": _proj(root), "scope": A17, "positions": {RMD18: [1, 2]}})
+    assert status == 200 and payload["positions"] == 0  # a card #17 does not show is skipped
+
+
+def test_http_layout_must_name_the_project_its_page_shows(live, tmp_path):
+    """A page still showing project B posts after another window switched
+    the server to A: the write is refused (409, state project_changed) and
+    A's canvas.json is untouched (verifier finding). GET /api/canvas names
+    the project every write must echo."""
+    base, root, _ = live
+    _, view = _call(base, "GET", "/api/canvas")
+    assert view["project"] == _proj(root)
+    body = {"scope": "all", "positions": {PY16: [1, 2]}}
+    status, payload = _call(base, "POST", "/api/canvas/layout", dict(body, project=str(tmp_path)))
+    assert status == 409 and payload.get("state") == "project_changed"
+    status, payload = _call(base, "POST", "/api/canvas/layout", body)
+    assert status == 400 and "project" in payload["error"]
+    assert not paths.canvas_state_path(root).exists()
+    status, _ = _call(base, "POST", "/api/canvas/layout", dict(body, project=view["project"]))
+    assert status == 200 and canvas.load_layout(root, "all")["positions"] == {PY16: [1.0, 2.0]}
 
 
 def test_http_layout_corrupt_file_degrades_on_read(live):
@@ -868,6 +901,8 @@ def test_http_new_endpoints_reject_wrong_host(live, method, path, body):
 @pytest.mark.parametrize("method, path, body", _ENDPOINTS[:3])
 def test_http_new_endpoints_accept_the_portless_loopback_origin(live, method, path, body):
     """The Safari/WebKit shape (8.9 "Origin"): the shell adds no new one."""
-    base, _, _ = live
+    base, root, _ = live
+    if path == "/api/canvas/layout":
+        body = dict(body, project=_proj(root))
     status, _ = _call(base, method, path, body, headers={"Origin": "http://127.0.0.1"})
     assert status == 200

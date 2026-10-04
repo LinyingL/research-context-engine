@@ -685,6 +685,7 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 const state = {
   attemptsById: new Map(), projectLabel: "", panelSubject: null,
   attemptsConfig: null, projectState: null,
+  headerError: false, // the header line holds a blocking error (showHeaderError)
 };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
@@ -963,20 +964,41 @@ function basename(path) {
   return parts.length ? parts[parts.length - 1] : String(path);
 }
 
-async function loadProjectSummary() {
+// A blocked action's error in the header line (8.8 "Errors": switching
+// project, removing missing ones, stopping the service, the Finder
+// commands). It stays until the researcher clicks the line or a later
+// action of theirs rewrites it: the summary refresh every generation bump
+// makes (an editor autosave, a knit) must not wipe it unread (verifier
+// finding), so loadProjectSummary leaves the line alone meanwhile.
+function showHeaderError(framing, err) {
+  renderBlockingError(document.getElementById("project-line"), framing, err);
+  state.headerError = true;
+}
+
+document.getElementById("project-line").addEventListener("click", (e) => {
+  if (!state.headerError || e.target.closest(".err-detail")) return; // reading the detail is not dismissing
+  loadProjectSummary(true);
+});
+
+// `force`: a researcher's action rewrites the line, a header error included.
+async function loadProjectSummary(force) {
   const line = document.getElementById("project-line");
+  if (force) state.headerError = false;
   try {
     const data = await apiGet("/api/summary");
+    state.attemptsConfig = data.attempts_config || null;
+    if (state.headerError) return;
     // Registry label when loadProjects() found one, else the directory
     // basename -- never the raw path, which lives on as the hover title.
     const label = state.projectLabel || basename(data.project_root);
     line.textContent = "项目：" + label + "   ·   待确认：" + data.pending;
     line.title = data.project_root;
-    // The edit form's column names ride along on this same fetch (task V3
-    // phase 3) -- kept fresh here so a config edit mid-serve is picked up
-    // by the next summary refresh, not only by a full page reload.
-    state.attemptsConfig = data.attempts_config || null;
+    // The edit form's column names (attemptsConfig, above) ride along on
+    // this same fetch (task V3 phase 3) -- kept fresh so a config edit
+    // mid-serve is picked up by the next summary refresh, not only by a
+    // full page reload.
   } catch (err) {
+    if (state.headerError) return;
     line.textContent = "";
     line.title = "";
   }
@@ -1067,14 +1089,13 @@ removeMissingBtn.addEventListener("click", async () => {
     "从项目列表里移除这些已经找不到的项目？\n\n" + names +
     "\n\n只是把它们从列表里去掉，不会删除任何文件。"
   )) return;
-  const line = document.getElementById("project-line");
   removeMissingBtn.disabled = true;
   let failed = false;
   try {
     for (const p of dead) await apiPost("/api/projects/remove", { path: p.path });
   } catch (err) {
     // 8.8 "Errors": the Chinese framing, the engine's text behind 「详情」.
-    renderBlockingError(line, "移除失效项目失败", err);
+    showHeaderError("移除失效项目失败", err);
     failed = true;
   }
   // Re-read the registry either way: a partial failure must leave the list
@@ -1082,7 +1103,7 @@ removeMissingBtn.addEventListener("click", async () => {
   await loadProjects();
   // The header line quotes the registry label too -- but after a failure it
   // is holding the error, which the summary refresh would wipe unread.
-  if (!failed) loadProjectSummary();
+  if (!failed) loadProjectSummary(true);
 });
 
 async function reloadAllViews() {
@@ -1100,19 +1121,18 @@ async function reloadAllViews() {
   // immediately re-fetch everything this function just fetched.
   await syncGeneration();
   await loadProjects();
-  loadProjectSummary();
+  loadProjectSummary(true); // the switch succeeded: the line is the new project's
   if (currentView === "tree") loadTreeView();
   else if (currentView === "lineage") loadLineageView();
   else if (currentView === "canvas") RCECanvas.load(views.canvas);
 }
 
 projectSwitcher.addEventListener("change", async () => {
-  const line = document.getElementById("project-line");
   projectSwitcher.disabled = true;
   try {
     await apiPost("/api/projects/switch", { path: projectSwitcher.value });
   } catch (err) {
-    renderBlockingError(line, "切换项目失败", err);
+    showHeaderError("切换项目失败", err);
     await loadProjects(); // resync the select with what the server actually serves
     projectSwitcher.disabled = false;
     return;
@@ -2196,8 +2216,7 @@ document.getElementById("shutdown-btn").addEventListener("click", async () => {
     await apiPost("/api/shutdown", {});
   } catch (err) {
     btn.disabled = false;
-    const line = document.getElementById("project-line");
-    renderBlockingError(line, "停止服务失败", err);
+    showHeaderError("停止服务失败", err);
     return;
   }
   renderStoppedState();
@@ -2248,9 +2267,7 @@ function shellZoom(step) {
 // A failed Finder command reports in the header line, the same spot a
 // failed project switch uses; the engine's own text sits behind 「详情」.
 function shellReport(message, err) {
-  const line = document.getElementById("project-line");
-  if (!line) return;
-  renderBlockingError(line, message, err);
+  showHeaderError(message, err);
 }
 
 async function shellOpen(path, reveal, failure) {

@@ -575,7 +575,7 @@ def test_engine_errors_are_one_click_away_not_visible_english_or_hover_only():
     box = box[: box.index("\n}\n")]
     assert "box.title = " not in box and "出了点问题" in box
     assert 'renderBlockingError(msg, "引擎返回了错误，这一页没能显示。", err)' in box
-    assert 'renderBlockingError(line, "移除失效项目失败", err)' in _APP_SRC
+    assert 'showHeaderError("移除失效项目失败", err)' in _APP_SRC
     status = _CANVAS_SRC[_CANVAS_SRC.index("function showStatus("):]
     status = status[: status.index("\n  }\n")]
     assert "if (err) renderBlockingError(el, text, err);" in status
@@ -761,13 +761,19 @@ def test_a_frame_is_not_stretched_out_to_its_member_in_the_loose_block():
 _SCENARIO_RUNNER = """
 global.window = { confirm: () => { global.asked = (global.asked || 0) + 1; return true; } };
 global.posts = [];
-global.apiPost = async (url, body) => { posts.push({ url, body: JSON.parse(JSON.stringify(body)) }); return { ok: true }; };
+global.apiPost = async (url, body) => {
+  posts.push({ url, body: JSON.parse(JSON.stringify(body)) });
+  if (global.gate) await global.gate;  // a write held in flight
+  if (global.fail) throw global.fail;
+  return { ok: true };
+};
 require(process.argv[1]);
 const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
 const C = window.RCECanvas, S = C._state;
 function enter(payload) {
   S.data = payload;
   S.scope = payload.scope.id;
+  S.project = payload.project || null;
   S.nodes = new Map(payload.nodes.map((n) => [n.id, n]));
   S.positions = Object.assign({}, payload.positions || {});
   S.pinned = Object.keys(S.positions).length > 0;
@@ -789,10 +795,13 @@ def _scenario(script: str, **payload: Any) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
+PROJECT = "/tmp/fixture-project"  # what GET /api/canvas names; every write echoes it
+
+
 def _view(scope: str, nodes: list[str], links: list[dict[str, Any]], positions: dict[str, list[int]] | None = None):
     return {
         "scope": {"id": scope}, "nodes": [_node(n) for n in nodes], "links": links,
-        "frames": [], "step_groups": [], "positions": positions or {}, "scopes": [],
+        "frames": [], "step_groups": [], "positions": positions or {}, "scopes": [], "project": PROJECT,
     }
 
 
@@ -819,7 +828,8 @@ def test_the_first_move_pins_every_visible_card_in_one_post():
     expected[PY16] = [5, 7]
     assert first["body"]["positions"] == expected
     assert "reset" not in first["body"]
-    assert second["body"] == {"scope": "attempt:map.md#17", "positions": {RMD18: [900, 40]}}
+    assert first["body"]["project"] == PROJECT
+    assert second["body"] == {"project": PROJECT, "scope": "attempt:map.md#17", "positions": {RMD18: [900, 40]}}
 
 
 def test_a_move_in_a_pinned_view_also_saves_cards_that_appeared_since():
@@ -841,7 +851,7 @@ def test_a_move_in_a_pinned_view_also_saves_cards_that_appeared_since():
         apart_y = max(y - (sy + _height(sid)), sy - (y + _height(RMD18)))
         assert max(apart_x, apart_y) >= 96, sid
     (post,) = run["posts"]
-    assert post["body"] == {"scope": "all", "positions": {RAW: [10, 500], RMD18: run["out"]["placed"]}}
+    assert post["body"] == {"project": PROJECT, "scope": "all", "positions": {RAW: [10, 500], RMD18: run["out"]["placed"]}}
 
 
 def test_writes_go_to_the_view_they_were_made_in():
@@ -856,8 +866,8 @@ def test_writes_go_to_the_view_they_were_made_in():
       await new Promise((r) => setTimeout(r, 0));
     """, a=_view("attempt:map.md#17", [PY16], []), b=_view("all", [PY16], []), id=PY16)
     assert [p["body"] for p in run["posts"]] == [
-        {"scope": "attempt:map.md#17", "positions": {PY16: [1, 2]}},
-        {"scope": "all", "positions": {PY16: [3, 4]}},
+        {"project": PROJECT, "scope": "attempt:map.md#17", "positions": {PY16: [1, 2]}},
+        {"project": PROJECT, "scope": "all", "positions": {PY16: [3, 4]}},
     ]
 
 
@@ -877,7 +887,7 @@ def test_relayout_asks_then_forgets_this_views_arrangement():
     assert run["out"]["pinned"] is False and run["out"]["positions"] == {}
     assert run["out"]["auto"] == fresh
     (post,) = run["posts"]
-    assert post["body"] == {"scope": "all", "reset": True, "viewport": None}
+    assert post["body"] == {"project": PROJECT, "scope": "all", "reset": True, "viewport": None}
     relayout = _CANVAS_SRC[_CANVAS_SRC.index("function relayout"):]
     relayout = relayout[: relayout.index("\n  }\n")]
     assert "将丢弃你在这个视图里摆放的位置" in relayout
@@ -951,3 +961,108 @@ def test_resize_refits_only_until_the_researcher_moves_the_camera():
         body = _CANVAS_SRC[_CANVAS_SRC.index(handler):]
         body = body[: body.index("\n  }\n")]
         assert "userCamera()" in body, handler
+
+
+# -- a re-fetch never undoes the researcher's hand (verifier findings) ------------
+
+_EL = "{ classList: { add() {}, remove() {} } }"
+
+
+def test_a_refetch_mid_drag_keeps_the_card_under_the_pointer():
+    """A generation bump re-renders while a card is being dragged: the card
+    stays where the pointer has it, the drag goes on with the new element,
+    and the release saves the dragged position (8.4's ComfyUI contract)."""
+    pinned = {i: [k * 320, 0] for k, i in enumerate(PIPELINE_NODES)}
+    view = _view("attempt:map.md#17", PIPELINE_NODES, PIPELINE_LINKS, positions=pinned)
+    run = _scenario(f"""
+      enter(input.view);
+      S.drag = {{ kind: "node", id: input.id, el: {_EL}, sx: 0, sy: 0, start: S.positions[input.id].slice(), moved: true, hadPosition: true }};
+      S.positions[input.id] = [640, 303];  // moveNodeTo, mid-drag
+      C._applyPayload(JSON.parse(JSON.stringify(input.view)));
+      const during = {{ pos: S.positions[input.id], dragging: !!S.drag }};
+      S.drag = null;
+      C._cardMoved(input.id);
+      await C._flushSave();
+      return during;
+    """, view=view, id=RMD17)
+    assert run["out"] == {"pos": [640, 303], "dragging": True}
+    (post,) = run["posts"]
+    assert post["body"]["positions"] == {RMD17: [640, 303]}
+
+
+def test_a_refetch_that_drops_the_dragged_card_ends_the_drag():
+    view = _view("all", PIPELINE_NODES, PIPELINE_LINKS)
+    gone = _view("all", [n for n in PIPELINE_NODES if n != PDF17], [])
+    run = _scenario(f"""
+      enter(input.view);
+      S.drag = {{ kind: "node", id: input.id, el: {_EL}, sx: 0, sy: 0, start: [0, 0], moved: true, hadPosition: false }};
+      S.positions[input.id] = [5, 5];
+      C._applyPayload(input.gone);
+      return {{ drag: S.drag, has: input.id in S.positions }};
+    """, view=dict(view, nodes=view["nodes"] + [_node(PDF17)]), gone=gone, id=PDF17)
+    assert run["out"] == {"drag": None, "has": False}
+
+
+def test_a_refetch_answered_before_the_write_lands_keeps_the_move():
+    """The pinning POST is in flight when a re-fetch is answered from the
+    file as it was: the view stays pinned with the move, and does not
+    re-lay itself out (the in-flight write is laid over the payload)."""
+    view = _view("all", PIPELINE_NODES, PIPELINE_LINKS)
+    run = _scenario("""
+      enter(input.view);
+      let open; global.gate = new Promise((r) => { open = r; });
+      drag(input.id, [0, 768]);
+      const flushing = C._flushSave();
+      C._applyPayload(JSON.parse(JSON.stringify(input.view)));  // the file still has nothing
+      const during = { pos: S.positions[input.id], pinned: S.pinned, inflight: S.inflight.length };
+      open(); await flushing;
+      return Object.assign(during, { after: S.inflight.length });
+    """, view=view, id=RAW)
+    assert run["out"] == {"pos": [0, 768], "pinned": True, "inflight": 1, "after": 0}
+
+
+def test_a_write_for_a_project_the_server_left_is_dropped():
+    """Another window switched the server: the refused write (409
+    project_changed) is not retried, and a payload of the other project
+    drops what was queued here instead of sending it there."""
+    run = _scenario("""
+      enter(input.view);
+      global.fail = Object.assign(new Error("switched"), { state: "project_changed" });
+      drag(input.id, [1, 2]);
+      await C._flushSave();
+      const dropped = S.save.scope;
+      global.fail = null;
+      drag(input.id, [3, 4]);
+      C._applyPayload(Object.assign({}, input.view, { project: "/tmp/other-project" }));
+      await C._flushSave();
+      return { dropped, project: S.project, queued: S.save.scope };
+    """, view=_view("all", [PY16], []), id=PY16)
+    assert run["out"] == {"dropped": None, "project": "/tmp/other-project", "queued": None}
+    assert [p["body"]["project"] for p in run["posts"]] == [PROJECT]
+
+
+def test_an_open_failure_is_not_the_save_chips_message():
+    """8.8: a failed open shows its error until the researcher dismisses
+    it; owned by "save", the next pan's successful save hid it."""
+    body = _CANVAS_SRC[_CANVAS_SRC.index("async function openWithDefaultApp"):]
+    body = body[: body.index("\n  }\n")]
+    assert 'kind: "open"' in body
+
+
+def test_a_header_error_outlives_the_summary_refresh():
+    """8.8: a blocked action's error in the header line (switch project,
+    remove missing, stop the service, the Finder commands) is not wiped by
+    the summary refresh every generation bump makes; only the researcher
+    (a click on the line, a successful switch) replaces it."""
+    summary = _APP_SRC[_APP_SRC.index("async function loadProjectSummary"):]
+    summary = summary[: summary.index("\n}\n")]
+    assert "if (state.headerError) return;" in summary
+    assert 'renderBlockingError(line' not in _APP_SRC and "renderBlockingError(document.getElementById(\"project-line\")" in _APP_SRC
+    for framing in ("切换项目失败", "移除失效项目失败", "停止服务失败"):
+        assert f'showHeaderError("{framing}", err)' in _APP_SRC
+    shell = _APP_SRC[_APP_SRC.index("function shellReport"):]
+    assert "showHeaderError(message, err)" in shell[: shell.index("\n}\n")]
+    refresh = _APP_SRC[_APP_SRC.index("async function refreshCurrentView"):]
+    assert "loadProjectSummary();" in refresh[: refresh.index("\n}\n")]  # not forced
+    reload = _APP_SRC[_APP_SRC.index("async function reloadAllViews"):]
+    assert "loadProjectSummary(true)" in reload[: reload.index("\n}\n")]

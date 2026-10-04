@@ -68,9 +68,9 @@ its own"), `{"views": {<scope id>: {"positions", "viewport"}}}`, the scope
 id being `all` or an attempt node id. It is derived UI state: a missing,
 corrupt or older-format file (or a corrupt entry inside it) degrades to
 "nothing saved", never to an error; writes are atomic but never backed up.
-A write names its view, which must exist in the graph, and may set
-positions only for cards that view shows, so the file's keys are bounded
-by the graph rather than by what a page sends. A merge changes only the
+A write names its view, which must exist in the graph, and sets
+positions only for cards that view shows (others are skipped), so the
+file's keys are bounded by the graph rather than by what a page sends. A merge changes only the
 ids a request names, and `null` deletes one; `reset` forgets the view's
 whole arrangement (「重新排列」).
 """
@@ -515,22 +515,27 @@ def save_layout(conn: Connection, project_root: Path, body: dict[str, Any]) -> d
 
     The graph bounds what the file can hold, so a page cannot grow it with
     keys it invents: the scope must be `all` or an attempt in the graph
-    (`UnknownScopeError`), a position may be SET only for a card that view
-    shows (`LayoutShapeError` otherwise -- `null` may delete any id, which
-    only shrinks the file), and views of attempts the graph no longer has
-    are dropped on the way out. Within the view only the ids a request
-    names change, so two pages (or the debounced drag and a later one)
-    never wipe each other's unrelated positions."""
+    (`UnknownScopeError`), and a position is SET only for a card that view
+    shows -- one for any other id is skipped, not written (`null` may
+    delete any id, which only shrinks the file). Skipped, not refused: a
+    card can leave the view between the page's last fetch and its save (an
+    output deleted by a checkout or a re-knit), and refusing the whole
+    write for it made every later save of that view fail with it.
+
+    Other views are carried over untouched, including views of attempts
+    the graph lacks at this moment: a map row cut and pasted back by an
+    autosaving editor must not cost that attempt's arrangement. Within the
+    view only the ids a request names change, so two pages (or the
+    debounced drag and a later one) never wipe each other's unrelated
+    positions."""
     scope, positions, viewport, reset = parse_layout_body(body)
     visible = view_card_ids(conn, project_root, scope)
     stray = sorted(k for k, v in positions.items() if v is not None and k not in visible)
     if stray:
-        raise LayoutShapeError(
-            f"{len(stray)} position(s) name a card scope {scope!r} does not show, e.g. {stray[0]!r}"
-        )
-    live = {SCOPE_ALL} | {a["id"] for a in db.get_nodes_by_type(conn, "attempt")}
+        logger.info("layout for %s: skipped %d card(s) the view does not show, e.g. %r", scope, len(stray), stray[0])
+    positions = {k: v for k, v in positions.items() if v is None or k in visible}
     with _LAYOUT_LOCK:
-        views = {k: v for k, v in load_views(project_root).items() if k in live}
+        views = load_views(project_root)
         view = views.setdefault(scope, _empty_view())
         if reset:
             view["positions"] = {}

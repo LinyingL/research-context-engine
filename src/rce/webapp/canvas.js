@@ -149,15 +149,17 @@ window.RCECanvas = (function () {
   // moves its cards again. auto: the 8.4 layout of the cards the
   // arrangement does not hold yet; loose: the 「未连线」 cards' rect;
   // layoutKey: what auto was computed for. save: what the next debounced
-  // POST sends, for the ONE view it was made in (emptySave). autoFit: the
+  // POST sends, for the ONE view it was made in (emptySave); inflight:
+  // writes sent and not yet answered, oldest first. project: which project
+  // the payload on screen is of, echoed by every write. autoFit: the
   // camera is a fit the researcher has not touched since, so a resize
   // re-fits it (8.4).
   const cv = {
-    dom: null, container: null, data: null, scope: null,
+    dom: null, container: null, data: null, scope: null, project: null,
     nodes: new Map(), positions: {}, pinned: false, auto: {}, cycle: new Set(), loose: null, looseIds: [], layoutKey: null,
     camera: { x: 0, y: 0, zoom: 1 }, needsFit: false, autoFit: true, resizeObs: null, resizeTimer: null,
     selected: null, hovered: null, query: "",
-    save: emptySave(), saveTimer: null,
+    save: emptySave(), saveTimer: null, inflight: [],
     space: false, drag: null, clickTimer: null, lastClick: null,
     loadSeq: 0, nodeEls: new Map(), linkEls: new Map(), listenersBound: false,
     // Editing (phase 2b): the selected link (its hover card pinned), the
@@ -173,11 +175,11 @@ window.RCECanvas = (function () {
 
   // -- Small helpers ----------------------------------------------------------
 
-  // A layout write for one view (8.6): its positions (null = forget one),
-  // its viewport (undefined = unchanged, null = forget it), and whether it
-  // first forgets the view's whole arrangement (「重新排列」).
+  // A layout write for one view (8.6) of one project: its positions (null
+  // = forget one), its viewport (undefined = unchanged, null = forget it),
+  // and whether it first forgets the view's whole arrangement (「重新排列」).
   function emptySave() {
-    return { scope: null, positions: {}, viewport: undefined, reset: false };
+    return { scope: null, project: null, positions: {}, viewport: undefined, reset: false };
   }
 
   function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
@@ -1161,6 +1163,7 @@ window.RCECanvas = (function () {
   }
 
   function renderScopeSelect() {
+    if (!cv.dom) return; // the node tests run applyPayload without a DOM
     const sel = cv.dom.scope;
     sel.innerHTML = "";
     const all = document.createElement("option");
@@ -1239,6 +1242,7 @@ window.RCECanvas = (function () {
   }
 
   function viewSize() {
+    if (!cv.dom) return { w: 0, h: 0, left: 0, top: 0 };
     const r = cv.dom.svg.getBoundingClientRect();
     return { w: r.width, h: r.height, left: r.left, top: r.top };
   }
@@ -1353,6 +1357,7 @@ window.RCECanvas = (function () {
   function saveSlot() {
     if (cv.save.scope !== null && cv.save.scope !== cv.scope) flushSave();
     cv.save.scope = cv.scope;
+    cv.save.project = cv.project;
     return cv.save;
   }
 
@@ -1389,21 +1394,29 @@ window.RCECanvas = (function () {
     const slot = cv.save;
     cv.save = emptySave();
     if (!slot.scope) return;
-    const body = { scope: slot.scope };
+    const body = { project: slot.project, scope: slot.scope };
     if (slot.reset) body.reset = true;
     if (Object.keys(slot.positions).length) body.positions = slot.positions;
     if (slot.viewport !== undefined) body.viewport = slot.viewport;
-    if (Object.keys(body).length === 1) return;
+    if (Object.keys(body).length === 2) return;
+    // Until it is answered, a re-fetch may still be answered from the file
+    // as it was before this write: applyPayload lays it over that.
+    cv.inflight.push(slot);
     try {
       await apiPost("/api/canvas/layout", body);
       hideStatus("save");
     } catch (err) {
-      // Keep what failed for the next save of the same view, under anything
-      // newer: its reset first, then its positions unless a newer write
-      // replaced them. A failed write for a view already left is dropped.
+      // A write for a project the server no longer serves (switched from
+      // another window) was refused and stays dropped: it is a picture of
+      // the other project. Otherwise keep what failed for the next save of
+      // the same view, under anything newer: its reset first, then its
+      // positions unless a newer write replaced them. A failed write for a
+      // view already left is dropped.
+      if ((err && err.state === "project_changed") || slot.project !== cv.project) return;
       const now = cv.save;
       if (now.scope === null || now.scope === slot.scope) {
         now.scope = slot.scope;
+        now.project = slot.project;
         if (!now.reset) {
           now.reset = slot.reset;
           Object.entries(slot.positions).forEach(([id, p]) => { if (!hasOwn(now.positions, id)) now.positions[id] = p; });
@@ -1411,7 +1424,27 @@ window.RCECanvas = (function () {
         if (now.viewport === undefined) now.viewport = slot.viewport;
       }
       showStatus("位置未能保存，下次移动时会重试", err);
+    } finally {
+      const i = cv.inflight.indexOf(slot);
+      if (i >= 0) cv.inflight.splice(i, 1);
     }
+  }
+
+  // This view's arrangement as this page knows it: what canvas.json holds
+  // for it (`saved`), then this page's writes for it still in flight, then
+  // those not sent yet -- a re-fetch answered from the file before a POST
+  // landed must not undo the move (verifier finding).
+  function arrangementOf(saved) {
+    let positions = Object.assign({}, saved);
+    cv.inflight.concat([cv.save]).forEach((slot) => {
+      if (slot.scope !== cv.scope || slot.project !== cv.project) return;
+      if (slot.reset) positions = {};
+      Object.entries(slot.positions).forEach(([id, p]) => {
+        if (p === null) delete positions[id];
+        else positions[id] = p;
+      });
+    });
+    return positions;
   }
 
   // 「重新排列」(8.4): forget THIS view's arrangement (other views keep
@@ -2061,7 +2094,7 @@ window.RCECanvas = (function () {
     try {
       await apiPost("/api/open", { path: n.path, reveal: false });
     } catch (err) {
-      showStatus("无法打开 " + n.label, err);
+      showStatus("无法打开 " + n.label, err, { kind: "open" }); // not "save": a pan's save must not hide it
     }
   }
 
@@ -2327,24 +2360,40 @@ window.RCECanvas = (function () {
   // UNPINNED view re-laid itself out because its links changed -- then
   // keepCamera holds the card being worked on in place.
   function applyPayload(payload) {
-    const entering = !cv.data || cv.data.scope.id !== payload.scope.id;
+    // Another project under the same page (the server was switched from
+    // another window): a new picture, and nothing queued here is its.
+    const otherProject = !!cv.data && cv.project !== (payload.project || null);
+    if (otherProject) {
+      clearTimeout(cv.saveTimer);
+      cv.save = emptySave();
+    }
+    const entering = !cv.data || otherProject || cv.data.scope.id !== payload.scope.id;
     // Where the camera's anchor cards sit now, before a re-layout moves them.
     const before = {};
     if (!entering) cameraAnchors().forEach((id) => { before[id] = posOf(id).slice(); });
+    // A card drag in progress survives a re-fetch (8.4: nothing moves
+    // unless the researcher moves it): where it is now, laid over below.
+    const drag = cv.drag && cv.drag.kind === "node" ? cv.drag : null;
+    const held = drag && drag.moved && !entering && cv.nodes.has(drag.id) ? posOf(drag.id).slice() : null;
     cv.data = payload;
     mergeOptimistic(payload);
     cv.scope = payload.scope.id;
+    cv.project = payload.project || null;
     cv.nodes = new Map(payload.nodes.map((n) => [n.id, n]));
-    // This view's arrangement: what canvas.json keeps for it, then this
-    // page's own writes for it not sent yet.
-    const slot = cv.save.scope === cv.scope ? cv.save : emptySave();
-    cv.positions = slot.reset ? {} : Object.assign({}, payload.positions);
-    Object.entries(slot.positions).forEach(([id, p]) => {
-      if (p === null) delete cv.positions[id];
-      else cv.positions[id] = p;
-    });
+    cv.positions = arrangementOf(payload.positions);
+    const slot = cv.save.scope === cv.scope && cv.save.project === cv.project ? cv.save : emptySave();
     cv.pinned = Object.keys(cv.positions).length > 0;
     const relaid = layoutView(entering);
+    if (drag) {
+      if (held && cv.nodes.has(drag.id)) cv.positions[drag.id] = held;
+      else if (!drag.moved && !entering && cv.nodes.has(drag.id)) {
+        drag.start = posOf(drag.id).slice(); // not moved yet: it starts from where it is drawn now
+        drag.hadPosition = hasOwn(cv.positions, drag.id);
+      } else {
+        cv.drag = null; // its card left the view, or the view changed under it
+        if (!drag.hadPosition) delete cv.positions[drag.id];
+      }
+    }
     if (relaid && !entering && !cv.pinned) {
       // An unpinned view re-laid out under the researcher's hand.
       const ids = Object.keys(before).filter((id) => cv.nodes.has(id));
@@ -2364,6 +2413,10 @@ window.RCECanvas = (function () {
     if (cv.selectedLink && !payload.links.some((l) => l.id === cv.selectedLink)) cv.selectedLink = null;
     renderScopeSelect();
     render();
+    if (cv.drag && cv.drag.kind === "node") { // re-bound to the card just drawn
+      cv.drag.el = cv.nodeEls.get(cv.drag.id) || cv.drag.el;
+      if (cv.drag.moved) cv.drag.el.classList.add("dragging");
+    }
     if (entering) {
       const vp = slot.viewport !== undefined ? slot.viewport : payload.viewport;
       if (vp) {
@@ -2439,6 +2492,7 @@ window.RCECanvas = (function () {
     Object.assign(cv, {
       data: null, scope: null, nodes: new Map(), positions: {}, pinned: false, auto: {}, cycle: new Set(),
       loose: null, looseIds: [], layoutKey: null, selected: null, hovered: null, save: emptySave(), saveTimer: null,
+      inflight: [], project: null,
       autoFit: true, resizeTimer: null,
       drag: null, lastClick: null, nodeEls: new Map(), linkEls: new Map(),
       selectedLink: null, optimistic: new Map(), focus: null,
@@ -2462,6 +2516,7 @@ window.RCECanvas = (function () {
     _layoutView: layoutView,
     _cardMoved: cardMoved,
     _flushSave: flushSave,
+    _applyPayload: applyPayload,
     _relayout: relayout,
     _keepCamera: keepCamera,
     _frameMembers: frameMembers,

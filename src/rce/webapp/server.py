@@ -91,7 +91,8 @@ Endpoints (all GET unless noted):
                             figures, links, attempt frames, saved positions
                             and scope list (DESIGN.md 8.1/8.7; see
                             `rce.webapp.canvas.build_canvas`).
-    POST /api/canvas/layout -- body `{"scope": "all"|<attempt id>,
+    POST /api/canvas/layout -- body `{"project": <as GET /api/canvas
+                            returned it>, "scope": "all"|<attempt id>,
                             "positions"?: {id: [x, y] | null},
                             "viewport"?: {x, y, zoom} | null,
                             "reset"?: bool}`: merge into THAT view's entry
@@ -341,7 +342,8 @@ class ApiError(Exception):
     the two degraded-project states the design names, the canvas's two
     refusals that have their own product-language sentence
     (`mapping_exists` -> 「这条映射已存在」, `human_link` -> delete the
-    标注 instead), and the attempt form's coded refusals
+    标注 instead), the canvas layout's `project_changed` (the page drops
+    the write, `ProjectChangedError`), and the attempt form's coded refusals
     (`AttemptEditError`, `attempt_*`) carry one; every other error stays a
     plain message the page frames generically."""
 
@@ -1016,12 +1018,34 @@ def attempts_write_payload(
 # -- The node canvas (DESIGN.md section 8, task V4 phase 1b) -----------------
 
 
+def _canvas_project(project_root: Path) -> str:
+    """The identity a canvas payload carries and a layout POST must echo:
+    the served root, compared as a string and never used as a path."""
+    return str(Path(project_root).resolve())
+
+
 def canvas_payload(conn: Connection, project_root: Path, scope: str | None) -> dict[str, Any]:
-    """`rce.webapp.canvas.build_canvas`, with an unknown scope as a 404."""
+    """`rce.webapp.canvas.build_canvas`, with an unknown scope as a 404,
+    plus `project` -- which project this picture is of (see
+    `canvas_layout_payload`)."""
     try:
-        return canvas.build_canvas(conn, project_root, scope)
+        payload = canvas.build_canvas(conn, project_root, scope)
     except canvas.UnknownScopeError as exc:
         raise NotFoundError(str(exc)) from exc
+    payload["project"] = _canvas_project(project_root)
+    return payload
+
+
+class ProjectChangedError(ApiError):
+    """A layout POST made in a page still showing another project: the
+    server was switched (from another window, or RCE.app) after that page
+    fetched its canvas. 409 -- well-formed, but it describes a picture of a
+    project this server no longer serves, and two projects can share card
+    ids (a copied replication package), so writing it would overwrite the
+    other project's arrangement. The page drops such a write."""
+
+    status = 409
+    state = "project_changed"
 
 
 def canvas_layout_payload(conn: Connection, project_root: Path, body: dict[str, Any]) -> dict[str, Any]:
@@ -1029,8 +1053,16 @@ def canvas_layout_payload(conn: Connection, project_root: Path, body: dict[str, 
     8.6). Opened through `_open_conn`, so `_require_db` runs first: the
     file lives in the graph's own directory, which exists only for an
     initialized project, and the graph is what bounds the write -- a scope
-    the project does not have is a 404 (as `GET /api/canvas`), a position
-    for a card that view does not show is a 400."""
+    the project does not have is a 404 (as `GET /api/canvas`); a position
+    for a card that view does not show is skipped. The body must carry the
+    `project` its page's canvas payload named; any other value is a 409
+    (`ProjectChangedError`) and nothing is written."""
+    body = dict(body)
+    project = body.pop("project", None)
+    if not isinstance(project, str) or not project:
+        raise MissingParamError("layout body must carry 'project', as GET /api/canvas returned it")
+    if project != _canvas_project(project_root):
+        raise ProjectChangedError("layout made for another project; this server now serves a different one")
     try:
         view = canvas.save_layout(conn, project_root, body)
     except canvas.UnknownScopeError as exc:

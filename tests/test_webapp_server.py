@@ -801,12 +801,12 @@ def test_served_ui_has_no_hover_only_errors_and_one_detail_helper(live_server):
     assert '"详情"' in html and 'toggle.type = "button"' in html
     assert ".err-detail {" in html and "var(--ink-soft)" in html[html.index(".err-detail {"):][:300]
     for call in (
-        'renderBlockingError(line, "切换项目失败", err)',             # switch project
-        'renderBlockingError(line, "移除失效项目失败", err)',         # remove project
-        'renderBlockingError(line, "停止服务失败", err)',             # stop service
+        'showHeaderError("切换项目失败", err)',                        # switch project
+        'showHeaderError("移除失效项目失败", err)',                    # remove project
+        'showHeaderError("停止服务失败", err)',                        # stop service
         'renderBlockingError(statusEl, reveal ? "无法在 Finder 中显示" : "无法打开", err)',
         "renderBlockingError(statusEl, cnText, err)",                 # attempt form
-        "renderBlockingError(line, message, err)",                    # shell Finder commands
+        "showHeaderError(message, err)",                              # shell Finder commands
     ):
         assert call in html, call
     assert "if (err) renderBlockingError(el, text, err);" in js       # every canvas write
