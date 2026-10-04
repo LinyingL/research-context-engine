@@ -66,6 +66,11 @@ Storage is a single SQLite file at `.rce/graph.db` inside the project,
 alongside `.git` rather than inside it. Two tables — `nodes` and `edges` —
 plus a migrations table. No database server, no message queue, no daemon.
 
+*Superseded in location only (Section 8.10, rule 1): the graph is still a
+single SQLite file per project, but it now lives at
+`~/.rce/graphs/<id>/graph.db`, outside the project, because a project
+folder may be cloud-synced. Everything else in this paragraph stands.*
+
 The confirmation queue is not a third table; it is `edges` filtered by
 `status = 'pending'`.
 
@@ -1117,7 +1122,10 @@ Three failures seen in the first week of real use become rules:
    its own connection and surfaces `ProjectNotInitializedError` as a header
    state (「项目不可用 — 图谱文件已不存在」) that leaves the project switcher
    usable; the watcher, on a missing graph, logs once, sets `last_error`,
-   and stops re-ingesting that root until the file reappears.
+   and stops re-ingesting that root until the file reappears. While a
+   project state (「项目不可用…」/「图谱文件正在从云端下载…」) is showing, the
+   refresh chip (「重扫失败…」) is suppressed — both are true, but one
+   cause deserves one message, and the project state is the cause.
 3. **A registry entry whose directory is gone is shown as such and can be
    removed from the switcher** (「移除失效项目」 next to a disabled entry), so
    the researcher never has to hand-edit `~/.rce/projects.json`.
@@ -1128,4 +1136,6 @@ Minimap; multi-select and box-select; adding an arbitrary project file as a
 node from a picker (ghosts from `step_files` cover the researcher's actual
 case); frames for anything other than attempts; drawing `cites`/`supports`
 links (claims and references are not on this canvas); a Windows/Linux
-shell.
+shell. A project folder that is *moved* gets a new graph id and so an
+empty graph (re-ingest is cheap and deterministic); noticing the orphaned
+graph directory and offering to re-attach it is later work.
