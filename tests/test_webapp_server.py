@@ -695,6 +695,34 @@ def test_canvas_js_carries_the_design_copy_in_product_language():
         assert copy in js, f"missing product-language copy in canvas.js: {copy}"
 
 
+def test_canvas_js_carries_the_editing_copy_in_product_language():
+    """Phase 2b's binding copy (8.1 refusal, 8.3 popover and link actions,
+    8.5 duplicate), pinned the same way -- and nothing on the canvas says
+    node/edge/socket to the user (8.8): those words appear only in code."""
+    js = _CANVAS_JS_FILE.read_text(encoding="utf-8")
+    for copy in (
+        "只能把数据集接到脚本的「读取」插口",             # 8.1 refusal
+        "确认标注", "取消", "备注",                      # 8.3 popover
+        "删除标注", "标记为错误提取", "撤销",              # 8.3 link actions
+        "这条映射已存在", "无法标注",                     # 8.5 / 8.8 error framing
+    ):
+        assert copy in js, f"missing product-language copy in canvas.js: {copy}"
+
+
+def test_canvas_js_writes_only_through_the_canvas_endpoints():
+    """Every POST the canvas makes is one of the origin-checked endpoints
+    the server routes -- no write path exists only in the page."""
+    js = _CANVAS_JS_FILE.read_text(encoding="utf-8")
+    posted = set(re.findall(r'apiPost\("(/api/[\w/]+)"', js))
+    assert posted == {
+        "/api/canvas/layout", "/api/open", "/api/mappings/add", "/api/mappings/delete",
+        "/api/edges/reject", "/api/edges/restore",
+    }
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    for path in posted:
+        assert f'"{path}"' in source, f"canvas.js posts to {path}, which the server does not route"
+
+
 def test_canvas_js_loads_nothing_external():
     """Zero external resources holds for the second served file too. The
     only URL-shaped string allowed is the SVG namespace, an identifier that

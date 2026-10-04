@@ -75,7 +75,7 @@
       server-side from graph edges; this page only renders them.
     - 血缘: GET /api/lineage. Four fixed blocks in report order --
       orphan inputs, chains, broken links, duplicate copies.
-    - 画布 (task V4 phase 2a): GET /api/canvas, drawn by the second served
+    - 画布 (task V4 phases 2a-2b): GET /api/canvas, drawn and edited by the second served
       file, /canvas.js (window.RCECanvas; see its own top comment). This
       page owns only the tab, the full-window "canvas-mode" layout, the
       canvas CSS (kept here with every other style, on the same tokens),
@@ -480,7 +480,10 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 .cv-link.human { stroke: var(--clay); stroke-width: 2.25; }
 .cv-link.cycle { stroke: var(--clay); stroke-width: 1.5; stroke-dasharray: 6 4; }
 .cv-link-g.lit .cv-link.machine { stroke-opacity: 1; }
-.cv-link-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; }
+.cv-link-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; vector-effect: non-scaling-stroke; cursor: pointer; }
+.cv-link.optimistic { stroke-opacity: 0.6; }
+.cv-link-g.selected .cv-link.machine { stroke-opacity: 1; stroke-width: 2.25; }
+.cv-link-g.selected .cv-link.human, .cv-link-g.selected .cv-link.cycle { stroke-width: 3; }
 .cv-link-dot { fill: var(--clay); }
 .cv-node.dim, .cv-link-g.dim { opacity: 0.22; }
 
@@ -534,6 +537,46 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
   padding: 0.25rem 0.55rem; box-shadow: 0 2px 8px rgba(38, 34, 27, 0.1);
 }
 .cv-tip.human { border-color: var(--clay); }
+/* Link editing (phase 2b): the curve being drawn, the socket halos, the
+   confirm popover, the pinned link card, the right-click menu. */
+.cv-root.on-socket .cv-svg, .cv-root.on-socket .cv-node,
+.cv-root.linking .cv-svg, .cv-root.linking .cv-node { cursor: crosshair; }
+.cv-draft { pointer-events: none; }
+.cv-draft-path { fill: none; stroke: var(--clay); stroke-width: 2.25; stroke-opacity: 0.85; }
+.cv-socket-halo {
+  fill: var(--clay-soft); stroke: var(--clay); stroke-width: 1; stroke-opacity: 0.5; pointer-events: none;
+  transform-box: fill-box; transform-origin: center; animation: cv-pulse 1.1s ease-in-out infinite;
+}
+@keyframes cv-pulse { 0%, 100% { transform: scale(1); opacity: 0.95; } 50% { transform: scale(1.5); opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .cv-socket-halo { animation: none; } }
+.cv-node.link-no .cv-socket.in, .cv-node.link-no .cv-socket-label.in { opacity: 0.25; }
+.cv-node.link-hot .cv-socket.in { fill: var(--clay); stroke: var(--clay); }
+.cv-pop {
+  position: absolute; z-index: 4; width: 21rem; max-width: calc(100% - 16px);
+  background: var(--paper); border: 1px solid var(--clay); padding: 0.7rem 0.8rem;
+  box-shadow: 0 4px 14px rgba(38, 34, 27, 0.14); user-select: text; -webkit-user-select: text;
+}
+.cv-pop-line { font-size: 0.86rem; color: var(--ink); line-height: 1.45; word-break: break-all; margin-bottom: 0.6rem; }
+.cv-pop-field { display: block; }
+.cv-pop-note { font-size: 0.8rem; }
+.cv-pop-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.65rem; }
+.cv-linkcard {
+  position: absolute; z-index: 3; max-width: 22rem;
+  font-size: 0.76rem; color: var(--ink); background: var(--paper); border: 1px solid var(--line-strong);
+  padding: 0.35rem 0.6rem; box-shadow: 0 2px 8px rgba(38, 34, 27, 0.1);
+}
+.cv-linkcard.human { border-color: var(--clay); }
+.cv-linkcard-assert { word-break: break-all; }
+.cv-linkcard-hint { color: var(--ink-soft); margin-top: 0.1rem; }
+.cv-linkcard-actions { display: flex; gap: 0.8rem; margin-top: 0.3rem; }
+.cv-text-btn, .cv-status-action {
+  font: inherit; font-size: 0.74rem; color: var(--clay); background: none; border: none; padding: 0;
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.cv-text-btn:hover, .cv-status-action:hover { color: var(--ink); }
+.cv-status.notice { color: var(--ink); background: var(--paper); border-color: var(--line-strong); }
+.cv-status-action { margin-left: 0.6rem; }
+.cv-ctx { top: auto; right: auto; z-index: 4; }
 .cv-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 2rem; text-align: center; color: var(--ink-soft); font-size: 0.88rem; pointer-events: none; }
 
 @media (max-width: 720px) {

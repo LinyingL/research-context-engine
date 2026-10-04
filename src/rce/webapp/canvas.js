@@ -1,5 +1,5 @@
 /*
-  RCE node canvas (DESIGN.md section 8, task V4 phase 2a): the 「画布」 view.
+  RCE node canvas (DESIGN.md section 8, task V4 phases 2a-2b): the 「画布」 view.
 
   Served verbatim by rce.webapp.server at GET /canvas.js (same read-fresh,
   same origin-check discipline as app.html) and loaded by app.html with a
@@ -11,9 +11,8 @@
   which time the inline script has defined them. Wrapped in one IIFE so no
   name here can collide with the page's own top-level declarations.
 
-  What this phase draws (8.0-8.4, 8.7, 8.8) -- rendering, navigation and
-  moving cards; NO link editing yet (the next phase builds on the small
-  named functions below):
+  What phase 2a draws (8.0-8.4, 8.7, 8.8) -- rendering, navigation and
+  moving cards:
 
     - an SVG canvas on --paper with a 24px dot grid in --line (dots, not
       lines -- lines fight the Béziers); pan by dragging empty canvas,
@@ -34,9 +33,28 @@
       saved position always wins), positions persisted debounced 400ms
       through POST /api/canvas/layout, which also keeps the viewport.
 
-  The page never writes the graph from here: this phase's only write is
-  canvas.json (UI state, section 8.6), and the server confines that to a
-  path computed from the served root alone.
+  What phase 2b adds (8.1 grammar, 8.2 link states, 8.3, 8.5) -- editing:
+
+    - drag from an OUTPUT socket to draw a link; compatible inputs pulse,
+      the rest dim; the drop is checked against ONE table (LINK_RULES)
+      that mirrors rce.ingest.mappings.GRAMMAR -- an incompatible drop
+      gets its one-line refusal, a drop on nothing does nothing;
+    - the confirm popover (assertion line, 备注, 确认标注 / 取消) -> POST
+      /api/mappings/add, the human link drawn optimistically and
+      reconciled by the re-fetch, taken back with a Chinese chip (engine
+      text on hover) if the write fails;
+    - click a link to select it and pin its card; right-click or the
+      card's text button: 删除标注 (human, also Backspace/Delete) ->
+      /api/mappings/delete, 标记为错误提取 (machine) -> /api/edges/reject
+      with 「撤销」 -> /api/edges/restore offered on the chip.
+
+  The page never writes the graph directly from here. Its writes are
+  canvas.json (UI state, section 8.6) and the three canvas write
+  endpoints, which take only paths/ids and resolve every file location
+  server-side (mappings.toml from the served root alone, confined like
+  every other path); a status change goes through the human-only
+  db.set_edge_status path. Every drop is re-validated by the server --
+  the JS grammar only spares a round trip.
 */
 "use strict";
 
@@ -82,6 +100,28 @@ window.RCECanvas = (function () {
     "badge-gray": "gray", "badge-plain": "plain",
   };
 
+  // 8.1's socket grammar -- the whole of what a human may draw -- as ONE
+  // table: an output socket (card type + output index into SOCKETS) -> the
+  // card type whose single input it may join, the edge type that makes,
+  // and the one-line refusal for any other drop. Every card has exactly
+  // one input (index 0), so the target needs no socket name. It mirrors
+  // rce.ingest.mappings.GRAMMAR (entry direction: from = this card, to =
+  // the target) and a test pins the two together; the server stays the
+  // authority, this only spares the user a round trip and lights the
+  // right sockets while dragging.
+  const LINK_RULES = {
+    "dataset:0": { toType: "script", type: "reads", refusal: "只能把数据集接到脚本的「读取」插口" },
+    "script:0": { toType: "dataset", type: "writes", refusal: "「写出」只能接到数据集的「来源」插口" },
+    "script:1": { toType: "figure", type: "generates", refusal: "「生成」只能接到图表的「生成自」插口" },
+  };
+  const DUPLICATE_TEXT = "这条映射已存在";
+  // Sockets are 10px to the eye but at least this many SCREEN pixels to
+  // the pointer, at every zoom (8.3 edge case: hit-testable at 25%) -- the
+  // hit test is geometric, so the visual never grows.
+  const SOCKET_HIT_PX = 12;
+  const NOTICE_MS = 5000;     // a refusal or a done-notice fades on its own
+  const UNDO_MS = 10000;      // 「撤销」 stays offered this long
+
   const STORAGE_SCOPE_PREFIX = "rce.canvas.scope:";
 
   // -- State --------------------------------------------------------------------
@@ -97,6 +137,12 @@ window.RCECanvas = (function () {
     pending: {}, viewportDirty: false, saveTimer: null,
     space: false, drag: null, clickTimer: null, lastClick: null,
     loadSeq: 0, nodeEls: new Map(), linkEls: new Map(), listenersBound: false,
+    // Editing (phase 2b): the selected link (its hover card pinned), the
+    // open confirm popover, the open right-click menu, links drawn
+    // optimistically while their write is in flight (keyed by the entry
+    // they assert), and what the chip at the bottom currently says.
+    selectedLink: null, pop: null, ctx: null, optimistic: new Map(),
+    statusKind: null, statusTimer: null,
   };
 
   // -- Small helpers ----------------------------------------------------------
@@ -257,6 +303,65 @@ window.RCECanvas = (function () {
       x: (e.x1 + 3 * c.c1x + 3 * c.c2x + e.x2) / 8,
       y: (e.y1 + 3 * c.c1y + 3 * c.c2y + e.y2) / 8,
     };
+  }
+
+  // -- Link grammar and socket hit-testing (8.1 / 8.3) -------------------------
+  // Pure functions over plain node objects ({id, type, path, label?}) so
+  // the node test runner can pin them without a DOM.
+
+  function nodeLabel(n) {
+    return n.label || String(n.path).split("/").pop();
+  }
+
+  // Can output socket `outIndex` of `fromNode` join input `inIndex` of
+  // `toNode`? Returns {ok: true, type, from, to} -- the mappings.toml entry
+  // the link would append (from/to are project-relative paths, entry
+  // direction) -- or {ok: false, reason} with the one-line refusal in
+  // product language. `links` are the drawn links: an existing HUMAN link
+  // asserting the same entry is the server's 409 said early (8.5); a
+  // machine link with the same ends is no obstacle -- the human may assert
+  // what the machine also found, and both lines show.
+  function checkConnection(fromNode, outIndex, toNode, inIndex, links) {
+    const rule = LINK_RULES[fromNode.type + ":" + outIndex];
+    if (!rule) return { ok: false, reason: "这个插口不能连线" };
+    if (!toNode || toNode.id === fromNode.id || inIndex !== 0 || toNode.type !== rule.toType) {
+      return { ok: false, reason: rule.refusal };
+    }
+    const dup = (links || []).some((l) => l.human && l.from === fromNode.id && l.to === toNode.id && l.type === rule.type);
+    if (dup) return { ok: false, reason: DUPLICATE_TEXT };
+    return { ok: true, type: rule.type, from: fromNode.path, to: toNode.path };
+  }
+
+  // The confirm popover's one assertion line (8.3's own example:
+  // 「17-….Rmd 生成 → 17-….pdf」). A script is the actor of both its verbs,
+  // so a 读取 names the script first; the arrow still points the way the
+  // data flows, matching the link on screen.
+  function assertionText(fromNode, toNode, type) {
+    const a = nodeLabel(fromNode), b = nodeLabel(toNode);
+    if (type === "reads") return b + " 读取 ← " + a;
+    if (type === "writes") return a + " 写出 → " + b;
+    if (type === "generates") return a + " 生成 → " + b;
+    return a + " → " + b;
+  }
+
+  // The nearest socket on `side` ("in" | "out") of any card within
+  // `radius` world units of (wx, wy), or null: {id, index, dist}. `posFn`
+  // maps a card id to its [x, y]. Geometric rather than DOM-targeted so
+  // the hit area scales with 1/zoom while the drawn circle does not, and
+  // so it works under pointer capture (where every event targets the svg).
+  function socketAt(nodes, posFn, side, wx, wy, radius) {
+    let best = null;
+    nodes.forEach((n) => {
+      const s = SOCKETS[n.type] || SOCKETS.dataset;
+      const list = side === "in" ? s.inputs : s.outputs;
+      const [x, y] = posFn(n.id);
+      const sx = side === "in" ? x : x + NODE_W;
+      list.forEach((_, i) => {
+        const d = Math.hypot(wx - sx, wy - (y + socketY(i)));
+        if (d <= radius && (!best || d < best.dist)) best = { id: n.id, index: i, dist: d };
+      });
+    });
+    return best;
   }
 
   // -- Layout (8.4) -------------------------------------------------------------
@@ -460,9 +565,12 @@ window.RCECanvas = (function () {
     const frames = svgEl("g", null, "cv-frames");
     const links = svgEl("g", null, "cv-links");
     const nodes = svgEl("g", null, "cv-nodes");
-    world.append(frames, links, nodes);
+    // The link being drawn sits ABOVE the cards (it must stay visible
+    // while it crosses them to reach a socket); drawn links stay below.
+    const draft = svgEl("g", null, "cv-draft");
+    world.append(frames, links, nodes, draft);
     svg.append(defs, bg, world);
-    return { svg, pattern, world, frames, links, nodes };
+    return { svg, pattern, world, frames, links, nodes, draft };
   }
 
   function ensureDom(container) {
@@ -476,9 +584,14 @@ window.RCECanvas = (function () {
     const status = htmlEl("div", "cv-status hidden");
     const tip = htmlEl("div", "cv-tip hidden");
     const empty = htmlEl("div", "cv-empty hidden");
-    root.append(s.svg, t.bar, zoom, status, tip, empty);
+    const linkCard = htmlEl("div", "cv-linkcard hidden");
+    const ctxMenu = htmlEl("div", "cv-menu cv-ctx hidden");
+    root.append(s.svg, t.bar, zoom, status, tip, empty, linkCard, ctxMenu);
     container.appendChild(root);
-    cv.dom = Object.assign({ root, zoom, status, tip, empty }, s, t);
+    cv.dom = Object.assign({ root, zoom, status, tip, empty, linkCard, ctxMenu }, s, t);
+    // A click on the chip dismisses it -- unless it offers an action: a
+    // near miss on 「撤销」 must not silently throw the undo away.
+    status.addEventListener("click", () => { if (!status.querySelector(".cv-status-action")) hideStatus(); });
     bindSvgEvents(s.svg);
     bindGlobalEvents();
     applyCamera();
@@ -503,15 +616,15 @@ window.RCECanvas = (function () {
       const y = socketY(i);
       const orphan = i === 0 && n.orphan_input;
       g.appendChild(svgEl("circle", { cx: 0, cy: y, r: SOCKET_R },
-        "cv-socket sock-" + sock.carries + (orphan ? " orphan" : "")));
-      const label = svgEl("text", { x: 12, y: y + 4 }, "cv-socket-label");
+        "cv-socket in sock-" + sock.carries + (orphan ? " orphan" : "")));
+      const label = svgEl("text", { x: 12, y: y + 4 }, "cv-socket-label in");
       label.textContent = fitRight(sock.label, mono, NODE_W / 2 - 16);
       g.appendChild(label);
     });
     s.outputs.forEach((sock, i) => {
       const y = socketY(i);
-      g.appendChild(svgEl("circle", { cx: NODE_W, cy: y, r: SOCKET_R }, "cv-socket sock-" + sock.carries));
-      const label = svgEl("text", { x: NODE_W - 12, y: y + 4, "text-anchor": "end" }, "cv-socket-label");
+      g.appendChild(svgEl("circle", { cx: NODE_W, cy: y, r: SOCKET_R }, "cv-socket out sock-" + sock.carries));
+      const label = svgEl("text", { x: NODE_W - 12, y: y + 4, "text-anchor": "end" }, "cv-socket-label out");
       label.textContent = sock.label;
       g.appendChild(label);
     });
@@ -558,13 +671,14 @@ window.RCECanvas = (function () {
     if (cv.cycle.has(link.id)) cls.push("cycle");
     else cls.push(link.human ? "human" : "machine");
     if (!link.human && link.status === "pending") cls.push("pending");
+    if (link.optimistic) cls.push("optimistic");
     return cls.join(" ");
   }
 
   function renderLink(link) {
     const ends = linkEnds(link);
     if (!ends) return null;
-    const g = svgEl("g", { "data-link": link.id }, "cv-link-g");
+    const g = svgEl("g", { "data-link": link.id }, "cv-link-g" + (link.id === cv.selectedLink ? " selected" : ""));
     const d = linkPathD(ends);
     g.appendChild(svgEl("path", { d }, linkClass(link)));
     g.appendChild(svgEl("path", { d }, "cv-link-hit"));
@@ -664,6 +778,11 @@ window.RCECanvas = (function () {
     renderEmpty();
     updateLit();
     applySearch();
+    renderLinkCard();
+    if (cv.drag && cv.drag.kind === "link" && cv.drag.moved) {
+      if (cv.nodes.has(cv.drag.fromId)) markLinkTargets(cv.drag);
+      else endLinkDrag(false); // its source left the graph mid-drag
+    }
   }
 
   function scopeOptionLabel(s) {
@@ -697,6 +816,7 @@ window.RCECanvas = (function () {
     const ends = new Set([cv.hovered, cv.selected].filter(Boolean));
     cv.linkEls.forEach(({ g, link }) => {
       g.classList.toggle("lit", ends.has(link.from) || ends.has(link.to));
+      g.classList.toggle("selected", link.id === cv.selectedLink);
     });
     cv.nodeEls.forEach((g, id) => {
       g.classList.toggle("selected", id === cv.selected);
@@ -731,6 +851,7 @@ window.RCECanvas = (function () {
 
   function select(id) {
     cv.selected = id;
+    if (id && cv.selectedLink) { selectLink(null); return; }
     updateLit();
   }
 
@@ -743,6 +864,8 @@ window.RCECanvas = (function () {
     cv.dom.world.setAttribute("transform", t);
     cv.dom.pattern.setAttribute("patternTransform", t);
     cv.dom.zoom.textContent = Math.round(zoom * 100) + "%";
+    updateLinkDrag();   // a link drag survives pan and zoom
+    positionLinkCard();
   }
 
   function viewSize() {
@@ -843,7 +966,7 @@ window.RCECanvas = (function () {
     cv.viewportDirty = false;
     try {
       await apiPost("/api/canvas/layout", body);
-      hideStatus();
+      hideStatus("save");
     } catch (err) {
       // Keep what failed for the next save, unless a newer move replaced it.
       Object.entries(sent).forEach(([id, p]) => { if (!(id in cv.pending)) cv.pending[id] = p; });
@@ -864,15 +987,41 @@ window.RCECanvas = (function () {
 
   // -- Status chip (product language; engine English on hover, 8.8) ---------
 
-  function showStatus(text, err) {
+  // One chip, bottom-left beside the zoom readout, for everything the
+  // canvas has to say: a failed save, a refused drop, a failed write, the
+  // 「撤销」 offer after 标记为错误提取. `opts.kind` names who owns the
+  // message so only its owner clears it (a successful position save must
+  // not wipe an undo offer); `opts.ms` makes it fade; `opts.action` adds
+  // one small text button; `opts.notice` is the neutral (non-error) look.
+  // A click on an action-less chip dismisses it (see ensureDom).
+  function showStatus(text, err, opts) {
     if (!cv.dom) return;
-    cv.dom.status.textContent = text;
-    cv.dom.status.title = err ? errText(err) : "";
-    cv.dom.status.classList.remove("hidden");
+    opts = opts || {};
+    const el = cv.dom.status;
+    el.innerHTML = "";
+    el.appendChild(htmlEl("span", "cv-status-text", text));
+    el.title = err ? errText(err) : "";
+    el.classList.toggle("notice", !!opts.notice);
+    if (opts.action) {
+      const b = htmlEl("button", "cv-status-action", opts.action.label);
+      b.type = "button";
+      b.addEventListener("click", (e) => { e.stopPropagation(); opts.action.run(); });
+      el.appendChild(b);
+    }
+    el.classList.remove("hidden");
+    cv.statusKind = opts.kind || "save";
+    clearTimeout(cv.statusTimer);
+    cv.statusTimer = opts.ms ? setTimeout(() => hideStatus(), opts.ms) : null;
   }
 
-  function hideStatus() {
-    if (cv.dom) cv.dom.status.classList.add("hidden");
+  // `kind` given: hide only if the chip still says that owner's message.
+  function hideStatus(kind) {
+    if (!cv.dom) return;
+    if (kind && cv.statusKind !== kind) return;
+    clearTimeout(cv.statusTimer);
+    cv.statusTimer = null;
+    cv.statusKind = null;
+    cv.dom.status.classList.add("hidden");
   }
 
   // -- Hover card for links (8.2) -------------------------------------------
@@ -884,6 +1033,7 @@ window.RCECanvas = (function () {
   }
 
   function showTip(link, clientX, clientY) {
+    if (link.id === cv.selectedLink) return; // its card is already pinned
     const tip = cv.dom.tip;
     tip.textContent = linkTipText(link);
     tip.classList.toggle("human", !!link.human);
@@ -901,6 +1051,421 @@ window.RCECanvas = (function () {
     if (cv.dom) cv.dom.tip.classList.add("hidden");
   }
 
+  // -- Editing: drawing a link (8.3) ------------------------------------------
+  // Press on an OUTPUT socket, drag, drop on an input socket. While the
+  // pointer moves, compatible inputs pulse (a --clay-soft halo) and the
+  // rest dim; the curve snaps to a compatible socket under the pointer.
+  // Drop on a compatible socket -> the confirm popover; on an incompatible
+  // one -> its one-line refusal; anywhere else -> nothing at all. The
+  // drag lives in WORLD coordinates re-derived from the last pointer
+  // position on every camera change, which is what lets it survive a
+  // two-finger pan or a pinch mid-drag.
+
+  function worldPoint(clientX, clientY) {
+    const v = viewSize();
+    return {
+      x: (clientX - v.left - cv.camera.x) / cv.camera.zoom,
+      y: (clientY - v.top - cv.camera.y) / cv.camera.zoom,
+    };
+  }
+
+  function screenPoint(wx, wy) {
+    return { x: wx * cv.camera.zoom + cv.camera.x, y: wy * cv.camera.zoom + cv.camera.y };
+  }
+
+  function hitRadius() {
+    return Math.max(SOCKET_R + 3, SOCKET_HIT_PX / cv.camera.zoom);
+  }
+
+  function visibleNodes() {
+    return (cv.data && cv.data.nodes) || [];
+  }
+
+  function socketPoint(id, side, index) {
+    const [x, y] = posOf(id);
+    return { x: side === "in" ? x : x + NODE_W, y: y + socketY(index) };
+  }
+
+  // The link being drawn: horizontal tangents like every link, but never
+  // the back-loop -- it follows the pointer, wherever that is.
+  function drawDraft(fromId, outIndex, end) {
+    const a = socketPoint(fromId, "out", outIndex);
+    const dx = Math.max(40, Math.abs(end.x - a.x) * 0.5);
+    let path = cv.dom.draft.querySelector("path");
+    if (!path) {
+      path = svgEl("path", null, "cv-draft-path");
+      cv.dom.draft.appendChild(path);
+    }
+    path.setAttribute("d", `M${a.x},${a.y} C${a.x + dx},${a.y} ${end.x - dx},${end.y} ${end.x},${end.y}`);
+  }
+
+  function clearDraft() {
+    if (cv.dom) cv.dom.draft.innerHTML = "";
+  }
+
+  // Light every card's input for the drag in progress: halo where the
+  // drop would be accepted, dim where it would be refused. Re-applied
+  // after a re-render, since a generation bump may land mid-drag.
+  function markLinkTargets(d) {
+    clearLinkTargets();
+    const from = cv.nodes.get(d.fromId);
+    d.compat = new Map();
+    cv.nodeEls.forEach((g, id) => {
+      const ok = !!from && checkConnection(from, d.outIndex, cv.nodes.get(id), 0, cv.data.links).ok;
+      d.compat.set(id, ok);
+      g.classList.add(ok ? "link-ok" : "link-no");
+      if (ok) {
+        const halo = svgEl("circle", { cx: 0, cy: socketY(0), r: SOCKET_R + 4 }, "cv-socket-halo");
+        g.insertBefore(halo, g.querySelector(".cv-socket.in"));
+      }
+    });
+    if (d.hot) {
+      const g = cv.nodeEls.get(d.hot.id);
+      if (g) g.classList.add("link-hot");
+    }
+  }
+
+  function clearLinkTargets() {
+    cv.nodeEls.forEach((g) => {
+      g.classList.remove("link-ok", "link-no", "link-hot");
+      g.querySelectorAll(".cv-socket-halo").forEach((h) => h.remove());
+    });
+  }
+
+  function startLinkDrag(hit, e) {
+    cv.drag = {
+      kind: "link", fromId: hit.id, outIndex: hit.index, pointerId: e.pointerId,
+      sx: e.clientX, sy: e.clientY, cx: e.clientX, cy: e.clientY,
+      moved: false, compat: new Map(), hot: null,
+    };
+  }
+
+  function updateLinkDrag() {
+    const d = cv.drag;
+    if (!d || d.kind !== "link" || !d.moved || !cv.dom) return;
+    const w = worldPoint(d.cx, d.cy);
+    const t = socketAt(visibleNodes(), posOf, "in", w.x, w.y, hitRadius());
+    const hot = t && d.compat.get(t.id) ? t : null;
+    if ((hot && hot.id) !== (d.hot && d.hot.id)) {
+      if (d.hot && cv.nodeEls.get(d.hot.id)) cv.nodeEls.get(d.hot.id).classList.remove("link-hot");
+      if (hot && cv.nodeEls.get(hot.id)) cv.nodeEls.get(hot.id).classList.add("link-hot");
+    }
+    d.hot = hot;
+    drawDraft(d.fromId, d.outIndex, hot ? socketPoint(hot.id, "in", hot.index) : w);
+  }
+
+  // `keepDraft`: the drop opened the popover, which keeps the curve on
+  // screen (pinned to its target socket) while it asks.
+  function endLinkDrag(keepDraft) {
+    const d = cv.drag;
+    cv.drag = null;
+    clearLinkTargets();
+    if (cv.dom) cv.dom.root.classList.remove("linking");
+    if (!keepDraft) clearDraft();
+    if (d && cv.dom) {
+      try { cv.dom.svg.releasePointerCapture(d.pointerId); } catch (err) { /* already released */ }
+    }
+  }
+
+  function dropLink(d) {
+    const w = worldPoint(d.cx, d.cy);
+    const target = socketAt(visibleNodes(), posOf, "in", w.x, w.y, hitRadius());
+    const from = cv.nodes.get(d.fromId);
+    if (!target || !from) { endLinkDrag(false); return; } // dropped on nothing: nothing happens
+    const to = cv.nodes.get(target.id);
+    const check = checkConnection(from, d.outIndex, to, target.index, cv.data.links);
+    if (!check.ok) {
+      endLinkDrag(false);
+      showStatus(check.reason, null, { kind: "refusal", ms: NOTICE_MS });
+      return;
+    }
+    drawDraft(d.fromId, d.outIndex, socketPoint(to.id, "in", target.index));
+    endLinkDrag(true);
+    openPopover(check, from, to, target);
+  }
+
+  // -- Editing: the confirm popover (8.3) ------------------------------------
+  // The canvas's only write dialog: the assertion in one line, an optional
+  // 备注, 确认标注 / 取消. Keys typed in it never reach the canvas (its
+  // own keydown stops them), so F, Space and Backspace in the 备注 field
+  // are just text.
+
+  function openPopover(check, from, to, target) {
+    closePopover();
+    const el = htmlEl("div", "cv-pop");
+    el.setAttribute("role", "dialog");
+    el.setAttribute("aria-label", "确认标注");
+    const line = htmlEl("div", "cv-pop-line", assertionText(from, to, check.type));
+    line.title = check.from + "\n→ " + check.to;
+    const field = htmlEl("label", "cv-pop-field");
+    const input = htmlEl("input", "form-input cv-pop-note");
+    input.type = "text";
+    input.placeholder = "备注（可选）";
+    input.setAttribute("aria-label", "备注");
+    input.maxLength = 200;
+    field.appendChild(input);
+    const actions = htmlEl("div", "cv-pop-actions");
+    const ok = htmlEl("button", "btn btn-primary", "确认标注");
+    ok.type = "button";
+    ok.addEventListener("click", () => confirmPopover());
+    const cancel = htmlEl("button", "btn", "取消");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => closePopover());
+    actions.append(ok, cancel);
+    el.append(line, field, actions);
+    el.addEventListener("keydown", (e) => {
+      e.stopPropagation(); // nothing typed here is a canvas shortcut
+      if (e.key === "Escape") { e.preventDefault(); closePopover(); }
+      else if (e.key === "Enter" && e.target === input && !e.isComposing) { e.preventDefault(); confirmPopover(); }
+    });
+    el.addEventListener("keyup", (e) => e.stopPropagation());
+    el.addEventListener("pointerdown", (e) => e.stopPropagation());
+    cv.dom.root.appendChild(el);
+    cv.pop = { el, input, check, fromId: from.id, toId: to.id };
+    const s = screenPoint(socketPoint(to.id, "in", target.index).x, socketPoint(to.id, "in", target.index).y);
+    placeFloating(el, s.x + 14, s.y + 14);
+    input.focus();
+  }
+
+  function closePopover() {
+    if (!cv.pop) return;
+    cv.pop.el.remove();
+    cv.pop = null;
+    clearDraft();
+  }
+
+  // Keep a floating HTML element (popover, pinned card, menu) inside the
+  // canvas, preferring below-right of the anchor point.
+  function placeFloating(el, x, y) {
+    const v = viewSize();
+    const w = el.offsetWidth, h = el.offsetHeight;
+    if (x + w > v.w - 8) x = Math.max(8, x - w - 28);
+    if (y + h > v.h - 8) y = Math.max(8, y - h - 28);
+    el.style.left = Math.round(x) + "px";
+    el.style.top = Math.round(y) + "px";
+  }
+
+  function localDate() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+
+  function entryKey(from, to, type) {
+    return JSON.stringify([from, to, type]);
+  }
+
+  // Confirm: draw the human link at once (optimistic), write the mapping,
+  // then re-fetch -- applyPayload swaps the optimistic link for the real
+  // one the re-ingest produced (and a ghost endpoint for a real card). A
+  // failed write takes the optimistic link back and says why.
+  async function confirmPopover() {
+    const p = cv.pop;
+    if (!p) return;
+    const note = p.input.value.trim();
+    closePopover();
+    const key = entryKey(p.check.from, p.check.to, p.check.type);
+    const link = {
+      id: "optimistic:" + key, from: p.fromId, to: p.toId, type: p.check.type,
+      extractor: "mapping", status: "confirmed", human: true, optimistic: true,
+      evidence_hint: "你于 " + localDate() + " 标注" + (note ? " · " + note : ""),
+    };
+    cv.optimistic.set(key, link);
+    cv.data.links.push(link);
+    rerenderLinks();
+    const body = { from: p.check.from, to: p.check.to, type: p.check.type };
+    if (note) body.note = note;
+    let res;
+    try {
+      res = await apiPost("/api/mappings/add", body);
+    } catch (err) {
+      dropOptimistic(key);
+      showStatus(err.state === "mapping_exists" ? DUPLICATE_TEXT : "无法标注：映射没有写入（悬停查看原因）", err, { kind: "write" });
+      return;
+    }
+    if (res && res.ingest_error) {
+      showStatus("已写入映射文件，但图谱没能更新（悬停查看原因）", res.ingest_error, { kind: "write" });
+    }
+    await refresh();
+    dropOptimistic(key); // reconciled by now; never let it outlive its write
+  }
+
+  function dropOptimistic(key) {
+    const link = cv.optimistic.get(key);
+    cv.optimistic.delete(key);
+    if (!link || !cv.data) return;
+    const before = cv.data.links.length;
+    cv.data.links = cv.data.links.filter((l) => l !== link);
+    if (cv.data.links.length !== before) rerenderLinks();
+  }
+
+  // An optimistic link stays drawn across re-fetches until the real one
+  // (same entry, extractor mapping) arrives in a payload.
+  function mergeOptimistic(payload) {
+    cv.optimistic.forEach((link, key) => {
+      const real = payload.links.some((l) => l.human && l.from === link.from && l.to === link.to && l.type === link.type);
+      if (real) cv.optimistic.delete(key);
+      else payload.links.push(link);
+    });
+  }
+
+  function rerenderLinks() {
+    renderLinks();
+    updateLit();
+    applySearch();
+    renderLinkCard();
+  }
+
+  function refresh() {
+    return cv.container ? load(cv.container) : Promise.resolve();
+  }
+
+  // -- Editing: selecting a link, and what can be done to it (8.3) ----------
+  // A click selects a link and pins its hover card; the pinned card holds
+  // the same action as the right-click menu as a small text button (a
+  // trackpad has no comfortable right-click). Human link: 删除标注 (the
+  // entry leaves mappings.toml). Machine link: 标记为错误提取 (status
+  // rejected through the human-only path), undoable from the chip.
+
+  function linkActions(link) {
+    if (link.optimistic) return [];
+    if (link.human) return [{ label: "删除标注", run: () => deleteHumanLink(link) }];
+    return [{ label: "标记为错误提取", run: () => rejectMachineLink(link) }];
+  }
+
+  function linkAssertion(link) {
+    const from = cv.nodes.get(link.from), to = cv.nodes.get(link.to);
+    return from && to ? assertionText(from, to, link.type) : "";
+  }
+
+  function selectLink(id) {
+    cv.selectedLink = id;
+    if (id) cv.selected = null;
+    updateLit();
+    renderLinkCard();
+  }
+
+  function renderLinkCard() {
+    if (!cv.dom) return;
+    const card = cv.dom.linkCard;
+    const entry = cv.selectedLink ? cv.linkEls.get(cv.selectedLink) : null;
+    card.innerHTML = "";
+    if (!entry) { card.classList.add("hidden"); return; }
+    const link = entry.link;
+    card.classList.toggle("human", !!link.human);
+    card.appendChild(htmlEl("div", "cv-linkcard-assert", linkAssertion(link)));
+    card.appendChild(htmlEl("div", "cv-linkcard-hint", linkTipText(link)));
+    if (link.optimistic) card.appendChild(htmlEl("div", "cv-linkcard-hint", "正在写入…"));
+    const actions = linkActions(link);
+    if (actions.length) {
+      const row = htmlEl("div", "cv-linkcard-actions");
+      actions.forEach((a) => {
+        const b = htmlEl("button", "cv-text-btn", a.label);
+        b.type = "button";
+        b.addEventListener("click", () => a.run());
+        row.appendChild(b);
+      });
+      card.appendChild(row);
+    }
+    card.classList.remove("hidden");
+    positionLinkCard();
+  }
+
+  function positionLinkCard() {
+    if (!cv.dom || cv.dom.linkCard.classList.contains("hidden")) return;
+    const entry = cv.selectedLink ? cv.linkEls.get(cv.selectedLink) : null;
+    const ends = entry && linkEnds(entry.link);
+    if (!ends) return;
+    const m = linkMidpoint(ends);
+    const s = screenPoint(m.x, m.y);
+    placeFloating(cv.dom.linkCard, s.x + 12, s.y + 12);
+  }
+
+  function openCtxMenu(link, clientX, clientY) {
+    const menu = cv.dom.ctxMenu;
+    menu.innerHTML = "";
+    linkActions(link).forEach((a) => {
+      const b = htmlEl("button", "cv-menu-item", a.label);
+      b.type = "button";
+      b.addEventListener("click", (e) => { e.stopPropagation(); closeCtxMenu(); a.run(); });
+      menu.appendChild(b);
+    });
+    if (!menu.childNodes.length) return;
+    menu.classList.remove("hidden");
+    cv.dom.linkCard.classList.add("hidden"); // one floating thing at a time
+    cv.ctx = true;
+    const v = viewSize();
+    placeFloating(menu, clientX - v.left + 2, clientY - v.top + 2);
+  }
+
+  function closeCtxMenu() {
+    if (!cv.ctx) return;
+    cv.ctx = false;
+    if (cv.dom) cv.dom.ctxMenu.classList.add("hidden");
+    renderLinkCard(); // the selected link's card comes back
+  }
+
+  function onContextMenu(e) {
+    closeCtxMenu();
+    const linkEl = e.target.closest(".cv-link-g");
+    const entry = linkEl && cv.linkEls.get(linkEl.getAttribute("data-link"));
+    if (!entry) return; // elsewhere: the platform's own menu
+    e.preventDefault();
+    hideTip();
+    selectLink(entry.link.id);
+    openCtxMenu(entry.link, e.clientX, e.clientY);
+  }
+
+  async function deleteHumanLink(link) {
+    if (!link.human || link.optimistic) return;
+    const from = cv.nodes.get(link.from), to = cv.nodes.get(link.to);
+    if (!from || !to) return;
+    if (!window.confirm("删除这条标注？\n\n" + assertionText(from, to, link.type) +
+      "\n\n它会从 .rce/mappings.toml 中删去（删除前自动备份）。")) return;
+    let res;
+    try {
+      res = await apiPost("/api/mappings/delete", { from: from.path, to: to.path, type: link.type });
+    } catch (err) {
+      showStatus("无法删除标注：映射文件没有改动（悬停查看原因）", err, { kind: "write" });
+      return;
+    }
+    selectLink(null);
+    if (res && res.ingest_error) {
+      showStatus("已从映射文件删去，但图谱没能更新（悬停查看原因）", res.ingest_error, { kind: "write" });
+    }
+    await refresh();
+  }
+
+  async function rejectMachineLink(link) {
+    if (link.human || link.optimistic) return;
+    if (!window.confirm("把这条连线标记为错误提取？\n\n" + linkAssertion(link) + "\n" + link.evidence_hint +
+      "\n\n它会从画布上消失，之后可以撤销。")) return;
+    const body = { src: link.src, dst: link.dst, type: link.type, extractor: link.extractor };
+    try {
+      await apiPost("/api/edges/reject", body);
+    } catch (err) {
+      showStatus(err.state === "human_link" ? "这是你的标注：请用「删除标注」移除" : "无法标记为错误提取（悬停查看原因）", err, { kind: "write" });
+      return;
+    }
+    selectLink(null);
+    showStatus("已标记为错误提取", null, {
+      kind: "undo", notice: true, ms: UNDO_MS,
+      action: { label: "撤销", run: () => restoreLink(body) },
+    });
+    await refresh();
+  }
+
+  async function restoreLink(body) {
+    hideStatus("undo");
+    try {
+      await apiPost("/api/edges/restore", body);
+    } catch (err) {
+      showStatus("无法撤销（悬停查看原因）", err, { kind: "write" });
+      return;
+    }
+    await refresh();
+  }
+
   // -- Pointer, wheel, gesture and keyboard handling (8.3) ------------------
 
   function svgPoint(e) {
@@ -911,13 +1476,30 @@ window.RCECanvas = (function () {
   function onPointerDown(e) {
     if (e.button !== 0 || !cv.data) return;
     if (cv.dom.menu && !cv.dom.menu.classList.contains("hidden")) cv.dom.menu.classList.add("hidden");
-    const nodeEl = e.target.closest(".cv-node");
+    closeCtxMenu();
+    closePopover(); // a press anywhere on the canvas is 取消
     hideTip();
+    if (!cv.space) {
+      // An output socket wins over the card under it: that press draws.
+      const w = worldPoint(e.clientX, e.clientY);
+      const hit = socketAt(visibleNodes(), posOf, "out", w.x, w.y, hitRadius());
+      if (hit) {
+        startLinkDrag(hit, e);
+        cv.dom.svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        return;
+      }
+    }
+    const nodeEl = e.target.closest(".cv-node");
     if (nodeEl && !cv.space) {
       const id = nodeEl.getAttribute("data-id");
       cv.drag = { kind: "node", id, el: nodeEl, sx: e.clientX, sy: e.clientY, start: posOf(id).slice(), moved: false };
     } else {
-      cv.drag = { kind: "pan", sx: e.clientX, sy: e.clientY, cam: Object.assign({}, cv.camera), moved: false };
+      const linkEl = cv.space ? null : e.target.closest(".cv-link-g");
+      cv.drag = {
+        kind: "pan", sx: e.clientX, sy: e.clientY, cam: Object.assign({}, cv.camera), moved: false,
+        linkId: linkEl ? linkEl.getAttribute("data-link") : null,
+      };
       cv.dom.root.classList.add("panning");
     }
     cv.dom.svg.setPointerCapture(e.pointerId);
@@ -931,13 +1513,20 @@ window.RCECanvas = (function () {
       if (link.from === id || link.to === id) updateLinkGeometry(link, g);
     });
     renderFrames();
+    positionLinkCard();
   }
 
   function onPointerMove(e) {
     const d = cv.drag;
     if (!d) return;
     const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
+    if (d.kind === "link") { d.cx = e.clientX; d.cy = e.clientY; }
     if (!d.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+    if (d.kind === "link") {
+      if (!d.moved) { d.moved = true; cv.dom.root.classList.add("linking"); markLinkTargets(d); }
+      updateLinkDrag();
+      return;
+    }
     d.moved = true;
     if (d.kind === "pan") {
       cv.camera = { x: d.cam.x + dx, y: d.cam.y + dy, zoom: d.cam.zoom };
@@ -953,12 +1542,22 @@ window.RCECanvas = (function () {
   function onPointerUp(e) {
     const d = cv.drag;
     if (!d) return;
+    if (d.kind === "link") {
+      if (e.type === "pointercancel") endLinkDrag(false);
+      else if (d.moved) dropLink(d);
+      else { endLinkDrag(false); onNodeClick(d.fromId); } // a click on a socket is a click on its card
+      return;
+    }
     cv.drag = null;
     cv.dom.root.classList.remove("panning");
     try { cv.dom.svg.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
     if (d.kind === "pan") {
       if (d.moved) queueViewport();
-      else if (cv.selected) select(null); // a click on empty canvas clears the selection
+      else if (d.linkId && cv.linkEls.has(d.linkId)) selectLink(d.linkId);
+      else { // a click on empty canvas clears the selection
+        if (cv.selected) select(null);
+        if (cv.selectedLink) selectLink(null);
+      }
       return;
     }
     d.el.classList.remove("dragging");
@@ -1051,7 +1650,10 @@ window.RCECanvas = (function () {
   }
 
   function onHoverMove(e) {
-    if (!cv.drag && cv.dom && !cv.dom.tip.classList.contains("hidden")) moveTip(e.clientX, e.clientY);
+    if (cv.drag || !cv.dom) return;
+    if (!cv.dom.tip.classList.contains("hidden")) moveTip(e.clientX, e.clientY);
+    const w = worldPoint(e.clientX, e.clientY);
+    cv.dom.root.classList.toggle("on-socket", !cv.space && !!socketAt(visibleNodes(), posOf, "out", w.x, w.y, hitRadius()));
   }
 
   function bindSvgEvents(svg) {
@@ -1062,6 +1664,7 @@ window.RCECanvas = (function () {
     svg.addEventListener("pointercancel", onPointerUp);
     svg.addEventListener("pointerover", onPointerOver);
     svg.addEventListener("pointerout", onPointerOut);
+    svg.addEventListener("contextmenu", onContextMenu);
     svg.addEventListener("wheel", onWheel, { passive: false });
     svg.addEventListener("gesturestart", onGestureStart);
     svg.addEventListener("gesturechange", onGestureChange);
@@ -1074,6 +1677,7 @@ window.RCECanvas = (function () {
 
   function typingTarget(e) {
     const t = e.target;
+    if (t && t.closest && t.closest(".cv-pop, .cv-linkcard, .cv-ctx")) return true; // the canvas's own floating UI
     return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
   }
 
@@ -1085,15 +1689,27 @@ window.RCECanvas = (function () {
   function onKeyDown(e) {
     if (!canvasVisible() || typingTarget(e)) return;
     if (e.key === "Escape") {
+      // One Esc undoes the innermost thing: menu, popover, link drag,
+      // then (as before) a card drag plus the selection.
+      if (cv.ctx) { closeCtxMenu(); return; }
+      if (cv.pop) { closePopover(); return; }
+      if (cv.drag && cv.drag.kind === "link") { endLinkDrag(false); return; }
       if (cv.drag && cv.drag.kind === "node") {
         moveNodeTo(cv.drag.id, cv.drag.el, cv.drag.start);
         cv.drag.el.classList.remove("dragging");
         cv.drag = null;
       }
       select(null);
+      if (cv.selectedLink) selectLink(null);
       return;
     }
     if (panelOpen() || e.metaKey || e.ctrlKey || e.altKey) return;
+    if ((e.key === "Backspace" || e.key === "Delete") && cv.selectedLink) {
+      e.preventDefault();
+      const entry = cv.linkEls.get(cv.selectedLink);
+      if (entry && entry.link.human) deleteHumanLink(entry.link);
+      return;
+    }
     if (e.key === " ") {
       e.preventDefault(); // never scroll the page from the canvas
       if (!cv.space) { cv.space = true; cv.dom.root.classList.add("space"); }
@@ -1114,6 +1730,7 @@ window.RCECanvas = (function () {
     if (cv.dom && !cv.dom.menu.classList.contains("hidden") && !e.target.closest(".cv-more")) {
       cv.dom.menu.classList.add("hidden");
     }
+    if (cv.ctx && !e.target.closest(".cv-ctx")) closeCtxMenu();
   }
 
   function bindGlobalEvents() {
@@ -1149,6 +1766,7 @@ window.RCECanvas = (function () {
   function applyPayload(payload, opts) {
     const first = !cv.data;
     cv.data = payload;
+    mergeOptimistic(payload);
     cv.scope = payload.scope.id;
     storageSet(scopeKey(), cv.scope);
     cv.nodes = new Map(payload.nodes.map((n) => [n.id, n]));
@@ -1164,6 +1782,7 @@ window.RCECanvas = (function () {
     cv.cycle = layout.cycle;
     if (cv.selected && !cv.nodes.has(cv.selected)) cv.selected = null;
     if (cv.hovered && !cv.nodes.has(cv.hovered)) cv.hovered = null;
+    if (cv.selectedLink && !payload.links.some((l) => l.id === cv.selectedLink)) cv.selectedLink = null;
     renderScopeSelect();
     render();
     if (opts.fit) fitAll();
@@ -1217,11 +1836,20 @@ window.RCECanvas = (function () {
     clearTimeout(cv.saveTimer);
     clearTimeout(cv.clickTimer);
     cv.loadSeq++;
+    // Nothing being drawn, asked or offered belongs to the next project:
+    // an open popover's entry, an optimistic link, an undo for a link
+    // that lives in the previous project's graph.
+    if (cv.drag && cv.drag.kind === "link") endLinkDrag(false);
+    closePopover();
+    closeCtxMenu();
+    hideStatus();
     Object.assign(cv, {
       data: null, scope: null, nodes: new Map(), positions: {}, auto: {}, cycle: new Set(),
       selected: null, hovered: null, pending: {}, viewportDirty: false, saveTimer: null,
       drag: null, lastClick: null, nodeEls: new Map(), linkEls: new Map(),
+      selectedLink: null, optimistic: new Map(),
     });
+    if (cv.dom) cv.dom.linkCard.classList.add("hidden");
     if (cv.dom) {
       cv.dom.search.value = "";
       cv.query = "";
@@ -1236,6 +1864,10 @@ window.RCECanvas = (function () {
     // Exposed for the next phase (link editing) and for inspection; not
     // part of any server contract.
     _computeLayout: computeLayout,
+    _checkConnection: checkConnection,
+    _assertionText: assertionText,
+    _socketAt: socketAt,
+    _linkRules: LINK_RULES,
     _state: cv,
   };
 })();

@@ -124,3 +124,126 @@ def test_cards_of_different_frames_get_room_for_the_frame_title():
     y17, y18 = out["positions"][RMD17][1], out["positions"][RMD18][1]
     script_height = 26 + 46 + 2 * 20 + 8
     assert y18 - (y17 + script_height) >= 24 + 2 * 16 + 26
+
+
+# -- Link editing (DESIGN.md 8.1 grammar, 8.3; task V4 phase 2b) ---------------
+#
+# The drop-time grammar check, the assertion line and the socket hit test
+# are pure functions of plain node objects, exposed on RCECanvas like the
+# layout, so they are pinned the same way: the real file under node.
+
+_CALL_RUNNER = """
+global.window = {};
+require(process.argv[1]);
+const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const C = window.RCECanvas;
+let out;
+if (input.fn === "rules") out = C._linkRules;
+else if (input.fn === "socketAt") {
+  const pos = input.positions;
+  out = C._socketAt(input.nodes, (id) => pos[id], input.side, input.x, input.y, input.radius);
+} else out = C["_" + input.fn](...input.args);
+process.stdout.write(JSON.stringify(out === undefined ? null : out));
+"""
+
+
+def _call(fn: str, **payload: Any) -> Any:
+    result = subprocess.run(
+        [NODE, "-e", _CALL_RUNNER, str(CANVAS_JS)],
+        input=json.dumps({"fn": fn, **payload}), capture_output=True, text=True, check=True, timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+def _check(frm: str, out_index: int, to: str | None, in_index: int = 0, links: list[dict[str, Any]] | None = None):
+    return _call("checkConnection", args=[_node(frm), out_index, _node(to) if to else None, in_index, links or []])
+
+
+def test_js_link_rules_mirror_the_mappings_grammar_exactly():
+    """One table in the JS, one in the ingest: every rule the canvas offers
+    is an entry the server accepts, and every entry type is drawable."""
+    from rce.ingest import mappings
+
+    rules = _call("rules")
+    derived = {rule["type"]: (key.split(":")[0], rule["toType"]) for key, rule in rules.items()}
+    assert derived == mappings.GRAMMAR
+    assert len(rules) == len(mappings.GRAMMAR)
+
+
+@pytest.mark.parametrize(
+    "frm, out_index, to, edge_type",
+    [
+        (MONTHLY, 0, RMD17, "reads"),       # 数据集.数据 -> 脚本.读取
+        (PY16, 0, MONTHLY, "writes"),       # 脚本.写出 -> 数据集.来源
+        (RMD17, 1, PDF17, "generates"),     # 脚本.生成 -> 图表.生成自
+    ],
+)
+def test_compatible_pairings_name_the_entry_in_file_direction(frm, out_index, to, edge_type):
+    out = _check(frm, out_index, to)
+    assert out == {
+        "ok": True, "type": edge_type,
+        "from": frm.partition(":")[2], "to": to.partition(":")[2],
+    }
+
+
+@pytest.mark.parametrize(
+    "frm, out_index, to, reason",
+    [
+        (MONTHLY, 0, PDF17, "只能把数据集接到脚本的「读取」插口"),
+        (MONTHLY, 0, RAW, "只能把数据集接到脚本的「读取」插口"),
+        (PY16, 0, PDF17, "「写出」只能接到数据集的「来源」插口"),
+        (RMD17, 1, MONTHLY, "「生成」只能接到图表的「生成自」插口"),
+        (RMD17, 1, RMD18, "「生成」只能接到图表的「生成自」插口"),
+    ],
+)
+def test_incompatible_pairings_are_refused_in_product_language(frm, out_index, to, reason):
+    assert _check(frm, out_index, to) == {"ok": False, "reason": reason}
+
+
+def test_a_card_cannot_link_to_itself_or_to_a_non_input():
+    assert _check(PY16, 0, PY16)["ok"] is False
+    assert _check(MONTHLY, 0, RMD17, in_index=1)["ok"] is False
+    assert _check(PDF17, 0, RMD17)["ok"] is False  # a figure has no outputs
+
+
+def test_duplicate_human_mapping_is_refused_but_a_machine_twin_is_not():
+    """8.5: the same from/to/type twice is 「这条映射已存在」; a mapping that
+    repeats or contradicts a MACHINE edge is allowed."""
+    human = {"id": "h", "from": RMD17, "to": PDF17, "type": "generates", "human": True}
+    machine = dict(human, id="m", human=False)
+    assert _check(RMD17, 1, PDF17, links=[human]) == {"ok": False, "reason": "这条映射已存在"}
+    assert _check(RMD17, 1, PDF17, links=[machine])["ok"] is True
+
+
+def test_assertion_line_matches_the_design_example():
+    rmd = {**_node(RMD17), "label": "17-叙事更替与汇率波动.Rmd"}
+    pdf = {**_node(PDF17), "label": "17-叙事更替与汇率波动.pdf"}
+    assert _call("assertionText", args=[rmd, pdf, "generates"]) == (
+        "17-叙事更替与汇率波动.Rmd 生成 → 17-叙事更替与汇率波动.pdf"
+    )
+    # A script is the actor of both its verbs; the arrow follows the data.
+    assert _call("assertionText", args=[_node(MONTHLY), _node(RMD17), "reads"]) == (
+        "17-叙事更替与汇率波动.Rmd 读取 ← topicshift_monthly.csv"
+    )
+    assert _call("assertionText", args=[_node(PY16), _node(MONTHLY), "writes"]) == (
+        "16-构建指标.py 写出 → topicshift_monthly.csv"
+    )
+
+
+def test_socket_hit_test_picks_the_nearest_socket_within_the_radius():
+    """A script's 写出 (index 0) and 生成 (index 1) sit 20 world units apart
+    on its right edge at y = 26 + 46 + 10 (+ 20); the hit test returns the
+    nearer one, honours the radius, and keeps inputs and outputs apart."""
+    nodes = [_node(PY16)]
+    positions = {PY16: [100, 50]}
+    out0_y, out1_y = 50 + 82, 50 + 102
+    hit = _call("socketAt", nodes=nodes, positions=positions, side="out", x=322, y=out1_y - 3, radius=12)
+    assert (hit["id"], hit["index"]) == (PY16, 1)
+    hit = _call("socketAt", nodes=nodes, positions=positions, side="out", x=318, y=out0_y + 2, radius=12)
+    assert (hit["id"], hit["index"]) == (PY16, 0)
+    assert _call("socketAt", nodes=nodes, positions=positions, side="out", x=340, y=out0_y, radius=12) is None
+    # At 25% zoom the caller passes 12 / 0.25 = 48 world units: still hit.
+    assert _call("socketAt", nodes=nodes, positions=positions, side="out", x=340, y=out0_y, radius=48) is not None
+    hit = _call("socketAt", nodes=nodes, positions=positions, side="in", x=101, y=out0_y, radius=12)
+    assert (hit["id"], hit["index"]) == (PY16, 0)
+    assert _call("socketAt", nodes=nodes, positions=positions, side="in", x=320, y=out0_y, radius=12) is None
