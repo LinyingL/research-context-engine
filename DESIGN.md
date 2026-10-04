@@ -932,28 +932,61 @@ confirm → file write → graph follows" shape as writing an attempt row.
 
 ### 8.4 Layout
 
-Nodes without a saved position are placed by a layered layout, left to
-right, computed client-side with no library:
+**Auto-layout is a property of the view; memory is a property of the
+card.** A card the researcher has moved has a saved position, and that
+position is global — it is where the card is, in every scope. A card with
+no saved position has no position at all: it is laid out fresh, among the
+cards *visible in the current view only*, every time the view is drawn.
+(The first implementation laid unsaved cards out over the whole graph so
+that they would "keep their place across scopes"; on the researcher's real
+project that scattered the ten cards of the current attempt across 4,000px
+and the default view opened as dust at 25% zoom. A suggestion is not a
+memory; the default view must open compact and legible.)
 
-1. **Layer** = longest path from a source. A dataset nobody writes is layer
-   0; a script is 1 + max(layer of the datasets it reads); a dataset or
-   figure some script writes is that script's layer + 1. (This is what
-   makes the researcher's own pipeline read correctly: `16.py` writes
-   `topicshift_monthly.csv`, which `17.Rmd` and `18.Rmd` read, so 17/18 sit
-   two columns right of 16 rather than beside it.) Cycles, should a
+The layout, client-side and with no library, in five steps:
+
+1. **Islands.** Split the visible cards into connected components (links
+   taken as undirected). A research project is many small pipelines, not
+   one deep graph; each pipeline is laid out on its own. For this purpose
+   only, a ghost (8.1) counts as linked to the step script of its own
+   attempt that shares its numeric step prefix (`17-….pdf` with
+   `17-….Rmd`), so an output waiting to be connected sits beside the
+   script that most plausibly made it — placement, never an asserted edge.
+2. **Layer** within an island = longest path from a source. A dataset
+   nobody writes is layer 0; a script is 1 + max(layer of the datasets it
+   reads); a dataset or figure some script writes is that script's layer +
+   1; a ghost sits one layer right of its step-prefix script. (This is
+   what makes the researcher's own pipeline read correctly: `16.py` writes
+   `topicshift_monthly.csv`, which `17.Rmd` and `18.Rmd` read, so 17/18
+   sit two columns right of 16 rather than beside it.) Cycles, should a
    pipeline contain one, are broken at the edge that closes them and that
    edge is drawn dashed in clay with a hover note 「检测到循环」.
-2. **Order within a layer** by one barycenter pass (mean y of already
-   placed neighbors), ties broken by the numeric step prefix of the path so
-   step order survives.
-3. Columns 320px apart, rows packed with 24px gaps; frames (8.1) are
-   drawn around the scripts of each attempt after placement and never move
-   nodes.
+3. **Order within a layer** by one barycenter pass (mean y of already
+   placed neighbors), ties broken by the numeric step prefix of the path
+   so step order survives. Columns 320px apart, rows packed with 24px
+   gaps. A layer taller than 12 cards wraps into side-by-side sub-columns
+   of at most 12 (220px apart, inside the same layer band, which widens to
+   hold them) so no island becomes a tower.
+4. **Loose cards** — visible cards with no links and no step-prefix
+   script — are not islands of one. They are gathered into a single grid
+   block titled 「未连线」 (quiet mono caption, `--ink-soft`), 4 columns
+   wide, ordered by type then path.
+5. **Packing.** Islands are placed in rows, left to right, wrapping to a
+   new row when the row would exceed the target width W = max(widest
+   island, √(1.6 × total island area)) — a page shaped like the window
+   rather than a strip — with 96px between islands. Order: the island
+   holding the current attempt's scripts first, then by card count
+   descending, ties by the smallest step prefix; 「未连线」 last.
 
-A saved position always wins over the layout. 「重新排列」 in the toolbar
-overflow re-runs the layout for *all* visible nodes and therefore asks
-first (「将丢弃你手动摆放的位置」). Fit-all never moves nodes; it moves the
-camera.
+Saved positions always win: a saved card is drawn where it was put and
+takes no part in steps 1–5 except as a fixed neighbor for the barycenter
+of unsaved cards linked to it. Frames (8.1) are drawn around each
+attempt's scripts after placement and never move cards. 「重新排列」 in the
+toolbar overflow discards the saved positions of the *visible* cards and
+therefore asks first (「将丢弃你手动摆放的位置」). Fit-all never moves
+cards; it moves the camera, and on entering a view with no saved viewport
+the camera fits all — the scope the researcher opens on must be readable
+without touching anything.
 
 ### 8.5 Human mappings are a file: `.rce/mappings.toml`
 
@@ -1022,19 +1055,49 @@ most recent) and offers 全部 plus every attempt. Scoping to an attempt
 shows its step scripts, every dataset/figure they touch, and one hop
 further along `writes → reads` chains so upstream generators stay visible;
 its frame is drawn; other attempts' nodes are simply absent, not dimmed.
-Positions are global (a node keeps its place across scopes). Search
+A position the researcher has *set* is global (8.4); unsaved cards are laid
+out per view. Switching scope clears the selection and any pinned link
+card — they belong to the view that was left. Search
 (「查找节点…」) highlights matching nodes and dims the rest without
 changing scope; Enter fits the camera to the matches.
 
 ### 8.8 Product language
 
-New UI copy is Chinese product language (the established rule for this
-app), and this task also brings the two existing tabs in line: the tabs
-read 「决策树」「血缘」「画布」. The brand mark stays `RCE`. Raw error strings
-from the engine remain English and live on hover titles; what the user
-reads is the Chinese framing (「无法标注：…」). Nothing on the canvas says
-"node", "edge", or "socket" to the user — it says 数据集, 脚本, 图表, 连线,
-插口, 标注.
+All UI copy is Chinese product language — not only what V4 adds. The
+three tabs read 「决策树」「血缘」「画布」, and the English left over from
+V1–V3 is translated in the same pass. The brand mark stays `RCE`; its
+subtitle becomes 「研究脉络」 (the old "decision tree & lineage" named two
+of three views, in the wrong language). What stays as it is: file names
+and paths, the researcher's own text (attempt titles, verdicts, column
+names), and raw engine error strings — which remain English and live on
+hover titles, behind a Chinese framing (「无法标注：…」). Nothing on the
+canvas says "node", "edge", or "socket" to the user — it says 数据集, 脚本,
+图表, 连线, 插口, 标注.
+
+Binding glossary (one term per concept, everywhere it appears):
+
+| Was | Is |
+|---|---|
+| Reads / READS | 读取 |
+| Writes / WRITES | 写出 |
+| No recorded reads or writes. | RCE 没有读到这个文件的读写。 |
+| Orphan inputs | 无来源输入 |
+| READ BY | 被这些脚本读取 |
+| WRITTEN BY | 由这些脚本写出 |
+| Lineage chains | 血缘链 |
+| Broken links | 断链 |
+| (reads, not found) / (writes, not found) | （读取，文件不存在）/（写出，文件不存在） |
+| Duplicate copies | 同名拷贝 |
+| OTHER COPIES | 其它拷贝 |
+| Open | 打开 |
+| Reveal in Finder | 在 Finder 中显示 |
+| Close | 关闭 |
+| Loading… | 载入中… |
+
+Anything not in the table is translated in the same register — short,
+concrete, no jargon — and the same English source always gets the same
+Chinese. The command line stays English (it is a developer surface, and
+its messages are quoted in docs and tests).
 
 ### 8.9 The native shell: `RCE.app`
 
@@ -1110,8 +1173,10 @@ Three failures seen in the first week of real use become rules:
    `backups/`. `canvas.json` (8.6) lives beside the graph, not in the
    project — it is derived too. A legacy in-project `graph.db` is migrated
    on first touch by any subcommand: copied, checked with `PRAGMA
-   integrity_check`, then removed, one log line, and `rce init` leaves a
-   one-line `.rce/README` saying where the graph went. `rce status` and
+   integrity_check`, then removed, one log line; the migration and `rce
+   init` both leave a one-line `.rce/README` saying where the graph went
+   — the researcher who opens `.rce/` and finds no `graph.db` must find
+   the answer in the same folder. `rce status` and
    `/api/summary` report the graph's actual location so nothing is hidden.
    Before opening, the server checks macOS's dataless flag on the file
    (`st_flags & SF_DATALESS`) and, if set, answers with a header state
@@ -1139,3 +1204,35 @@ links (claims and references are not on this canvas); a Windows/Linux
 shell. A project folder that is *moved* gets a new graph id and so an
 empty graph (re-ingest is cheap and deterministic); noticing the orphaned
 graph directory and offering to re-attach it is later work.
+
+### 8.12 Rulings made during implementation
+
+Decisions the implementers took where this section was silent, reviewed
+and adopted as design:
+
+- **A `reads` mapping is written the way the canvas is drawn.** In
+  `mappings.toml`, `type = "reads"` has `from` = the dataset and `to` = the
+  script (the link runs 数据 → 读取); the graph still stores `script
+  --reads--> dataset`, as the dataflow extractor does. A reversed entry is
+  refused with a "swap from and to" hint, never silently flipped.
+- **A missing `mappings.toml` is not a deletion; an empty one is.** Failing
+  to find the source is not evidence that the researcher retracted
+  anything (the attempt-orphans doctrine of Section 4). To retract every
+  mapping, empty the file.
+- **The file outranks `rce confirm`.** A mapping edge is re-confirmed on
+  every ingest; the way to retract one is to delete its entry.
+- **Undo restores what was there.** 「撤销」 after 「标记为错误提取」 returns the
+  link to the status it had before (a link the researcher had confirmed
+  comes back confirmed), not to a default.
+- **Rejected links are wrong everywhere.** The 血缘 report skips rejected
+  edges just as the canvas does, so the two views never disagree about
+  whether a dataset has a source.
+- **Mappings are read at startup.** The first poll of a project ingests
+  `mappings.toml` once, so edits made while the app was closed are not
+  lost; attempts are still only re-read when their file changes.
+- **The app only stops what it started.** On quit the shell names its
+  child's pid to `/api/shutdown`; an engine started from a terminal
+  refuses and keeps serving.
+- **The last tab is remembered; the scope is not.** Reopening the app
+  returns to the view last used, always on the current attempt.
+
