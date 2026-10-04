@@ -104,7 +104,7 @@
   Every fetch is wrapped (apiGet/apiPost below) so a failure renders a
   readable message inside the page -- never only to the console.
 -->
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -605,7 +605,7 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark">RCE</span>
-      <span class="brand-sub">decision tree &amp; lineage</span>
+      <span class="brand-sub">研究脉络</span>
     </div>
     <select id="project-switcher" class="project-switcher hidden" title="切换项目" aria-label="切换项目"></select>
     <span id="project-state" class="project-state hidden" role="status"></span>
@@ -636,7 +636,7 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
       <div class="panel-title" id="panel-title"></div>
       <div class="panel-subtitle" id="panel-subtitle"></div>
     </div>
-    <button class="panel-close" id="panel-close" type="button" aria-label="Close">&times;</button>
+    <button class="panel-close" id="panel-close" type="button" aria-label="关闭" title="关闭">&times;</button>
   </div>
   <div class="panel-body" id="panel-body"></div>
 </aside>
@@ -696,7 +696,7 @@ const PROJECT_STATES = {
 };
 
 function apiError(path, res, body) {
-  const err = new Error((body && body.error) ? body.error : (path + " failed: HTTP " + res.status));
+  const err = new Error((body && body.error) ? body.error : ("请求 " + path + " 失败：HTTP " + res.status));
   if (body && typeof body.state === "string") err.state = body.state;
   return err;
 }
@@ -710,7 +710,7 @@ async function apiGet(path) {
   try {
     res = await fetch(path, { headers: { "Accept": "application/json" } });
   } catch (err) {
-    throw new Error("Network error requesting " + path + ": " + err.message);
+    throw new Error("请求 " + path + " 时网络出错：" + err.message);
   }
   const text = await res.text();
   let body = null;
@@ -718,7 +718,7 @@ async function apiGet(path) {
     try {
       body = JSON.parse(text);
     } catch (err) {
-      throw new Error("Could not parse response from " + path + " as JSON: " + err.message);
+      throw new Error("无法把 " + path + " 的响应解析为 JSON：" + err.message);
     }
   }
   if (!res.ok) {
@@ -736,7 +736,7 @@ async function apiPost(path, payload) {
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    throw new Error("Network error requesting " + path + ": " + err.message);
+    throw new Error("请求 " + path + " 时网络出错：" + err.message);
   }
   const text = await res.text();
   let body = null;
@@ -744,7 +744,7 @@ async function apiPost(path, payload) {
     try {
       body = JSON.parse(text);
     } catch (err) {
-      throw new Error("Could not parse response from " + path + " as JSON: " + err.message);
+      throw new Error("无法把 " + path + " 的响应解析为 JSON：" + err.message);
     }
   }
   if (!res.ok) {
@@ -1042,8 +1042,8 @@ projectSwitcher.addEventListener("change", async () => {
   try {
     await apiPost("/api/projects/switch", { path: projectSwitcher.value });
   } catch (err) {
-    line.textContent = "切换项目失败：" + (err instanceof Error ? err.message : String(err));
-    line.title = "";
+    line.textContent = "切换项目失败（悬停查看原因）";
+    line.title = err instanceof Error ? err.message : String(err);
     await loadProjects(); // resync the select with what the server actually serves
     projectSwitcher.disabled = false;
     return;
@@ -1178,11 +1178,11 @@ async function pollGeneration() {
 // -- Decision Tree view --------------------------------------------------------
 
 const SAMPLE_ATTEMPTS_TOML =
-  'file = "docs/attempt-log.md"     # markdown file, relative to project root\n' +
-  'heading = "Attempt Log"          # heading right above the table\n' +
-  'steps_dir = "scripts"            # optional: numbered step-script directory\n' +
+  'file = "docs/attempt-log.md"     # Markdown 文件，相对于项目根目录\n' +
+  'heading = "Attempt Log"          # 表格正上方的标题\n' +
+  'steps_dir = "scripts"            # 可选：按编号命名的步骤脚本目录\n' +
   "\n" +
-  "[columns]                        # your table's actual header text\n" +
+  "[columns]                        # 你的表格实际使用的表头文字\n" +
   'id = "#"\n' +
   'date = "date"\n' +
   'description = "path"\n' +
@@ -1190,15 +1190,15 @@ const SAMPLE_ATTEMPTS_TOML =
   'result = "result"\n' +
   'verdict = "verdict"';
 
-function renderGuideCard(hint) {
+function renderGuideCard() {
   const card = document.createElement("div");
   card.className = "guide-card";
   const h2 = document.createElement("h2");
-  h2.textContent = "No attempt timeline configured yet";
+  h2.textContent = "还没有配置尝试年表";
   const p1 = document.createElement("p");
-  p1.textContent = hint || "Configure .rce/attempts.toml and run 'rce attempts' to ingest your attempt timeline.";
+  p1.textContent = "在 .rce/attempts.toml 里配置尝试年表，再运行 rce attempts 把它读入图谱。";
   const p2 = document.createElement("p");
-  p2.textContent = "Example .rce/attempts.toml:";
+  p2.textContent = "示例 .rce/attempts.toml：";
   const pre = document.createElement("pre");
   pre.textContent = SAMPLE_ATTEMPTS_TOML;
   card.append(h2, p1, p2, pre);
@@ -1222,7 +1222,7 @@ function verdictBadge(verdictText) {
   const span = document.createElement("span");
   span.className = "badge " + (marker ? VERDICT_BADGE_CLASS[marker] : "badge-plain");
   span.textContent = marker || "·";
-  span.title = verdictText || "(no verdict)";
+  span.title = verdictText || "（无结论）";
   return span;
 }
 
@@ -1250,7 +1250,7 @@ function renderAttemptNode(attempt) {
   date.textContent = attempt.date || "";
   const desc = document.createElement("span");
   desc.className = "attempt-desc";
-  desc.textContent = attempt.description || "(no description)";
+  desc.textContent = attempt.description || "（无描述）";
   content.append(num, date, desc);
   content.addEventListener("click", (e) => {
     e.preventDefault();
@@ -1345,12 +1345,12 @@ function fileList(entries, direction) {
     const icon = document.createElement("span");
     icon.className = "flow-icon " + direction;
     icon.textContent = direction === "read" ? "←" : "→";
-    icon.title = direction === "read" ? "reads (data flows in)" : "writes (data flows out)";
+    icon.title = direction === "read" ? "读取（数据流入）" : "写出（数据流出）";
     li.appendChild(icon);
     if (entry.role === "orphan_input") {
       const dot = document.createElement("span");
       dot.className = "orphan-dot";
-      dot.title = "orphan input: no script anywhere writes this file";
+      dot.title = "无来源输入：没有任何脚本写出这个文件";
       li.appendChild(dot);
     }
     const pathSpan = document.createElement("span");
@@ -1359,7 +1359,7 @@ function fileList(entries, direction) {
     if (entry.missing) {
       const flag = document.createElement("span");
       flag.className = "missing-flag";
-      flag.textContent = "(not found on disk)";
+      flag.textContent = "（文件不存在）";
       li.appendChild(flag);
     }
     li.addEventListener("click", () => openFilePanel(entry.path));
@@ -1375,16 +1375,16 @@ function renderScriptBody(body, script) {
   if (!hasReads && !hasWrites) {
     const note = document.createElement("div");
     note.className = "empty-note";
-    note.textContent = "No recorded reads or writes.";
+    note.textContent = "RCE 没有读到这个文件的读写。";
     body.appendChild(note);
     return;
   }
   if (hasReads) {
-    body.appendChild(rwLabel("Reads"));
+    body.appendChild(rwLabel("读取"));
     body.appendChild(fileList(script.reads, "read"));
   }
   if (hasWrites) {
-    body.appendChild(rwLabel("Writes"));
+    body.appendChild(rwLabel("写出"));
     body.appendChild(fileList(script.writes, "write"));
   }
 }
@@ -1426,9 +1426,9 @@ async function loadTreeView(preserveState) {
   const container = views.tree;
   const saved = preserveState ? captureTreeState() : null;
   // An auto-refresh keeps the old DOM in place until the new data has
-  // actually arrived -- no "Loading…" flash wiping the user's view every
+  // actually arrived -- no 「载入中…」 flash wiping the user's view every
   // time they save a file in their editor.
-  if (!saved) container.innerHTML = '<p class="empty-note">Loading…</p>';
+  if (!saved) container.innerHTML = '<p class="empty-note">载入中…</p>';
   let treeData, attemptsData;
   try {
     [treeData, attemptsData] = await Promise.all([apiGet("/api/tree"), apiGet("/api/attempts")]);
@@ -1440,7 +1440,7 @@ async function loadTreeView(preserveState) {
   state.attemptsById = new Map((attemptsData.attempts || []).map((a) => [a.id, a]));
   container.innerHTML = "";
   if (!treeData.attempts || treeData.attempts.length === 0) {
-    container.appendChild(renderGuideCard(treeData.hint));
+    container.appendChild(renderGuideCard());
     views.tree.dataset.loaded = "1";
     return;
   }
@@ -1470,7 +1470,7 @@ function scriptRefSpan(scriptPath, line, callee, human) {
   span.textContent = human
     ? scriptPath + " · 人工标注"
     : scriptPath + ":" + line + (callee ? " (" + callee + ")" : "");
-  span.title = "Open " + scriptPath;
+  span.title = "打开 " + scriptPath;
   span.addEventListener("click", () => openFilePanel(scriptPath, "script"));
   return span;
 }
@@ -1496,7 +1496,7 @@ function renderOrphanItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.readers && item.readers.length) {
-    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
+    div.appendChild(subList("被这些脚本读取", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
   }
   return div;
 }
@@ -1506,10 +1506,10 @@ function renderChainItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.writers && item.writers.length) {
-    div.appendChild(subList("Written by", item.writers, (w) => scriptRefSpan(w.script, w.line, w.callee, w.human)));
+    div.appendChild(subList("由这些脚本写出", item.writers, (w) => scriptRefSpan(w.script, w.line, w.callee, w.human)));
   }
   if (item.readers && item.readers.length) {
-    div.appendChild(subList("Read by", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
+    div.appendChild(subList("被这些脚本读取", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
   }
   return div;
 }
@@ -1525,7 +1525,7 @@ function renderBrokenItem(item) {
   row.appendChild(clickablePath(item.target));
   const flag = document.createElement("span");
   flag.className = "missing-flag";
-  flag.textContent = " (" + item.kind + ", not found)";
+  flag.textContent = item.kind === "writes" ? "（写出，文件不存在）" : "（读取，文件不存在）";
   row.appendChild(flag);
   div.appendChild(row);
   return div;
@@ -1536,7 +1536,7 @@ function renderDuplicateItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.other_copies && item.other_copies.length) {
-    div.appendChild(subList("Other copies", item.other_copies, (p) => clickablePath(p)));
+    div.appendChild(subList("其它拷贝", item.other_copies, (p) => clickablePath(p)));
   }
   return div;
 }
@@ -1556,7 +1556,7 @@ function lineageBlock(title, items, renderItem, accentClay) {
   if (!items || items.length === 0) {
     const note = document.createElement("div");
     note.className = "empty-note";
-    note.textContent = "None found.";
+    note.textContent = "没有。";
     section.appendChild(note);
     return section;
   }
@@ -1566,7 +1566,7 @@ function lineageBlock(title, items, renderItem, accentClay) {
 
 async function loadLineageView() {
   const container = views.lineage;
-  container.innerHTML = '<p class="empty-note">Loading…</p>';
+  container.innerHTML = '<p class="empty-note">载入中…</p>';
   let data;
   try {
     data = await apiGet("/api/lineage");
@@ -1576,10 +1576,10 @@ async function loadLineageView() {
   }
   clearProjectState(); // the graph answered: whatever was wrong is over
   container.innerHTML = "";
-  container.appendChild(lineageBlock("Orphan inputs", data.orphans, renderOrphanItem, true));
-  container.appendChild(lineageBlock("Chains", data.chains, renderChainItem, false));
-  container.appendChild(lineageBlock("Broken links", data.broken_links, renderBrokenItem, false));
-  container.appendChild(lineageBlock("Duplicate copies", data.duplicates, renderDuplicateItem, false));
+  container.appendChild(lineageBlock("无来源输入", data.orphans, renderOrphanItem, true));
+  container.appendChild(lineageBlock("血缘链", data.chains, renderChainItem, false));
+  container.appendChild(lineageBlock("断链", data.broken_links, renderBrokenItem, false));
+  container.appendChild(lineageBlock("同名拷贝", data.duplicates, renderDuplicateItem, false));
   views.lineage.dataset.loaded = "1";
 }
 
@@ -1611,17 +1611,17 @@ document.addEventListener("keydown", (e) => {
 });
 
 const FILE_TYPE_RULES = [
-  [/\.(py|r|rmd|jl|ipynb|sh)$/i, "script (code)"],
-  [/\.(csv|tsv|json|parquet|dta|rds|rda|pkl|feather|h5|hdf5)$/i, "dataset"],
-  [/\.(png|jpe?g|pdf|svg|eps|gif|tiff?)$/i, "figure"],
-  [/\.(md|txt|tex|bib|rst)$/i, "text / document"],
-  [/\.(toml|yaml|yml|ini|cfg)$/i, "config"],
+  [/\.(py|r|rmd|jl|ipynb|sh)$/i, "脚本"],
+  [/\.(csv|tsv|json|parquet|dta|rds|rda|pkl|feather|h5|hdf5)$/i, "数据集"],
+  [/\.(png|jpe?g|pdf|svg|eps|gif|tiff?)$/i, "图表"],
+  [/\.(md|txt|tex|bib|rst)$/i, "文本 / 文档"],
+  [/\.(toml|yaml|yml|ini|cfg)$/i, "配置"],
 ];
 
 function classifyFileType(path, hint) {
-  if (hint === "script") return "script (code)";
+  if (hint === "script") return "脚本";
   for (const [pattern, label] of FILE_TYPE_RULES) if (pattern.test(path)) return label;
-  return "file";
+  return "文件";
 }
 
 function codePreview(content) {
@@ -1639,14 +1639,17 @@ function codePreview(content) {
 
 async function runOpenAction(path, reveal, statusEl) {
   statusEl.className = "panel-status";
-  statusEl.textContent = "Working…";
+  statusEl.textContent = "处理中…";
   try {
     const result = await apiPost("/api/open", { path, reveal });
     statusEl.className = "panel-status ok";
-    statusEl.textContent = (reveal ? "Revealed in Finder: " : "Opened: ") + result.opened;
+    statusEl.textContent = (reveal ? "已在 Finder 中显示：" : "已打开：") + result.opened;
+    statusEl.title = "";
   } catch (err) {
     statusEl.className = "panel-status err";
-    statusEl.textContent = err.message;
+    // 8.8: Chinese framing up front, the engine's English on the hover.
+    statusEl.textContent = (reveal ? "无法在 Finder 中显示" : "无法打开") + "（悬停查看原因）";
+    statusEl.title = err.message;
   }
 }
 
@@ -1656,11 +1659,11 @@ function buildFileActions(path, statusEl) {
   const openBtn = document.createElement("button");
   openBtn.className = "btn";
   openBtn.type = "button";
-  openBtn.textContent = "Open";
+  openBtn.textContent = "打开";
   const revealBtn = document.createElement("button");
   revealBtn.className = "btn";
   revealBtn.type = "button";
-  revealBtn.textContent = "Reveal in Finder";
+  revealBtn.textContent = "在 Finder 中显示";
   openBtn.addEventListener("click", () => runOpenAction(path, false, statusEl));
   revealBtn.addEventListener("click", () => runOpenAction(path, true, statusEl));
   actions.append(openBtn, revealBtn);
@@ -1670,6 +1673,7 @@ function buildFileActions(path, statusEl) {
 async function openFilePanel(path, hint) {
   state.panelSubject = { kind: "file", path: path };
   panelTitle.textContent = path;
+  panelTitle.title = "";
   panelSubtitle.textContent = classifyFileType(path, hint);
   panelBody.innerHTML = "";
   const status = document.createElement("div");
@@ -1677,7 +1681,7 @@ async function openFilePanel(path, hint) {
   panelBody.appendChild(buildFileActions(path, status));
   panelBody.appendChild(status);
   const contentHost = document.createElement("div");
-  contentHost.innerHTML = '<p class="empty-note">Loading preview…</p>';
+  contentHost.innerHTML = '<p class="empty-note">预览载入中…</p>';
   panelBody.appendChild(contentHost);
   openPanel();
 
@@ -1692,7 +1696,7 @@ async function openFilePanel(path, hint) {
   if (data.truncated) {
     const note = document.createElement("div");
     note.className = "truncated-note";
-    note.textContent = "Showing the first " + data.content.length + " of " + data.size + " bytes (truncated).";
+    note.textContent = "只显示了开头 " + data.content.length + " 个字符，文件共 " + data.size + " 字节（已截断）。";
     contentHost.appendChild(note);
   }
   contentHost.appendChild(codePreview(data.content));
@@ -1712,13 +1716,17 @@ function kvRow(table, label, value) {
 function openAttemptPanel(id) {
   const attempt = state.attemptsById.get(id);
   state.panelSubject = { kind: "attempt", id: id };
-  panelTitle.textContent = id;
-  panelSubtitle.textContent = "attempt record";
+  // The graph id ("attempt:<file>#14") is an engine key, not copy: the
+  // title reads like the tree row, the raw id stays on the hover.
+  const shownNumber = attempt && attempt.attrs && attempt.attrs.number;
+  panelTitle.textContent = shownNumber ? "尝试 #" + String(shownNumber).replace(/^#/, "") : id;
+  panelTitle.title = id;
+  panelSubtitle.textContent = "尝试记录";
   panelBody.innerHTML = "";
   if (!attempt) {
     renderErrorBox(
       panelBody,
-      new Error("No details loaded for " + id + " -- reopen the Decision Tree tab and try again."),
+      new Error("没有载入 " + id + " 的详情——请重新打开「决策树」再试。"),
     );
     openPanel();
     return;
@@ -1740,11 +1748,11 @@ function openAttemptPanel(id) {
   const table = document.createElement("table");
   table.className = "kv-table";
   kvRow(table, "#", attrs.number || "");
-  kvRow(table, "Date", attrs.date || "");
-  kvRow(table, "Path / description", attrs.description || "");
-  kvRow(table, "Variables", attrs.variables || "");
-  kvRow(table, "Verdict", attempt.verdict || "(none)");
-  kvRow(table, "Result", attempt.result || "(none)");
+  kvRow(table, "日期", attrs.date || "");
+  kvRow(table, "路径 / 描述", attrs.description || "");
+  kvRow(table, "变量", attrs.variables || "");
+  kvRow(table, "结论", attempt.verdict || "（无）");
+  kvRow(table, "结果", attempt.result || "（无）");
 
   const sourceSpan = document.createElement("span");
   if (attrs.source_file) {
@@ -1752,16 +1760,16 @@ function openAttemptPanel(id) {
     sourceSpan.textContent = attrs.source_file + (attrs.source_line ? ":" + attrs.source_line : "");
     sourceSpan.addEventListener("click", () => openFilePanel(attrs.source_file));
   } else {
-    sourceSpan.textContent = "(unknown)";
+    sourceSpan.textContent = "（未知）";
   }
-  kvRow(table, "Source", sourceSpan);
-  kvRow(table, "Step files", (attrs.step_files && attrs.step_files.length) ? attrs.step_files.join(", ") : "(none)");
+  kvRow(table, "出处", sourceSpan);
+  kvRow(table, "步骤脚本", (attrs.step_files && attrs.step_files.length) ? attrs.step_files.join(", ") : "（无）");
   panelBody.appendChild(table);
 
   if (attrs.step_files_broken && attrs.step_files_broken.length) {
     const warn = document.createElement("div");
     warn.className = "step-broken";
-    warn.textContent = "Unresolved step references: " + attrs.step_files_broken.join(", ");
+    warn.textContent = "找不到的步骤脚本：" + attrs.step_files_broken.join(", ");
     panelBody.appendChild(warn);
   }
   openPanel();
@@ -1854,11 +1862,13 @@ function setFormStatus(statusEl, cls, cnText, err) {
   // Product language up front, the raw technical message folded below it
   // -- same division as the refresh chip's error handling.
   statusEl.className = "panel-status " + cls;
-  statusEl.textContent = cnText + (err ? "：" + (err instanceof Error ? err.message : String(err)) : "");
+  statusEl.textContent = cnText + (err ? "（悬停查看原因）" : "");
+  statusEl.title = err ? (err instanceof Error ? err.message : String(err)) : "";
 }
 
 function openAttemptForm(mode, attemptId) {
   state.panelSubject = { kind: "attempt-form" };
+  panelTitle.title = "";
   panelBody.innerHTML = "";
   const config = state.attemptsConfig;
   if (!config) {
@@ -1902,11 +1912,11 @@ function openAttemptForm(mode, attemptId) {
   // Field labels come from the project's OWN [columns] header text -- the
   // researcher's words, not this tool's.
   const defs = [
-    { key: "date", label: "日期（" + (config.columns.date || "date") + "）", mono: true },
-    { key: "description", label: config.columns.description || "description", multiline: true },
-    { key: "variables", label: config.columns.variables || "variables", multiline: true },
-    { key: "result", label: config.columns.result || "result", multiline: true },
-    { key: "verdict", label: config.columns.verdict || "verdict" },
+    { key: "date", label: config.columns.date ? "日期（" + config.columns.date + "）" : "日期", mono: true },
+    { key: "description", label: config.columns.description || "描述", multiline: true },
+    { key: "variables", label: config.columns.variables || "变量", multiline: true },
+    { key: "result", label: config.columns.result || "结果", multiline: true },
+    { key: "verdict", label: config.columns.verdict || "结论" },
   ];
   defs.forEach((def) => {
     let input;
@@ -2114,8 +2124,8 @@ document.getElementById("shutdown-btn").addEventListener("click", async () => {
   } catch (err) {
     btn.disabled = false;
     const line = document.getElementById("project-line");
-    line.textContent = "停止服务失败：" + (err instanceof Error ? err.message : String(err));
-    line.title = "";
+    line.textContent = "停止服务失败（悬停查看原因）";
+    line.title = err instanceof Error ? err.message : String(err);
     return;
   }
   renderStoppedState();

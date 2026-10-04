@@ -187,7 +187,7 @@ def test_migration_removes_the_wal_and_shm_sidecars(tmp_path):
     paths.migrate_legacy_graph(project)
 
     leftovers = sorted(p.name for p in (project / ".rce").iterdir())
-    assert leftovers == []
+    assert leftovers == ["README"]  # the signpost (8.10 rule 1), nothing of the graph
 
 
 def test_migration_preserves_commits_still_living_in_the_wal(tmp_path):
@@ -329,6 +329,55 @@ def test_write_project_readme_names_the_graph_directory(tmp_path):
     text = readme.read_text(encoding="utf-8")
     assert str(paths.graph_dir(project)) in text
     assert text.count("\n") == 1  # one line, as the design says
+
+
+def test_migration_leaves_the_same_readme_rce_init_writes(tmp_path):
+    """8.10 rule 1 (amended): the researcher who opens `.rce/` after the
+    move and finds no `graph.db` finds the answer in the same folder."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    _mk_legacy_graph(project)
+
+    paths.migrate_legacy_graph(project)
+
+    readme = project / ".rce" / "README"
+    migrated_text = readme.read_text(encoding="utf-8")
+    readme.unlink()
+    assert paths.write_project_readme(project).read_text(encoding="utf-8") == migrated_text
+    assert str(paths.graph_dir(project)) in migrated_text
+
+
+def test_a_failed_migration_writes_no_readme(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    _mk_legacy_graph(project)
+    monkeypatch.setattr(paths, "_backup_database", lambda src, dst: "*** in database main ***")
+
+    with pytest.raises(paths.GraphMigrationError):
+        paths.migrate_legacy_graph(project)
+
+    assert not (project / ".rce" / "README").exists()
+
+
+def test_a_no_op_migration_writes_no_readme(tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".rce").mkdir()
+    assert paths.migrate_legacy_graph(project) is None
+    assert not (project / ".rce" / "README").exists()
+
+
+def test_a_readme_that_cannot_be_written_does_not_fail_a_completed_move(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    _mk_legacy_graph(project)
+
+    def _boom(_root):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(paths, "write_project_readme", _boom)
+    assert paths.migrate_legacy_graph(project) == paths.graph_db_path(project)
+    assert paths.graph_db_path(project).exists()
 
 
 def test_write_project_readme_is_rewritten_not_appended(tmp_path):

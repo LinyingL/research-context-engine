@@ -681,6 +681,121 @@ def test_served_app_tabs_read_in_product_language(live_server):
     assert ">Decision Tree<" not in html and ">Lineage<" not in html
 
 
+# DESIGN.md 8.8's binding glossary, English side: every spelling the old UI
+# used for each term (the source spelling and, where CSS upper-cased it, the
+# displayed one). Matched case-sensitively and as whole words, so code such
+# as `"/api/open"` or the payload's `kind === "reads"` never trips it.
+_GLOSSARY_ENGLISH = (
+    "Reads", "READS", "Writes", "WRITES",
+    "No recorded reads or writes",
+    "Orphan inputs", "Orphan input",
+    "Read by", "READ BY", "Written by", "WRITTEN BY",
+    "Lineage chains", "Chains",
+    "Broken links", "not found)",
+    "Duplicate copies", "Other copies", "OTHER COPIES",
+    "Open", "Reveal in Finder", "Close", "Loading",
+)
+_GLOSSARY_CHINESE = (
+    "读取", "写出", "RCE 没有读到这个文件的读写。", "无来源输入", "被这些脚本读取",
+    "由这些脚本写出", "血缘链", "断链", "（读取，文件不存在）", "（写出，文件不存在）",
+    "同名拷贝", "其它拷贝", "打开", "在 Finder 中显示", "关闭", "载入中…",
+)
+
+
+def _js_string_literals(source: str) -> list[str]:
+    """Every '…', "…" and `…` literal in `source`, comments skipped -- the
+    places a script's user-visible copy can live. Regex literals are
+    skipped by the usual "a slash after an operator starts a regex" rule,
+    which is all this codebase's two scripts need."""
+    out, i, n = [], 0, len(source)
+    while i < n:
+        c = source[i]
+        if source.startswith("//", i):
+            j = source.find("\n", i)
+            i = n if j < 0 else j
+        elif source.startswith("/*", i):
+            i = source.index("*/", i) + 2
+        elif c in "'\"`":
+            j = i + 1
+            while source[j] != c:
+                j += 2 if source[j] == "\\" else 1
+            out.append(source[i + 1:j])
+            i = j + 1
+        elif c == "/" and re.search(r"(^|[(,=:\[!&|?{};+]|return)\s*$", source[max(0, i - 8):i]):
+            j, in_class = i + 1, False
+            while j < n and source[j] != "\n" and (source[j] != "/" or in_class):
+                if source[j] == "\\":
+                    j += 1
+                elif source[j] == "[":
+                    in_class = True
+                elif source[j] == "]":
+                    in_class = False
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _html_markup_copy(html: str) -> list[str]:
+    """Text nodes and copy-carrying attributes of the markup itself (the
+    inline script and style removed, comments removed)."""
+    markup = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    markup = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", "", markup, flags=re.S)
+    texts = [t for t in re.findall(r">([^<]+)<", markup) if t.strip()]
+    attrs = re.findall(r'\b(?:title|aria-label|placeholder|alt)="([^"]*)"', markup)
+    return texts + attrs
+
+
+def _english_glossary_hits(pieces: list[str]) -> list[tuple[str, str]]:
+    hits = []
+    for piece in pieces:
+        for term in _GLOSSARY_ENGLISH:
+            if re.search(r"(?<![A-Za-z])" + re.escape(term) + r"(?![A-Za-z])", piece):
+                hits.append((term, piece))
+    return hits
+
+
+def test_served_ui_copy_uses_the_8_8_glossary_not_its_english(live_server):
+    """DESIGN.md 8.8 (amended): ALL UI copy is Chinese, and each glossary
+    term has exactly one rendering. Fails if any glossary term's English
+    comes back as copy -- a quoted string literal in either served script,
+    or a text node / title / aria-label / placeholder in the markup.
+    Comments may say what they like."""
+    html = _get_raw(live_server[0], "/")[1].decode("utf-8")
+    js = _get_with_type(live_server[0], "/canvas.js")[2].decode("utf-8")
+    inline = html[html.index('<script>\n"use strict"') + len("<script>"):html.rindex("</script>")]
+
+    page_literals = _js_string_literals(inline)
+    canvas_literals = _js_string_literals(js)
+    pieces = page_literals + canvas_literals + _html_markup_copy(html)
+
+    assert _english_glossary_hits(pieces) == []
+    # The scanner really saw the copy (a broken tokenizer must not pass by
+    # finding nothing): the Chinese side of the glossary is there instead.
+    seen = "\n".join(pieces)
+    for term in _GLOSSARY_CHINESE:
+        assert term in seen, f"glossary rendering missing from the served UI: {term}"
+
+
+def test_glossary_scanner_catches_english_copy_but_not_comments_or_code():
+    """The guard above is only worth something if it would fail: pin that
+    it flags a reintroduced English label and ignores comments and code."""
+    caught = _js_string_literals('x.textContent = "Reads"; // Reads\nfetch("/api/open")')
+    assert _english_glossary_hits(caught) == [("Reads", "Reads")]
+    assert _english_glossary_hits(_html_markup_copy('<button aria-label="Close">x</button>')) == [("Close", "Close")]
+    assert _english_glossary_hits(_html_markup_copy("<!-- Loading… -->\n<p>载入中…</p>")) == []
+    assert _english_glossary_hits(_js_string_literals("/* Open */ const r = /Open/; kind === 'reads'")) == []
+
+
+def test_served_brand_subtitle_is_yanjiu_mailuo(live_server):
+    """8.8 (amended): the brand mark stays RCE; its subtitle becomes
+    「研究脉络」 (the old English one named two of three views)."""
+    html = _get_raw(live_server[0], "/")[1].decode("utf-8")
+    assert '<span class="brand-sub">研究脉络</span>' in html
+    assert "decision tree &amp; lineage" not in html
+
+
 def test_canvas_js_carries_the_design_copy_in_product_language():
     """The canvas's binding copy (8.1-8.4, 8.7, 8.8), pinned so it is not
     casually reworded: type labels, the 8.1 socket names, the toolbar, the

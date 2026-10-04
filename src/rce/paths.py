@@ -525,6 +525,16 @@ def migrate_legacy_graph(project_root: str | Path) -> Path | None:
     # (adversarial review of the V4 work), which section 8.10's "one log
     # line ... so nothing is hidden" rules out.
     logger.warning("RCE moved this project's graph out of the project: %s -> %s", legacy, target)
+    # Section 8.10 rule 1 (amended): the researcher who opens `.rce/` and
+    # finds no `graph.db` must find the answer in the same folder -- the
+    # same one-line signpost `rce init` writes. Only here, after the move
+    # succeeded; every failure above raised before reaching this line. A
+    # signpost that cannot be written does not undo a completed move, so
+    # that failure is logged, not raised.
+    try:
+        write_project_readme(project_root)
+    except OSError as exc:
+        logger.warning("could not write %s (%s)", project_rce_dir(project_root) / README_FILENAME, exc)
     return target
 
 
