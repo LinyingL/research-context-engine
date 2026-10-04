@@ -1268,3 +1268,520 @@ and adopted as design:
   the 「未连线」 block, so one stray step file cannot stretch it across the
   page.
 
+## Section 9 — Human records outlive the index (task V5)
+
+*Status: DRAFT 2 for the researcher's review (revised after three
+adversarial design reviews; 46 findings, 5 of them blocking, all ruled on).
+Nothing in this section is implemented, and nothing in it may be
+implemented, until it is approved.*
+
+**The goal, in the researcher's words: a judgment the user has made is kept
+for the long term, independently of the machine index, which can always be
+rebuilt.** A stable project identity answers "after the folder moves, find
+the same data again". It does not answer "after the database is rebuilt,
+get the human records back". This section answers both.
+
+### 9.0 What was found (2026-10-04, read from the code and by experiment)
+
+Section 4 already says the researcher's own file is the truth and the graph
+follows it. Two kinds of human labor obey that rule today (attempt verdicts
+in the Markdown table; hand-drawn links in `.rce/mappings.toml`). The rest
+does not:
+
+- A confirm or a reject on a machine-extracted link exists only as
+  `edges.status` in `~/.rce/graphs/<path hash>/graph.db`. No time, no note,
+  no history, and no record of the evidence the researcher was looking at.
+  `updated_at` is overwritten by every later scan. Undo deletes its own
+  memory.
+- Rebuilding the database loses every confirm and reject.
+- Moving or renaming the project folder strands the database and the
+  canvas arrangement under the old path's hash. Worse: a *different*
+  project later created at the old path silently inherits the old one's
+  judgments, and the moved project's stale registry entry still serves the
+  stranded database from a path that no longer exists.
+- When the evidence under a judgment changes, the judgment is silently
+  carried over. (Experiment: a confirmed read stayed confirmed after the
+  call was deleted from the script; a confirmed claim–metric link stayed
+  confirmed, still quoting 0.873, after the metric became 0.95.) When the
+  *identity* of the judged thing changes (file renamed, sentence reworded),
+  the judgment stays on the old id with nothing pointing to the new one.
+- Canvas arrangements were classified "safe to delete" (8.6) and sit beside
+  the database. The researcher counts them as labor; so they are.
+- Two processes writing the same record file lose updates (600 concurrent
+  position writes → 201 survive, 279 raise), because every lock is
+  in-process and the temp-file name is fixed.
+
+### 9.1 The rule
+
+Two stores of opposite nature, and one direction between them.
+
+- **The record** (人工记录) lives inside the project, in `.rce/`, as plain
+  files the researcher can read, diff, commit, and back up with the
+  project. It is never derived from anything.
+- **The index** (机器索引) is `graph.db` under `~/.rce/graphs/<project
+  id>/`. It is derived from the project's sources plus the record. Deleting
+  it loses nothing.
+
+**The index may forget; the record may not. Whatever the index knows about
+a human judgment, it learned from the record.** Every human action is
+written to the record first and only then reflected in the index — through
+one code path, whichever surface it came from (canvas, CLI, MCP). No
+surface may write a human status to the index directly. The record files
+join the watch set and are applied on first sight of a project, as
+`mappings.toml` already is (8.12), so an index can lag the record only
+until the next poll.
+
+One consequence for Section 4: orphan claim and attempt nodes were kept
+forever when a link on them had been judged, "because the graph is the
+sole record of that decision". It no longer is. Cleanup removes such
+orphans like any other; the ledger keeps the judgment (9.6 says how it is
+shown).
+
+### 9.2 Inventory: what counts as human labor, and where each lives
+
+| Human labor | Today | Source of truth after V5 | Backup |
+|---|---|---|---|
+| Attempt verdict and result (尝试结论) | the researcher's Markdown table | unchanged | before each app write (as today), **and** a snapshot the first time RCE sees the file changed each day — which is what covers hand edits |
+| Hand-drawn link and its note (手工连线、备注) | `.rce/mappings.toml` | unchanged | same |
+| Confirm / reject of a machine link (确认、拒绝) | `edges.status` in the index only | **`.rce/judgements.toml`** (9.3) | daily snapshot; and the file is append-only, so it is its own history |
+| Undo, withdraw (撤销、撤回) | an evidence key, erased on use | entries in `judgements.toml` | same |
+| Note on a judgment (备注) | does not exist | optional `note` on the entry | same |
+| Canvas arrangement, per view (画布位置) | `canvas.json` beside the index | **`.rce/canvas.json`** | daily snapshot, and before 「重新排列」 discards an arrangement |
+| Attempt-table configuration | `.rce/attempts.toml`, hand-written | unchanged | daily snapshot when changed; RCE never writes it |
+
+Snapshots go to `.rce/backups/`, newest 20 per file. A snapshot per day
+rather than per write, because a review session of thirty clicks must not
+rotate the last good copy away.
+
+Not human labor, and said so: the last-used tab; the project registry
+(`~/.rce/projects.json`); a model's second opinion from `rce judge`
+(`semantic_review` — a machine annotation; it can be recomputed, at a
+cost, and its persistence is out of scope here).
+
+### 9.3 The judgment ledger: `.rce/judgements.toml`
+
+Append-only. An RCE write is the file's existing bytes plus the new
+entry's bytes; existing text, comments and unknown keys are never
+re-emitted. History is therefore not a feature to build — it is the file.
+
+```toml
+# 你对机器提取结果的判断。RCE 只追加、不改写；图谱里的确认/否决从这里派生。
+[[judgement]]
+id       = "j-0b6f3c1e9a4d4f7ea2c5d8e1f0a3b6c9"   # random, unique
+at       = "2026-10-04T21:15:03+02:00"
+verdict  = "rejected"       # confirmed | rejected | withdrawn | undone
+src      = "script:复现包_分步/17-叙事更替与汇率波动.Rmd"
+dst      = "dataset:复现包_分步/Data/panel_pricing.csv"
+type     = "reads"
+extractor = "dataflow"
+via      = "canvas"         # canvas | cli | mcp | migrated | recovered
+note     = "这里读的是旧版面板"   # optional
+[judgement.basis]           # what the researcher was looking at (9.6)
+calls = ["read.csv"]
+```
+
+- A link is identified as it is in the index: (`src`, `dst`, `type`,
+  `extractor`). Node ids are project-relative (verified: none contains the
+  project root), so the ledger is valid wherever the folder goes. The
+  ledger never holds `extractor = "mapping"`: a hand-drawn link has one
+  authority, `mappings.toml`, and every write path refuses a second.
+- **Two different acts, two verdicts.** 「撤销」 takes back the researcher's
+  *last act* on a link: an `undone` entry naming the entry it cancels
+  (`undoes = "<id>"`), after which the link is whatever it was before — a
+  link confirmed, then rejected by a mis-click, then undone, is confirmed
+  again (8.12's rule, kept). 「撤回」 takes back the *judgment*: a
+  `withdrawn` entry, after which the link is whatever the machine says.
+- **The state of a link** is its entry with the latest `at` among entries
+  not cancelled by an `undone` (equal times go by file order; a file whose
+  order disagrees with its times is reported, never reordered).
+- **`basis`** is the heart of 9.6: the substantive facts the link rested on
+  when the researcher judged it. It is stored readable, so that in a year
+  the researcher can see *what* they confirmed, not merely *that* they did.
+- Hand edits are legal; it is the researcher's file. An entry that fails
+  validation makes the whole ledger unreadable, and RCE names the line.
+
+**A ledger RCE cannot trust is never built upon.** While the ledger is
+missing though the project has one (`.rce/project.toml` records that it
+does, from the first entry on), still in the cloud, or unreadable:
+
+- the index keeps the human state it had (Section 4: failing to read the
+  source is not evidence of deletion); a brand-new index shows none and
+  says why;
+- **every write to the ledger is refused** (「判断记录文件当前无法读取，请先
+  恢复它」). RCE never replaces a file it could not parse and never
+  recreates one that should exist — otherwise one click on a morning when
+  the sync service is mid-transfer would found a new one-entry ledger and
+  the next read would retract everything else.
+
+**A ledger that has shrunk is not obeyed silently.** The index keeps a
+copy of every entry it has applied. That copy is a safety net, never a
+second authority: if a readable ledger lacks entries the index applied (a
+sync service kept the other machine's file; a truncation that still
+parses; a zero-byte download; a restore from backup), RCE changes nothing
+and asks — 「记录文件比图谱少了 N 条判断」 with two answers, 「以文件为准」
+(this is what a deliberate restore wants) and 「把缺少的补回文件」 (appended
+with `via = "recovered"`). The same question, mirrored, when the file has
+entries the index never saw is not a question: they are simply applied.
+
+`mappings.toml` keeps its format and its 8.12 rules.
+
+### 9.4 Project identity
+
+A project is identified by a file it carries, not by where it sits.
+
+```toml
+# .rce/project.toml
+id      = "p-3f9c2a7e5b1d4c68a0e7b2d94c1f6a35"   # random, assigned once
+created = "2026-10-04"
+ledger  = true                  # set when judgements.toml gets its first entry
+# forked_from = "p-…"           # only on a folder declared an independent branch
+```
+
+The index lives at `~/.rce/graphs/<id>/` and remembers its home in
+`home.json` beside `graph.db`: the folder's canonical path (as the file
+system stores it) and its device and inode numbers. "This folder is the
+home" means *the same directory*, whatever it is spelled as — a change of
+letter case, a Unicode-normalization variant or a symlink is not a move,
+and only rewrites the spelling.
+
+**The identity check is the first thing every entry point does** — every
+CLI subcommand, `rce serve` with or without a path, a project switch in
+the app, the MCP server — before anything is written: no registry entry or
+recency bump, no README, no scan, no project node.
+
+| Situation | What it is | What happens |
+|---|---|---|
+| id present, an index for it exists, its home is this directory | the normal case | open |
+| …its home is elsewhere, and the old home is **confirmed** gone (its volume is mounted, its parent is readable, the folder is not there) or confirmed to carry a different id | **moved or renamed** | adopt: update `home.json` and the registry entry (path and label); one log line |
+| …its home is elsewhere, and the old home still carries this id | **a copy** — two live folders, one identity | stop and ask (below) |
+| …its home is elsewhere, and the old home **cannot be checked** (volume not mounted, unreadable, its identity file still in the cloud) | cannot tell a move from a copy | stop and ask, with a third answer 「原位置暂时不可用，先只读打开」 |
+| id present, no index for it on this machine | restored, cloned, synced from another Mac, or the index was deleted | build the index from sources and the record |
+| no `project.toml`, but `.rce/` holds record files | the identity file was lost, or `.rce/` was copied in from elsewhere | stop and ask; never mint an id silently over existing records |
+| `project.toml` exists but cannot be read (in the cloud, unparseable, or a sync conflict copy sits beside it) | cannot tell who this is | stop: 「项目身份文件无法读取」; nothing is written |
+| no `project.toml`, no record files | not an RCE project, or one from before V5 | `rce init`; and see 9.5 for what is checked first |
+
+"Gone" is never inferred from failing to look. That is the Section 4
+error in another coat: an unmounted disk is not a deleted folder.
+
+**A copy is never guessed at.** Until the researcher answers, nothing is
+written — not the index, not the record, not the registry. The answers:
+
+- 「作为独立分支继续」 (`rce project fork`): this folder gets a new id and
+  `forked_from`. Its record files came with the copy, so its judgments
+  start equal to the original's and diverge from here; it gets its own
+  index. (If `project.toml` is tracked by git, RCE says that committing it
+  will carry the new identity into whatever branch it is merged to.)
+- 「这里才是原项目」 (`rce project claim`): the index's home becomes this
+  folder **and the index is rebuilt from this folder** (9.8), so nothing
+  from the other folder's scans or record survives in it. The other folder
+  is asked the same question when it is next opened.
+- 「这是另一个项目」: for a folder that merely received a copy of someone
+  else's `.rce/`. A new id with no `forked_from`; the copied ledger and
+  arrangement are moved into `.rce/backups/`, since they speak about
+  another project's files.
+
+**Identity is re-checked at every write, not only at open.** A running
+engine holds a folder open for hours; the folder can be moved in Finder
+under it, or claimed elsewhere. Under the project lock (9.7), each write
+to a record file or to the index first confirms that the served folder
+still exists, still carries the id, and is still that id's home. If not,
+it writes nothing and the page says 「项目已移动或已在别处认领，请重新打开」.
+Record writers create `.rce/` only inside a folder that exists; they never
+re-create a folder that has gone.
+
+Consequences worth stating. A new, unrelated project created at a path an
+old project used to occupy has a different id (or none) and inherits
+nothing. A registry entry is `{id, path, label}`, keyed by id; a moved
+project updates its entry instead of adding one, and an entry whose folder
+is gone is shown as 「找不到项目文件夹（可能已移动）」 with 「选择新位置…」 —
+the folder chosen goes through the same identity check, so a moved project
+can be re-attached from the app, which is how the app (started with no
+path) finds it again; RCE never searches for a folder by itself. The
+`project` node in the index is `project:<id>`. The same project synced to
+two Macs is one identity with one local index per machine.
+
+### 9.5 Migrating what exists
+
+Before V5 the judgments sit in indexes keyed by a path hash — and a path
+hash does not prove whose they are. So migration is **an explicit act,
+never a side effect of opening a folder**, and it accounts for every old
+index on the machine, not just the obvious one.
+
+**What is looked for.** On every open, whether or not the folder already
+has an id, RCE checks for un-retired pre-V5 databases that may hold this
+project's judgments: the index at this path's hash; a legacy
+`.rce/graph.db` inside the folder (pre-8.10); and — listed by `rce migrate
+--list` for the researcher to recognise — every other un-retired index
+under `~/.rce/graphs/`, each with the project path it recorded, whether
+that path still exists, and how many judgments it holds. Indexes stranded
+by a move before V5 are found this way, and so is the second Mac's own
+index when the identity file arrived by sync.
+
+**What the researcher is shown before anything is exported**: where the
+index says it came from, how many confirms and rejects and arranged views
+it holds, and how many of the judged links' endpoints a scan of *this*
+folder actually produces. A folder that merely reuses an old project's
+path will show a low match; 「这不是这个项目的」 leaves that index alone.
+Until a pre-V5 project is migrated it opens for reading; writing a human
+record waits for the migration, so that nothing new lands in the old
+store.
+
+**The steps**, under the project lock from the first to the last:
+
+1. **Export.** Every confirmed or rejected machine link in the old index
+   becomes ledger entries (`via = "migrated"`; a reject that remembered a
+   prior confirmation becomes two entries, in order; `mapping` links are
+   skipped — their truth is already a file). An arrangement is copied to
+   `.rce/canvas.json` only if none exists there. Exporting twice adds
+   nothing. Exporting a second old index merges by content; a migrated
+   entry that contradicts the state the ledger already has for that link
+   is recorded and the link is put under review (9.6) — two machines
+   disagreed, and a migration date must not decide between them.
+2. **Basis.** The evidence at the moment of the original judgment was
+   never kept. The old index's evidence is an accumulation of everything
+   ever seen. So: if those accumulated occurrences yield exactly one basis
+   and it equals what a fresh scan yields, that basis is recorded
+   (`basis_recorded = "at-migration"`). Otherwise the entry records what
+   the old index held and the link comes up **under review** — a judgment
+   that was already silently carried over to changed evidence is not
+   re-certified on the new evidence by the act of migrating it.
+3. **Identity.** `.rce/project.toml` is created exclusively and never
+   overwritten; it carries `migrating_from` until step 5, and any open of
+   such a folder resumes here rather than treating it as migrated.
+4. **Rebuild and verify.** Build a new index for the new id from scratch —
+   sources, then the record — and reconcile it against the *old index's own
+   count*, not against what the exporter says it exported: **M** judged
+   links in the old index, each matched by key to the ledger and found in
+   the new index as exactly one of *applied*, *under review*, or *under
+   review because no scan produces the link any more*; unmatched must be
+   zero. A source file that could not be read during this scan is a fourth
+   count, 「来源文件暂不可读」, and any number other than zero there stops
+   the migration — an evicted file must not be mistaken for a vanished
+   link. Attempt verdicts and hand-drawn links in the new index must equal
+   *their source files*; where the old index differed it is listed as a
+   stale mirror, not a failure. The tally is printed.
+5. **Only then retire the old index**, and only if no other process holds
+   it open (an engine or MCP server still running old code would go on
+   writing into a retired file: 「请先退出 RCE 与 MCP 服务」). It is renamed
+   into `~/.rce/graphs/.retired/<hash>-<date>/`, not deleted, and the
+   command says where it went.
+
+If step 4 does not balance, nothing is retired: the half-built index is
+removed, the old one keeps serving, what did not match is shown, and a
+retry duplicates nothing. The researcher's own project is migrated by hand
+at acceptance, after a backup, as the graph move was.
+
+### 9.6 When the evidence changes
+
+A judgment is a statement about particular evidence. It is applied only
+while that evidence stands; otherwise it is kept, shown, and waits.
+
+**Basis.** Each extractor defines, for its links, a small canonical record
+of the facts a link rests on, and nothing positional. Line numbers,
+timestamps, run counters, the name of a receiving variable and the
+spelling of an expression are not facts.
+
+| Extractor | Basis |
+|---|---|
+| `dataflow` reads / writes | the set of bare call names that produced the link (`read_csv`, `open`; in R the function without its package prefix: `read.csv`, `read_dta`). The path is not repeated: the resolved path *is* the link's `dst` |
+| `claims` backed_by | the claim's normalized sentence and printed number; the names of the metrics of that experiment that match it, each value rounded to the claim's printed precision |
+| `pyfig` generates | the bare call name |
+| `mlflow` / `wandb` produces | the artifact path |
+| `latex` / `mdpaper` includes, cites; `git`; `attempts_consistency` | the link's identity alone |
+
+**What a scan must report**, which it does not today. The basis compared
+is the one produced by *this scan*, not the index's accumulated evidence.
+And a link can only be said to be "no longer produced" by a scan that
+actually read its source. So every extractor reports, per source, one of
+*read and parsed* / *unreadable* / *unparseable* (today an unparseable
+script and a script with no calls look the same). A link's source is the
+file named in its evidence, or for experiment links the tracking store
+read in that run; a file absent from a successfully read inventory is an
+observation too. A scan speaks only for the extractors it ran and the
+sources it read; everything else keeps its previous state.
+
+**On every scan, for each link whose ledger state is a verdict:**
+
+- **Same basis** → the judgment applies. A line inserted above, a renamed
+  variable, a rescan: nothing happens, and nothing is written.
+- **Anything else** → the judgment is **not applied**. The link is shown
+  at the machine's own status and marked 「待复核」, with the old verdict,
+  its date, its note, its basis, and the reason, which is one of:
+  - 「依据已变化」 — the link is still produced, on a different basis;
+  - 「机器不再得出这条关联」 — both ends are still in the scan, the link is
+    not (the call was removed; the metric no longer rounds to the printed
+    number);
+  - 「关联的一端不在本次扫描结果里」 — a file was renamed or removed, a
+    sentence was reworded so that the claim has a new id.
+
+  The wording says what the scan did, never that something "no longer
+  exists": a path the extractor could no longer resolve is not a deleted
+  file. A source that could not be read is none of these — it is 「来源文件
+  暂不可读」, and the judgment stays as it was.
+- The ledger is not touched by any of this. The researcher settles a
+  review with a new entry: 「仍然成立」 (the same verdict, recorded on the
+  basis as it is now), the opposite verdict, or 「撤回」. If the same link
+  comes back with the same basis, the judgment applies again by itself,
+  because the facts it was made on are back.
+
+**No transfer, but a prompt.** RCE never moves a judgment onto another
+link by itself. But when a judged link stops being produced, the review
+item lists the links that *appeared in the same scan from the same source
+with the same type and the same basis* — the renamed script's read of the
+same file — and each of those links carries the hint 「可能对应一条待复核的
+旧判断」. Applying the old verdict to one of them is the researcher's click
+and a new ledger entry. This is how "the new state has a prompt" is met
+when an edit changes an id.
+
+**Where it shows.** A link under review is marked as such in every place
+that shows links — canvas, 血缘, 决策树, `rce lineage`/`trace`, MCP —
+because a link the researcher had rejected reappears at the machine's
+status, and must not pass for an ordinary one. The header counts
+「待复核：N」; a link under review is counted there and not in 「待确认」.
+Clicking the count lists the items in the existing side panel with the
+three actions; `rce review` prints the same list. The canvas gets nothing
+else in V5.
+
+What V5 does **not** change: machine links nobody judged, which a scan no
+longer produces, stay in the index and in the views as they do today.
+Cleaning those up is a separate decision (9.10).
+
+### 9.7 One writer at a time
+
+Every write to a record file, and every scan that writes the index, takes
+a cross-process lock on the project: `flock` on
+`~/.rce/locks/<project id>.lock` — local, never synced, never evicted, and
+the same file for every spelling of the folder (before a project has an
+id, the lock is keyed by its canonical path). Temp-file names are unique
+per write. Two engines, or an engine and a CLI command, may run against
+one project; they take turns.
+
+Record files sit in a folder that may be cloud-synced. Before reading
+one, RCE checks whether the sync service has evicted it (8.10's dataless
+flag), asks for the download, and says 「记录文件正在从云端下载…」 rather
+than blocking. If the sync service leaves a conflict copy of a record file
+(`judgements 2.toml`), RCE says so and merges nothing by itself; entry ids
+make a merge tool possible, and that tool is not V5.
+
+### 9.8 Commands
+
+- `rce records` — the inventory of 9.2 for this project: where each kind
+  lives, how many, the newest snapshot. `rce records --verify` checks, per
+  link, that the index's human state is what the record implies, and exits
+  non-zero if not.
+- `rce rebuild` — build a fresh index beside the current one, apply the
+  record, and compare human state per link before and after: on unchanged
+  sources, a judgment applied before and not applied after is a failure,
+  and any unreadable source blocks the swap. Then swap; the previous index
+  is kept one generation.
+- `rce review` — the list of 9.6. `rce confirm` gains `--note` and the
+  `withdrawn` and `undone` verdicts and writes the ledger like every other
+  surface; MCP's `confirm_edge` is narrowed to the same verdicts and, like
+  the canvas, refuses hand-drawn links.
+- `rce migrate`, `rce migrate --list`, `rce migrate --from <dir>` — 9.5.
+- `rce project fork` / `rce project claim` — 9.4.
+
+### 9.9 Acceptance
+
+Each scenario runs on a fixture that holds, at the start: one confirmed
+machine link, one rejected, one confirmed-then-rejected-then-undone (so:
+confirmed), one hand-drawn link with a note, an attempt table with
+verdicts, and a canvas view arranged by hand. "All records present" means
+all six, each readable through the app and through `rce records`.
+
+1. **Move.** Move the folder elsewhere and open it there — from the CLI,
+   and from the app through 「选择新位置…」: all records present; one
+   registry entry, at the new path; the old path is not servable; the
+   index directory did not change. Move it *while an engine is serving
+   it* and click a judgment: nothing is written at the old path, and the
+   page says to reopen.
+2. **Rename**, including a change of letter case only: as 1, with no copy
+   question.
+3. **Copy.** Open a copy: blocked, with the answers, and nothing written
+   (registry included) until one is taken. *Fork*: new id, `forked_from`,
+   all records present in both; a later judgment in the copy does not
+   appear in the original. *Claim*: the index is rebuilt from the
+   claiming folder, `rce records --verify` passes there, and the original
+   is asked on its next open. With the original on a volume that is not
+   mounted: the third answer, read-only, and no adoption.
+4. **Path reuse.** After V5: move the project away, create an unrelated
+   project at the old path — it has no judgments, no arrangement, its own
+   id. Before V5: the same, then upgrade — the new folder is shown the
+   old index with its low match, declines, and inherits nothing.
+5. **Rebuild.** Delete `~/.rce/graphs/<id>/` and open the project: all
+   records present; `rce records --verify` passes. `rce rebuild` on a
+   healthy project: the same, and the per-link comparison is clean.
+6. **Repeated scans.** Run every scan three times: the ledger is
+   byte-identical, the index's human state is identical, nothing comes
+   under review.
+7. **Backup and restore.** Copy `.rce/` aside; make further judgments;
+   restore the copy over `.rce/`: RCE reports that the file has N fewer
+   judgments than the index and asks; 「以文件为准」 gives exactly the
+   copy's records. Restore the whole project folder from an earlier copy
+   on a machine with no index for it: the same records, no question.
+8. **Evidence changes.** (a) Insert lines above a judged call; rename its
+   receiving variable or the import alias: the judgment applies, nothing
+   is flagged. (b) Change which function is called: 「待复核 · 依据已变化」,
+   the old verdict and basis visible, the link at the machine's status and
+   marked in every view; 「仍然成立」 clears it and the ledger shows both
+   entries. (c) Delete the call; change a metric so it no longer rounds to
+   the claim's number: 「待复核 · 机器不再得出这条关联」; put it back: the
+   judgment applies again with no new entry. (d) Rename the script: the old
+   judgment is under review with its reason, the new read is listed beside
+   it as a candidate and carries the hint; nothing is carried across until
+   the researcher clicks. (e) Make the script unparseable, and separately
+   unreadable: nothing comes under review; the judgment is unchanged and
+   the source is reported.
+9. **Migration.** A pre-V5 index holding: a confirmed link; a rejected one
+   with and one without a remembered prior status; a judged link whose
+   stored evidence shows two different bases; a judged link the script no
+   longer produces; a preserved orphan claim and a preserved orphan
+   attempt, each with a judgment; a judged hand-drawn link; arranged
+   views. Migrate: the tally starts from the old index's own count and
+   balances with nothing unmatched; the two-bases link is under review,
+   not re-certified; the old index is retired only afterwards, and not
+   while another process holds it. Make verification fail on purpose, and
+   kill the process between each pair of steps: nothing is retired, the
+   old index still serves, and a retry resumes and duplicates nothing. A
+   second old index for the same project (another machine's) merges, and
+   its one contradicting verdict comes under review.
+10. **Two writers.** Two processes each make 300 judgments and 300
+    position changes on one project at once: every one is in the record
+    afterwards, and nothing raises.
+11. **A record RCE cannot trust.** Make the ledger unparseable; remove
+    it; make it zero bytes; truncate it at an entry boundary: in each
+    case the index keeps what it had, the app says what is wrong, **a
+    click on confirm or reject writes nothing**, and repairing the file
+    restores normal operation. Truncated and zero-byte ask the 9.3
+    question.
+12. **History.** Confirm; reject; undo — the link is confirmed; confirm
+    again with a note; withdraw — the link is the machine's. The ledger
+    holds five entries in order, the app shows the last state, and the
+    others as its history.
+
+### 9.10 Not in V5, said plainly
+
+The result-review flow (entering from a figure, a PDF or a claim) — the
+next phase; it will read the review list this phase creates. Folding the
+attempt table's stale-verdict check into that list. Removing from the
+views machine links nobody judged that a scan no longer produces. Merging
+two diverged copies of a record file. Keeping `rce judge` annotations
+across a rebuild. Any new canvas feature.
+
+One limit the researcher should approve with open eyes: **a judgment on a
+claim loses its link whenever the claim's id changes, and that id changes
+often.** Verified causes: rewording the sentence; changing the printed
+number; renaming the section heading (every claim in the section);
+renaming or moving the file (every claim in it); and, in Chinese prose
+written one paragraph per line, *any* edit in the paragraph, because 。！？
+are not yet treated as sentence ends. V5 guarantees such a judgment is
+kept, shown under review with its original sentence, and offered against
+the candidates that replaced it — not that it stays attached. Splitting
+Chinese sentences properly is extractor work and comes after.
+
+**Suggested order of building**, each stage shippable: (a) the record,
+identity, migration, rebuild and locking — 9.2–9.5, 9.7, 9.8, acceptance
+1–7 and 9–12 — with every new judgment already recording its basis; then
+(b) the scan reports and the review list — 9.6, acceptance 8. After (a)
+nothing the researcher has judged can be lost; (b) is what stops an old
+judgment from vouching for new evidence.
