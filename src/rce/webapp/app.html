@@ -682,14 +682,12 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 // projectState is the degraded-project condition currently on screen
 // ("graph_missing" / "graph_downloading", null when healthy) -- it decides
 // whether the header chip shows and whether the switcher is forced visible.
-// attemptsGen / configGen stamp attemptsById / attemptsConfig with the
-// server generation they reflect (null: never loaded, or unknown), and
 // dataEpoch counts project switches so a fetch that started for the
 // previous project never lands in this one -- see "Attempt records" below.
 const state = {
   attemptsById: new Map(), projectLabel: "", panelSubject: null,
   attemptsConfig: null, projectState: null,
-  attemptsGen: null, configGen: null, dataEpoch: 0,
+  dataEpoch: 0,
   headerError: false, // the header line holds a blocking error (showHeaderError)
 };
 
@@ -1118,13 +1116,11 @@ async function reloadAllViews() {
   // Everything on screen belongs to the previous project: drop the cached
   // attempt records, mark both views stale, and re-fetch the one currently
   // visible (the other reloads lazily on its next activation). The attempt
-  // records and the map config are dropped with their stamps, and the epoch
-  // moves so a fetch still in flight for the previous project is discarded.
+  // records and the map config are dropped, and the epoch moves so a fetch
+  // still in flight for the previous project is discarded.
   state.dataEpoch += 1;
   state.attemptsById = new Map();
-  state.attemptsGen = null;
   state.attemptsConfig = null;
-  state.configGen = null;
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
@@ -1213,7 +1209,7 @@ function updateChipFromStatus(status) {
 
 // An attempt panel stays open when the native menu switches view under it,
 // so its record is brought current here whatever view is showing (in the
-// tree, loadTreeView has just done so and this costs one generation read).
+// tree, loadTreeView has just done so and this re-reads it once more).
 // If that fails the panel is left as it stands until the next bump.
 async function revalidatePanel() {
   const subject = state.panelSubject;
@@ -1545,7 +1541,7 @@ async function loadTreeView(preserveState) {
   let treeData, current;
   try {
     // The attempt records come through the same loader the edit form uses
-    // (fetchAttemptRecords), which stamps them with their generation.
+    // (fetchAttemptRecords).
     [treeData, current] = await Promise.all([apiGet("/api/tree"), fetchAttemptRecords()]);
   } catch (err) {
     renderViewFailure(container, err);
@@ -1908,21 +1904,17 @@ const EDITABLE_KEYS = ["date", "description", "variables", "result", "verdict"];
 // menu's 新增尝试 work on 画布 and 血缘 too, where nothing has loaded the
 // records (verifier finding on 53c61a7: a page that reopened on 画布 built
 // the form from an empty map -- number 1, a full date in an MM-DD table,
-// no verdict choices). So each is stamped with the server generation it
-// reflects, and ensureAttemptData() re-fetches whichever is missing or
-// older than the server's current generation before the form is built.
-// The generation is read BEFORE the data, so a stamp can only ever be
-// older than its data (a harmless extra fetch next time), never newer.
+// no verdict choices). So ensureAttemptData() re-reads BOTH, every time,
+// before the form is built. It used to skip the read when the server's
+// generation counter had not moved since the last one (a038210), but that
+// counter is not a reliable "the graph changed" signal (verifier finding on
+// a038210): a CLI `rce attempts` / `rce ingest` while the server is up, or
+// a server restart that starts counting again from 1, changes the records
+// without moving it, and the form then proposed a number that already
+// exists and left out new verdict choices. Two small requests per form
+// opening cost nothing a researcher can notice.
 // Everything from here to toCellText is loaded into node by
-// tests/test_webapp_canvas_js.py; the first four functions are pure.
-
-// True when data stamped `loadedGen` cannot be trusted at `currentGen`:
-// never loaded, an unknown generation on either side, or the server moved.
-function attemptDataStale(loadedGen, currentGen) {
-  if (loadedGen === null || loadedGen === undefined) return true;
-  if (currentGen === null || currentGen === undefined) return true;
-  return loadedGen !== currentGen;
-}
+// tests/test_webapp_canvas_js.py; the first three functions are pure.
 
 // `attempts`: any iterable of /api/attempts records.
 function defaultNewNumber(attempts) {
@@ -1958,54 +1950,38 @@ function distinctVerdicts(attempts) {
   return Array.from(seen).slice(0, 8);
 }
 
-// The server's current generation, or null when it could not be read
-// (which attemptDataStale treats as "re-fetch").
-async function currentGeneration() {
-  try {
-    const status = await apiGet("/api/generation");
-    return typeof status.generation === "number" ? status.generation : null;
-  } catch (err) {
-    return null;
-  }
-}
-
 // The ONE path that fills state.attemptsById (the tree view loads through
 // it too). Resolves true when the records were stored, false when the
 // project was switched while the request was out (they are dropped);
 // rejects when /api/attempts failed.
-async function fetchAttemptRecords(knownGen) {
+async function fetchAttemptRecords() {
   const epoch = state.dataEpoch;
-  const gen = knownGen === undefined ? await currentGeneration() : knownGen;
   const data = await apiGet("/api/attempts");
   if (epoch !== state.dataEpoch) return false;
   state.attemptsById = new Map((data.attempts || []).map((a) => [a.id, a]));
-  state.attemptsGen = gen;
   return true;
 }
 
 // The ONE path that fills state.attemptsConfig (the header's summary line
 // reads through it too). Resolves the /api/summary body, or null when the
-// project was switched meanwhile. Unstamped when called without a
-// generation (the summary refresh), so the form re-reads it before use.
-async function fetchSummary(knownGen) {
+// project was switched meanwhile.
+async function fetchSummary() {
   const epoch = state.dataEpoch;
   const data = await apiGet("/api/summary");
   if (epoch !== state.dataEpoch) return null;
   state.attemptsConfig = data.attempts_config || null;
-  state.configGen = knownGen === undefined ? null : knownGen;
   return data;
 }
 
-// Makes the records and the config current. Resolves true when both are,
-// false when a project switch overtook it; rejects with the fetch's error.
+// Re-reads the records and the config (both, always -- see above).
+// Resolves true when both are current, false when a project switch
+// overtook it; rejects with the fetch's error.
 async function ensureAttemptData() {
   const epoch = state.dataEpoch;
-  const gen = await currentGeneration();
-  if (epoch !== state.dataEpoch) return false;
-  const jobs = [];
-  if (attemptDataStale(state.attemptsGen, gen)) jobs.push(fetchAttemptRecords(gen));
-  if (attemptDataStale(state.configGen, gen)) jobs.push(fetchSummary(gen).then((d) => d !== null));
-  const results = await Promise.all(jobs);
+  const results = await Promise.all([
+    fetchAttemptRecords(),
+    fetchSummary().then((d) => d !== null),
+  ]);
   return epoch === state.dataEpoch && results.every(Boolean);
 }
 

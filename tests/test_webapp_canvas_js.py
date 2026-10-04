@@ -1077,7 +1077,7 @@ def test_a_header_error_outlives_the_summary_refresh():
 _ATTEMPT_RUNNER = r"""
 const block = require("fs").readFileSync(0, "utf8");
 const input = JSON.parse(process.argv[1]);
-global.state = { attemptsById: new Map(), attemptsConfig: null, attemptsGen: null, configGen: null, dataEpoch: 0 };
+global.state = { attemptsById: new Map(), attemptsConfig: null, dataEpoch: 0 };
 global.calls = [];
 global.server = input.server || {};
 global.apiGet = async (path) => {
@@ -1087,7 +1087,7 @@ global.apiGet = async (path) => {
   if (answer === undefined || answer === "fail") throw new Error("boom " + path);
   return JSON.parse(JSON.stringify(answer));
 };
-eval(block + "; global.F = { attemptDataStale, defaultNewNumber, defaultDateValue, distinctVerdicts, ensureAttemptData, fetchAttemptRecords };");
+eval(block + "; global.F = { defaultNewNumber, defaultDateValue, distinctVerdicts, ensureAttemptData, fetchAttemptRecords };");
 (async () => {
   const out = await eval("(async () => {" + input.body + "})()");
   process.stdout.write(JSON.stringify({ out: out === undefined ? null : out, calls }));
@@ -1157,70 +1157,63 @@ def test_form_defaults_keep_a_full_date_table_full_and_an_empty_project_at_one()
     assert (out["number"], out["date"]) == ("8", "10-04")
 
 
-def test_attempt_data_is_stale_unless_stamped_with_the_current_generation():
-    out = _attempt_run("""
-      return [[null, 5], [undefined, 5], [5, null], [4, 5], [5, 5], [0, 0], [0, 1]]
-        .map(([a, b]) => F.attemptDataStale(a, b));
-    """)["out"]
-    assert out == [True, True, True, True, False, False, True]
-
-
 _SERVER = {
     "/api/generation": {"generation": 7},
     "/api/attempts": {"attempts": [_attempt("1", "03-01", "✅"), _attempt("2", "03-02")]},
     "/api/summary": {"attempts_config": {"file": "docs/map.md", "columns": {}}, "pending": 0},
 }
-_STATE = "return { ok, ids: [...state.attemptsById.keys()], gen: state.attemptsGen, cgen: state.configGen, file: state.attemptsConfig && state.attemptsConfig.file };"
+_STATE = "return { ok, ids: [...state.attemptsById.keys()], file: state.attemptsConfig && state.attemptsConfig.file };"
 
 
-def test_ensure_loads_never_loaded_data_and_stamps_it():
+def test_ensure_loads_never_loaded_data():
     run = _attempt_run("const ok = await F.ensureAttemptData();" + _STATE, server=_SERVER)
-    assert run["out"] == {"ok": True, "ids": ["attempt:docs/map.md#1", "attempt:docs/map.md#2"], "gen": 7, "cgen": 7, "file": "docs/map.md"}
-    # The generation is read first, so a stamp is never newer than its data.
-    assert run["calls"][0] == "/api/generation"
-    assert sorted(run["calls"][1:]) == ["/api/attempts", "/api/summary"]
+    assert run["out"] == {"ok": True, "ids": ["attempt:docs/map.md#1", "attempt:docs/map.md#2"], "file": "docs/map.md"}
+    assert sorted(run["calls"]) == ["/api/attempts", "/api/summary"]
 
 
-def test_ensure_skips_current_data_and_refetches_after_a_generation_bump():
+def test_ensure_rereads_even_when_the_server_generation_did_not_move():
+    """Verifier finding on a038210: a CLI `rce attempts` run while the
+    server is up (or a server restart, whose counter starts again at 1)
+    changes the records without moving /api/generation. The form must
+    still see row 26 and its new verdict: next number 27, not 26."""
     run = _attempt_run("""
       await F.ensureAttemptData();
+      const before = F.defaultNewNumber(state.attemptsById.values());
       calls.length = 0;
-      await F.ensureAttemptData();
-      const same = calls.slice();
-      calls.length = 0;
-      server["/api/generation"] = { generation: 8 };
-      server["/api/attempts"].attempts.push(input.extra);
-      await F.ensureAttemptData();
-      return { same, moved: calls.slice().sort(), gen: state.attemptsGen, cgen: state.configGen,
-               number: F.defaultNewNumber(state.attemptsById.values()) };
-    """, server=_SERVER, extra=_attempt("3", "03-03"))
-    out = run["out"]
-    assert out["same"] == ["/api/generation"]  # current: nothing re-fetched
-    assert out["moved"] == ["/api/attempts", "/api/generation", "/api/summary"]
-    assert (out["gen"], out["cgen"], out["number"]) == (8, 8, "4")
-
-
-def test_ensure_refetches_when_the_generation_cannot_be_read_and_rejects_on_failure():
-    server = dict(_SERVER, **{"/api/generation": "fail"})
-    run = _attempt_run("""
-      state.attemptsGen = 7; state.configGen = 7;
+      server["/api/attempts"].attempts.push(input.extra);  // generation stays 7
+      server["/api/summary"].attempts_config.file = "docs/map2.md";
       const ok = await F.ensureAttemptData();
-    """ + _STATE, server=server)
-    assert run["out"]["ok"] is True and run["out"]["gen"] is None  # unknown: re-read next time too
-    assert sorted(run["calls"]) == ["/api/attempts", "/api/generation", "/api/summary"]
+      const list = [...state.attemptsById.values()];
+      return { ok, before, after: F.defaultNewNumber(list), verdicts: F.distinctVerdicts(list),
+               file: state.attemptsConfig.file, calls: calls.slice().sort() };
+    """, server=_SERVER, extra=_attempt("26", "03-26", "重启期间"))
+    out = run["out"]
+    assert out["before"] == "3" and out["after"] == "27"
+    assert "重启期间" in out["verdicts"] and out["file"] == "docs/map2.md"
+    assert out["calls"] == ["/api/attempts", "/api/summary"]
+    assert "/api/generation" not in run["calls"]  # no longer consulted at all
+
+
+def test_ensure_rejects_when_a_read_fails_and_keeps_nothing_half_loaded():
     server = dict(_SERVER, **{"/api/attempts": "fail"})
     run = _attempt_run("""
       try { await F.ensureAttemptData(); return "resolved"; }
-      catch (err) { return { message: err.message, gen: state.attemptsGen, size: state.attemptsById.size }; }
+      catch (err) { return { message: err.message, size: state.attemptsById.size }; }
     """, server=server)
-    assert run["out"] == {"message": "boom /api/attempts", "gen": None, "size": 0}
+    assert run["out"] == {"message": "boom /api/attempts", "size": 0}
+    server = dict(_SERVER, **{"/api/summary": "fail"})
+    run = _attempt_run("""
+      try { await F.ensureAttemptData(); return "resolved"; }
+      catch (err) { return err.message; }
+    """, server=server)
+    assert run["out"] == "boom /api/summary"
 
 
 def test_ensure_drops_data_that_arrives_after_a_project_switch():
     server = dict(_SERVER, onCall='if (path === "/api/attempts") state.dataEpoch += 1;')
     run = _attempt_run("const ok = await F.ensureAttemptData();" + _STATE, server=server)
     assert run["out"]["ok"] is False
-    assert run["out"]["ids"] == [] and run["out"]["gen"] is None
+    assert run["out"]["ids"] == []
 
 
 def _function_body(src: str, signature: str) -> str:
@@ -1252,8 +1245,10 @@ def test_every_way_into_the_attempt_form_awaits_the_loader_first():
     assert "fetchAttemptRecords()" in _function_body(_APP_SRC, "async function loadTreeView(")
     assert _APP_SRC.count("state.attemptsById = ") == 2  # the loader, and the project-switch reset
     reset = _function_body(_APP_SRC, "async function reloadAllViews(")
-    for line in ("state.dataEpoch += 1;", "state.attemptsGen = null;", "state.attemptsConfig = null;", "state.configGen = null;"):
+    for line in ("state.dataEpoch += 1;", "state.attemptsConfig = null;"):
         assert line in reset
+    # The form's freshness never rests on the generation counter again.
+    assert "attemptsGen" not in _APP_SRC and "configGen" not in _APP_SRC
     # An attempt panel left open under another view is revalidated there too.
     refresh = _function_body(_APP_SRC, "async function refreshCurrentView(")
     assert "await revalidatePanel();" in refresh
