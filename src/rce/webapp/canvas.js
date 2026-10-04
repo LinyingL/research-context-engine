@@ -148,7 +148,7 @@ window.RCECanvas = (function () {
   // debounced POST will send (null = forget that saved position).
   const cv = {
     dom: null, container: null, data: null, scope: null,
-    nodes: new Map(), positions: {}, auto: {}, cycle: new Set(), loose: null, layoutKey: null,
+    nodes: new Map(), positions: {}, auto: {}, cycle: new Set(), loose: null, looseIds: [], layoutKey: null,
     camera: { x: 0, y: 0, zoom: 1 }, needsFit: false,
     selected: null, hovered: null, query: "",
     pending: {}, viewportDirty: false, saveTimer: null,
@@ -160,6 +160,9 @@ window.RCECanvas = (function () {
     // they assert), and what the chip at the bottom currently says.
     selectedLink: null, pop: null, ctx: null, optimistic: new Map(),
     statusKind: null, statusTimer: null,
+    // The cards of the link just confirmed, which the camera keeps on
+    // screen through the re-layout that link causes (keepCamera).
+    focus: null,
   };
 
   // -- Small helpers ----------------------------------------------------------
@@ -662,11 +665,27 @@ window.RCECanvas = (function () {
   // Shelf-pack blocks ({w, h}) in order: left to right, a new row (96px
   // below the tallest of the last) when the next block would push the row
   // past `W`. Returns each block's top-left and the page's size.
-  function packRows(items, W) {
+  //
+  // `obstacles` are the saved cards' world rects [x0, y0, x1, y1]. 8.4
+  // keeps them out of steps 1-5 but says nothing of where the packed page
+  // lands relative to them; packing from the origin blind to them put
+  // unsaved cards UNDER a card the researcher had nudged (verifier
+  // finding on bb76a9f). A block that would come within ISLAND_GAP of one
+  // -- the gap islands keep from each other -- moves right past it, and
+  // wraps to a new row if that crosses W (an empty row never wraps, so
+  // the loop always ends: x only grows within a row, y only across rows).
+  function packRows(items, W, obstacles) {
     const at = [];
     let x = 0, y = 0, rowH = 0, right = 0;
     items.forEach((b) => {
       if (x > 0 && x + b.w > W) { y += rowH + ISLAND_GAP; x = 0; rowH = 0; }
+      for (;;) {
+        const hit = (obstacles || []).find((o) => x < o[2] + ISLAND_GAP && o[0] - ISLAND_GAP < x + b.w
+          && y < o[3] + ISLAND_GAP && o[1] - ISLAND_GAP < y + b.h);
+        if (!hit) break;
+        x = hit[2] + ISLAND_GAP;
+        if (rowH > 0 && x + b.w > W) { y += rowH + ISLAND_GAP; x = 0; rowH = 0; }
+      }
       at.push([x, y]);
       right = Math.max(right, x + b.w);
       x += b.w + ISLAND_GAP;
@@ -746,9 +765,13 @@ window.RCECanvas = (function () {
       looseBlock = Object.assign({ cards: loose, loose: true }, layoutLoose(loose));
       items.push(looseBlock);
     }
+    const obstacles = order.filter((n) => isFixed(n.id)).map((n) => {
+      const [x, y] = fixed[n.id];
+      return [x, y, x + NODE_W, y + nodeHeight(n.type)];
+    });
     let best = null;
     for (let k = 0; k <= PACK_STEPS; k++) {
-      const p = packRows(items, W0 * (1 + k / 10));
+      const p = packRows(items, W0 * (1 + k / 10), obstacles);
       const miss = p.h ? Math.abs(Math.log(p.w / p.h / PAGE_ASPECT)) : 0;
       if (!best || miss < best.miss - 1e-9) best = Object.assign(p, { miss });
     }
@@ -761,6 +784,7 @@ window.RCECanvas = (function () {
     return {
       positions, cycle,
       loose: looseBlock ? { x: looseBlock.x, y: looseBlock.y, w: looseBlock.w, h: looseBlock.h } : null,
+      looseIds: loose.map((n) => n.id),
       islands: islands.map((b) => b.cards.map((n) => n.id)),
     };
   }
@@ -970,8 +994,22 @@ window.RCECanvas = (function () {
     return TONE_BY_BADGE[badge] || "plain";
   }
 
+  // Which of a frame's visible members its rectangle is drawn around. A
+  // step file with no link and no step-prefix script (a helper `clean.R`
+  // in step_files) is a loose card (8.4 step 4) and sits in the 「未连线」
+  // block at the end of the page; a frame stretched out to it enclosed
+  // unrelated cards and the caption, claiming them for the attempt
+  // (verifier finding on bb76a9f). So the frame is drawn around its
+  // members outside that block, and around the loose ones only when it
+  // has no other. Pure, for the node tests.
+  function frameMembers(memberIds, looseIds) {
+    const loose = new Set(looseIds);
+    const placed = memberIds.filter((id) => !loose.has(id));
+    return placed.length ? placed : memberIds;
+  }
+
   function frameRect(frame) {
-    const members = frame.node_ids.filter((id) => cv.nodes.has(id));
+    const members = frameMembers(frame.node_ids.filter((id) => cv.nodes.has(id)), cv.looseIds);
     if (!members.length) return null;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     members.forEach((id) => {
@@ -1543,6 +1581,7 @@ window.RCECanvas = (function () {
     if (!p) return;
     const note = p.input.value.trim();
     closePopover();
+    cv.focus = [p.toId, p.fromId]; // the camera holds on these through the re-layout
     const key = entryKey(p.check.from, p.check.to, p.check.type);
     const link = {
       id: "optimistic:" + key, from: p.fromId, to: p.toId, type: p.check.type,
@@ -1559,6 +1598,7 @@ window.RCECanvas = (function () {
       res = await apiPost("/api/mappings/add", body);
     } catch (err) {
       dropOptimistic(key);
+      cv.focus = null;
       showStatus(err.state === "mapping_exists" ? DUPLICATE_TEXT : "无法标注：映射没有写入（悬停查看原因）", err, { kind: "write" });
       return;
     }
@@ -2076,12 +2116,60 @@ window.RCECanvas = (function () {
   function layoutView(force) {
     const d = cv.data;
     const key = [d.scope.id, d.nodes.map((n) => n.id).join("\n"), d.links.map((l) => l.id).join("\n")].join("\f");
-    if (!force && key === cv.layoutKey) return;
+    if (!force && key === cv.layoutKey) return false;
     cv.layoutKey = key;
     const layout = computeLayout(d.nodes, d.links, d.frames, { fixed: cv.positions, current: currentAttemptId(d) });
     cv.auto = layout.positions;
     cv.cycle = layout.cycle;
     cv.loose = layout.loose;
+    cv.looseIds = layout.looseIds;
+    return true;
+  }
+
+  // 8.4 lays a view out fresh whenever what it draws changes, so a link
+  // the researcher just confirmed (8.3's draw -> confirm -> re-render)
+  // re-packs every unsaved card while the camera stayed put -- the new link
+  // and both its ends could leave the screen (verifier finding on
+  // bb76a9f). Cards must move; the camera need not. It follows the first
+  // of `anchors` present before and after, so that card stays exactly
+  // where it was on screen, then pans the least needed to show the cards
+  // of `show` (world rects) if they fit. Pure, for the node tests.
+  function keepCamera(camera, view, before, after, anchors, show) {
+    const cam = { x: camera.x, y: camera.y, zoom: camera.zoom };
+    const id = anchors.find((a) => before[a] && after[a]);
+    if (id) {
+      cam.x += (before[id][0] - after[id][0]) * cam.zoom;
+      cam.y += (before[id][1] - after[id][1]) * cam.zoom;
+    }
+    if (!show.length || !view.w || !view.h) return cam;
+    const m = 24;
+    [["x", 0, 2, view.w], ["y", 1, 3, view.h]].forEach(([k, lo, hi, size]) => {
+      const s0 = cam[k] + Math.min(...show.map((r) => r[lo])) * cam.zoom;
+      const s1 = cam[k] + Math.max(...show.map((r) => r[hi])) * cam.zoom;
+      if (s1 - s0 > size - 2 * m) return; // does not fit: the anchor alone holds
+      if (s0 < m) cam[k] += m - s0;
+      else if (s1 > size - m) cam[k] -= s1 - (size - m);
+    });
+    return cam;
+  }
+
+  // What the camera holds on through a re-layout, best first: the cards
+  // of the link just confirmed (its drop target first -- under the
+  // pointer), the selected card, then the card nearest the view's center.
+  function cameraAnchors() {
+    const ids = (cv.focus || []).concat(cv.selected ? [cv.selected] : []);
+    const v = viewSize();
+    if (v.w && v.h) {
+      const cx = (v.w / 2 - cv.camera.x) / cv.camera.zoom, cy = (v.h / 2 - cv.camera.y) / cv.camera.zoom;
+      let best = null, bd = Infinity;
+      cv.nodes.forEach((n, id) => {
+        const [x, y] = posOf(id);
+        const d = (x + NODE_W / 2 - cx) ** 2 + (y + nodeHeight(n.type) / 2 - cy) ** 2;
+        if (d < bd) { bd = d; best = id; }
+      });
+      if (best) ids.push(best);
+    }
+    return ids;
   }
 
   // 8.4: on entering a view with no saved viewport the camera fits all.
@@ -2109,6 +2197,9 @@ window.RCECanvas = (function () {
 
   function applyPayload(payload, opts) {
     const first = !cv.data;
+    // Where the camera's anchor cards sit now, before a re-layout moves them.
+    const before = {};
+    if (!first && !opts.fit) cameraAnchors().forEach((id) => { before[id] = posOf(id).slice(); });
     cv.data = payload;
     mergeOptimistic(payload);
     cv.scope = payload.scope.id;
@@ -2120,7 +2211,20 @@ window.RCECanvas = (function () {
       if (p === null) delete cv.positions[id];
       else cv.positions[id] = p;
     });
-    layoutView(false);
+    const relaid = layoutView(false);
+    if (relaid && !first && !opts.fit) {
+      const ids = Object.keys(before).filter((id) => cv.nodes.has(id));
+      const after = {};
+      ids.forEach((id) => { after[id] = posOf(id); });
+      const show = (cv.focus || []).filter((id) => cv.nodes.has(id)).map((id) => {
+        const [x, y] = posOf(id);
+        return [x, y, x + NODE_W, y + nodeHeight(cv.nodes.get(id).type)];
+      });
+      cv.camera = keepCamera(cv.camera, viewSize(), before, after, ids, show);
+      cv.focus = null;
+      applyCamera();
+      queueViewport();
+    }
     if (cv.selected && !cv.nodes.has(cv.selected)) cv.selected = null;
     if (cv.hovered && !cv.nodes.has(cv.hovered)) cv.hovered = null;
     if (cv.selectedLink && !payload.links.some((l) => l.id === cv.selectedLink)) cv.selectedLink = null;
@@ -2171,6 +2275,7 @@ window.RCECanvas = (function () {
     closeCtxMenu();
     cv.selected = null;
     cv.hovered = null;
+    cv.focus = null;
     selectLink(null);
     cv.scope = scope;
     if (cv.container) load(cv.container, { fit: true });
@@ -2198,9 +2303,9 @@ window.RCECanvas = (function () {
     hideStatus();
     Object.assign(cv, {
       data: null, scope: null, nodes: new Map(), positions: {}, auto: {}, cycle: new Set(),
-      loose: null, layoutKey: null, selected: null, hovered: null, pending: {}, viewportDirty: false, saveTimer: null,
+      loose: null, looseIds: [], layoutKey: null, selected: null, hovered: null, pending: {}, viewportDirty: false, saveTimer: null,
       drag: null, lastClick: null, nodeEls: new Map(), linkEls: new Map(),
-      selectedLink: null, optimistic: new Map(),
+      selectedLink: null, optimistic: new Map(), focus: null,
     });
     if (cv.dom) cv.dom.linkCard.classList.add("hidden");
     if (cv.dom) {
@@ -2217,6 +2322,8 @@ window.RCECanvas = (function () {
     // Exposed for the next phase (link editing) and for inspection; not
     // part of any server contract.
     _computeLayout: computeLayout,
+    _keepCamera: keepCamera,
+    _frameMembers: frameMembers,
     _checkConnection: checkConnection,
     _assertionText: assertionText,
     _socketAt: socketAt,

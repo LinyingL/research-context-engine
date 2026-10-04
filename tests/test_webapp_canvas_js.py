@@ -42,7 +42,7 @@ global.window = {};
 require(process.argv[1]);
 const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
 const out = window.RCECanvas._computeLayout(input.nodes, input.links, input.frames, input.opts);
-process.stdout.write(JSON.stringify({ positions: out.positions, cycle: [...out.cycle], loose: out.loose, islands: out.islands }));
+process.stdout.write(JSON.stringify({ positions: out.positions, cycle: [...out.cycle], loose: out.loose, looseIds: out.looseIds, islands: out.islands }));
 """
 
 
@@ -367,6 +367,27 @@ def test_saved_positions_are_untouched_and_only_order_their_neighbors():
     assert out["positions"][b][1] < out["positions"][a][1]  # b's saved output sits higher
 
 
+def test_unsaved_cards_are_packed_clear_of_saved_cards():
+    """Verifier finding on bb76a9f: the researcher nudges 16-构建指标.py
+    50px (saved at (367, 74)); on the next layout the rest of its pipeline
+    was packed from the origin blind to it and 17-….Rmd landed under it.
+    Saved cards still take no part in steps 1-5; packing only keeps every
+    island and the 「未连线」 block 96px clear of them."""
+    n2, l2 = _pipeline("p2", 30)
+    loose = [f"dataset:散/z{k}.csv" for k in range(3)]
+    for fixed in ({PY16: [367, 74]}, {PY16: [0, 0]}, {PY16: [367, 74], RMD18: [900, 300]}):
+        out = _layout(PIPELINE_NODES + n2 + loose, PIPELINE_LINKS + l2, fixed=fixed)
+        placed = {i: p for i, p in out["positions"].items()}
+        placed.update(fixed)
+        assert set(fixed).isdisjoint(out["positions"])  # still never moved
+        assert _overlap({"positions": placed}) == [], fixed
+        for sid, (sx, sy) in fixed.items():
+            for cid, (x, y) in out["positions"].items():
+                apart_x = max(x - (sx + 220), sx - (x + 220))
+                apart_y = max(y - (sy + _height(sid)), sy - (y + _height(cid)))
+                assert max(apart_x, apart_y) >= 96, (sid, cid)
+
+
 # -- Link editing (DESIGN.md 8.1 grammar, 8.3; task V4 phase 2b) ---------------
 #
 # The drop-time grammar check, the assertion line and the socket hit test
@@ -559,3 +580,73 @@ def test_engine_errors_are_hover_titles_not_visible_english():
     box = box[: box.index("\n}\n")]
     assert "box.title = " in box and "出了点问题" in box
     assert '"移除失效项目失败（悬停查看原因）"' in _APP_SRC
+
+
+def test_a_relayout_keeps_the_anchor_card_where_it_was_on_screen():
+    """Verifier finding on bb76a9f: confirming a link re-packs every unsaved
+    card (8.4: laid out fresh), and the camera stayed put, so the new link
+    and both of its ends could leave the screen. The cards still move; the
+    camera follows the drop target so it stays under the pointer."""
+    cam = {"x": 100, "y": 50, "zoom": 0.5}
+    view = {"w": 1280, "h": 840}
+    before = {"to": [320, 0], "from": [1596, 442]}
+    after = {"to": [960, 52], "from": [640, 124]}
+    out = _call("keepCamera", args=[cam, view, before, after, ["to", "from"], []])
+    assert out["zoom"] == 0.5
+    # Screen position of the anchor is unchanged: cam + world * zoom.
+    assert out["x"] + 960 * 0.5 == 100 + 320 * 0.5 and out["y"] + 52 * 0.5 == 50 + 0 * 0.5
+    # An anchor that is gone falls through to the next one.
+    out = _call("keepCamera", args=[cam, view, {"from": [0, 0]}, {"from": [10, 20]}, ["to", "from"], []])
+    assert (out["x"], out["y"]) == (95, 40)
+    # No anchor at all: the camera is left alone.
+    assert _call("keepCamera", args=[cam, view, {}, {}, [], []]) == cam
+
+
+def test_a_relayout_pans_the_least_needed_to_show_both_ends_of_the_new_link():
+    cam = {"x": 0, "y": 0, "zoom": 1}
+    view = {"w": 1280, "h": 840}
+    before, after = {"to": [100, 100]}, {"to": [100, 100]}
+    # The other end landed off the right edge; both fit, so pan left just enough.
+    show = [[100, 100, 320, 200], [1100, 300, 1320, 400]]
+    out = _call("keepCamera", args=[cam, view, before, after, ["to"], show])
+    assert out["x"] == -(1320 - (1280 - 24)) and out["y"] == 0
+    # Too far apart to show both: the anchor alone holds.
+    show = [[100, 100, 320, 200], [3000, 300, 3220, 400]]
+    assert _call("keepCamera", args=[cam, view, before, after, ["to"], show])["x"] == 0
+
+
+def test_confirming_a_link_focuses_its_two_cards_for_the_relayout():
+    confirm = _CANVAS_SRC[_CANVAS_SRC.index("async function confirmPopover"):]
+    confirm = confirm[: confirm.index("\n  }\n")]
+    assert "cv.focus = [p.toId, p.fromId];" in confirm
+    assert confirm.index("cv.focus = [p.toId, p.fromId];") < confirm.index("await refresh()")
+    apply = _CANVAS_SRC[_CANVAS_SRC.index("function applyPayload"):]
+    apply = apply[: apply.index("\n  }\n")]
+    assert "const relaid = layoutView(false);" in apply
+    assert apply.index("cameraAnchors()") < apply.index("cv.positions = ") < apply.index("keepCamera(")
+
+
+def test_a_frame_is_not_stretched_out_to_its_member_in_the_loose_block():
+    """Verifier finding on bb76a9f: attempt A's helper `clean.R` (no links,
+    no step prefix) is loose per 8.4 step 4 and sits in the 「未连线」
+    block; frame A was drawn as the bounding box of 14-a.py and clean.R,
+    enclosing m1.csv, an unrelated unused.csv and the caption. The frame
+    is drawn around A's members outside the block."""
+    a, clean = "script:A/14-a.py", "script:A/clean.R"
+    b, c = "script:B/20-b.py", "script:C/21-c.py"
+    r1, m1, r2, m2, m3 = (f"dataset:x/{n}.csv" for n in ("r1", "m1", "r2", "m2", "m3"))
+    unused = "dataset:x/unused.csv"
+    links = [_link("1", r1, a), _link("2", a, m1), _link("3", r2, b), _link("4", b, m2),
+             _link("5", m2, c), _link("6", c, m3)]
+    frames = [("A", [a, clean]), ("B", [b]), ("C", [c])]
+    out = _layout([r1, a, m1, clean, r2, b, m2, c, m3, unused], links, frames=frames)
+    assert set(out["looseIds"]) == {clean, unused}
+    members = _call("frameMembers", args=[[a, clean], out["looseIds"]])
+    assert members == [a]
+    x0, y0, x1, y1 = _bbox(out, members)
+    for other in (unused, m1):
+        ox, oy = out["positions"][other]
+        assert not (ox < x1 and x0 < ox + 220 and oy < y1 and y0 < oy + _height(other)), other
+    # An attempt whose every visible member is loose keeps its frame.
+    assert _call("frameMembers", args=[[clean], [clean, unused]]) == [clean]
+    assert _call("frameMembers", args=[[a, b], []]) == [a, b]
