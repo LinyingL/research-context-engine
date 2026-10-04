@@ -1021,6 +1021,27 @@ def _node_type_for_extension(path: str) -> str | None:
     return None
 
 
+# Source-file suffixes (lowercased) whose node type is `script`: the three
+# this module parses (.py/.R/.Rmd, see parse_py_file/parse_r_file/
+# parse_rmd_file) plus .jl, which DESIGN.md section 8.1 lists among the
+# canvas's 脚本 extensions even though no extractor parses Julia yet -- a
+# human mapping or a ghost node may still name one.
+SCRIPT_EXTENSIONS = frozenset({".py", ".r", ".rmd", ".jl"})
+
+
+def node_type_for_path(path: str) -> str | None:
+    """The canvas's deterministic extension classification (DESIGN.md
+    section 8.1, ghost nodes; section 8.5, mapping endpoints): `script`
+    for a `SCRIPT_EXTENSIONS` suffix, otherwise exactly
+    `_node_type_for_extension` (dataset/figure/None). Kept separate from
+    that function on purpose -- the dataflow extractor's *targets* must
+    never be classified as scripts (a `script --reads--> script` edge is
+    not in the grammar), so its own classifier stays unchanged."""
+    if posixpath.splitext(path)[1].lower() in SCRIPT_EXTENSIONS:
+        return "script"
+    return _node_type_for_extension(path)
+
+
 def ingest_dataflow_repo(
     conn: Connection,
     repo_root: str | Path,

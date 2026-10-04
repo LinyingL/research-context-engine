@@ -985,3 +985,56 @@ def test_lineage_clean_chain_with_no_orphans_or_broken_links_exits_0(tmp_path, c
     assert "Nothing to report" not in out
     assert "Orphan inputs" not in out
     assert "Broken links" not in out
+
+
+# -- rce mappings (DESIGN.md section 8.5) ------------------------------------------
+
+
+def _mappings_project(tmp_path: Path, text: str | None) -> Path:
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert cli.main(["init", str(project)]) == 0
+    if text is not None:
+        (project / ".rce" / "mappings.toml").write_text(text, encoding="utf-8")
+    return project
+
+
+def test_mappings_ingests_and_reports_counts_and_refused_entries(tmp_path, capsys):
+    project = _mappings_project(
+        tmp_path,
+        '[[mapping]]\nfrom = "a.Rmd"\nto = "a.pdf"\ntype = "generates"\n\n'
+        '[[mapping]]\nfrom = "a.py"\nto = "d.csv"\ntype = "reads"\n',
+    )
+    capsys.readouterr()
+    assert cli.main(["mappings", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "Mappings (.rce/mappings.toml): mappings=1 refused=1 nodes_created=2" in out
+    assert "refused line 6:" in out and "swap" in out
+    conn = db.connect(paths.graph_db_path(project))
+    try:
+        (edge,) = db.query_edges(conn, type="generates")
+        assert edge["extractor"] == "mapping" and edge["status"] == "confirmed"
+    finally:
+        conn.close()
+
+
+def test_mappings_without_a_file_is_not_an_error(tmp_path, capsys):
+    project = _mappings_project(tmp_path, None)
+    capsys.readouterr()
+    assert cli.main(["mappings", str(project)]) == 0
+    assert "nothing to ingest" in capsys.readouterr().out
+
+
+def test_mappings_unparseable_file_is_a_clean_error(tmp_path, capsys):
+    project = _mappings_project(tmp_path, "[[mapping]\n")
+    capsys.readouterr()
+    assert cli.main(["mappings", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert "not valid TOML" in err and "graph left untouched" in err and "Traceback" not in err
+
+
+def test_mappings_without_init_reports_clear_error(tmp_path, capsys):
+    project = tmp_path / "proj"
+    project.mkdir()
+    assert cli.main(["mappings", str(project)]) == 1
+    assert "rce init" in capsys.readouterr().err

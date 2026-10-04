@@ -22,7 +22,10 @@ never a recursive walk of the whole project:
   - every file directly inside `steps_dir` -- one level only, no
     recursion: `rce.ingest.attempts._resolve_step_files` itself only ever
     links files at that level, so watching deeper would watch things no
-    view is derived from.
+    view is derived from;
+  - `.rce/mappings.toml` (DESIGN.md section 8.5: "the file joins the
+    watch set"), watched whether or not an attempts config exists -- the
+    hand-drawn links do not depend on the attempt timeline.
 
 A file that does not (yet) exist is simply absent from the snapshot, so a
 change is any difference in the (path -> (mtime_ns, size)) mapping: an
@@ -43,6 +46,14 @@ the piece of the full ingest the tree/lineage views are actually derived
 from, cheap enough to re-run on a local project. A map-file-only edit
 never re-runs dataflow; nothing about commits/latex/mlflow is re-ingested
 here at all (an edited step script or attempt row changes none of those).
+A change to `.rce/mappings.toml` re-runs exactly what `rce mappings` runs
+(`mappings_ingest.ingest_mappings`), and a change touching ONLY that file
+runs nothing else -- in particular not the attempts ingest, which would
+fail outright on a project that has mappings but no attempts config. Its
+failures (an unparseable file mid-save) are contained exactly like an
+attempts failure; refused individual entries are not failures -- they are
+logged by the ingest and left for the canvas to show, not raised into the
+refresh chip.
 
 A vanished graph is not a transient failure (DESIGN.md section 8.10
 rule 2). Observed in real use: the graph disappeared mid-serve and this
@@ -101,6 +112,7 @@ from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
+from rce.ingest import mappings as mappings_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -139,12 +151,16 @@ def _stat_entry(path: Path) -> tuple[int, int] | None:
 
 def take_snapshot(project_root: Path) -> WatchSnapshot:
     """Stat the bounded watch set for `project_root` (module docstring):
-    the attempts config, the source Markdown it names, and the files one
-    level inside `steps_dir`. Rebuilt from the config on every call, so a
+    the mappings file, the attempts config, the source Markdown it names,
+    and the files one level inside `steps_dir`. Rebuilt from the config on every call, so a
     config edit re-shapes what the next poll watches with no extra
     bookkeeping."""
     files: dict[str, tuple[int, int]] = {}
     steps: set[str] = set()
+
+    mappings_entry = _stat_entry(mappings_ingest.mappings_path(project_root))
+    if mappings_entry is not None:
+        files[str(mappings_ingest.mappings_path(project_root))] = mappings_entry
 
     config_path = project_root / attempts_ingest.CONFIG_RELATIVE_PATH
     entry = _stat_entry(config_path)
@@ -186,6 +202,11 @@ def _steps_changed(old: WatchSnapshot, new: WatchSnapshot) -> bool:
     differing = set(old.files.items()) ^ set(new.files.items())
     differing_paths = {path for path, _ in differing}
     return bool(differing_paths & (old.steps_paths | new.steps_paths))
+
+
+def _changed_paths(old: WatchSnapshot, new: WatchSnapshot) -> set[str]:
+    """Every path that changed, appeared or vanished between old and new."""
+    return {path for path, _ in set(old.files.items()) ^ set(new.files.items())}
 
 
 def _absorb_non_steps_only(old: WatchSnapshot, fresh: WatchSnapshot) -> WatchSnapshot:
@@ -355,10 +376,16 @@ class ProjectWatcher:
             self._refreshing = True
 
         steps_changed = _steps_changed(baseline, snapshot)
+        changed = _changed_paths(baseline, snapshot)
+        mappings_file = str(mappings_ingest.mappings_path(root))
+        mappings_changed = mappings_file in changed
+        attempts_changed = bool(changed - {mappings_file})
         error: str | None = None
         try:
             with self._ingest_lock:
-                self._reingest(root, steps_changed)
+                self._reingest(
+                    root, steps_changed, attempts=attempts_changed, mappings=mappings_changed,
+                )
         except Exception as exc:  # noqa: BLE001 -- containment is the whole point
             # A half-saved table or a mid-edit script must never kill the
             # watcher (module docstring): remember the failure for the
@@ -416,12 +443,21 @@ class ProjectWatcher:
             self._generation += 1
         logger.info("graph for %s is back -- auto re-ingest resumed", recovered)
 
-    def _reingest(self, root: Path, steps_changed: bool) -> None:
+    def _reingest(
+        self, root: Path, steps_changed: bool, *, attempts: bool = True, mappings: bool = False,
+    ) -> None:
         """Re-run the ingests the changed files feed (module docstring):
-        always the attempts ingest -- exactly `rce.cli.cmd_attempts`'s own
-        calls -- plus, only when the change touched `steps_dir`, the same
-        dataflow step `rce.cli.cmd_ingest` runs. Raises on failure; the
-        caller (`poll_once`) is the one place that catches and records."""
+        the attempts ingest -- exactly `rce.cli.cmd_attempts`'s own calls --
+        when anything but the mappings file changed, plus, only when the
+        change touched `steps_dir`, the same dataflow step `rce.cli.
+        cmd_ingest` runs; and the mappings ingest -- exactly `rce.cli.
+        cmd_mappings`' call -- when `.rce/mappings.toml` changed. The two
+        halves are independent: a failure in one does not skip the other
+        (a half-saved attempt table must not keep a just-drawn link out of
+        the graph, nor the reverse). Raises on failure -- the first
+        failure itself when only one half failed, so its message reaches
+        `last_error` unchanged; the caller (`poll_once`) is the one place
+        that catches and records."""
         db_path = paths.graph_db_path(root)
         if not db_path.exists():
             # Never let db.connect() conjure a fresh graph.db where the
@@ -436,14 +472,34 @@ class ProjectWatcher:
                 "the graph database disappeared while being served"
             )
         conn = db.connect(db_path)
+        errors: list[Exception] = []
         try:
-            config = attempts_ingest.load_config(root)
-            counts = attempts_ingest.ingest_attempts_repo(conn, root, config)
-            logger.info("watcher re-ingested attempts for %s: %s", root, counts)
-            if steps_changed:
-                self._reingest_dataflow(conn, root)
+            if attempts:
+                try:
+                    config = attempts_ingest.load_config(root)
+                    counts = attempts_ingest.ingest_attempts_repo(conn, root, config)
+                    logger.info("watcher re-ingested attempts for %s: %s", root, counts)
+                    if steps_changed:
+                        self._reingest_dataflow(conn, root)
+                except Exception as exc:  # noqa: BLE001 -- re-raised below, after the other half
+                    errors.append(exc)
+            if mappings:
+                try:
+                    report = mappings_ingest.ingest_mappings(conn, root)
+                    logger.info("watcher re-ingested mappings for %s: %s", root, report.counts)
+                    for problem in report.problems:
+                        logger.warning(
+                            "%s %s refused: %s", mappings_ingest.MAPPINGS_RELATIVE_PATH,
+                            problem.location(), problem.message,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- re-raised below
+                    errors.append(exc)
         finally:
             conn.close()
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise RuntimeError("; ".join(str(e) for e in errors))
 
     def _reingest_dataflow(self, conn, root: Path) -> None:
         """The dataflow slice of `rce.cli.cmd_ingest`, reused not

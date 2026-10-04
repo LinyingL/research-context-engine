@@ -124,6 +124,20 @@ EDGE_STATUSES = frozenset({"auto", "pending", "confirmed", "rejected"})
 # status fields are human-write only").
 _MACHINE_EDGE_STATUSES = frozenset({"auto", "pending"})
 
+# Extractor names that belong to a human-authored source, never to a
+# machine extractor (DESIGN.md section 8.5): `mapping` edges are derived
+# from `.rce/mappings.toml`, a file the researcher writes by hand (or the
+# canvas writes on their behalf), and "no machine extractor may write
+# `extractor = "mapping"`". Enforced at this one boundary rather than by
+# convention: `upsert_edge` refuses these names unless the caller passes
+# `human_source=True` -- which only `rce.ingest.mappings` does -- and
+# `delete_edges_for_node` leaves them alone unless asked for by name, so a
+# machine orphan cleanup that clears "every edge on this node" can never
+# take a human assertion down with it. A keyword flag, not a capability
+# token: the threat is an accidental copy-paste of the extractor name into
+# a machine path, which a loud ValueError catches, not a hostile caller.
+HUMAN_EXTRACTORS = frozenset({"mapping"})
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -392,8 +406,14 @@ def upsert_edge(
     status: str = "auto",
     *,
     edge_attrs: dict[str, Any] | None = None,
+    human_source: bool = False,
 ) -> None:
     """Insert or update an edge, keyed on (src, dst, type, extractor).
+
+    `extractor` must not be one of `HUMAN_EXTRACTORS` unless
+    `human_source=True` (DESIGN.md section 8.5; see `HUMAN_EXTRACTORS`).
+    Even then `status` stays machine-restricted: the human-sourced ingest
+    still reaches 'confirmed' only through `set_edge_status`.
 
     Idempotent: re-running the same extractor over the same pair updates the
     existing row rather than duplicating it (see the UNIQUE constraint in
@@ -456,6 +476,11 @@ def upsert_edge(
     """
     if type not in EDGE_TYPES:
         raise ValueError(f"unknown edge type: {type!r}")
+    if extractor in HUMAN_EXTRACTORS and not human_source:
+        raise ValueError(
+            f"extractor {extractor!r} is reserved for a human-authored source "
+            "(DESIGN.md section 8.5) -- a machine extractor must not write it"
+        )
     if status not in _MACHINE_EDGE_STATUSES:
         raise ValueError(
             f"upsert_edge only accepts machine-owned statuses {sorted(_MACHINE_EDGE_STATUSES)!r}, "
@@ -682,13 +707,38 @@ def delete_edges_for_node(
     rce.ingest.claims) is the first caller -- it must delete only the edges
     its own extractor produced, never another extractor's judgement on the
     same node.
+
+    With `extractor=None`, edges from a `HUMAN_EXTRACTORS` source are NOT
+    deleted (DESIGN.md section 8.5: "no machine re-ingest may remove ...
+    a `mapping` edge"). They go only when asked for by name, which only
+    the source's own resync does. A node still carrying such an edge then
+    cannot be `delete_node`d (the foreign key refuses) -- a loud failure
+    instead of a silently erased human assertion.
     """
     clauses = ["(src = ? OR dst = ?)"]
     params: list[Any] = [node_id, node_id]
     if extractor is not None:
         clauses.append("extractor = ?")
         params.append(extractor)
+    else:
+        placeholders = ", ".join("?" for _ in HUMAN_EXTRACTORS)
+        clauses.append(f"extractor NOT IN ({placeholders})")
+        params.extend(sorted(HUMAN_EXTRACTORS))
     cursor = conn.execute(f"DELETE FROM edges WHERE {' AND '.join(clauses)}", params)
+    conn.commit()
+    return cursor.rowcount
+
+
+def delete_edge(conn: sqlite3.Connection, src: str, dst: str, type: str, extractor: str) -> int:
+    """Delete exactly one edge by its identity (src, dst, type, extractor);
+    returns the number of rows deleted (0 or 1). The resync primitive for
+    a human-authored source (`rce.ingest.mappings`): its entry left the
+    file, so its edge goes -- and only that edge, never another
+    extractor's judgement on the same pair."""
+    cursor = conn.execute(
+        "DELETE FROM edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+        (src, dst, type, extractor),
+    )
     conn.commit()
     return cursor.rowcount
 

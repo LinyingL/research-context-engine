@@ -466,48 +466,64 @@ def _fsync_dir(dir_path: Path) -> None:
         os.close(fd)
 
 
-def _write_backup(project_root: Path, plan: EditPlan) -> str:
-    """The original bytes, verbatim, to `.rce/backups/<name>.<stamp>Z.md`;
-    then prune that file's own backups to the newest `BACKUP_KEEP`. The
-    stamp is zero-padded UTC down to microseconds, so lexicographic name
-    order IS chronological order and pruning needs no mtime reads."""
+def write_backup_bytes(project_root: Path, source_path: Path, raw: bytes, ext: str) -> str:
+    """`raw`, verbatim, to `.rce/backups/<name>.<stamp>Z<ext>`; then prune
+    that file's own backups to the newest `BACKUP_KEEP`. The stamp is
+    zero-padded UTC down to microseconds, so lexicographic name order IS
+    chronological order and pruning needs no mtime reads. Shared by every
+    writer of a researcher-owned file (this module's map edits, and
+    `rce.ingest.mappings`' `.rce/mappings.toml` writer, DESIGN.md section
+    8.5) -- one backup discipline, not two that could drift. Returns the
+    backup's project-relative path."""
     backups_dir = project_root / RCE_DIRNAME / BACKUPS_DIRNAME
     backups_dir.mkdir(parents=True, exist_ok=True)
-    source_name = plan.source_path.name
+    source_name = source_path.name
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-    backup_path = backups_dir / f"{source_name}.{stamp}Z.md"
+    backup_path = backups_dir / f"{source_name}.{stamp}Z{ext}"
     counter = 0
     while backup_path.exists():  # same microsecond twice: disambiguate, never overwrite
         counter += 1
-        backup_path = backups_dir / f"{source_name}.{stamp}Z.{counter}.md"
-    _write_bytes_durably(backup_path, plan.original_raw)
+        backup_path = backups_dir / f"{source_name}.{stamp}Z.{counter}{ext}"
+    _write_bytes_durably(backup_path, raw)
     _fsync_dir(backups_dir)  # the new backup's directory entry, durable too
 
     siblings = sorted(
         p for p in backups_dir.iterdir()
-        if p.is_file() and p.name.startswith(source_name + ".") and p.name.endswith(".md")
+        if p.is_file() and p.name.startswith(source_name + ".") and p.name.endswith(ext)
     )
     for old in siblings[:-BACKUP_KEEP]:
         old.unlink()
-        logger.info("pruned old map backup %s (keeping newest %d)", old, BACKUP_KEEP)
+        logger.info("pruned old backup %s (keeping newest %d)", old, BACKUP_KEEP)
     return str(backup_path.relative_to(project_root))
 
 
-def _atomic_write(plan: EditPlan) -> None:
+def _write_backup(project_root: Path, plan: EditPlan) -> str:
+    """The map file's original bytes via `write_backup_bytes`, named
+    `<name>.<UTC stamp>Z.md`."""
+    return write_backup_bytes(project_root, plan.source_path, plan.original_raw, ".md")
+
+
+def atomic_replace_bytes(path: Path, data: bytes) -> None:
     """Full new content to a tmp file in the same directory (same
     filesystem, so the rename is atomic), fsynced (`_write_bytes_durably`
     -- the rename must never become durable before the data it renames
-    into place), then `os.replace` over the original, then a best-effort
+    into place), then `os.replace` over `path`, then a best-effort
     directory fsync so the rename itself sticks -- a failure at any point
     before the replace leaves the original untouched, and the tmp file is
-    cleaned up on the way out."""
-    tmp_path = plan.source_path.parent / f".{plan.source_path.name}.rce-edit-tmp"
+    cleaned up on the way out. Shared with `rce.ingest.mappings`' writer
+    (see `write_backup_bytes`)."""
+    tmp_path = path.parent / f".{path.name}.rce-edit-tmp"
     try:
-        _write_bytes_durably(tmp_path, plan.new_text.encode("utf-8"))
-        os.replace(tmp_path, plan.source_path)
-        _fsync_dir(plan.source_path.parent)
+        _write_bytes_durably(tmp_path, data)
+        os.replace(tmp_path, path)
+        _fsync_dir(path.parent)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _atomic_write(plan: EditPlan) -> None:
+    """The planned map text, UTF-8, via `atomic_replace_bytes`."""
+    atomic_replace_bytes(plan.source_path, plan.new_text.encode("utf-8"))
 
 
 def _reingest_attempts(project_root: Path) -> None:

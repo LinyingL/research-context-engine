@@ -73,6 +73,7 @@ from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import latex as latex_ingest
+from rce.ingest import mappings as mappings_ingest
 from rce.ingest import mdpaper as mdpaper_ingest
 from rce.ingest import mlflow as mlflow_ingest
 from rce.ingest import pyfig as pyfig_ingest
@@ -567,6 +568,39 @@ def cmd_attempts(args: argparse.Namespace) -> int:
         _print_attempts_listing(conn, config)
     finally:
         conn.close()
+    return 0
+
+
+def cmd_mappings(args: argparse.Namespace) -> int:
+    """`rce mappings` (DESIGN.md section 8.5): ingest the human mappings
+    file `.rce/mappings.toml` -- the same `ingest_mappings` the web app's
+    watcher runs when the file changes -- and print the counts plus every
+    refused entry with its line (or entry index). Refused entries do not
+    fail the run (the good ones were ingested; the file is the researcher's
+    to fix), so the exit code is 0; a file that cannot be read or parsed at
+    all exits 1 with the graph untouched (failing to read the source is not
+    evidence its entries were deleted). A missing file is reported, not an
+    error: there is simply nothing to ingest, and existing mapping edges
+    are left as they are."""
+    project_root = _resolve_project_root(args.path)
+    conn = db.connect(_require_db(project_root))
+    try:
+        try:
+            report = mappings_ingest.ingest_mappings(conn, project_root)
+        except mappings_ingest.MappingsFileError as exc:
+            print(f"Error: {exc} -- graph left untouched", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    if not report.file_present:
+        print(
+            f"Mappings: no {mappings_ingest.MAPPINGS_RELATIVE_PATH} -- nothing to ingest "
+            "(existing mapping edges left untouched)"
+        )
+        return 0
+    print(f"Mappings ({mappings_ingest.MAPPINGS_RELATIVE_PATH}): {_format_counts(report.counts)}")
+    for problem in report.problems:
+        print(f"  refused {problem.location()}: {problem.message}")
     return 0
 
 
@@ -1251,6 +1285,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.set_defaults(func=cmd_attempts)
+
+    p = sub.add_parser(
+        "mappings",
+        help=(
+            "Ingest hand-drawn links from .rce/mappings.toml (reads | writes | generates) as "
+            "confirmed edges; prints counts and any refused entries"
+        ),
+    )
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_mappings)
 
     p = sub.add_parser(
         "confirm",

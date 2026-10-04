@@ -617,3 +617,107 @@ def test_start_is_idempotent_and_stop_without_start_is_safe(tmp_path):
     assert w._thread is first_thread
     w.stop()
     assert w._thread is None
+
+
+# -- DESIGN.md section 8.5: .rce/mappings.toml joins the watch set ---------------
+
+
+_MAPPING = '[[mapping]]\nfrom = "a.py"\nto = "f.png"\ntype = "generates"\n'
+
+
+def _mapping_edges(project_root: Path) -> list[dict]:
+    conn = db.connect(paths.graph_db_path(project_root))
+    try:
+        return [e for e in db.query_edges(conn) if e["extractor"] == "mapping"]
+    finally:
+        conn.close()
+
+
+def test_take_snapshot_watches_the_mappings_file_even_without_attempts_config(tmp_path):
+    _init_project(tmp_path)
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    snap = watcher.take_snapshot(tmp_path)
+    assert set(snap.files) == {str(tmp_path / ".rce" / "mappings.toml")}
+
+
+def test_mappings_edit_reingests_mappings_without_an_attempts_config(tmp_path):
+    """A project with hand-drawn links but no attempt timeline: a mappings
+    change must run the mappings ingest alone -- running the attempts half
+    too would fail on the missing config and surface a bogus error."""
+    _init_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    assert w.poll_once() is True
+    assert w.status_payload() == {"generation": 2, "refreshing": False, "last_error": None}
+    (edge,) = _mapping_edges(tmp_path)
+    assert edge["status"] == "confirmed"
+
+    (tmp_path / ".rce" / "mappings.toml").write_text("# emptied\n")
+    assert w.poll_once() is True
+    assert _mapping_edges(tmp_path) == []
+
+
+def test_mappings_only_edit_does_not_rerun_attempts(tmp_path, monkeypatch):
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    calls = []
+    monkeypatch.setattr(
+        watcher.attempts_ingest, "ingest_attempts_repo", lambda *a, **k: calls.append(a) or {},
+    )
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    assert w.poll_once() is True
+    assert calls == [] and len(_mapping_edges(tmp_path)) == 1
+
+
+def test_broken_mappings_save_is_contained_and_deletes_nothing(tmp_path):
+    """A half-saved (unparseable) mappings file is a contained failure like
+    a half-saved table: last_error set, the generation bumps, polling
+    continues, the existing mapping edge survives (failing to read the
+    file is not evidence its entries were deleted), and the next good save
+    clears the error."""
+    _init_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+    w.poll_once()
+
+    (tmp_path / ".rce" / "mappings.toml").write_text("[[mapping]\nfrom = ")
+    assert w.poll_once() is True
+    status = w.status_payload()
+    assert status["generation"] == 3 and "not valid TOML" in (status["last_error"] or "")
+    assert len(_mapping_edges(tmp_path)) == 1
+
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING + "\n")
+    assert w.poll_once() is True
+    assert w.status_payload()["last_error"] is None
+
+
+def test_attempts_failure_does_not_keep_a_mapping_out_of_the_graph(tmp_path):
+    """Both files change in one poll; the attempts half fails (heading
+    renamed) -- the mappings half still runs, and the error reported is
+    the attempts one, unchanged."""
+    _make_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    broken = (tmp_path / "map.md").read_text().replace("## H", "## renamed")
+    (tmp_path / "map.md").write_text(broken)
+    (tmp_path / ".rce" / "mappings.toml").write_text(_MAPPING)
+
+    assert w.poll_once() is True
+    assert "heading" in (w.status_payload()["last_error"] or "")
+    assert len(_mapping_edges(tmp_path)) == 1
+
+
+def test_refused_mapping_entries_are_not_a_watcher_error(tmp_path):
+    _init_project(tmp_path)
+    w = _mk_watcher(tmp_path)
+    w.poll_once()
+    (tmp_path / ".rce" / "mappings.toml").write_text(
+        _MAPPING + '\n[[mapping]]\nfrom = "a.py"\nto = "x.docx"\ntype = "generates"\n'
+    )
+    assert w.poll_once() is True
+    assert w.status_payload()["last_error"] is None
+    assert len(_mapping_edges(tmp_path)) == 1
