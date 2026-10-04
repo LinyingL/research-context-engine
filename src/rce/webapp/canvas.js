@@ -72,6 +72,21 @@ window.RCECanvas = (function () {
   const SOCKET_R = 5;         // 10px circles
   const COL_GAP = 320;        // 8.4: columns 320px apart
   const ROW_GAP = 24;         // 8.4: rows packed with 24px gaps
+  // 8.4 step 3: a layer taller than 12 cards wraps into sub-columns
+  // "220px apart". Read as the space BETWEEN sub-columns: read as a pitch
+  // it would equal NODE_W, the cards would touch and one sub-column's
+  // output sockets would sit exactly on the next one's input sockets.
+  const SUBCOL_MAX = 12;
+  const SUBCOL_PITCH = NODE_W + 220;
+  const LOOSE_COLS = 4;       // 8.4 step 4: the 「未连线」 block is 4 columns wide
+  const LOOSE_GAP = 24;       // ...its cards 24px apart, like the rows
+  // Room above the block for its caption, clear of the title band an
+  // attempt frame draws above the same cards (FRAME_PAD + FRAME_TITLE_H):
+  // the caption must not read as part of a frame's title.
+  const LOOSE_CAPTION_H = 64;
+  const ISLAND_GAP = 96;      // 8.4 step 5: 96px between islands
+  const PAGE_ASPECT = 1.6;    // ...on a page shaped like the window
+  const PACK_STEPS = 15;      // ...its target width tried up to 2.5 x the floor
   const GRID = 24;            // 8.2: 24px dot grid
   const SNAP = 8;             // 8.3: 8px snap while Shift is held
   const ZOOM_MIN = 0.25;
@@ -126,13 +141,14 @@ window.RCECanvas = (function () {
 
   // -- State --------------------------------------------------------------------
   // positions: saved positions (server canvas.json ∪ this page's unsaved
-  // moves) -- the ones that always win. auto: the 8.4 layout of the WHOLE
-  // graph (so a card sits in the same place in every scope, 8.7), used
-  // only where no saved position exists. pending: what
-  // the next debounced POST will send (null = forget that saved position).
+  // moves) -- global, the ones that always win. auto: the 8.4 layout of
+  // the cards of THIS view without a saved position (layout belongs to
+  // the view, memory to the card); loose: the 「未连线」 block's rect;
+  // layoutKey: what auto was computed for. pending: what the next
+  // debounced POST will send (null = forget that saved position).
   const cv = {
     dom: null, container: null, data: null, scope: null,
-    nodes: new Map(), positions: {}, auto: {}, cycle: new Set(),
+    nodes: new Map(), positions: {}, auto: {}, cycle: new Set(), loose: null, layoutKey: null,
     camera: { x: 0, y: 0, zoom: 1 }, needsFit: false,
     selected: null, hovered: null, query: "",
     pending: {}, viewportDirty: false, saveTimer: null,
@@ -444,26 +460,6 @@ window.RCECanvas = (function () {
     return layer;
   }
 
-  // A card with no links at all that belongs to an attempt frame -- the
-  // knitted .pdf ghost is the case -- goes beside its frame-mates rather
-  // than into column 0 far away from them: one column right of the
-  // rightmost linked member for a dataset/figure (it is that step's
-  // product, the very link the researcher is about to draw), the same
-  // column for a script. Not in 8.4's text; the obvious reading of 8.1.
-  function placeIsolatedFrameMembers(layer, graph, frames, byId, cycle) {
-    const linked = (id) => graph.ins.get(id).some((l) => !cycle.has(l.id)) ||
-      graph.outs.get(id).some((l) => !cycle.has(l.id));
-    frames.forEach((f) => {
-      const members = f.node_ids.filter((id) => byId.has(id));
-      const anchors = members.filter(linked);
-      if (!anchors.length) return;
-      const right = Math.max(...anchors.map((id) => layer.get(id)));
-      members.filter((id) => !linked(id)).forEach((id) => {
-        layer.set(id, byId.get(id).type === "script" ? right : right + 1);
-      });
-    });
-  }
-
   // Which frame (attempt) a card sits in, for spacing only: two stacked
   // cards in different frames need room for both frames' padding and the
   // lower frame's title, or one frame's title hides under the other's
@@ -474,62 +470,299 @@ window.RCECanvas = (function () {
     return of;
   }
 
-  function orderAndPlace(order, graph, layer, cycle, frameOf) {
-    const columns = new Map();
+  // 8.4 step 1's placement-only adjacency: a card with no link in this
+  // view that belongs to an attempt whose step SCRIPT shares its numeric
+  // step prefix (`17-….pdf` with `17-….Rmd`) is placed as if that script
+  // wrote it -- never an asserted edge, never drawn, never in the payload.
+  // 8.1 states it for ghosts; it is applied to every unlinked card, since
+  // 8.4 step 4 defines loose cards as "no links and no step-prefix
+  // script" (a ghost has no links by construction, so ghosts are the
+  // common case). Each prefix of each attempt has ONE anchor -- its first
+  // linked script in step order, else its first script -- and an anchor
+  // never anchors to anything itself, so these edges can never form a
+  // loop. Returns [{id, from, to, virtual: true}].
+  function stepAnchorLinks(nodes, linkedIds, frames, byId) {
+    const out = [];
+    const anchored = new Set();
+    (frames || []).forEach((f) => {
+      const members = f.node_ids.filter((id) => byId.has(id)).map((id) => byId.get(id));
+      const byPrefix = new Map();
+      members.forEach((n) => {
+        const k = stepKey(n.path);
+        if (!Number.isFinite(k)) return;
+        if (!byPrefix.has(k)) byPrefix.set(k, []);
+        byPrefix.get(k).push(n);
+      });
+      byPrefix.forEach((group) => {
+        const scripts = group.filter((n) => n.type === "script").sort(compareByStep);
+        if (!scripts.length) return;
+        const anchor = scripts.find((n) => linkedIds.has(n.id)) || scripts[0];
+        group.slice().sort(compareByStep).forEach((n) => {
+          if (n.id === anchor.id || linkedIds.has(n.id) || anchored.has(n.id)) return;
+          anchored.add(n.id);
+          out.push({ id: "step:" + anchor.id + "->" + n.id, from: anchor.id, to: n.id, virtual: true });
+        });
+      });
+    });
+    return out;
+  }
+
+  // Connected components of `ids` over `links` taken as undirected
+  // (8.4 step 1), each in step order, in order of their first card.
+  function connectedIslands(order, links) {
+    const ids = new Set(order.map((n) => n.id));
+    const adj = new Map(order.map((n) => [n.id, []]));
+    links.forEach((l) => {
+      if (!ids.has(l.from) || !ids.has(l.to)) return;
+      adj.get(l.from).push(l.to);
+      adj.get(l.to).push(l.from);
+    });
+    const seen = new Set();
+    const islands = [];
     order.forEach((n) => {
+      if (seen.has(n.id)) return;
+      const members = new Set([n.id]);
+      const stack = [n.id];
+      seen.add(n.id);
+      while (stack.length) {
+        const id = stack.pop();
+        adj.get(id).forEach((next) => {
+          if (!seen.has(next)) { seen.add(next); members.add(next); stack.push(next); }
+        });
+      }
+      islands.push(order.filter((m) => members.has(m.id)));
+    });
+    return islands;
+  }
+
+  // Lay out ONE island at its own origin (8.4 steps 2-3): longest-path
+  // layers left to right, one barycenter pass per layer, step-prefix
+  // tie-break, a layer taller than SUBCOL_MAX cards wrapped into
+  // side-by-side sub-columns inside a band that widens to hold them. The
+  // result is normalized so its top-left card corner is (0, 0).
+  //
+  // `fixedY` maps a card id to the world center y of a SAVED neighbor
+  // (8.4: saved cards take part only as fixed neighbors for the
+  // barycenter). A saved card's y is in world space and the island is not
+  // yet placed, so it orders cards only among those with no placed
+  // neighbor inside the island, and never pulls a card's y.
+  function layoutIsland(island, graph, cycle, frameOf, fixedY) {
+    const layer = assignLayers(island, graph, cycle);
+    const columns = new Map();
+    island.forEach((n) => {
       const k = layer.get(n.id);
       if (!columns.has(k)) columns.set(k, []);
       columns.get(k).push(n);
     });
     const positions = {};
     const centerY = new Map();
+    let bandX = 0;
     [...columns.keys()].sort((a, b) => a - b).forEach((k) => {
-      // One barycenter pass: mean center y of already-placed neighbors
-      // (both directions, so a frame-placed isolate is not special), ties
-      // by step prefix. Cards with no placed neighbor sort after, in step
-      // order.
-      const bary = new Map();
+      const bary = new Map(), fixed = new Map();
       columns.get(k).forEach((n) => {
         const ys = [];
         graph.ins.get(n.id).forEach((l) => { if (!cycle.has(l.id) && centerY.has(l.from)) ys.push(centerY.get(l.from)); });
         graph.outs.get(n.id).forEach((l) => { if (!cycle.has(l.id) && centerY.has(l.to)) ys.push(centerY.get(l.to)); });
         bary.set(n.id, ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Infinity);
+        const fs = fixedY.get(n.id) || [];
+        fixed.set(n.id, fs.length ? fs.reduce((a, b) => a + b, 0) / fs.length : Infinity);
       });
       const col = columns.get(k).slice().sort((a, b) => {
         const ba = bary.get(a.id), bb = bary.get(b.id);
         if (ba !== bb) return ba < bb ? -1 : 1;
+        const fa = fixed.get(a.id), fb = fixed.get(b.id);
+        if (fa !== fb) return fa < fb ? -1 : 1;
         return compareByStep(a, b);
       });
-      // Packed top-down with ROW_GAP between cards; a card with a
-      // barycenter is pulled toward it (never closer than ROW_GAP to the
-      // card above), so a straight chain reads as a straight line.
-      let bottom = -Infinity;
-      let prevFrame;
-      col.forEach((n) => {
-        const h = nodeHeight(n.type);
-        const b = bary.get(n.id);
-        const frame = frameOf.has(n.id) ? frameOf.get(n.id) : -1;
-        const gap = bottom === -Infinity || frame === prevFrame
-          ? ROW_GAP : ROW_GAP + 2 * FRAME_PAD + FRAME_TITLE_H;
-        prevFrame = frame;
-        let y = bottom === -Infinity ? 0 : bottom + gap;
-        if (Number.isFinite(b)) y = Math.max(bottom === -Infinity ? -Infinity : bottom + gap, b - h / 2);
-        positions[n.id] = [k * COL_GAP, Math.round(y)];
-        centerY.set(n.id, y + h / 2);
-        bottom = y + h;
-      });
+      // Balanced sub-columns of at most SUBCOL_MAX (13 -> 7 + 6), filled
+      // column by column so barycenter order reads top-down, then across.
+      const nsub = Math.ceil(col.length / SUBCOL_MAX);
+      const per = Math.ceil(col.length / nsub);
+      for (let s = 0; s < nsub; s++) {
+        const chunk = col.slice(s * per, (s + 1) * per);
+        const x = bandX + s * SUBCOL_PITCH;
+        // Packed top-down with ROW_GAP between cards; in a single column a
+        // card with a barycenter is pulled toward it (never closer than
+        // ROW_GAP to the card above), so a straight chain reads straight.
+        // A wrapped layer is packed tight: the pull would only re-tower it.
+        let bottom = -Infinity;
+        let prevFrame;
+        chunk.forEach((n) => {
+          const h = nodeHeight(n.type);
+          const b = nsub === 1 ? bary.get(n.id) : Infinity;
+          const frame = frameOf.has(n.id) ? frameOf.get(n.id) : -1;
+          const gap = bottom === -Infinity || frame === prevFrame
+            ? ROW_GAP : ROW_GAP + 2 * FRAME_PAD + FRAME_TITLE_H;
+          prevFrame = frame;
+          let y = bottom === -Infinity ? 0 : bottom + gap;
+          if (Number.isFinite(b)) y = Math.max(bottom === -Infinity ? -Infinity : bottom + gap, b - h / 2);
+          positions[n.id] = [x, Math.round(y)];
+          centerY.set(n.id, y + h / 2);
+          bottom = y + h;
+        });
+      }
+      bandX += (nsub - 1) * SUBCOL_PITCH + COL_GAP;
     });
-    return positions;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    island.forEach((n) => {
+      const [x, y] = positions[n.id];
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+      x1 = Math.max(x1, x + NODE_W); y1 = Math.max(y1, y + nodeHeight(n.type));
+    });
+    island.forEach((n) => { positions[n.id] = [positions[n.id][0] - x0, positions[n.id][1] - y0]; });
+    return { positions, w: x1 - x0, h: y1 - y0 };
   }
 
-  function computeLayout(nodes, links, frames) {
+  // 8.4 step 4: loose cards in one grid block, LOOSE_COLS wide, ordered by
+  // type then path, under the 「未连线」 caption (whose height the block
+  // includes, so packing leaves it room).
+  const TYPE_ORDER = { dataset: 0, script: 1, figure: 2 };
+
+  function layoutLoose(cards) {
+    const sorted = cards.slice().sort((a, b) => {
+      const ta = a.type in TYPE_ORDER ? TYPE_ORDER[a.type] : 9;
+      const tb = b.type in TYPE_ORDER ? TYPE_ORDER[b.type] : 9;
+      if (ta !== tb) return ta - tb;
+      return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+    });
+    const positions = {};
+    let y = LOOSE_CAPTION_H, w = 0;
+    for (let r = 0; r * LOOSE_COLS < sorted.length; r++) {
+      const row = sorted.slice(r * LOOSE_COLS, (r + 1) * LOOSE_COLS);
+      let rowH = 0;
+      row.forEach((n, c) => {
+        positions[n.id] = [c * (NODE_W + LOOSE_GAP), y];
+        rowH = Math.max(rowH, nodeHeight(n.type));
+        w = Math.max(w, c * (NODE_W + LOOSE_GAP) + NODE_W);
+      });
+      y += rowH + ROW_GAP;
+    }
+    return { positions, w, h: y - ROW_GAP };
+  }
+
+  // 8.4 step 5's order: the island holding the current attempt's scripts
+  // first, then card count descending, ties by the smallest step prefix
+  // (then the first id, so the order is total).
+  function islandOrder(islands, currentScripts) {
+    const meta = islands.map((cards, i) => ({
+      cards, i,
+      current: cards.some((n) => currentScripts.has(n.id)),
+      step: Math.min(...cards.map((n) => stepKey(n.path))),
+      first: cards.map((n) => n.id).sort()[0],
+    }));
+    meta.sort((a, b) => {
+      if (a.current !== b.current) return a.current ? -1 : 1;
+      if (a.cards.length !== b.cards.length) return b.cards.length - a.cards.length;
+      if (a.step !== b.step) return a.step < b.step ? -1 : 1;
+      return a.first < b.first ? -1 : a.first > b.first ? 1 : 0;
+    });
+    return meta.map((m) => m.cards);
+  }
+
+  // Shelf-pack blocks ({w, h}) in order: left to right, a new row (96px
+  // below the tallest of the last) when the next block would push the row
+  // past `W`. Returns each block's top-left and the page's size.
+  function packRows(items, W) {
+    const at = [];
+    let x = 0, y = 0, rowH = 0, right = 0;
+    items.forEach((b) => {
+      if (x > 0 && x + b.w > W) { y += rowH + ISLAND_GAP; x = 0; rowH = 0; }
+      at.push([x, y]);
+      right = Math.max(right, x + b.w);
+      x += b.w + ISLAND_GAP;
+      rowH = Math.max(rowH, b.h);
+    });
+    return { at, w: right, h: y + rowH };
+  }
+
+  // The 8.4 layout of the cards of ONE view. Pure: plain objects in, plain
+  // objects out, so the node test runner pins it without a DOM.
+  //
+  //   nodes  -- the visible cards ({id, type, path, ghost?})
+  //   links  -- the visible links ({id, from, to, human?, entry?})
+  //   frames -- the view's attempt frames ({attempt_id?, node_ids})
+  //   opts   -- {fixed: {id: [x, y]} saved positions (they always win and
+  //             are never moved), current: the current attempt's id}
+  //
+  // Returns {positions} for the UNSAVED cards only, {cycle} (link ids that
+  // close a loop -- over every visible link, saved ends or not), {loose}
+  // (the 「未连线」 block's world rect, caption included, or null) and
+  // {islands} (card ids per island, in packing order).
+  function computeLayout(nodes, links, frames, opts) {
+    opts = opts || {};
+    frames = frames || [];
+    const fixed = opts.fixed || {};
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const order = nodes.slice().sort(compareByStep);
-    const graph = flowGraph(nodes, links);
-    const cycle = findCycleLinks(order, graph, byId);
-    const layer = assignLayers(order, graph, cycle);
-    placeIsolatedFrameMembers(layer, graph, frames || [], byId, cycle);
-    return { positions: orderAndPlace(order, graph, layer, cycle, frameOfNode(frames)), cycle };
+    const cycle = findCycleLinks(order, flowGraph(nodes, links), byId);
+
+    const isFixed = (id) => Object.prototype.hasOwnProperty.call(fixed, id) && byId.has(id);
+    const visibleLinks = links.filter((l) => byId.has(l.from) && byId.has(l.to));
+    const linkedIds = new Set();
+    visibleLinks.forEach((l) => { linkedIds.add(l.from); linkedIds.add(l.to); });
+    const anchors = stepAnchorLinks(nodes, linkedIds, frames, byId);
+    anchors.forEach((l) => { linkedIds.add(l.from); linkedIds.add(l.to); });
+
+    // Saved cards take no part in steps 1-5: islands, layers and packing
+    // are over the unsaved cards and the links among them; a link to a
+    // saved card only feeds that card's world y into the barycenter.
+    const free = order.filter((n) => !isFixed(n.id));
+    const freeIds = new Set(free.map((n) => n.id));
+    const freeLinks = visibleLinks.concat(anchors).filter((l) => freeIds.has(l.from) && freeIds.has(l.to));
+    const graph = flowGraph(free, freeLinks);
+    const fixedY = new Map();
+    visibleLinks.concat(anchors).forEach((l) => {
+      if (cycle.has(l.id)) return;
+      [[l.from, l.to], [l.to, l.from]].forEach(([a, b]) => {
+        if (!freeIds.has(a) || !isFixed(b)) return;
+        if (!fixedY.has(a)) fixedY.set(a, []);
+        fixedY.get(a).push(fixed[b][1] + nodeHeight(byId.get(b).type) / 2);
+      });
+    });
+
+    const loose = free.filter((n) => !linkedIds.has(n.id));
+    const linkedFree = free.filter((n) => linkedIds.has(n.id));
+    const currentFrame = frames.find((f) => opts.current && f.attempt_id === opts.current);
+    const currentScripts = new Set(currentFrame
+      ? currentFrame.node_ids.filter((id) => byId.has(id) && byId.get(id).type === "script") : []);
+    const frameOf = frameOfNode(frames);
+    const islands = islandOrder(connectedIslands(linkedFree, freeLinks), currentScripts)
+      .map((cards) => Object.assign({ cards }, layoutIsland(cards, graph, cycle, frameOf, fixedY)));
+
+    // 8.4 step 5: rows left to right, wrapping past the target width W =
+    // max(widest island, √(1.6 × total island area)). That W assumes a
+    // perfect packing; greedy rows of pipeline-wide islands plus the
+    // 「未连线」 block waste enough of each row that on realistic graphs the
+    // page came out taller than wide (0.8 : 1), the tower 8.4 exists to
+    // prevent, and 全部 no longer fit at 25%. So W is the floor: the target
+    // is widened in 10% steps and the packing whose page is closest to the
+    // stated 1.6 : 1 is kept (the narrowest on a tie).
+    const area = islands.reduce((s, b) => s + b.w * b.h, 0);
+    const widest = islands.reduce((m, b) => Math.max(m, b.w), 0);
+    const W0 = Math.max(widest, Math.sqrt(1.6 * area));
+    const items = islands.slice();
+    let looseBlock = null;
+    if (loose.length) {
+      looseBlock = Object.assign({ cards: loose, loose: true }, layoutLoose(loose));
+      items.push(looseBlock);
+    }
+    let best = null;
+    for (let k = 0; k <= PACK_STEPS; k++) {
+      const p = packRows(items, W0 * (1 + k / 10));
+      const miss = p.h ? Math.abs(Math.log(p.w / p.h / PAGE_ASPECT)) : 0;
+      if (!best || miss < best.miss - 1e-9) best = Object.assign(p, { miss });
+    }
+    const positions = {};
+    items.forEach((b, i) => {
+      const [x, y] = best.at[i];
+      b.x = x; b.y = y;
+      b.cards.forEach((n) => { positions[n.id] = [x + b.positions[n.id][0], y + b.positions[n.id][1]]; });
+    });
+    return {
+      positions, cycle,
+      loose: looseBlock ? { x: looseBlock.x, y: looseBlock.y, w: looseBlock.w, h: looseBlock.h } : null,
+      islands: islands.map((b) => b.cards.map((n) => n.id)),
+    };
   }
 
   // -- DOM scaffold ---------------------------------------------------------------
@@ -765,6 +998,13 @@ window.RCECanvas = (function () {
       g.appendChild(title);
       host.appendChild(g);
     });
+    // 8.4 step 4: the loose cards' block is captioned, quietly, and is no
+    // frame -- it groups cards by what they lack, not by an attempt.
+    if (cv.loose) {
+      const t = svgEl("text", { x: cv.loose.x, y: cv.loose.y + 14 }, "cv-loose-title");
+      t.textContent = "未连线";
+      host.appendChild(t);
+    }
   }
 
   function renderLinks() {
@@ -936,21 +1176,28 @@ window.RCECanvas = (function () {
   // Fit never moves cards, only the camera (8.4); never zooms past 100%
   // just because a scope is small -- a fitted single card at 250% reads
   // as a bug, not as "everything".
+  // The camera that fits `ids`, or null when none of them is drawn; the
+  // view must have a size.
+  function fitCamera(ids) {
+    const v = viewSize();
+    const b = boundsOf(ids);
+    if (!b) return null;
+    const top = 56; // the floating toolbar
+    const availW = v.w - 2 * FIT_PAD, availH = v.h - top - 2 * FIT_PAD;
+    const z = clamp(Math.min(availW / (b.x1 - b.x0), availH / (b.y1 - b.y0), 1), ZOOM_MIN, ZOOM_MAX);
+    return {
+      x: (v.w - (b.x1 - b.x0) * z) / 2 - b.x0 * z,
+      y: top + FIT_PAD + (availH - (b.y1 - b.y0) * z) / 2 - b.y0 * z,
+      zoom: z,
+    };
+  }
+
   function fitTo(ids) {
     if (!cv.dom) return;
     const v = viewSize();
     if (!v.w || !v.h) { cv.needsFit = true; return; }
     cv.needsFit = false;
-    const b = boundsOf(ids);
-    if (!b) { cv.camera = { x: FIT_PAD, y: FIT_PAD + 40, zoom: 1 }; applyCamera(); return; }
-    const top = 56; // the floating toolbar
-    const availW = v.w - 2 * FIT_PAD, availH = v.h - top - 2 * FIT_PAD;
-    const z = clamp(Math.min(availW / (b.x1 - b.x0), availH / (b.y1 - b.y0), 1), ZOOM_MIN, ZOOM_MAX);
-    cv.camera = {
-      x: (v.w - (b.x1 - b.x0) * z) / 2 - b.x0 * z,
-      y: top + FIT_PAD + (availH - (b.y1 - b.y0) * z) / 2 - b.y0 * z,
-      zoom: z,
-    };
+    cv.camera = fitCamera(ids) || { x: FIT_PAD, y: FIT_PAD + 40, zoom: 1 };
     applyCamera();
     queueViewport();
   }
@@ -1004,12 +1251,15 @@ window.RCECanvas = (function () {
     }
   }
 
-  // 「重新排列」(8.4): forget every saved position of the visible cards,
-  // after asking -- it discards hand placement, which is the user's work.
+  // 「重新排列」(8.4): forget the saved positions of the VISIBLE cards only
+  // (a card placed by hand in another scope keeps its place there), after
+  // asking -- it discards hand placement, which is the user's work -- then
+  // lay the view out afresh.
   function relayout() {
     if (!cv.data) return;
     if (!window.confirm("重新排列当前画布？\n\n将丢弃你手动摆放的位置。")) return;
     cv.nodes.forEach((n, id) => { if (id in cv.positions) queuePosition(id, null); });
+    layoutView(true);
     render();
     fitAll();
   }
@@ -1797,29 +2047,67 @@ window.RCECanvas = (function () {
   // re-fetches (cv.scope). A chosen scope that no longer exists (the row
   // was deleted from the map) falls back to the default, not to an error.
   //
-  // 8.7 also says "positions are global (a node keeps its place across
-  // scopes)". A card without a saved position is placed by the 8.4 layout,
-  // so that layout is computed over the WHOLE graph, never the scope's
-  // slice -- otherwise every scope switch re-shuffled every card the
-  // researcher had not dragged (same review). Hence the second request
-  // for scope "all" whenever the view is narrower; `whole` is what the
-  // layout (and the cycle marking, a property of the graph) is run on.
+  // One request: auto-layout belongs to the view (8.4), so the cards of
+  // THIS scope are all it needs. (The first V4 build also fetched scope
+  // "all" to lay unsaved cards out over the whole graph; on real data
+  // that scattered the default view over 4,000px.)
   async function fetchCanvas() {
     const scope = cv.scope;
-    let payload;
     try {
-      payload = await apiGet(canvasUrl(scope));
+      return await apiGet(canvasUrl(scope));
     } catch (err) {
       if (!scope || (typeof projectStateOf === "function" && projectStateOf(err))) throw err;
       cv.scope = null;
-      payload = await apiGet(canvasUrl(null));
+      return apiGet(canvasUrl(null));
     }
-    const whole = payload.scope.id === SCOPE_ALL ? payload : await apiGet(canvasUrl(SCOPE_ALL));
-    return { payload, whole };
   }
 
-  function applyPayload(fetched, opts) {
-    const payload = fetched.payload, whole = fetched.whole;
+  // The current attempt (8.7's default scope), whose island packs first.
+  function currentAttemptId(payload) {
+    const cur = (payload.scopes || []).find((s) => s.current);
+    return cur ? cur.id : null;
+  }
+
+  // Lay the view out (8.4) over its own cards, saved ones fixed. Re-run
+  // only when what is drawn changes -- the scope, the cards or the links --
+  // or when 「重新排列」 asks: a card the researcher just dragged gains a
+  // saved position, and re-packing the rest around it on the next poll
+  // would make every other card jump under their hand.
+  function layoutView(force) {
+    const d = cv.data;
+    const key = [d.scope.id, d.nodes.map((n) => n.id).join("\n"), d.links.map((l) => l.id).join("\n")].join("\f");
+    if (!force && key === cv.layoutKey) return;
+    cv.layoutKey = key;
+    const layout = computeLayout(d.nodes, d.links, d.frames, { fixed: cv.positions, current: currentAttemptId(d) });
+    cv.auto = layout.positions;
+    cv.cycle = layout.cycle;
+    cv.loose = layout.loose;
+  }
+
+  // 8.4: on entering a view with no saved viewport the camera fits all.
+  // canvas.json keeps ONE viewport (8.6), saved in whatever scope was last
+  // shown, and the scope itself is not remembered -- so the saved camera
+  // is restored only when it plausibly belongs to this view: it must show
+  // at least one of this view's cards (never open onto empty paper), and
+  // it must not be zoomed out further than fitting this view would be (a
+  // camera from 全部 at 25% would open the ten cards of the current attempt
+  // as dust, where fitting shows all of them larger).
+  function savedViewportFits(vp) {
+    const v = viewSize();
+    if (!v.w || !v.h) return true; // hidden: nothing to judge; activate() fits if asked
+    const z = clamp(vp.zoom, ZOOM_MIN, ZOOM_MAX);
+    const ids = [...cv.nodes.keys()];
+    const fit = fitCamera(ids);
+    if (fit && z < fit.zoom - 1e-6) return false;
+    const wx0 = -vp.x / z, wy0 = -vp.y / z, wx1 = (v.w - vp.x) / z, wy1 = (v.h - vp.y) / z;
+    return ids.some((id) => {
+      const [x, y] = posOf(id);
+      const h = nodeHeight(cv.nodes.get(id).type);
+      return x < wx1 && x + NODE_W > wx0 && y < wy1 && y + h > wy0;
+    });
+  }
+
+  function applyPayload(payload, opts) {
     const first = !cv.data;
     cv.data = payload;
     mergeOptimistic(payload);
@@ -1832,10 +2120,7 @@ window.RCECanvas = (function () {
       if (p === null) delete cv.positions[id];
       else cv.positions[id] = p;
     });
-    const layoutLinks = whole === payload ? payload.links : whole.links.concat([...cv.optimistic.values()]);
-    const layout = computeLayout(whole.nodes, layoutLinks, whole.frames);
-    cv.auto = layout.positions;
-    cv.cycle = layout.cycle;
+    layoutView(false);
     if (cv.selected && !cv.nodes.has(cv.selected)) cv.selected = null;
     if (cv.hovered && !cv.nodes.has(cv.hovered)) cv.hovered = null;
     if (cv.selectedLink && !payload.links.some((l) => l.id === cv.selectedLink)) cv.selectedLink = null;
@@ -1844,8 +2129,10 @@ window.RCECanvas = (function () {
     if (opts.fit) fitAll();
     else if (first) {
       const vp = payload.viewport;
-      if (vp) { cv.camera = { x: vp.x, y: vp.y, zoom: clamp(vp.zoom, ZOOM_MIN, ZOOM_MAX) }; applyCamera(); }
-      else fitAll();
+      if (vp && savedViewportFits(vp)) {
+        cv.camera = { x: vp.x, y: vp.y, zoom: clamp(vp.zoom, ZOOM_MIN, ZOOM_MAX) };
+        applyCamera();
+      } else fitAll();
     }
   }
 
@@ -1856,9 +2143,9 @@ window.RCECanvas = (function () {
     opts = opts || {};
     const seq = ++cv.loadSeq;
     ensureDom(container);
-    let fetched;
+    let payload;
     try {
-      fetched = await fetchCanvas();
+      payload = await fetchCanvas();
     } catch (err) {
       if (seq !== cv.loadSeq) return;
       cv.dom = null;
@@ -1870,10 +2157,21 @@ window.RCECanvas = (function () {
     if (typeof clearProjectState === "function") clearProjectState();
     ensureDom(container);
     container.dataset.loaded = "1";
-    applyPayload(fetched, opts);
+    applyPayload(payload, opts);
   }
 
+  // 8.7: the selection and a pinned link card belong to the view that was
+  // left -- cleared at once, not when the new payload arrives (a link
+  // present in both scopes kept its card floating over the new view).
+  // So does anything half-done on a link: a drag, its confirm popover,
+  // the right-click menu.
   function changeScope(scope) {
+    if (cv.drag && cv.drag.kind === "link") endLinkDrag(false);
+    closePopover();
+    closeCtxMenu();
+    cv.selected = null;
+    cv.hovered = null;
+    selectLink(null);
     cv.scope = scope;
     if (cv.container) load(cv.container, { fit: true });
   }
@@ -1900,7 +2198,7 @@ window.RCECanvas = (function () {
     hideStatus();
     Object.assign(cv, {
       data: null, scope: null, nodes: new Map(), positions: {}, auto: {}, cycle: new Set(),
-      selected: null, hovered: null, pending: {}, viewportDirty: false, saveTimer: null,
+      loose: null, layoutKey: null, selected: null, hovered: null, pending: {}, viewportDirty: false, saveTimer: null,
       drag: null, lastClick: null, nodeEls: new Map(), linkEls: new Map(),
       selectedLink: null, optimistic: new Map(),
     });
