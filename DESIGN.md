@@ -1347,6 +1347,7 @@ shown).
 | Undo, withdraw (撤销、撤回) | an evidence key, erased on use | entries in `judgements.toml` | same |
 | Note on a judgment (备注) | does not exist | optional `note` on the entry | same |
 | Canvas arrangement, per view (画布位置) | `canvas.json` beside the index | **`.rce/canvas.json`** | daily snapshot, and before 「重新排列」 discards an arrangement |
+| Variable definition, construction and the reason for it (变量定义卡) | nowhere — a shorthand name in the attempt table | **`.rce/variables/<id>.toml`** (9.11) | daily snapshot; confirmed versions are never rewritten |
 | Attempt-table configuration | `.rce/attempts.toml`, hand-written | unchanged | daily snapshot when changed; RCE never writes it |
 
 Snapshots go to `.rce/backups/`, newest 20 per file. A snapshot per day
@@ -1781,7 +1782,191 @@ Chinese sentences properly is extractor work and comes after.
 
 **Suggested order of building**, each stage shippable: (a) the record,
 identity, migration, rebuild and locking — 9.2–9.5, 9.7, 9.8, acceptance
-1–7 and 9–12 — with every new judgment already recording its basis; then
-(b) the scan reports and the review list — 9.6, acceptance 8. After (a)
-nothing the researcher has judged can be lost; (b) is what stops an old
-judgment from vouching for new evidence.
+1–7 and 9–12 — with every new judgment already recording its basis; (c)
+variable cards — 9.11, acceptance 13–16; then (b) the scan reports and
+the review list — 9.6, acceptance 8 and 17. After (a) nothing the
+researcher has judged can be lost; after (c) neither can what a variable
+meant when it was used; (b) is what stops an old judgment, or an old
+definition, from vouching for evidence that has since changed.
+
+### 9.11 Variable definition cards
+
+*Added at the researcher's direction after draft 2: "protecting human
+labor" must protect not only the judgments but the variable definitions
+those judgments were made on.*
+
+**The gap.** In the researcher's project a variable exists only as a
+shorthand in the attempt table — `TopicShift→RV/NetBuyRate(月)`, `私有
+Shannon 熵→lnRate(月,ECM)` — and as a substring in the dead-variable list.
+Nothing records what `RV` means, which returns it uses, how it is
+aggregated, what happens to missing trading days, or why that definition
+was chosen over another. A script path does not answer "what is this
+indicator and why is it built this way"; a name does not answer "how was
+it computed". The card keeps both, and keeps them apart: **the research
+definition is the researcher's statement; the implementation is where RCE
+can check that statement against the files.**
+
+**One file per variable, `.rce/variables/<id>.toml`**, a record file like
+the ledger: inside the project, plain, diffable, under the same lock,
+snapshot and identity rules (9.2, 9.4, 9.7).
+
+```toml
+id   = "topicshift"            # the file's stem; never changes
+name = "TopicShift（叙事更替）"   # display name; may be reworded freely
+
+[[version]]
+v      = 1
+state  = "confirmed"           # draft | confirmed
+# 含义
+meaning     = "相邻两月新闻主题分布的差异，衡量叙事更替的幅度"
+unit        = "无量纲，0–1"
+granularity = "月"
+# 输入
+[[version.input]]
+dataset      = "复现包_分步/Data/theme_counts_2017_2024.csv"
+fields       = ["month", "theme", "count"]
+data_version = "2017-01 至 2024-12，2026-07 下载"
+# 构建口径
+[version.construction]
+formula     = "TS_t = 1 − cos(p_t, p_{t−1})，p_t 为当月各主题占比向量"
+filter      = "剔除当月文章数 < 30 的月份"
+aggregation = "日度主题计数先按月求和，再归一"
+missing     = "缺月不插值，记为缺失"
+transform   = "不标准化；回归中取一阶滞后"
+params      = "主题数 K=12"
+# 实现依据
+[version.implementation]
+script = "复现包_分步/16-构造叙事更替指标.py"
+output = "复现包_分步/Data/topicshift_monthly.csv"
+field  = "topicshift"
+# 人工决策
+[version.decision]
+why          = "余弦距离对主题总量不敏感；试过 JS 散度，对稀疏主题过于敏感"
+confirmed_by = "LL"
+confirmed_at = "2026-07-26"
+[version.checked]              # written by RCE at confirmation, read from disk — never typed
+at           = "2026-10-05T10:12:00+02:00"
+script       = { found = true, sha256 = "9c1f…" }
+writes       = "dataflow · 第 27 行"      # the index has script --writes--> output; or "mapping"; or "未核对"
+field        = "found in header"          # csv only; otherwise "未核对"
+inputs       = [{ dataset = "…theme_counts_2017_2024.csv", sha256 = "44ab…" }]
+```
+
+The five blocks are the researcher's list: meaning (name, research
+meaning, unit, granularity); inputs (source data, fields, data version);
+construction (formula, filters, aggregation, missing values,
+standardization and lags, parameters); implementation (script, output
+file and field); the human decision (why this definition, who confirmed
+it, when).
+
+**Who writes what.** Everything except `version.checked` is the
+researcher's. RCE never fills in a formula, a filter or a reason — reading
+code and guessing what it computes is exactly what Section 0 forbids.
+What RCE does at confirmation is *check the pointers*, and say honestly
+which it could not check: the script exists (its content hash is taken);
+the index already holds a link from that script to that output, by the
+machine or by the researcher's own hand; for a CSV output the named field
+is in its header line; each input file exists (its hash is taken, by
+content below 50 MB and by size and time above). A check that fails does
+not block confirmation — a variable computed inside an Rmd chunk and never
+written to a file is still a variable — it is recorded as 「未核对」 and
+shown as such on the card.
+
+**Versions, and the rule that protects history.**
+
+- A version is a `draft` until the researcher confirms it. A draft may be
+  edited freely; nothing can depend on it.
+- **Confirming freezes the definition.** The fields that *are* the
+  definition — unit, granularity, inputs, construction — cannot change in
+  a confirmed version. To change how a variable is built is to write the
+  next version: `rce variable revise <id>` appends `v+1` as a draft copied
+  from the current one. When it is confirmed, the previous version is
+  marked superseded as of that date and is otherwise left byte for byte as
+  it was.
+- **A result always points at a version, never at a name**: the reference
+  form is `topicshift@v2`. So when today's definition replaces
+  yesterday's, yesterday's results still say what they were computed
+  from.
+- What may still be edited in a confirmed version, because it is not the
+  definition: the display name, the wording of `meaning` and `why`, and
+  where the implementation lives (a script that was moved). Each such edit
+  is logged as an event (below), so even those leave a trace.
+- **A confirmed version edited in place is not obeyed silently.** The
+  index keeps a copy of every confirmed version (the same safety net as
+  9.3). If the file later shows a confirmed version whose definition
+  fields differ, RCE applies nothing and asks: 「v2 的构建口径被改动了」 —
+  「另存为新版本 v3」 or 「这是笔误更正」. A correction is recorded with what
+  it changed. A card file that has lost a confirmed version, or has
+  vanished, gets the 9.3 question, and writes to it are refused meanwhile.
+
+**Events.** After its versions, a card carries its history as appended
+`[[event]]` blocks — never rewritten:
+
+```toml
+[[event]]
+at      = "2026-09-02T09:30:00+02:00"
+version = 1
+act     = "abandoned"      # abandoned | revived | corrected | repointed | reaffirmed
+note    = "placebo 检验后判伪，见尝试 #6"
+```
+
+`abandoned` and `revived` are how a dead variable is recorded with its
+reason, in the researcher's words and with a date, instead of as a bare
+substring in a configuration list. (The existing revived-dead-variable
+check keeps reading `attempts.toml` in V5; teaching it to read cards is
+later.) `reaffirmed` is the researcher's answer when the implementation
+has changed but the definition has not (below).
+
+**When the implementation moves under a confirmed version.** At
+confirmation RCE recorded the script's hash and the inputs' hashes. When a
+later scan finds either different, the version comes under review (9.6's
+list, stage (b)): 「实现脚本在确认后有改动」 or 「输入数据在确认后有变化」.
+RCE does not decide whether the definition changed — it cannot know which
+lines compute the variable, and says so. The researcher answers 「口径未变」
+(a `reaffirmed` event carrying the new hashes) or 「口径已变」 (a draft of
+the next version opens). This will fire on edits that did not touch the
+variable; that is the price of not guessing, and one click settles it.
+
+**In the index and in the app.** Each version is ingested as a node
+`variable:<id>@v<n>` (a new node type), from the file, on the same watch
+and first-sight rules as the other record files. V5 draws no links from
+it: connecting results to variable versions is the next phase's work, and
+the reference form above is what it will use. The app gets one plain
+view, 「变量」: the cards, the version in use, the history, what was and
+was not checked, what is under review. Writing a card in V5 is done in the
+file and through `rce variable new | revise | confirm | abandon`, which
+create a commented template and enforce the rules above; the same rules
+apply to hand edits, because they are enforced on read.
+
+**What V5 covers and does not.** Cards are written by the researcher for
+the variables that actually enter a model, a figure or a claim; RCE does
+not go looking for variables and does not create cards. Not in V5: links
+from attempts, figures and claims to variable versions; showing variables
+on the canvas; forms for writing cards in the app; discovering variables
+from data columns; replacing the dead-variable list.
+
+**Acceptance (continues 9.9).**
+
+13. **Life of a card.** `rce variable new` → a draft; edit it freely;
+    confirm: the definition is frozen and `checked` is filled from disk,
+    with a deliberately missing output recorded as 「未核对」 rather than
+    refused. Revise and confirm: `v2` is in use, `v1` is superseded with
+    its date, and `v1`'s bytes are unchanged.
+14. **History is not overwritten.** Edit a confirmed version's
+    `construction` by hand: nothing is applied and the question is asked;
+    「另存为新版本」 yields `v3` and restores `v2`; 「笔误更正」 keeps `v2` and
+    leaves a `corrected` event showing before and after. Reword `meaning`:
+    applied, with an event.
+15. **Survival.** Scenarios 1–7 and 10–11 of 9.9, with two cards (one of
+    them with two versions and an `abandoned` event) added to the fixture:
+    after a move, a rename, a copy with each answer, a rebuild, a restore
+    and two concurrent writers, every version and event is present and
+    `rce records --verify` passes; a card file made unparseable, removed
+    or truncated freezes what the index had and refuses writes.
+16. **Dead and back.** Abandon a variable with a reason; revive it: the
+    card shows the state and both events in order.
+17. **The implementation moves** (stage (b)). Change the script after
+    confirmation: 「待复核 · 实现脚本在确认后有改动」; 「口径未变」 records a
+    `reaffirmed` event and clears it; 「口径已变」 opens `v+1` as a draft.
+    Make the script unreadable: nothing comes under review.
+
