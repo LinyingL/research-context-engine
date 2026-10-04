@@ -696,7 +696,7 @@ _GLOSSARY_ENGLISH = (
     "Open", "Reveal in Finder", "Close", "Loading",
 )
 _GLOSSARY_CHINESE = (
-    "读取", "写出", "RCE 没有读到这个文件的读写。", "无来源输入", "被这些脚本读取",
+    "读取", "写出", "没有读到读写记录。", "无来源输入", "被这些脚本读取",
     "由这些脚本写出", "血缘链", "断链", "（读取，文件不存在）", "（写出，文件不存在）",
     "同名拷贝", "其它拷贝", "打开", "在 Finder 中显示", "关闭", "载入中…",
 )
@@ -786,6 +786,36 @@ def test_glossary_scanner_catches_english_copy_but_not_comments_or_code():
     assert _english_glossary_hits(_html_markup_copy('<button aria-label="Close">x</button>')) == [("Close", "Close")]
     assert _english_glossary_hits(_html_markup_copy("<!-- Loading… -->\n<p>载入中…</p>")) == []
     assert _english_glossary_hits(_js_string_literals("/* Open */ const r = /Open/; kind === 'reads'")) == []
+
+
+def test_served_ui_has_no_hover_only_errors_and_one_detail_helper(live_server):
+    """DESIGN.md 8.8 "Errors" (amended): an error that blocked an action is
+    never hover-only. The 「（悬停查看原因）」 wording is gone from every action
+    path in both served scripts, one shared 「详情」 helper exists, and each
+    action's failure path goes through it."""
+    html = _get_raw(live_server[0], "/")[1].decode("utf-8")
+    js = _get_with_type(live_server[0], "/canvas.js")[2].decode("utf-8")
+    assert "悬停查看原因" not in html and "悬停查看原因" not in js
+    assert html.count("function renderBlockingError(") == 1
+    assert "function renderBlockingError(" not in js  # shared, not copied
+    assert '"详情"' in html and 'toggle.type = "button"' in html
+    assert ".err-detail {" in html and "var(--ink-soft)" in html[html.index(".err-detail {"):][:300]
+    for call in (
+        'renderBlockingError(line, "切换项目失败", err)',             # switch project
+        'renderBlockingError(line, "移除失效项目失败", err)',         # remove project
+        'renderBlockingError(line, "停止服务失败", err)',             # stop service
+        'renderBlockingError(statusEl, reveal ? "无法在 Finder 中显示" : "无法打开", err)',
+        "renderBlockingError(statusEl, cnText, err)",                 # attempt form
+        "renderBlockingError(line, message, err)",                    # shell Finder commands
+    ):
+        assert call in html, call
+    assert "if (err) renderBlockingError(el, text, err);" in js       # every canvas write
+    # every coded refusal has its own sentence; the mapping ones keep 8.5's
+    for code in ("attempt_duplicate", "attempt_not_found", "attempt_line_break",
+                 "attempt_table_missing", "attempt_unknown_field"):
+        assert f"  {code}: \"" in html, code
+    assert 'mapping_exists: "这条映射已存在"' in html
+    assert 'human_link: "这是你的标注：请用「删除标注」移除"' in html
 
 
 def test_served_brand_subtitle_is_yanjiu_mailuo(live_server):
@@ -1400,6 +1430,35 @@ def test_http_attempts_write_unknown_number_update_returns_400(live_server):
         {"op": "update", "number": "99", "fields": {"verdict": "x"}},
     )
     assert status == 400 and "no row" in payload["error"]
+
+
+@pytest.mark.parametrize("endpoint", ["/api/attempts/preview", "/api/attempts/write"])
+def test_http_attempt_refusals_carry_their_code_as_state(live_server, endpoint):
+    """DESIGN.md 8.8 "Errors": each refusal the attempt form can cause names
+    its cause in `state` (the same channel `mapping_exists` uses) beside the
+    unchanged English `error`, so the page picks a Chinese sentence without
+    matching English."""
+    base_url, project = live_server
+    _map_project(project)
+    cases = [
+        ({"op": "append", "number": "1", "fields": {}}, "attempt_duplicate", "already exists"),
+        ({"op": "update", "number": "99", "fields": {"verdict": "x"}}, "attempt_not_found", "no row"),
+        ({"op": "update", "number": "1", "fields": {"result": "a\u2029b"}}, "attempt_line_break", "U+2029"),
+        ({"op": "append", "number": "2", "fields": {"id": "3"}}, "attempt_unknown_field", "unknown field"),
+    ]
+    for body, state, english in cases:
+        status, payload = _post(base_url, endpoint, body)
+        assert status == 400 and payload["state"] == state and english in payload["error"]
+    # a refusal outside the form's own cases stays uncoded
+    status, payload = _post(base_url, endpoint, {"op": "update", "number": "1", "fields": {}})
+    assert status == 400 and "state" not in payload
+    # the table can no longer be found: heading gone, then the config gone
+    (project / "map.md").write_text("# nothing here\n", encoding="utf-8")
+    status, payload = _post(base_url, endpoint, _APPEND_2)
+    assert status == 400 and payload["state"] == "attempt_table_missing"
+    (project / ".rce" / "attempts.toml").unlink()
+    status, payload = _post(base_url, endpoint, _APPEND_2)
+    assert status == 400 and payload["state"] == "attempt_table_missing"
 
 
 def test_http_attempts_write_malformed_op_returns_400(live_server):

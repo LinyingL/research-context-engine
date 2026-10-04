@@ -121,7 +121,39 @@ class MapEditError(Exception):
     currently is (duplicate/unknown number, invalid field content, a file
     this module refuses to rewrite faithfully). The message is shown to the
     user by the web UI, wrapped in its own Chinese product-language framing
-    -- same division as the refresh chip's error handling."""
+    -- same division as the refresh chip's error handling.
+
+    `code` is machine-readable for the refusals a researcher can cause from
+    the attempt form (DESIGN.md 8.8 "Errors"), so the page can say which in
+    Chinese without matching the English: `duplicate` (append of a number
+    already in the table), `not_found` (update of a number that is not),
+    `line_break` (an invisible line-break character in a cell or number),
+    `table_missing` (the map file is gone; see `error_code` for the config
+    and table cases), `unknown_field`. None for everything else -- the page
+    then shows its generic framing. The message stays English (the CLI and
+    tests quote it)."""
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def error_code(exc: Exception, project_root: str | Path) -> str | None:
+    """The machine-readable code for a refusal `preview_edit`/`apply_edit`
+    raised: a `MapEditError`'s own `code`, or `table_missing` for the two
+    `AttemptsConfigError` cases that mean "the table can no longer be
+    found" -- the configured heading/table is gone
+    (`AttemptsTableNotFoundError`), or `.rce/attempts.toml` itself is.
+    Those errors propagate from ingest untouched (it owns their messages),
+    so they are classified here rather than re-raised with a code."""
+    if isinstance(exc, MapEditError):
+        return exc.code
+    if isinstance(exc, attempts_ingest.AttemptsTableNotFoundError):
+        return "table_missing"
+    if isinstance(exc, attempts_ingest.AttemptsConfigError):
+        if not (Path(project_root) / attempts_ingest.CONFIG_RELATIVE_PATH).exists():
+            return "table_missing"
+    return None
 
 
 @dataclass(frozen=True)
@@ -170,7 +202,8 @@ def _reject_line_boundaries(value: str, what: str) -> None:
                 f"{what} must not contain raw newlines or other line-break characters "
                 f"-- found {ch!r} (U+{ord(ch):04X}), which Markdown table parsing would "
                 f"split the row on (use a literal <br> if you mean a line break inside "
-                f"a cell)"
+                f"a cell)",
+                code="line_break",
             )
 
 
@@ -206,7 +239,8 @@ def _validate_fields(fields: object) -> dict[str, str]:
         if key not in EDITABLE_FIELDS:
             raise MapEditError(
                 f"unknown field {key!r} -- editable fields are {list(EDITABLE_FIELDS)} "
-                f"(the id column is addressed via 'number', never as a field)"
+                f"(the id column is addressed via 'number', never as a field)",
+                code="unknown_field",
             )
         if not isinstance(value, str):
             raise MapEditError(f"field {key!r} must be a string, got {type(value).__name__}")
@@ -359,7 +393,8 @@ def _plan_edit(project_root: Path, op: str, number: str, fields: dict[str, str])
     try:
         raw = source_path.read_bytes()
     except OSError as exc:
-        raise MapEditError(f"cannot read {source_path}: {exc}") from exc
+        code = "table_missing" if isinstance(exc, (FileNotFoundError, NotADirectoryError)) else None
+        raise MapEditError(f"cannot read {source_path}: {exc}", code=code) from exc
     text, lines, newline, trailing = _decode_source(raw, source_path)
 
     # The real parser first: it owns heading/table location and column-name
@@ -380,7 +415,8 @@ def _plan_edit(project_root: Path, op: str, number: str, fields: dict[str, str])
             raise MapEditError(
                 f"attempt number {number!r} already exists in the table (line "
                 f"{matching[0].line}) -- appending it again would create the duplicate-id "
-                f"collision ingest refuses to merge (DESIGN.md section 4)"
+                f"collision ingest refuses to merge (DESIGN.md section 4)",
+                code="duplicate",
             )
         new_row = _build_row(lines[header_idx], header_cells, col_index, number, fields)
         new_lines = list(lines)
@@ -388,7 +424,10 @@ def _plan_edit(project_root: Path, op: str, number: str, fields: dict[str, str])
         old_row = None
     else:
         if not matching:
-            raise MapEditError(f"no row with attempt number {number!r} in the table -- nothing to update")
+            raise MapEditError(
+                f"no row with attempt number {number!r} in the table -- nothing to update",
+                code="not_found",
+            )
         if len(matching) > 1:
             raise MapEditError(
                 f"attempt number {number!r} appears on {len(matching)} rows -- refusing to "

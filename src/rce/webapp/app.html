@@ -344,6 +344,19 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 
 .error-box { border: 1px solid var(--clay); background: var(--clay-soft); color: var(--ink); padding: 0.9rem 1.1rem; font-size: 0.88rem; }
 .error-box .error-title { font-weight: 600; color: var(--clay); margin-bottom: 0.25rem; }
+/* DESIGN.md 8.8 "Errors": an error that blocked an action shows its Chinese
+   sentence, then a 「详情」 button that reveals the engine's raw text inline
+   -- one click, never a hover (renderBlockingError). */
+.err-detail-toggle {
+  font: inherit; font-family: var(--font-sans); font-size: 0.74rem; color: var(--clay);
+  background: none; border: none; padding: 0; margin-left: 0.5rem;
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.err-detail-toggle:hover { color: var(--ink); }
+.err-detail {
+  display: block; margin-top: 0.3rem; font-family: var(--font-mono); font-size: 0.72rem;
+  color: var(--ink-soft); white-space: pre-wrap; word-break: break-word; max-height: 12rem; overflow: auto;
+}
 
 .panel-backdrop { position: fixed; inset: 0; background: rgba(38, 34, 27, 0.28); z-index: 40; }
 .panel {
@@ -542,7 +555,7 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
   background: var(--paper); border: 1px solid var(--line); padding: 0.1rem 0.45rem;
 }
 .cv-status {
-  position: absolute; left: 72px; bottom: 12px; z-index: 2; cursor: help;
+  position: absolute; left: 72px; bottom: 12px; z-index: 2; max-width: calc(100% - 96px);
   font-size: 0.76rem; color: var(--clay); background: var(--clay-soft); border: 1px solid var(--clay); padding: 0.1rem 0.55rem;
 }
 .cv-tip {
@@ -759,22 +772,77 @@ function escapeHtml(value) {
   ));
 }
 
-// DESIGN.md 8.8: "Raw error strings from the engine remain English and live
-// on hover titles; what the user reads is the Chinese framing". This box is
-// what any view (the canvas included) falls back to for an error that is
-// not one of the project states -- e.g. a legacy graph whose migration
-// failed its integrity check -- so the engine's English goes on the box's
-// title, never into the visible text (adversarial review of the V4 work).
+// -- Errors that blocked an action (DESIGN.md 8.8 "Errors") -----------------
+// One helper for every place an error has just stopped something the
+// researcher tried to do (saving an attempt row, a link, a project switch,
+// opening a file, stopping the service; canvas.js calls it too). It shows,
+// in order: one specific Chinese sentence when the engine named the cause
+// with a machine-readable code (`err.state`, see apiError); otherwise the
+// caller's Chinese framing; and in both cases a 「详情」 button revealing
+// the engine's raw text inline -- one click, never a hover. Passive chips
+// (the refresh chip, the project state chip) keep their hover titles.
+const BLOCKING_ERROR_TEXT = {
+  // the attempt form's own refusals (rce/webapp/mapedit.py's codes)
+  attempt_duplicate: "这个编号已经在年表里了，请换一个编号。",
+  attempt_not_found: "年表里找不到这个编号，可能刚在文件里被改掉了。",
+  attempt_line_break: "有一格里含有看不见的换行字符（常见于从 PDF 复制的文字），请删掉它；需要换行时写 <br>。",
+  attempt_table_missing: "找不到尝试年表了：年表文件、它的标题或 .rce/attempts.toml 已经不在。",
+  attempt_unknown_field: "表单里有一栏年表已经没有了，请刷新页面后再试。",
+  // the canvas's refusals, in the wording 8.5 already gave them
+  mapping_exists: "这条映射已存在",
+  human_link: "这是你的标注：请用「删除标注」移除",
+};
+
+function blockingErrorText(framing, err) {
+  const code = err && typeof err === "object" ? err.state : null;
+  return (typeof code === "string" && Object.prototype.hasOwnProperty.call(BLOCKING_ERROR_TEXT, code))
+    ? BLOCKING_ERROR_TEXT[code] : framing;
+}
+
+// Replaces `el`'s content with the sentence, the 「详情」 toggle and the
+// (collapsed) raw text. `err` is an Error from apiGet/apiPost or a plain
+// engine string (a contained post-write ingest failure).
+function renderBlockingError(el, framing, err) {
+  el.textContent = "";
+  el.title = "";
+  const text = document.createElement("span");
+  text.className = "err-text";
+  text.textContent = blockingErrorText(framing, err);
+  el.appendChild(text);
+  const raw = err instanceof Error ? err.message : (err == null ? "" : String(err));
+  if (!raw) return;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "err-detail-toggle";
+  toggle.textContent = "详情";
+  toggle.setAttribute("aria-expanded", "false");
+  const detail = document.createElement("span");
+  detail.className = "err-detail hidden";
+  detail.textContent = raw;
+  toggle.addEventListener("click", (e) => {
+    e.stopPropagation(); // a canvas chip dismisses on click; this click is not that
+    const open = detail.classList.toggle("hidden") === false;
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  el.append(toggle, detail);
+}
+
+// DESIGN.md 8.8: what the user reads is the Chinese framing; the engine's
+// English stays out of the visible text (adversarial review of the V4 work)
+// and sits one click away behind 「详情」 (8.8 "Errors": a view that failed
+// to show is as blocked as a failed action, so no hover-only reason). This
+// box is what any view (the canvas included) falls back to for an error
+// that is not one of the project states -- e.g. a legacy graph whose
+// migration failed its integrity check.
 function renderErrorBox(container, err) {
   container.innerHTML = "";
   const box = document.createElement("div");
   box.className = "error-box";
-  box.title = err instanceof Error ? err.message : String(err);
   const title = document.createElement("div");
   title.className = "error-title";
   title.textContent = "出了点问题";
   const msg = document.createElement("div");
-  msg.textContent = "引擎返回了错误，这一页没能显示（悬停查看原因）。";
+  renderBlockingError(msg, "引擎返回了错误，这一页没能显示。", err);
   box.append(title, msg);
   container.appendChild(box);
 }
@@ -1001,18 +1069,20 @@ removeMissingBtn.addEventListener("click", async () => {
   )) return;
   const line = document.getElementById("project-line");
   removeMissingBtn.disabled = true;
+  let failed = false;
   try {
     for (const p of dead) await apiPost("/api/projects/remove", { path: p.path });
   } catch (err) {
-    // 8.8: the Chinese framing is what shows; the engine's English is the
-    // hover title.
-    line.textContent = "移除失效项目失败（悬停查看原因）";
-    line.title = err instanceof Error ? err.message : String(err);
+    // 8.8 "Errors": the Chinese framing, the engine's text behind 「详情」.
+    renderBlockingError(line, "移除失效项目失败", err);
+    failed = true;
   }
   // Re-read the registry either way: a partial failure must leave the list
   // showing what the server actually holds now, not what we hoped it would.
   await loadProjects();
-  loadProjectSummary(); // the header line quotes the registry label too
+  // The header line quotes the registry label too -- but after a failure it
+  // is holding the error, which the summary refresh would wipe unread.
+  if (!failed) loadProjectSummary();
 });
 
 async function reloadAllViews() {
@@ -1042,8 +1112,7 @@ projectSwitcher.addEventListener("change", async () => {
   try {
     await apiPost("/api/projects/switch", { path: projectSwitcher.value });
   } catch (err) {
-    line.textContent = "切换项目失败（悬停查看原因）";
-    line.title = err instanceof Error ? err.message : String(err);
+    renderBlockingError(line, "切换项目失败", err);
     await loadProjects(); // resync the select with what the server actually serves
     projectSwitcher.disabled = false;
     return;
@@ -1375,7 +1444,7 @@ function renderScriptBody(body, script) {
   if (!hasReads && !hasWrites) {
     const note = document.createElement("div");
     note.className = "empty-note";
-    note.textContent = "RCE 没有读到这个文件的读写。";
+    note.textContent = "没有读到读写记录。";
     body.appendChild(note);
     return;
   }
@@ -1647,9 +1716,8 @@ async function runOpenAction(path, reveal, statusEl) {
     statusEl.title = "";
   } catch (err) {
     statusEl.className = "panel-status err";
-    // 8.8: Chinese framing up front, the engine's English on the hover.
-    statusEl.textContent = (reveal ? "无法在 Finder 中显示" : "无法打开") + "（悬停查看原因）";
-    statusEl.title = err.message;
+    // 8.8 "Errors": Chinese framing up front, the engine's text behind 「详情」.
+    renderBlockingError(statusEl, reveal ? "无法在 Finder 中显示" : "无法打开", err);
   }
 }
 
@@ -1859,11 +1927,16 @@ function panelErrorBoxCn(message) {
 }
 
 function setFormStatus(statusEl, cls, cnText, err) {
-  // Product language up front, the raw technical message folded below it
-  // -- same division as the refresh chip's error handling.
+  // Product language up front -- the specific sentence when the engine named
+  // the cause (a duplicate number, ...) -- and the raw technical message one
+  // click away behind 「详情」 (8.8 "Errors").
   statusEl.className = "panel-status " + cls;
-  statusEl.textContent = cnText + (err ? "（悬停查看原因）" : "");
-  statusEl.title = err ? (err instanceof Error ? err.message : String(err)) : "";
+  if (err) {
+    renderBlockingError(statusEl, cnText, err);
+    return;
+  }
+  statusEl.textContent = cnText;
+  statusEl.title = "";
 }
 
 function openAttemptForm(mode, attemptId) {
@@ -2124,8 +2197,7 @@ document.getElementById("shutdown-btn").addEventListener("click", async () => {
   } catch (err) {
     btn.disabled = false;
     const line = document.getElementById("project-line");
-    line.textContent = "停止服务失败（悬停查看原因）";
-    line.title = err instanceof Error ? err.message : String(err);
+    renderBlockingError(line, "停止服务失败", err);
     return;
   }
   renderStoppedState();
@@ -2174,19 +2246,18 @@ function shellZoom(step) {
 }
 
 // A failed Finder command reports in the header line, the same spot a
-// failed project switch uses; the engine's own text stays on the hover.
-function shellReport(message, detail) {
+// failed project switch uses; the engine's own text sits behind 「详情」.
+function shellReport(message, err) {
   const line = document.getElementById("project-line");
   if (!line) return;
-  line.textContent = message;
-  line.title = detail || "";
+  renderBlockingError(line, message, err);
 }
 
 async function shellOpen(path, reveal, failure) {
   try {
     await apiPost("/api/open", { path: path, reveal: reveal });
   } catch (err) {
-    shellReport(failure, err instanceof Error ? err.message : String(err));
+    shellReport(failure, err);
   }
 }
 
@@ -2195,11 +2266,11 @@ async function shellOpenMap() {
   try {
     config = (await apiGet("/api/summary")).attempts_config;
   } catch (err) {
-    shellReport("无法打开项目地图", err instanceof Error ? err.message : String(err));
+    shellReport("无法打开项目地图", err);
     return;
   }
   if (!config || !config.file) {
-    shellReport("这个项目还没有配置项目地图（.rce/attempts.toml）", "");
+    shellReport("这个项目还没有配置项目地图（.rce/attempts.toml）", null);
     return;
   }
   await shellOpen(config.file, false, "无法打开项目地图");

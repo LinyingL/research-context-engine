@@ -532,3 +532,65 @@ def test_missing_graph_db_contained_as_ingest_error(tmp_path):
     assert "graph.db" in str(result["ingest_error"])
     assert "| 17 |" in _map_text(tmp_path)  # file written regardless
     assert not paths.graph_db_path(tmp_path).exists()  # nothing conjured
+
+
+# -- machine-readable refusal codes (DESIGN.md 8.8 "Errors") ------------------
+
+
+def _refusal(fn, *args):
+    with pytest.raises((mapedit.MapEditError, attempts_ingest.AttemptsConfigError)) as info:
+        fn(*args)
+    return info.value
+
+
+@pytest.mark.parametrize("fn", [mapedit.preview_edit, mapedit.apply_edit])
+def test_each_form_refusal_carries_its_code(tmp_path, fn):
+    """The attempt form's own refusals each name a code the page turns into
+    one Chinese sentence; the English message is unchanged beside it."""
+    _make_project(tmp_path)
+    cases = [
+        (("append", "16", {"date": "08-30"}), "duplicate", "already exists"),
+        (("update", "99", {"verdict": "x"}), "not_found", "no row"),
+        (("update", "16", {"description": "a b"}), "line_break", "U+2028"),
+        (("append", "1 7", {}), "line_break", "U+2028"),
+        (("append", "17", {"result": "a\nb"}), "line_break", "newline"),
+        (("append", "17", {"id": "18"}), "unknown_field", "unknown field"),
+    ]
+    for args, code, english in cases:
+        exc = _refusal(fn, tmp_path, *args)
+        assert isinstance(exc, mapedit.MapEditError)
+        assert exc.code == code and english in str(exc)
+        assert mapedit.error_code(exc, tmp_path) == code
+
+
+def test_refusals_outside_the_form_cases_have_no_code(tmp_path):
+    _make_project(tmp_path)
+    for args in [("update", "16", {}), ("append", "**17**", {})]:
+        exc = _refusal(mapedit.preview_edit, tmp_path, *args)
+        assert exc.code is None and mapedit.error_code(exc, tmp_path) is None
+
+
+def test_a_table_that_can_no_longer_be_found_is_table_missing(tmp_path):
+    # the heading drifted: ingest's own error, classified by error_code
+    _make_project(tmp_path, _MAP_MD.replace("## 二、尝试途径总年表", "## 改名了"))
+    exc = _refusal(mapedit.preview_edit, tmp_path, "append", "17", {})
+    assert isinstance(exc, attempts_ingest.AttemptsTableNotFoundError)
+    assert mapedit.error_code(exc, tmp_path) == "table_missing"
+    # the map file itself is gone
+    (tmp_path / "00-项目地图.md").unlink()
+    exc = _refusal(mapedit.preview_edit, tmp_path, "append", "17", {})
+    assert isinstance(exc, mapedit.MapEditError) and "cannot read" in str(exc)
+    assert mapedit.error_code(exc, tmp_path) == "table_missing"
+    # the config is gone
+    (tmp_path / ".rce" / "attempts.toml").unlink()
+    exc = _refusal(mapedit.preview_edit, tmp_path, "append", "17", {})
+    assert isinstance(exc, attempts_ingest.AttemptsConfigError)
+    assert mapedit.error_code(exc, tmp_path) == "table_missing"
+
+
+def test_a_broken_config_is_not_table_missing(tmp_path):
+    _make_project(tmp_path)
+    (tmp_path / ".rce" / "attempts.toml").write_text("file = [", encoding="utf-8")
+    exc = _refusal(mapedit.preview_edit, tmp_path, "append", "17", {})
+    assert isinstance(exc, attempts_ingest.AttemptsConfigError)
+    assert mapedit.error_code(exc, tmp_path) is None

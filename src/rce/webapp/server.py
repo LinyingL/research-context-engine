@@ -338,11 +338,12 @@ class ApiError(Exception):
     (DESIGN.md section 8.10 rule 2). It exists because the alternative is
     the page pattern-matching English engine prose to decide what to
     render, which would break the first time a message is reworded. Only
-    the two degraded-project states the design names, plus the canvas's
-    two refusals that have their own product-language sentence
+    the two degraded-project states the design names, the canvas's two
+    refusals that have their own product-language sentence
     (`mapping_exists` -> 「这条映射已存在」, `human_link` -> delete the
-    标注 instead), carry one; every other error stays a plain message the
-    page shows in its error box."""
+    标注 instead), and the attempt form's coded refusals
+    (`AttemptEditError`, `attempt_*`) carry one; every other error stays a
+    plain message the page frames generically."""
 
     status = 400
     state: str | None = None
@@ -413,9 +414,25 @@ class AttemptEditError(ApiError):
     content, unusable config/table) -- 400: the request, not the server,
     is what cannot be satisfied. Wraps `rce.webapp.mapedit.MapEditError`
     and `rce.ingest.attempts.AttemptsConfigError` with their own messages
-    intact, since those already say precisely what was wrong."""
+    intact, since those already say precisely what was wrong.
+
+    The refusals a researcher can cause from the form carry a `state` --
+    `attempt_` + `rce.webapp.mapedit.error_code` (`attempt_duplicate`,
+    `attempt_not_found`, `attempt_line_break`, `attempt_table_missing`,
+    `attempt_unknown_field`) -- through the same `state` channel the
+    mapping refusals use, so the page shows one Chinese sentence per cause
+    (DESIGN.md 8.8 "Errors") without matching the English."""
 
     status = 400
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.state = "attempt_" + code
+
+
+def _attempt_edit_error(exc: Exception, project_root: Path) -> AttemptEditError:
+    return AttemptEditError(str(exc), mapedit.error_code(exc, project_root))
 
 
 class MappingEditError(ApiError):
@@ -965,7 +982,7 @@ def attempts_preview_payload(project_root: Path, body: dict[str, Any]) -> dict[s
     try:
         return mapedit.preview_edit(project_root, op, number, fields)
     except (mapedit.MapEditError, attempts_ingest.AttemptsConfigError) as exc:
-        raise AttemptEditError(str(exc)) from exc
+        raise _attempt_edit_error(exc, project_root) from exc
 
 
 def attempts_write_payload(
@@ -985,7 +1002,7 @@ def attempts_write_payload(
             project_root, op, number, fields, ingest_lock=watcher.ingest_lock,
         )
     except (mapedit.MapEditError, attempts_ingest.AttemptsConfigError) as exc:
-        raise AttemptEditError(str(exc)) from exc
+        raise _attempt_edit_error(exc, project_root) from exc
     generation = watcher.record_external_change(result["ingest_error"])
     return {
         "ok": True,

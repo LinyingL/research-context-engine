@@ -567,14 +567,117 @@ def test_a_cycle_link_keeps_its_human_or_machine_class_and_its_dot():
     assert ".cv-link.human.cycle { stroke-dasharray: 6 4; }" in _APP_SRC
 
 
-def test_engine_errors_are_hover_titles_not_visible_english():
-    """8.8: the visible text is the Chinese framing; the engine's English
-    lives on the hover title."""
+def test_engine_errors_are_one_click_away_not_visible_english_or_hover_only():
+    """8.8 (amended, "Errors"): the visible text is the Chinese framing; the
+    engine's raw text is behind a 「详情」 button, never only on a hover."""
     assert "Something went wrong" not in _APP_SRC
     box = _APP_SRC[_APP_SRC.index("function renderErrorBox"):]
     box = box[: box.index("\n}\n")]
-    assert "box.title = " in box and "出了点问题" in box
-    assert '"移除失效项目失败（悬停查看原因）"' in _APP_SRC
+    assert "box.title = " not in box and "出了点问题" in box
+    assert 'renderBlockingError(msg, "引擎返回了错误，这一页没能显示。", err)' in box
+    assert 'renderBlockingError(line, "移除失效项目失败", err)' in _APP_SRC
+    status = _CANVAS_SRC[_CANVAS_SRC.index("function showStatus("):]
+    status = status[: status.index("\n  }\n")]
+    assert "if (err) renderBlockingError(el, text, err);" in status
+    assert "el.title = errText" not in status
+
+
+_BLOCKING_RUNNER = r"""
+// A DOM just big enough for renderBlockingError: elements with classList,
+// attributes, children and click listeners.
+function makeEl(tag) {
+  const el = {
+    tag, children: [], attrs: {}, listeners: {}, title: "", className: "", type: "",
+    _text: "",
+    get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); },
+    set textContent(v) { this._text = String(v); this.children = []; },
+    append(...cs) { this.children.push(...cs); },
+    appendChild(c) { this.children.push(c); return c; },
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    addEventListener(t, f) { this.listeners[t] = f; },
+  };
+  el.classList = {
+    has(c) { return el.className.split(/\s+/).includes(c); },
+    toggle(c) {
+      const cs = el.className.split(/\s+/).filter(Boolean);
+      const i = cs.indexOf(c);
+      if (i >= 0) cs.splice(i, 1); else cs.push(c);
+      el.className = cs.join(" ");
+      return i < 0;
+    },
+  };
+  return el;
+}
+global.document = { createElement: makeEl };
+const src = require("fs").readFileSync(0, "utf8");
+eval(src + "; global.renderBlockingError = renderBlockingError;");
+
+function snapshot(el) {
+  return el.children.map((c) => ({
+    tag: c.tag, cls: c.className, text: c.textContent, type: c.type,
+    expanded: c.attrs["aria-expanded"] || null,
+  }));
+}
+const out = {};
+const coded = new Error("attempt number '1' already exists in the table (line 7)");
+coded.state = "attempt_duplicate";
+let el = makeEl("div");
+el.title = "stale hover";
+renderBlockingError(el, "写入失败，文件没有被修改", coded);
+out.coded = { title: el.title, children: snapshot(el) };
+const toggle = el.children[1];
+let stopped = false;
+toggle.listeners.click({ stopPropagation() { stopped = true; } });
+out.opened = { children: snapshot(el), stopped };
+toggle.listeners.click({ stopPropagation() {} });
+out.closed = snapshot(el);
+el = makeEl("div");
+renderBlockingError(el, "切换项目失败", new Error("not a registered project"));
+out.uncoded = snapshot(el);
+el = makeEl("div");
+const dup = new Error("mapping already exists"); dup.state = "mapping_exists";
+renderBlockingError(el, "无法标注：映射没有写入", dup);
+out.mapping = snapshot(el)[0].text;
+el = makeEl("div");
+renderBlockingError(el, "已写入并备份，但重扫失败", "graph is locked");
+out.plain = snapshot(el);
+el = makeEl("div");
+renderBlockingError(el, "没有配置", null);
+out.none = snapshot(el);
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def _blocking_error_source() -> str:
+    start = _APP_SRC.index("const BLOCKING_ERROR_TEXT = {")
+    end = _APP_SRC.index("\n}\n", _APP_SRC.index("function renderBlockingError(")) + 3
+    return _APP_SRC[start:end]
+
+
+def test_blocking_error_shows_coded_sentence_and_a_collapsed_detail_button():
+    """8.8 "Errors": the specific sentence when the engine named the cause,
+    else the framing; in both cases a real 「详情」 button (keyboard
+    reachable, aria-expanded) revealing the raw engine text inline, collapsed
+    by default; clicking it never bubbles to the canvas chip's dismiss."""
+    result = subprocess.run(
+        [NODE, "-e", _BLOCKING_RUNNER], input=_blocking_error_source(),
+        capture_output=True, text=True, check=True,
+    )
+    out = json.loads(result.stdout)
+    coded = out["coded"]
+    assert coded["title"] == ""  # never hover-only
+    text, toggle, detail = coded["children"]
+    assert text["text"] == "这个编号已经在年表里了，请换一个编号。"
+    assert toggle == {"tag": "button", "cls": "err-detail-toggle", "text": "详情", "type": "button", "expanded": "false"}
+    assert detail["cls"] == "err-detail hidden" and "already exists" in detail["text"]
+    assert out["opened"]["stopped"] is True
+    assert out["opened"]["children"][1]["expanded"] == "true"
+    assert out["opened"]["children"][2]["cls"] == "err-detail"
+    assert out["closed"][2]["cls"] == "err-detail hidden"
+    assert [c["text"] for c in out["uncoded"]] == ["切换项目失败", "详情", "not a registered project"]
+    assert out["mapping"] == "这条映射已存在"
+    assert [c["text"] for c in out["plain"]] == ["已写入并备份，但重扫失败", "详情", "graph is locked"]
+    assert [c["text"] for c in out["none"]] == ["没有配置"]  # nothing to reveal, no button
 
 
 def test_a_relayout_keeps_the_anchor_card_where_it_was_on_screen():

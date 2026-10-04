@@ -6,7 +6,8 @@
   plain same-origin <script src> placed BEFORE the page's inline script.
   Nothing here runs at load time except defining window.RCECanvas: every
   function that touches app.html's own helpers (apiGet, apiPost,
-  openFilePanel, renderViewFailure, clearProjectState, projectStateOf,
+  openFilePanel, renderViewFailure, renderBlockingError, clearProjectState,
+  projectStateOf,
   verdictMarker, VERDICT_BADGE_CLASS, state) does so only when called, by
   which time the inline script has defined them. Wrapped in one IIFE so no
   name here can collide with the page's own top-level declarations.
@@ -196,8 +197,6 @@ window.RCECanvas = (function () {
   }
 
   function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
-
-  function errText(err) { return err instanceof Error ? err.message : String(err); }
 
   // The numeric step prefix of a path's basename ("16-构建指标.py" -> 16),
   // the tie-break that keeps step order (8.4 step 2).
@@ -929,7 +928,10 @@ window.RCECanvas = (function () {
     cv.dom = Object.assign({ root, zoom, status, tip, empty, linkCard, ctxMenu }, s, t);
     // A click on the chip dismisses it -- unless it offers an action: a
     // near miss on 「撤销」 must not silently throw the undo away.
-    status.addEventListener("click", () => { if (!status.querySelector(".cv-status-action")) hideStatus(); });
+    status.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest(".err-detail")) return; // selecting the engine text
+      if (!status.querySelector(".cv-status-action")) hideStatus();
+    });
     bindSvgEvents(s.svg);
     bindGlobalEvents();
     if (typeof ResizeObserver === "function") {
@@ -1431,7 +1433,7 @@ window.RCECanvas = (function () {
     autoFitAll();
   }
 
-  // -- Status chip (product language; engine English on hover, 8.8) ---------
+  // -- Status chip (product language; engine text behind 「详情」, 8.8) -------
 
   // One chip, bottom-left beside the zoom readout, for everything the
   // canvas has to say: a failed save, a refused drop, a failed write, the
@@ -1439,14 +1441,20 @@ window.RCECanvas = (function () {
   // message so only its owner clears it (a successful position save must
   // not wipe an undo offer); `opts.ms` makes it fade; `opts.action` adds
   // one small text button; `opts.notice` is the neutral (non-error) look.
-  // A click on an action-less chip dismisses it (see ensureDom).
+  // With `err`, the chip is an error that blocked what the researcher just
+  // tried (8.8 "Errors"): app.html's renderBlockingError shows the coded
+  // sentence when the engine named the cause (`mapping_exists`,
+  // `human_link`, ...) or else `text`, plus the 「详情」 toggle -- never a
+  // hover-only reason. A click on an action-less chip dismisses it (see
+  // ensureDom), except on its 详情 button or the revealed text.
   function showStatus(text, err, opts) {
     if (!cv.dom) return;
     opts = opts || {};
     const el = cv.dom.status;
     el.innerHTML = "";
-    el.appendChild(htmlEl("span", "cv-status-text", text));
-    el.title = err ? errText(err) : "";
+    el.title = "";
+    if (err) renderBlockingError(el, text, err);
+    else el.appendChild(htmlEl("span", "cv-status-text", text));
     el.classList.toggle("notice", !!opts.notice);
     if (opts.action) {
       const b = htmlEl("button", "cv-status-action", opts.action.label);
@@ -1728,7 +1736,7 @@ window.RCECanvas = (function () {
     } catch (err) {
       dropOptimistic(key);
       cv.focus = null;
-      showStatus(err.state === "mapping_exists" ? DUPLICATE_TEXT : "无法标注：映射没有写入（悬停查看原因）", err, { kind: "write" });
+      showStatus("无法标注：映射没有写入", err, { kind: "write" }); // mapping_exists -> 「这条映射已存在」
       return;
     }
     if (res && res.ingest_error) {
@@ -1740,7 +1748,7 @@ window.RCECanvas = (function () {
       // would refuse. One message for the one cause: this chip, not also
       // the header's 重扫失败 (adversarial review of the V4 work).
       link.syncing = true;
-      showStatus("已写入映射文件，图谱稍后自动同步（悬停查看原因）", res.ingest_error, { kind: "write" });
+      showStatus("已写入映射文件，图谱稍后自动同步", res.ingest_error, { kind: "write" });
       rerenderLinks();
       return;
     }
@@ -1884,12 +1892,12 @@ window.RCECanvas = (function () {
     try {
       res = await apiPost("/api/mappings/delete", { from: from.path, to: to.path, type: link.type });
     } catch (err) {
-      showStatus("无法删除标注：映射文件没有改动（悬停查看原因）", err, { kind: "write" });
+      showStatus("无法删除标注：映射文件没有改动", err, { kind: "write" });
       return;
     }
     selectLink(null);
     if (res && res.ingest_error) {
-      showStatus("已从映射文件删去，图谱稍后自动同步（悬停查看原因）", res.ingest_error, { kind: "write" });
+      showStatus("已从映射文件删去，图谱稍后自动同步", res.ingest_error, { kind: "write" });
     }
     await refresh();
   }
@@ -1902,7 +1910,7 @@ window.RCECanvas = (function () {
     try {
       await apiPost("/api/edges/reject", body);
     } catch (err) {
-      showStatus(err.state === "human_link" ? "这是你的标注：请用「删除标注」移除" : "无法标记为错误提取（悬停查看原因）", err, { kind: "write" });
+      showStatus("无法标记为错误提取", err, { kind: "write" }); // human_link -> use 「删除标注」
       return;
     }
     selectLink(null);
@@ -1918,7 +1926,7 @@ window.RCECanvas = (function () {
     try {
       await apiPost("/api/edges/restore", body);
     } catch (err) {
-      showStatus("无法撤销（悬停查看原因）", err, { kind: "write" });
+      showStatus("无法撤销", err, { kind: "write" });
       return;
     }
     await refresh();
