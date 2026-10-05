@@ -538,14 +538,19 @@ def test_layout_lives_in_the_project_with_a_daily_snapshot_and_one_before_reset(
     assert canvas.canvas_record_path(project).exists()
     assert not paths.canvas_state_path(project).exists()
     backups = project / ".rce" / "backups"
-    assert not backups.exists()  # the first write had nothing to keep
+
+    def canvas_snapshots():
+        # The identity keeps its own snapshots there too (9.12); these are the arrangement's.
+        return sorted(p for p in backups.glob("*") if p.name.startswith("canvas.json."))
+
+    assert not canvas_snapshots()  # the first write had nothing to keep
     _save(project, {"scope": "all", "positions": {PY16: [3, 4]}})
-    first = sorted(backups.iterdir())
+    first = canvas_snapshots()
     assert len(first) == 1  # the first change today
     _save(project, {"scope": "all", "positions": {PY16: [5, 6]}})
-    assert sorted(backups.iterdir()) == first  # once a day, not per write
+    assert canvas_snapshots() == first  # once a day, not per write
     _save(project, {"scope": "all", "reset": True})
-    snapshots = sorted(backups.iterdir())
+    snapshots = canvas_snapshots()
     assert len(snapshots) == 2
     assert json.loads(snapshots[-1].read_text())["views"]["all"]["positions"] == {PY16: [5.0, 6.0]}
 

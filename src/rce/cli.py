@@ -55,6 +55,12 @@ records [--verify|--clean [--yes]]` (`rce.inventory`) and `rce migrate
 moved into the record, an explicit act). `rce status` reports pre-V5
 indexes waiting for the folder.
 
+V5 phase 6 (DESIGN.md 9.12): every subcommand that addresses a project
+takes it as a positional path or as `--path` (`add_project_path`; both at
+once is refused); `rce project adopt|restore` answer a lost identity file;
+`rce records --answer ... --missing IDS` binds the shrink answer to the
+entries the question showed.
+
 F3 (Blocker C): `status --pending`/`confirm` give the zero-dependency
 baseline its own human-confirmation path -- previously the sole writer of
 `edges.status` was the optional `mcp` extra's `rce_confirm_edge`,
@@ -120,6 +126,51 @@ DB_FILENAME = paths.DB_FILENAME
 
 class CliError(Exception):
     """User-facing error; caught once in main() -> "Error: <msg>" on stderr, exit 1."""
+
+
+# -- one path convention (DESIGN.md 9.12, "The command line") --------------------
+#
+# Every subcommand that addresses a project takes it either as a positional
+# path or as `--path` -- both spellings everywhere, and the help says so.
+# Giving both is refused (it was already, for `attempts`); nothing that
+# worked before stops working.
+
+POSITIONAL_PATH_HELP = "project root (default: {default}); or give it as --path"
+FLAG_PATH_HELP = "project root, the same as the positional path (give one or the other, not both)"
+
+
+def add_project_path(parser: argparse.ArgumentParser, *, default: str | None = ".", help: str | None = None) -> None:
+    """Add the positional `path` and `--path` to a subcommand. `default`
+    is used when neither is given (None: the subcommand decides)."""
+    shown = f"'{default}'" if default is not None else "see below"
+    parser.add_argument("path", nargs="?", default=None, help=help or POSITIONAL_PATH_HELP.format(default=shown))
+    parser.add_argument("--path", dest="path_flag", default=None, metavar="PATH", help=FLAG_PATH_HELP)
+    parser.set_defaults(path_default=default)
+
+
+def settle_project_path(positional: str | None, flag: str | None, default: str | None) -> str | None:
+    """The one project path a command line gave (`add_project_path`)."""
+    if positional is not None and flag is not None:
+        raise CliError("give the project root either positionally or via --path, not both")
+    if flag is not None:
+        return flag
+    return positional if positional is not None else default
+
+
+def _settle_path(args: argparse.Namespace) -> None:
+    """After parsing: `args.path` is the project path whichever way it was
+    given; `args.path_flag` is consumed. `rce confirm --index N <path>`:
+    with --index there is no src/dst/type/extractor, so the one positional
+    given is the project path."""
+    if not hasattr(args, "path_flag"):
+        return
+    positional = args.path
+    if getattr(args, "func", None) is cmd_confirm and args.index is not None and positional is None:
+        given = [v for v in (args.src, args.dst, args.type, args.extractor) if v is not None]
+        if len(given) == 1 and args.src is not None:
+            positional, args.src = args.src, None
+    args.path = settle_project_path(positional, args.path_flag, args.path_default)
+    args.path_flag = None
 
 
 def _open(path_str: str, *, register: bool = False) -> project_identity.Opened:
@@ -651,7 +702,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             f"({ledger_state.get('detail') or ''}); the index keeps what it had and nothing is written to the ledger"
         )
         if ledger_state.get("state") == "shrunk":
-            print("  answer with: rce records --answer file|restore")
+            print("  see the question with: rce records (it prints the answers bound to the missing entries)")
     print(f"Under review: {items['count']}")
     for item in items["review"]:
         _print_review_item(item)
@@ -662,8 +713,19 @@ def cmd_review(args: argparse.Namespace) -> int:
     if items["not_in_index"]:
         print(f"Judged links the index does not hold: {len(items['not_in_index'])}")
         for item in items["not_in_index"]:
-            print(f"  {_item_label(item)} ({item['verdict']} at {item['at']})")
+            print(f"  {_item_label(item)} ({item['verdict']} {_when(item)})")
     return 0
+
+
+MIGRATED_WHEN = "migrated from the old index; original judgment time unknown"
+
+
+def _when(item: dict[str, Any]) -> str:
+    """When a judgment was made, as far as the record knows: a migrated
+    entry's `at` is the migration's (9.12), never shown as the judgment's."""
+    if item.get("migrated"):
+        return f"({MIGRATED_WHEN})"
+    return f"at {item.get('at')}"
 
 
 def _item_label(item: dict[str, Any]) -> str:
@@ -675,12 +737,12 @@ def _print_review_item(item: dict[str, Any]) -> None:
     print(f"    reason: {item['reason']} ({item['label']})")
     if item["outcome"] == "conflict":
         for n, branch in enumerate(item["detail"].get("branches", []), start=1):
-            acts = ", ".join(f"{e.get('verdict')} seq {e.get('seq')} at {e.get('at')}" for e in branch) or "-"
+            acts = ", ".join(f"{e.get('verdict')} seq {e.get('seq')} {_when(e)}" for e in branch) or "-"
             print(f"    history {n}: {acts}")
         print("    settle it with a new judgment: rce confirm ... --status confirmed|rejected|withdrawn")
         return
     note = f", note: {item['note']}" if item.get("note") else ""
-    print(f"    was: {item['verdict']} at {item['at']}{note}")
+    print(f"    was: {item['verdict']} {_when(item)}{note}")
     print(f"    basis then: {json.dumps(item['basis'], ensure_ascii=False, sort_keys=True)}")
     print(f"    basis now:  {json.dumps(item['basis_now'], ensure_ascii=False, sort_keys=True)}")
     for cand in item["candidates"]:
@@ -703,9 +765,12 @@ def cmd_records(args: argparse.Namespace) -> int:
     applied."""
     opened = _open(args.path)
     root = opened.root
+    if args.missing is not None and not args.answer:
+        raise CliError("--missing goes with --answer")
     if args.answer:
+        shown = None if args.missing is None else [i.strip() for i in args.missing.split(",") if i.strip()]
         try:
-            answered = judgements.answer_shrunk(root, args.answer, expected_id=opened.project_id)
+            answered = judgements.answer_shrunk(root, args.answer, expected_missing=shown, expected_id=opened.project_id)
         except judgements.JudgementRefused as exc:
             raise CliError(f"not answered: {exc}") from exc
         except records_situation.WriteRefused as exc:
@@ -760,14 +825,45 @@ def _records_clean(opened: project_identity.Opened, *, apply: bool) -> int:
 
 def records_inventory_lines(conn: Connection | None, root: Path) -> list[str]:
     """The 9.2 inventory (`rce.inventory.inventory`), one line per kind of
-    human labor, plus its problems."""
+    human labor -- each kind exactly once -- plus its problems, and, when
+    the ledger has shrunk, the exact command that answers the question
+    shown (with the ids of the missing entries, 9.12)."""
     lines = [f"Records of {root}:"]
+    seen: set[str] = set()
     for row in inventory.inventory(conn, root):
+        if row.kind in seen:
+            continue
+        seen.add(row.kind)
         snap = f"; newest snapshot {row.snapshot}" if row.snapshot else ""
         lines.append(f"  {row.kind}: {row.path} -- {row.count}{snap}")
-        for problem in row.problems:
+        for problem in dict.fromkeys(row.problems):
             lines.append(f"    ! {problem}")
+    if conn is not None:
+        lines += _shrunk_question_lines(conn, root)
     return lines
+
+
+def _shrunk_question_lines(conn: Connection, root: Path) -> list[str]:
+    """9.3's question, as the CLI shows it: the missing entries, and the
+    answers bound to them (`--missing`)."""
+    got = _identity_or_none(root)
+    loaded, decision = judgements.assess(conn, root, got, for_migration=True)
+    if decision.reason != "shrunk" or not decision.missing:
+        return []
+    ids = ",".join(str(m["id"]) for m in decision.missing)
+    out = [f"  The judgment ledger has {len(decision.missing)} fewer judgment(s) than the index applied:"]
+    for m in decision.missing:
+        out.append(f"    {m.get('id')}: {m.get('verdict')} {m.get('src')} --{m.get('type')}--> {m.get('dst')}")
+    out.append(f"  answer: rce records --answer file --missing {ids} {root}     (take the file as it is)")
+    out.append(f"      or: rce records --answer restore --missing {ids} {root}  (append the missing ones back)")
+    return out
+
+
+def _identity_or_none(root: Path):
+    from rce.records.identity import IdentityState, read_identity  # noqa: PLC0415
+
+    got = read_identity(root)
+    return got.identity if got.state is IdentityState.PRESENT else None
 
 
 def cmd_rebuild(args: argparse.Namespace) -> int:
@@ -877,6 +973,8 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         if result.exported is not None:
             print(f"  ledger entries appended: {result.exported.appended}"
                   + ("; arrangement copied to .rce/canvas.json" if result.exported.copied_arrangement else ""))
+        for note in result.notes:
+            print(f"  note: {note}")
         if result.ok:
             if result.retired_to is not None:
                 print(f"  the old index was retired to {result.retired_to}")
@@ -1300,6 +1398,15 @@ def _print_answered(result: project_identity.Answered) -> int:
         if result.replaced_index is not None:
             print(f"The previous index was kept at {result.replaced_index}.")
         print("The other folder carrying this id will be asked how to continue when it is next opened.")
+    elif result.answer == "adopt":
+        print(f"{result.root} keeps its records under a new identity: project {result.identity.id}.")
+        print("A fresh index was built from its sources and records.")
+    elif result.answer == "restore":
+        print(f"Restored {RCE_DIRNAME}/project.toml from {result.restored_from}: project {result.identity.id}.")
+        if result.blocked_after:
+            print(f"The folder now has a question of its own:\n{result.blocked_after}")
+            return 1
+        print(f"Opened: {result.situation_after}.")
     else:
         print(f"{result.root} is now an independent project {result.identity.id}.")
         if result.moved_aside:
@@ -1337,6 +1444,18 @@ def cmd_project_claim(args: argparse.Namespace) -> int:
     return _answer(args, project_identity.claim)
 
 
+def cmd_project_adopt(args: argparse.Namespace) -> int:
+    """「沿用这些记录，建立新身份」 (DESIGN.md 9.12): the identity file was
+    lost; a new id, every record kept where it is, a fresh index built."""
+    return _answer(args, project_identity.adopt)
+
+
+def cmd_project_restore(args: argparse.Namespace) -> int:
+    """Restore `.rce/project.toml` from its newest snapshot (9.12), then the
+    identity check as on any open."""
+    return _answer(args, project_identity.restore)
+
+
 def cmd_project_other(args: argparse.Namespace) -> int:
     """「这是另一个项目」 (9.4): a new id with no `forked_from`; copied record
     files are moved into `.rce/backups/`."""
@@ -1354,6 +1473,8 @@ def cmd_projects_remove(args: argparse.Namespace) -> int:
     in. That convenience is deliberately NOT extended to
     `POST /api/projects/remove`, whose caller may be a web page and which
     therefore matches by string equality alone."""
+    if args.path is None:
+        raise CliError("name the registered project path to drop (as 'rce projects list' prints it)")
     if not project_registry.remove(args.path):
         resolved = str(Path(args.path).expanduser().resolve())
         if resolved == args.path or not project_registry.remove(resolved):
@@ -1478,11 +1599,11 @@ def build_parser() -> argparse.ArgumentParser:
             "its graph under ~/.rce/graphs/<id>/ (outside the project) and a .rce/README saying so"
         ),
     )
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("ingest", help="Ingest git + LaTeX/.bib + MLflow sources into the graph")
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.add_argument(
         "--mlruns", default=None,
         help="MLflow local FileStore dir (default: <path>/mlruns if present)",
@@ -1497,7 +1618,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("status", help="Show node/edge counts and the pending confirmation queue")
-    p.add_argument("--path", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.add_argument(
         "--pending", action="store_true",
         help="also list each pending edge (src/dst/type/extractor/confidence/evidence) for 'rce confirm'",
@@ -1516,7 +1637,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("node_id", help="node id, e.g. figure:overview.png")
-    p.add_argument("--path", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.set_defaults(func=cmd_query)
 
     p = sub.add_parser(
@@ -1524,7 +1645,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Walk the multi-hop provenance chain from a node (see 'query' for single-hop)",
     )
     p.add_argument("node_id", help="node id, e.g. figure:overview.png")
-    p.add_argument("--path", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.add_argument(
         "--hops", type=_positive_hops, default=4, help="max traversal depth (default: 4, must be >= 1)"
     )
@@ -1540,7 +1661,7 @@ def build_parser() -> argparse.ArgumentParser:
             "lineage chains, broken (missing-on-disk) links, and duplicate-named copies"
         ),
     )
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.add_argument(
         "--orphans", action="store_true",
         help="print only block 1 (data files read by a script but written by none)",
@@ -1557,13 +1678,10 @@ def build_parser() -> argparse.ArgumentParser:
             "(task V1); prints the URL and opens a browser tab unless --no-browser is given"
         ),
     )
-    p.add_argument(
-        "path", nargs="?", default=None,
-        help=(
-            "project root; also registered in ~/.rce/projects.json as most recently "
-            "served. Omit to reopen the most recently served project instead"
-        ),
-    )
+    add_project_path(p, default=None, help=(
+        "project root, or give it as --path; also registered in ~/.rce/projects.json as most "
+        "recently served. Omit both to reopen the most recently served project instead"
+    ))
     p.add_argument(
         "--port", type=int, default=8317, help="TCP port to bind on 127.0.0.1 (default: 8317)"
     )
@@ -1587,14 +1705,17 @@ def build_parser() -> argparse.ArgumentParser:
     q = projects_sub.add_parser(
         "remove", help="Remove one entry from the registry (a bookmark only -- deletes nothing)",
     )
-    q.add_argument("path", help="the registered project path to drop (as 'rce projects list' prints it)")
+    add_project_path(q, default=None, help=(
+        "the registered project path to drop (as 'rce projects list' prints it); or give it as --path"
+    ))
     q.set_defaults(func=cmd_projects_remove)
 
     p = sub.add_parser(
         "project",
         help=(
-            "Answer what RCE asks when a project folder is a copy, or its original cannot be "
-            "checked (DESIGN.md 9.4): 'rce project fork|claim|other [path]'"
+            "Answer what RCE asks when a project folder is a copy, its original cannot be "
+            "checked, or its identity file was lost (DESIGN.md 9.4, 9.12): "
+            "'rce project fork|claim|other|adopt|restore [path]'"
         ),
     )
     project_sub = p.add_subparsers(dest="project_command", required=True)
@@ -1602,9 +1723,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("fork", cmd_project_fork, "continue this copy as an independent branch: new id, forked_from the original"),
         ("claim", cmd_project_claim, "this folder is the original: it becomes the id's home and the index is rebuilt from it"),
         ("other", cmd_project_other, "this is another project that received a copy of .rce/: new id, copied records moved to .rce/backups/"),
+        ("adopt", cmd_project_adopt, "the identity file was lost: keep every record here under a new id and build a fresh index from them"),
+        ("restore", cmd_project_restore, "the identity file was lost: put .rce/project.toml back from its newest snapshot in .rce/backups/"),
     ):
         q = project_sub.add_parser(name, help=text)
-        q.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+        add_project_path(q)
         q.set_defaults(func=func)
 
     p = sub.add_parser(
@@ -1635,14 +1758,7 @@ def build_parser() -> argparse.ArgumentParser:
             "never guessed); lists registered attempts, or runs consistency checks with --check"
         ),
     )
-    p.add_argument(
-        "path", nargs="?", default=None,
-        help="project root (default: '.'); consistent with 'init'/'ingest' -- --path below also accepted",
-    )
-    p.add_argument(
-        "--path", dest="path_flag", default=None,
-        help="project root, equivalent to the positional argument above (this subcommand's original form)",
-    )
+    add_project_path(p)
     p.add_argument(
         "--check", action="store_true",
         help=(
@@ -1660,7 +1776,7 @@ def build_parser() -> argparse.ArgumentParser:
             "confirmed edges; prints counts and any refused entries"
         ),
     )
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.set_defaults(func=cmd_mappings)
 
     p = sub.add_parser(
@@ -1688,7 +1804,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-status", default="pending", choices=sorted(db.EDGE_STATUSES),
         help="status to select --index from (default: pending)",
     )
-    p.add_argument("--path", default=".", help="project root (default: '.')")
+    add_project_path(p, help=(
+        "project root (default: '.'), after the four link args -- or, with --index, the one "
+        "positional; or give it as --path"
+    ))
     p.set_defaults(func=cmd_confirm)
 
     p = sub.add_parser(
@@ -1697,7 +1816,7 @@ def build_parser() -> argparse.ArgumentParser:
              "in conflict, or held because their source could not be read",
     )
     p.add_argument("--json", action="store_true", help="print the list as JSON")
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser(
@@ -1712,7 +1831,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--clean", action="store_true", help="list kept copies nothing refers to (dry run)")
     p.add_argument("--yes", action="store_true", help="with --clean: remove them")
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.add_argument(
+        "--missing", default=None, metavar="ID[,ID...]",
+        help="with --answer: the ids of the missing entries the question showed ('rce records' prints "
+             "them); if the file changed since, nothing is done and the question is shown again",
+    )
+    add_project_path(p)
     p.set_defaults(func=cmd_records)
 
     p = sub.add_parser(
@@ -1720,7 +1844,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build a fresh index beside the current one, apply the record, compare per link, then swap "
              "(the previous index is kept one generation)",
     )
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.set_defaults(func=cmd_rebuild)
 
     p = sub.add_parser(
@@ -1732,7 +1856,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--not-mine", action="store_true", help="this is not this project's index: leave it, and do not offer it again")
     p.add_argument("--from", dest="from_dir", default=None, metavar="DIR", help="migrate from this index directory (a stranded index)")
     p.add_argument("-v", "--verbose", action="store_true", help="print the scan's progress")
-    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser(
@@ -1743,7 +1867,7 @@ def build_parser() -> argparse.ArgumentParser:
             "rce.semantic.judge)"
         ),
     )
-    p.add_argument("--path", default=".", help="project root (default: '.')")
+    add_project_path(p)
     p.add_argument(
         "--limit", type=int, default=None, metavar="N",
         help="review at most N pending backed_by edges, in 'status --pending' order (default: all)",
@@ -1795,6 +1919,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
     try:
+        _settle_path(args)
         return args.func(args)
     except CliError as exc:
         print(f"Error: {exc}", file=sys.stderr)

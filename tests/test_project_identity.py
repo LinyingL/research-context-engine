@@ -508,7 +508,8 @@ def test_lost_identity_is_blocked_and_other_answers_it(tmp_path: Path, capsys) -
     (root / ".rce" / "judgements.toml").write_text("")
     (root / ".rce" / "project.toml").unlink()
     assert cli.main(["status", "--path", str(root)]) == 1
-    assert "Restore .rce/project.toml" in capsys.readouterr().err
+    err = capsys.readouterr().err  # 9.12: the three answers (init kept a snapshot of the identity)
+    assert "rce project restore" in err and "rce project adopt" in err and "rce project other" in err
     assert cli.main(["init", str(root)]) == 1  # never minted silently over records
     assert not (root / ".rce" / "project.toml").exists()
     assert cli.main(["project", "other", str(root)]) == 0

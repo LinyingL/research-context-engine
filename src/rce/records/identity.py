@@ -32,6 +32,11 @@ The rules this module enforces:
   `ledger` flag can only be raised: lowering it would let a missing
   ledger be re-created as an empty one, which is what 9.3's
   never-recreate rule forbids.
+- **Every version is kept.** Each write (creation included) leaves a
+  snapshot of what it wrote in `.rce/backups/`, and a rewrite also one of
+  what it replaced -- so a lost identity file can be restored from the
+  newest snapshot (`restore_identity_file`, DESIGN.md 9.12's first answer
+  to 「项目身份文件不见了」), created exclusively like any identity.
 - **Unknown keys are refused on read**, naming the key: this file is not
   edited by hand, so a key RCE does not know is either corruption or a
   newer RCE's format, and in both cases guessing is worse than stopping.
@@ -253,7 +258,25 @@ def create_identity(
         forked_from=forked_from,
         migrating_from=migrating_from,
     )
-    data = emit_identity(identity)
+    _link_exclusively(path, emit_identity(identity))
+    _keep_version(root, path)
+    return identity
+
+
+def _keep_version(project_root: Path, path: Path) -> None:
+    """A snapshot of the identity as just written (module docstring): the
+    newest snapshot is always the current identity. Never fails a write --
+    the identity itself has landed."""
+    try:
+        files.snapshot_now(project_root, path)
+    except (OSError, files.RecordFileError) as exc:  # pragma: no cover -- a full disk, a read-only .rce/backups
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning("could not keep a snapshot of %s: %s", path, exc)
+
+
+def _link_exclusively(path: Path, data: bytes) -> None:
+    """`data` at `path`, only if nothing is there (temp file + `link`)."""
     path.parent.mkdir(exist_ok=True)
     tmp = files.temp_path_for(path)
     try:
@@ -273,6 +296,40 @@ def create_identity(
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+def identity_snapshots(project_root: str | Path) -> list[tuple[Path, ProjectIdentity]]:
+    """The snapshots of `project.toml` in `.rce/backups/` that read as a
+    valid identity, newest first (an unreadable one is skipped, never
+    guessed at)."""
+    root = Path(project_root)
+    found = []
+    for snap in reversed(files.snapshots(root, identity_path(root))):
+        try:
+            text = snap.read_bytes().decode("utf-8")
+            found.append((snap, parse_identity(text)))
+        except (OSError, UnicodeDecodeError, _Invalid):
+            continue
+    return found
+
+
+def restore_identity_file(project_root: str | Path, snapshot: Path) -> ProjectIdentity:
+    """Put `snapshot`'s bytes back as `.rce/project.toml`, created
+    exclusively -- never over an identity that is there (in whatever
+    state). The snapshot must read as a valid identity. Hold the path's
+    project lock."""
+    root = Path(project_root)
+    if not root.is_dir():
+        raise IdentityError(f"{root} is not an existing folder; not creating it")
+    path = identity_path(root)
+    if os.path.lexists(path) or files.read_record(path).state is not RecordState.ABSENT:
+        raise IdentityExistsError(f"{path} already exists; an identity is never overwritten")
+    data = snapshot.read_bytes()
+    try:
+        identity = parse_identity(data.decode("utf-8"))
+    except (UnicodeDecodeError, _Invalid) as exc:
+        raise IdentityError(f"the snapshot {snapshot.name} is not a valid identity: {exc}") from exc
+    _link_exclusively(path, data)
     return identity
 
 
@@ -299,6 +356,7 @@ def replace_identity(
     if snapshot:
         files.snapshot_now(project_root, current.path)
     files.durable_write(current.path, data)
+    _keep_version(Path(project_root), current.path)
     return new
 
 

@@ -136,6 +136,13 @@ REASON_LABELS = {
 REVIEW_LABEL = "待复核"
 CANDIDATE_HINT = "可能对应一条待复核的旧判断"
 
+#: 9.12: an entry the migration wrote (`via = "migrated"`) carries the
+#: migration's time, not the judgment's. Readers get `migrated: true` and
+#: word the time with this label instead of showing `at` as when the
+#: researcher judged.
+MIGRATED_VIA = "migrated"
+MIGRATED_AT_LABEL = "迁移自旧索引（原判断时间未知）"
+
 #: `basis_recorded` values `judge` writes.
 AT_JUDGMENT = "at-judgment"
 LAST_KNOWN = "last-known"
@@ -200,9 +207,13 @@ def applied_copy(conn: Connection, loaded: LedgerLoad | None = None) -> dict[str
 
 
 def _summary(data: Mapping[str, Any]) -> dict[str, Any]:
-    """What a person needs to recognise an entry: no basis, everything else."""
+    """What a person needs to recognise an entry: no basis, everything else
+    -- plus `migrated` (9.12: its `at` is the migration's, not the
+    judgment's)."""
     keep = ("id", "seq", "at", "verdict", "src", "dst", "type", "extractor", "via", "note", "undoes")
-    return {k: _jsonable(data[k]) for k in keep if k in data}
+    out = {k: _jsonable(data[k]) for k in keep if k in data}
+    out["migrated"] = data.get("via") == MIGRATED_VIA
+    return out
 
 
 def status_payload(decision: TrustDecision, loaded: LedgerLoad) -> dict[str, Any]:
@@ -265,7 +276,7 @@ def _same_basis(a: Mapping[str, Any] | None, b: Mapping[str, Any] | None) -> boo
 
 
 def _judged_item(entry: LedgerEntry, outcome: str, reason: str | None, **extra: Any) -> dict[str, Any]:
-    return {
+    item = {
         "outcome": outcome,
         "reason": reason,
         "verdict": entry.get("verdict"),
@@ -275,6 +286,15 @@ def _judged_item(entry: LedgerEntry, outcome: str, reason: str | None, **extra: 
         "basis": _basis_of(entry) if entry.get("basis") is not None else None,
         **extra,
     }
+    return _mark_migrated(item, entry)
+
+
+def _mark_migrated(item: dict[str, Any], entry: LedgerEntry) -> dict[str, Any]:
+    """9.12: a migrated entry's `at` is the migration's. Kept in `detail`
+    (stored with the state), so every reader can say so."""
+    if entry.get("via") == MIGRATED_VIA:
+        item["detail"] = {**(item.get("detail") or {}), "migrated": True}
+    return item
 
 
 def _candidates(conn: Connection, key: Key) -> list[dict[str, Any]]:
@@ -371,7 +391,7 @@ def _contradiction_item(state: ledger_mod.KeyState, target_id: str) -> dict[str,
     entry = state.entry
     assert entry is not None
     before = [e for e in state.history if e.index < entry.index]
-    return {
+    return _mark_migrated({
         "outcome": "conflict",
         "reason": RECORD_CONFLICT,
         "verdict": None,
@@ -384,7 +404,7 @@ def _contradiction_item(state: ledger_mod.KeyState, target_id: str) -> dict[str,
             "branches": [[_summary(e.data) for e in before], [_summary(entry.data)]],
             "contradicts": target_id,
         },
-    }
+    }, entry)
 
 
 def _conflict_item(state: ledger_mod.KeyState) -> dict[str, Any]:
@@ -394,7 +414,7 @@ def _conflict_item(state: ledger_mod.KeyState) -> dict[str, Any]:
         assert target is not None
         return _contradiction_item(state, target)
     last = state.history[-1] if state.history else None
-    return {
+    item = {
         "outcome": "conflict",
         "reason": RECORD_CONFLICT,
         "verdict": None,
@@ -407,6 +427,7 @@ def _conflict_item(state: ledger_mod.KeyState) -> dict[str, Any]:
             "branches": [[_summary(e.data) for e in branch] for branch in conflict.branches],
         },
     }
+    return _mark_migrated(item, last) if last is not None else item
 
 
 @dataclass
@@ -820,6 +841,7 @@ def _restore_missing(
 
 def _public_item(key: Key, item: Mapping[str, Any]) -> dict[str, Any]:
     reason = item.get("reason")
+    migrated = bool((item.get("detail") or {}).get("migrated"))
     return {
         "src": key[0], "dst": key[1], "type": key[2], "extractor": key[3],
         "outcome": item["outcome"],
@@ -834,6 +856,10 @@ def _public_item(key: Key, item: Mapping[str, Any]) -> dict[str, Any]:
         "candidates": item.get("candidates") or [],
         "source_status": item.get("source_status"),
         "detail": item.get("detail") or {},
+        # 9.12: `at` of a migrated entry is the migration's time; a reader
+        # shows `at_label` in its place.
+        "migrated": migrated,
+        "at_label": MIGRATED_AT_LABEL if migrated else None,
     }
 
 
@@ -879,6 +905,7 @@ class LinkFlags:
             "candidate_hint": CANDIDATE_HINT if tuple(key) in self.candidates else None,
         }
         if item is not None:
+            migrated = bool((item.get("detail") or {}).get("migrated"))
             flags["judgement"] = {
                 "outcome": item["outcome"],
                 "reason": item.get("reason"),
@@ -886,6 +913,8 @@ class LinkFlags:
                 "verdict": item.get("verdict"),
                 "at": item.get("at"),
                 "note": item.get("note"),
+                "migrated": migrated,
+                "at_label": MIGRATED_AT_LABEL if migrated else None,
             }
         return flags
 

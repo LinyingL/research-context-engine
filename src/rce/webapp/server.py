@@ -74,9 +74,16 @@ Endpoints (all GET unless noted):
                             folder only if it carries that id (V5, see
                             `locate_payload`).
     POST /api/project/resolve -- body `{"answer": "fork"|"claim"|"other"|
-                            "readonly"}`: the answer to a blocked project's
-                            question (V5, DESIGN.md 9.4, see
-                            `resolve_payload`).
+                            "readonly"|"restore"|"adopt"}`: the answer to a
+                            blocked project's question -- only one its
+                            `situation.answers` lists (V5, DESIGN.md 9.4,
+                            9.12; see `resolve_payload`).
+    GET  /api/engine    -- which project this engine serves: `{"engine":
+                            "rce", "version": 5, "pid", "project_root",
+                            "project_id", "graph_path", "rce_home",
+                            "blocked", "needs_migration"}` -- what `rce
+                            migrate` asks before retiring an old index (9.12;
+                            see `engine_payload`). Opens no index.
     POST /api/attempts/preview -- body `{"op": "append"|"update", "number",
                             "fields"}`: a pure dry run of an attempt-row
                             edit against the researcher's own map file --
@@ -335,7 +342,7 @@ first, or a registry entry whose folder is gone -- the machine-readable
 reads or writes the project answers 409 with `state: "project_blocked"`
 and the situation's data (`situation`), so the app can ask the question;
 `/api/projects` and `/api/generation` keep answering; nothing is written.
-`POST /api/project/resolve {answer: fork|claim|other|readonly}` takes the
+`POST /api/project/resolve {answer: fork|claim|other|readonly|restore|adopt}` takes the
 answer (origin-checked like every POST); `POST /api/projects/locate {id,
 path}` re-attaches a registry entry whose folder moved, adopting the
 chosen folder only if it carries that id -- the one endpoint that takes a
@@ -736,6 +743,39 @@ def served_for(
         blocked = {"situation": "changed", "path": str(root), "detail": str(exc), "answers": [], "blocked": True}
         return ServedProject(root, expected_id, blocked=blocked, label=label)
     return ServedProject(root, opened.project_id, needs_migration=opened.needs_migration, label=label)
+
+
+def _served_graph_path(served: ServedProject) -> Path | None:
+    """The index database this server reads for `served` -- `_served_db`'s
+    choice without its checks (None when blocked: nothing is read)."""
+    if served.blocked is not None:
+        return None
+    if served.project_id is None:
+        return paths.graph_db_path(served.root)
+    path = records_situation.index_db_path(served.project_id)
+    if not path.exists() and served.needs_migration:
+        return paths.graph_db_path(served.root)
+    return path
+
+
+def engine_payload(served: ServedProject) -> dict[str, Any]:
+    """`GET /api/engine`: which project this engine serves, in the shape
+    `rce migrate` asks for before it retires an old index (DESIGN.md 9.12:
+    only an engine serving THIS project, or the old index itself, blocks
+    the retirement). Reads nothing but the served state: no index is
+    opened, so it answers even for a blocked or missing project."""
+    graph = _served_graph_path(served)
+    return {
+        "engine": "rce",
+        "version": 5,
+        "pid": os.getpid(),
+        "project_root": str(served.root),
+        "project_id": served.project_id,
+        "graph_path": str(graph) if graph is not None else None,
+        "rce_home": str(paths.rce_home()),
+        "blocked": served.blocked is not None,
+        "needs_migration": served.needs_migration,
+    }
 
 
 def _check_shutdown_target(body: dict[str, Any]) -> None:
@@ -1286,19 +1326,31 @@ def locate_payload(body: dict[str, Any]) -> tuple[ServedProject, dict[str, Any]]
     return served, {"current": str(root), "label": root.name, "project_id": project_id, "blocked": served.blocked}
 
 
-_ANSWERS = {"fork": project_identity.fork, "claim": project_identity.claim, "other": project_identity.other}
+_ANSWERS = {
+    "fork": project_identity.fork,
+    "claim": project_identity.claim,
+    "other": project_identity.other,
+    "adopt": project_identity.adopt,
+    "restore": project_identity.restore,
+}
+RESOLVE_ANSWERS = ("fork", "claim", "other", "readonly", "adopt", "restore")
 
 
 def resolve_payload(served: ServedProject, body: dict[str, Any]) -> tuple[ServedProject, dict[str, Any]]:
-    """The researcher's answer to the served project's question (9.4):
-    `fork` (「作为独立分支继续」), `claim` (「这里才是原项目」), `other`
-    (「这是另一个项目」), or `readonly` (「原位置暂时不可用，先只读打开」, for a
-    home that cannot be checked: the index is read, nothing is adopted and
-    nothing is written). Each answer re-checks the folder under the
-    project lock and writes nothing if the question no longer stands."""
+    """The researcher's answer to the served project's question (9.4,
+    9.12): `fork` (「作为独立分支继续」), `claim` (「这里才是原项目」),
+    `other` (「这是另一个项目」), `readonly` (「原位置暂时不可用，先只读打开」,
+    for a home that cannot be checked: the index is read, nothing is
+    adopted and nothing is written); for a lost identity file also
+    `restore` (「从备份恢复项目身份文件」, offered only when a snapshot
+    exists) and `adopt` (「沿用这些记录，建立新身份」). Only an answer the
+    situation's `answers` lists is taken. Each answer re-checks the folder
+    under the project lock and writes nothing if the question no longer
+    stands. After `restore` the folder may ask a question of its own (a
+    copy): `blocked` in the reply."""
     answer = body.get("answer")
-    if answer not in ("fork", "claim", "other", "readonly"):
-        raise MissingParamError("request body 'answer' must be one of fork, claim, other, readonly")
+    if answer not in RESOLVE_ANSWERS:
+        raise MissingParamError(f"request body 'answer' must be one of {', '.join(RESOLVE_ANSWERS)}")
     blocked = served.blocked
     if blocked is None or answer not in blocked.get("answers", ()):
         raise AnswerRefusedError(
@@ -1326,6 +1378,7 @@ def resolve_payload(served: ServedProject, body: dict[str, Any]) -> tuple[Served
         "moved_aside": list(result.moved_aside),
         "git_tracked_identity": result.git_tracked_identity,
         "build_error": result.build_error,
+        "restored_from": result.restored_from,
         "blocked": new_served.blocked,
     }
 
@@ -1833,9 +1886,10 @@ def migration_run_payload(served: ServedProject, body: dict[str, Any]) -> dict[s
     act of 9.5. `migrate` is the researcher's yes (resuming an unfinished
     migration needs none); `not_mine` is 「这不是这个项目的」, which leaves
     the old indexes untouched and remembers the refusal for this folder.
-    The engine answering on the app's port is this one, so the retire
-    step's engine probe is skipped here; other processes holding the old
-    index open still stop it."""
+    The retire step's checks (9.12) are the CLI's: another engine serving
+    this project or this old index, or another process with it open,
+    stops it; this engine itself never does (`migration.engine_holding`
+    recognises its own pid)."""
     if served.blocked is not None:
         raise ProjectBlockedError(served.blocked)
     answer = body.get("answer")
@@ -1844,7 +1898,7 @@ def migration_run_payload(served: ServedProject, body: dict[str, Any]) -> dict[s
     try:
         if answer == "not_mine":
             return {"declined": migration.decline(served.root)}
-        results = migration.migrate(served.root, yes=True, engine_probe=lambda: False)
+        results = migration.migrate(served.root, yes=True)
     except migration.MigrationRefused as exc:
         raise MigrationRefusedError(str(exc)) from exc
     except project_identity.ProjectBlocked as exc:
@@ -2101,6 +2155,11 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # projects exist must keep working even when the *current*
                 # project's own graph.db has gone missing mid-serve.
                 self._send_json(200, projects_payload(self._served()))
+            elif path == "/api/engine":
+                # Which project this engine serves (9.12, `rce migrate`'s
+                # retire guard). Like /api/projects, not routed through
+                # _open_conn: it must answer whatever state the project is in.
+                self._send_json(200, engine_payload(self._served()))
             elif path == "/api/generation":
                 # Watcher status only (task V3 phase 2) -- like
                 # /api/projects, deliberately not routed through

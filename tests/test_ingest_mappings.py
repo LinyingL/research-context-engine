@@ -477,7 +477,7 @@ def test_add_refuses_when_the_planned_text_would_not_round_trip(tmp_path):
         mappings.add_mapping(tmp_path, "a.py", "f.png", "generates")
     assert exc.value.code == "unsafe_edit"
     assert path.read_bytes() == before
-    assert not (tmp_path / ".rce" / "backups").exists()
+    assert not [b for b in (tmp_path / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)
 
 
 # -- the file itself is confined too (adversarial review of the V4 work) ----------
@@ -533,7 +533,7 @@ def test_add_and_delete_refuse_a_symlinked_mappings_file(tmp_path):
             call()
         assert excinfo.value.code == "escapes_root"
     assert (root / ".rce" / "mappings.toml").is_symlink()
-    assert not (root / ".rce" / "backups").exists()
+    assert not [b for b in (root / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)
 
 
 def test_ingest_refuses_a_mappings_file_that_resolves_outside_the_project(conn, tmp_path):

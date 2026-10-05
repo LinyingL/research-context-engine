@@ -482,26 +482,45 @@ def endpoints_present(
 
 
 def new_links_like(conn: Connection, edge: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The candidates of 9.6 "No transfer, but a prompt": links that first
-    appeared in the scan in which this link stopped being produced, with
-    the same type, extractor and basis, still produced now, and from the
-    same source -- or sharing an end with this link, which is how a renamed
-    script's read of the same file (a different source by definition) is
-    found. Empty while the link is produced, or when it was never stamped."""
+    """The candidates of 9.6 "No transfer, but a prompt", as 9.12 rules
+    them: links that first appeared in the scan in which this link stopped
+    being produced, with the same type and extractor, still produced now,
+    and
+
+    - for every extractor but claims: the same basis, from the same source
+      or sharing an end with this link (how a renamed script's read of the
+      same file -- a different source by definition -- is found);
+    - for claims `backed_by`: ANY basis -- a reworded claim has, by
+      construction, a different basis (its sentence) -- from a claim in the
+      same file to the same experiment.
+
+    Empty while the link is produced, or when it was never stamped. A
+    candidate is a prompt and nothing else."""
     row = db.edge_scan_row(conn, *_key(edge))
-    if row is None or row["scan_lost"] is None or row["scan_basis"] is None:
+    if row is None or row["scan_lost"] is None:
+        return []
+    claims = row["extractor"] == "claims" and row["type"] == "backed_by"
+    if not claims and row["scan_basis"] is None:
         return []
     candidates = []
     for other in db.edges_appeared_in_scan(
-        conn, row["scan_lost"], row["type"], row["extractor"], row["scan_basis"],
+        conn, row["scan_lost"], row["type"], row["extractor"], None if claims else row["scan_basis"],
     ):
         if _key(other) == _key(row):
             continue
-        related = (
-            other["scan_source"] == row["scan_source"]
-            or other["src"] == row["src"]
-            or other["dst"] == row["dst"]
-        )
+        if claims:
+            claim_file = node_file(row["src"])
+            related = (
+                claim_file is not None
+                and node_file(other["src"]) == claim_file
+                and other["dst"] == row["dst"]
+            )
+        else:
+            related = (
+                other["scan_source"] == row["scan_source"]
+                or other["src"] == row["src"]
+                or other["dst"] == row["dst"]
+            )
         if related and produced_in_latest_scan(conn, other):
             candidates.append(other)
     return candidates

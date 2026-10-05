@@ -1391,18 +1391,20 @@ def edge_scan_row(
 
 
 def edges_appeared_in_scan(
-    conn: sqlite3.Connection, scan_id: int, type: str, extractor: str, scan_basis: str,
+    conn: sqlite3.Connection, scan_id: int, type: str, extractor: str, scan_basis: str | None,
 ) -> list[dict[str, Any]]:
     """Links whose current run of productions began in scan `scan_id`, of
-    one type and extractor, on exactly the canonical basis `scan_basis`."""
+    one type and extractor, on exactly the canonical basis `scan_basis`
+    (None: on any basis -- the claims rule of DESIGN.md 9.12)."""
+    basis_clause = "" if scan_basis is None else " AND scan_basis = ?"
     rows = conn.execute(
-        """
+        f"""
         SELECT src, dst, type, extractor, status, scan_basis, scan_seen, scan_source,
                scan_appeared, scan_lost
         FROM edges
-        WHERE scan_appeared = ? AND type = ? AND extractor = ? AND scan_basis = ?
+        WHERE scan_appeared = ? AND type = ? AND extractor = ?{basis_clause}
         ORDER BY src, dst
         """,
-        (scan_id, type, extractor, scan_basis),
+        (scan_id, type, extractor) + (() if scan_basis is None else (scan_basis,)),
     ).fetchall()
     return [dict(row) for row in rows]

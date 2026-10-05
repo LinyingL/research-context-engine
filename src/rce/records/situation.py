@@ -97,15 +97,28 @@ class Situation(str, enum.Enum):
 # Situations in which nothing may be written until the researcher answers.
 BLOCKING = frozenset({Situation.COPY, Situation.CANNOT_CHECK, Situation.LOST_ID, Situation.UNREADABLE_ID})
 
-# The answers each blocking situation offers (9.4). LOST_ID: the copied-in
-# `.rce/` case is answered by 「这是另一个项目」; a lost identity file is
-# answered by restoring it, which is not a command. UNREADABLE_ID has no
-# command answer: the file must be repaired or brought back from the cloud.
+# The answers each blocking situation offers (9.4, 9.12). LOST_ID has three
+# (9.12): restore `project.toml` from its snapshot -- offered only when
+# `.rce/backups/` holds one that reads as an identity --, 「沿用这些记录，
+# 建立新身份」 (`adopt`), or 「这是另一个项目」 (`other`, for a `.rce/`
+# copied in from elsewhere). UNREADABLE_ID has no command answer: the file
+# must be repaired or brought back from the cloud.
 ANSWERS: dict[Situation, tuple[str, ...]] = {
     Situation.COPY: ("fork", "claim", "other"),
     Situation.CANNOT_CHECK: ("fork", "claim", "other", "readonly"),
-    Situation.LOST_ID: ("other",),
+    Situation.LOST_ID: ("adopt", "other"),
     Situation.UNREADABLE_ID: (),
+}
+RESTORE = "restore"
+
+# 8.8: the label of each answer, for the app (`answer_labels` in a payload).
+ANSWER_LABELS = {
+    "fork": "作为独立分支继续",
+    "claim": "这里才是原项目",
+    "other": "这是另一个项目",
+    "readonly": "原位置暂时不可用，先只读打开",
+    RESTORE: "从备份恢复项目身份文件",
+    "adopt": "沿用这些记录，建立新身份",
 }
 
 # 8.8: what the app says, one sentence per situation.
@@ -398,7 +411,10 @@ class Classification:
 
     @property
     def answers(self) -> tuple[str, ...]:
-        return ANSWERS.get(self.situation, ())
+        found = ANSWERS.get(self.situation, ())
+        if self.situation is Situation.LOST_ID and self.extra.get("snapshot"):
+            return (RESTORE, *found)
+        return found
 
     @property
     def message(self) -> str:
@@ -416,6 +432,7 @@ class Classification:
             "detail": self.detail,
             "other_id": self.other_id,
             "answers": list(self.answers),
+            "answer_labels": {a: ANSWER_LABELS[a] for a in self.answers if a in ANSWER_LABELS},
             "message": self.message,
             "blocked": self.blocked,
             "needs_migration": self.needs_migration,
@@ -434,6 +451,33 @@ def _v5_records_present(project_root: Path) -> list[str]:
     return found
 
 
+def _identity_snapshot(project_root: Path) -> dict[str, Any] | None:
+    """The snapshot 「从备份恢复项目身份文件」 would restore (9.12): the
+    newest one in `.rce/backups/` that reads as an identity, with what it
+    says and what this machine knows of that id -- so the researcher sees
+    which identity comes back before choosing it. None when there is none.
+    Reads only."""
+    from rce.records.identity import identity_snapshots  # noqa: PLC0415
+
+    try:
+        found = identity_snapshots(project_root)
+    except (OSError, files.RecordFileError):
+        return None
+    if not found:
+        return None
+    snap, ident = found[0]
+    home = read_home(ident.id) if index_db_path(ident.id).exists() else None
+    return {
+        "file": snap.relative_to(project_root).as_posix() if snap.is_relative_to(project_root) else str(snap),
+        "project_id": ident.id,
+        "created": ident.created,
+        "forked_from": ident.forked_from,
+        "migrating_from": ident.migrating_from,
+        "index_on_this_machine": index_db_path(ident.id).exists(),
+        "index_home": home.canonical_path if home is not None else None,
+    }
+
+
 def classify(project_root: str | Path, *, probes: Probes | None = None) -> Classification:
     """The 9.4 situation of the existing folder `project_root`. Reads only
     -- never writes, never requests anything but a cloud download of the
@@ -450,7 +494,7 @@ def classify(project_root: str | Path, *, probes: Probes | None = None) -> Class
             return Classification(
                 Situation.LOST_ID, root, identity_read=got, reason="records_without_identity",
                 detail=f".rce/ holds {', '.join(records)} but no project.toml",
-                extra={"records": records},
+                extra={"records": records, "snapshot": _identity_snapshot(root)},
             )
         if paths.has_legacy_index(root):
             return Classification(

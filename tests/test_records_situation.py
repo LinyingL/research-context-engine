@@ -196,8 +196,9 @@ def test_lost_id_when_v5_records_but_no_identity(tmp_path: Path) -> None:
     (tmp_path / ".rce").mkdir()
     (tmp_path / ".rce" / "judgements.toml").write_text("")
     got = situation.classify(tmp_path)
-    assert got.situation is Situation.LOST_ID and got.blocked and got.answers == ("other",)
-    assert got.payload()["records"] == ["judgements.toml"]
+    # 9.12: adopt and other; restore only when a snapshot of project.toml exists.
+    assert got.situation is Situation.LOST_ID and got.blocked and got.answers == ("adopt", "other")
+    assert got.payload()["records"] == ["judgements.toml"] and got.payload()["snapshot"] is None
 
 
 def test_attempts_and_mappings_alone_are_not_a_lost_id(tmp_path: Path) -> None:

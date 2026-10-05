@@ -18,7 +18,8 @@ legacy move:
 | NOT_A_PROJECT  | open (the callers' own "run rce init" refusal follows)      |
 | COPY, CANNOT_CHECK, LOST_ID, UNREADABLE_ID | `ProjectBlocked`, nothing written |
 
-The answers (`fork`, `claim`, `other`) are explicit acts, each under the
+The answers (`fork`, `claim`, `other`; for a lost identity file also
+`restore` and `adopt`, 9.12) are explicit acts, each under the
 project lock and each re-classifying the folder under that lock before
 it writes, so an answer given to a question that no longer stands writes
 nothing (`AnswerRefused`). Every index this module creates records its
@@ -46,6 +47,7 @@ from typing import Callable
 from rce import db, paths
 from rce.ingest import pipeline
 from rce.records import files, identity
+from rce.records import ledger as ledger_mod
 from rce.records.identity import ProjectIdentity
 from rce.records.lock import project_lock
 from rce.records.situation import (
@@ -119,13 +121,25 @@ def describe_blocked(c: Classification) -> str:
         )
     elif c.situation is Situation.LOST_ID:
         records = ", ".join(c.extra.get("records", []))
-        return (
+        snap = c.extra.get("snapshot")
+        lines = [
             f"{root} has no .rce/project.toml, but .rce/ holds records ({records}); RCE never gives "
-            f"existing records a new identity silently. Nothing was written. Restore .rce/project.toml "
-            f"(from git, a backup, or the folder this .rce/ came from), or, if this .rce/ was copied in "
-            f"from another project:\n  rce project other {root}   -- a new project; the copied records "
-            f"are moved into .rce/backups/"
-        )
+            f"existing records a new identity silently. Nothing was written. Choose one:"
+        ]
+        if snap:
+            known = (
+                f"; this machine has its index, home {snap['index_home'] or '(not recorded)'}"
+                if snap.get("index_on_this_machine") else "; this machine has no index for it"
+            )
+            lines.append(
+                f"  rce project restore {root}   -- put back .rce/project.toml from {snap['file']} "
+                f"(project {snap['project_id']}, created {snap['created']}{known})"
+            )
+        lines.append(f"  rce project adopt {root}     -- keep every record here under a new identity; build a fresh index from them")
+        lines.append(f"  rce project other {root}     -- this .rce/ was copied in from another project: new id, copied records moved into .rce/backups/")
+        if not snap:
+            lines.append("(or restore .rce/project.toml yourself, from git or the folder this .rce/ came from)")
+        return "\n".join(lines)
     elif c.situation is Situation.UNREADABLE_ID:
         where = f" (line {c.extra['line']})" if "line" in c.extra else ""
         copies = c.extra.get("conflict_copies")
@@ -337,6 +351,11 @@ class Answered:
     replaced_index: Path | None = None
     git_tracked_identity: bool = False
     build_error: str | None = None
+    # `restore`: the snapshot put back, and the folder's situation once the
+    # identity check has run on it (a copy, say, asks its own question).
+    restored_from: str | None = None
+    situation_after: str | None = None
+    blocked_after: str | None = None
 
 
 def _require(c: Classification, allowed: tuple[Situation, ...], answer: str) -> None:
@@ -485,3 +504,69 @@ def other(project_root: str | Path, *, probes: Probes | None = None, build: bool
             build_error = _build_from_sources(root, new, echo) if build else None
     logger.warning("RCE: %s is now an independent project %s (records moved aside: %s)", root, new.id, ", ".join(moved) or "none")
     return Answered("other", root, new, old.id if old else None, moved_aside=moved, build_error=build_error)
+
+
+def _ledger_in_use(root: Path) -> bool:
+    """Whether `.rce/judgements.toml` must be flagged in `project.toml`
+    (`ledger = true`): it is there and holds entries, or cannot be read --
+    a file that exists is never treated as absent (9.3)."""
+    loaded = ledger_mod.load_judgements(root)
+    if loaded.state is files.RecordState.ABSENT:
+        return False
+    return loaded.ledger is None or bool(loaded.ledger.entries)
+
+
+def adopt(project_root: str | Path, *, probes: Probes | None = None, build: bool = True, echo: Echo = lambda _l: None, today: date | None = None) -> Answered:
+    """「沿用这些记录，建立新身份」 (`rce project adopt`, DESIGN.md 9.12): a
+    folder whose identity file was lost keeps every record it holds --
+    ledger, arrangement, variable cards, all where they are -- under a NEW
+    id (no `forked_from`: what the old id was is not known), and gets a
+    fresh index built from its sources and those records. Only for
+    LOST_ID; nothing is moved or rewritten."""
+    root = Path(project_root)
+    c = classify(root, probes=probes)
+    _require(c, (Situation.LOST_ID,), "adopt")
+    with project_lock(root, None):
+        c = _reclassify_same(root, c, probes)
+        new = identity.create_identity(root, ledger=_ledger_in_use(root), today=today)
+        with project_lock(root, new.id):
+            create_index(root, new)
+            build_error = _build_from_sources(root, new, echo) if build else None
+    logger.warning("RCE: %s keeps its records under a new identity %s (its identity file was lost)", root, new.id)
+    return Answered("adopt", root, new, None, build_error=build_error)
+
+
+def restore(project_root: str | Path, *, probes: Probes | None = None, echo: Echo = lambda _l: None) -> Answered:
+    """Restore `.rce/project.toml` from its snapshot (`rce project restore`,
+    DESIGN.md 9.12): the newest snapshot in `.rce/backups/` that reads as
+    an identity is put back byte for byte, created exclusively. If the
+    ledger holds entries and the snapshot predates the flag, `ledger =
+    true` is raised again (9.3). Then the folder goes through the identity
+    check like any open: a missing index is built, a move adopted -- and a
+    copy, or a home that cannot be checked, asks its own question
+    (`blocked_after`). Only for LOST_ID."""
+    root = Path(project_root)
+    c = classify(root, probes=probes)
+    _require(c, (Situation.LOST_ID,), "restore")
+    with project_lock(root, None):
+        c = _reclassify_same(root, c, probes)
+        found = identity.identity_snapshots(root)
+        if not found:
+            raise AnswerRefused(f"there is no readable snapshot of .rce/project.toml in .rce/backups/ of {root} -- nothing written")
+        snap, _ident = found[0]
+        try:
+            ident = identity.restore_identity_file(root, snap)
+        except identity.IdentityError as exc:
+            raise AnswerRefused(f"{exc} -- nothing written") from exc
+        if not ident.ledger and _ledger_in_use(root):
+            with project_lock(root, ident.id):
+                ident = identity.set_flag(root, ident, "ledger", True)
+    rel = snap.relative_to(root).as_posix()
+    logger.warning("RCE: %s: restored .rce/project.toml (project %s) from %s", root, ident.id, rel)
+    blocked_after: str | None = None
+    try:
+        after = open_project(root, probes=probes).situation.value
+    except ProjectBlocked as exc:
+        after = exc.classification.situation.value
+        blocked_after = str(exc)
+    return Answered("restore", root, ident, None, restored_from=rel, situation_after=after, blocked_after=blocked_after)

@@ -274,14 +274,22 @@ def build_server(project_root: str | Path, project_id: str | None = None) -> Fas
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The one path convention of every subcommand (DESIGN.md 9.12): the
+    # project as a positional path or as --path.
+    from rce.cli import CliError, add_project_path, settle_project_path  # noqa: PLC0415 -- the CLI imports this module lazily
+
     parser = argparse.ArgumentParser(prog="rce mcp", description="Run the RCE MCP stdio server.")
-    parser.add_argument(
-        "--path", default=".",
-        help="project root of an initialized RCE project (default: '.'); the graph itself "
-             "lives at ~/.rce/graphs/<id>/graph.db, see rce.paths",
-    )
+    add_project_path(parser, help=(
+        "project root of an initialized RCE project (default: '.'), or give it as --path; the "
+        "graph itself lives at ~/.rce/graphs/<id>/graph.db, see rce.paths"
+    ))
     args = parser.parse_args(argv)
-    project_root = Path(args.path).resolve()
+    try:
+        chosen = settle_project_path(args.path, args.path_flag, args.path_default)
+    except CliError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    project_root = Path(chosen).resolve()
     try:
         # The identity check first (DESIGN.md 9.4): a copy, a home that
         # cannot be checked, a lost or unreadable identity stops here and

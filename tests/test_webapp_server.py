@@ -1369,7 +1369,7 @@ def test_http_attempts_preview_returns_diff_without_writing(live_server):
     assert payload["file"] == "map.md" and payload["old_row"] is None
     assert "| 2 |" in payload["new_row"] and "+| 2 |" in payload["diff"]
     assert (project / "map.md").read_text() == before  # a preview writes nothing
-    assert not (project / ".rce" / "backups").exists()
+    assert not [b for b in (project / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)
 
 
 def test_http_attempts_write_appends_row_tree_reflects_it_and_backup_exists(live_server):
@@ -1424,7 +1424,7 @@ def test_http_attempts_write_duplicate_number_returns_400_and_writes_nothing(liv
 
     assert status == 400 and "already exists" in payload["error"]
     assert (project / "map.md").read_text() == before
-    assert not (project / ".rce" / "backups").exists()  # refused before backing up
+    assert not [b for b in (project / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)  # refused before backing up
 
 
 def test_http_attempts_write_unknown_number_update_returns_400(live_server):
@@ -1501,7 +1501,7 @@ def test_http_attempts_write_rejects_foreign_origin_before_touching_the_file(liv
 
     assert status == 403 and "Origin" in payload["error"]
     assert (project / "map.md").read_text() == before
-    assert not (project / ".rce" / "backups").exists()
+    assert not [b for b in (project / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)
     _, generation = _get(base_url, "/api/generation")
     assert generation["generation"] == 1
 

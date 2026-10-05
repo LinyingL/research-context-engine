@@ -416,6 +416,12 @@ def snapshot_now(
     return _write_snapshot(project_root, _backups_dir(project_root, subdir), path, current.data or b"", moment)
 
 
+def snapshots(project_root: str | Path, path: str | Path, subdir: str | None = None) -> list[Path]:
+    """Every snapshot of `path`, oldest first."""
+    project_root, path = Path(project_root), Path(path)
+    return [p for _stamp, p in _snapshots_of(_backups_dir(project_root, subdir), path.name, path.suffix)]
+
+
 def newest_snapshot(project_root: str | Path, path: str | Path, subdir: str | None = None) -> Path | None:
     """The newest snapshot of `path`, for `rce records` (9.8)."""
     project_root, path = Path(project_root), Path(path)

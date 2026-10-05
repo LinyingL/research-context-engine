@@ -35,10 +35,13 @@ stops and asks -- instead of a migration that resumes. So, in order:
    `migrated_from = <source>`; a reject that remembered a prior
    confirmation is two entries in order; `mapping` links are skipped. The
    basis is recorded `at-migration` only when the old index's accumulated
-   occurrences, taken one by one, yield exactly one basis and it equals
-   the fresh scan's; otherwise the entry records what the old index held
-   (`basis_recorded = "old-index"`) and the link comes up under review --
-   never re-certified. Several bases are recorded as their canonical
+   occurrences yield exactly one basis and it equals the fresh scan's --
+   for a call-name basis (dataflow, pyfig) "exactly one" is the SET of
+   call names over the occurrences (9.12), so a link one scan produces
+   through two calls is not sent to review for that; otherwise the entry
+   records what the old index held (`basis_recorded = "old-index"`) and
+   the link comes up under review -- never re-certified. Several bases are
+   recorded as their canonical
    texts under `basis.old_index`, which no scan can ever produce, so such
    a link waits for 「仍然成立」 whatever the script does next. Exporting
    twice adds nothing: per link, this source's own migrated entries are
@@ -60,9 +63,14 @@ stops and asks -- instead of a migration that resumes. So, in order:
    half-built index is removed, the old index keeps serving, and what did
    not match is returned;
 5. install the new index (the swap of `rce rebuild` when the folder had
-   one), then retire the old index -- only if no engine answers on the
-   app's port and no other process holds its `graph.db` open (「请先退出 RCE
-   与 MCP 服务」) -- by renaming it into `~/.rce/graphs/.retired/<hash>-
+   one), then retire the old index -- only if no process holds it (9.12):
+   the engine on the app's port blocks only when it serves THIS project or
+   this old index (asked through `GET /api/engine` and compared
+   canonically; one that does not answer in the V5 shape blocks), and any
+   other process with its `graph.db` open blocks (lsof, or /proc; where
+   neither exists that is said, and the engine comparison stands alone).
+   The refusal names each process, pid and what it is (「请先退出 RCE
+   与 MCP 服务」). Retiring is renaming it into `~/.rce/graphs/.retired/<hash>-
    <date>/` (a `~/.rce/graphs/<hash>/` directory whole; from anywhere
    else -- a project's `.rce/` above all -- only `graph.db` and its
    sidecars, never the records beside it); then clear `migrating_from`.
@@ -433,13 +441,51 @@ def occurrence_bases(old: sqlite3.Connection, link: JudgedLink) -> list[dict[str
     return [{}]
 
 
+#: Extractors whose basis is a SET of call names (9.6): one scan may produce
+#: the link through several calls, and `db.merge_basis` unions them.
+CALL_SET_EXTRACTORS = ("dataflow", "pyfig")
+
+
+def _call_set_basis(link: JudgedLink, bases: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """9.12 "exactly one basis": for a call-name basis, the SET of call
+    names over the old index's stored occurrences -- the one basis they
+    yield together (a link one scan legitimately produces through two
+    calls is not sent to review for that). None for other extractors."""
+    if link.key[3] not in CALL_SET_EXTRACTORS:
+        return None
+    calls: set[str] = set()
+    for b in bases:
+        found = b.get("calls")
+        if not isinstance(found, list):
+            return None
+        calls.update(c for c in found if isinstance(c, str))
+    return {"calls": sorted(calls)} if calls else None
+
+
 def migration_basis(old: sqlite3.Connection, fresh: sqlite3.Connection, link: JudgedLink) -> tuple[dict[str, Any], str]:
-    """(basis, basis_recorded) for a migrated entry (module docstring)."""
+    """(basis, basis_recorded) for a migrated entry (module docstring;
+    9.12's ruling on "exactly one basis").
+
+    A call-name basis (dataflow, pyfig) is the set of call names over all
+    stored occurrences; it is recorded `at-migration` when it equals the
+    fresh scan's basis. Otherwise -- the set differs from what a scan of
+    this folder yields now -- the occurrences' own bases are kept under
+    `old_index`, which no scan can produce: the old index accumulated
+    every call it ever saw, so their union may never have been true at
+    once, and must not be re-certified by a later scan that happens to
+    produce it. Other bases still need exactly one distinct value."""
     bases = occurrence_bases(old, link)
+    now = scan_mod.current_basis(fresh, dict(zip(("src", "dst", "type", "extractor"), link.key)))
     distinct = sorted({db.canonical_basis(b) or "{}" for b in bases}) if bases is not None else None
+    combined = _call_set_basis(link, bases) if bases is not None else None
+    if combined is not None:
+        if now is not None and db.canonical_basis(now) == db.canonical_basis(combined):
+            return combined, AT_MIGRATION
+        if distinct is not None and len(distinct) == 1:
+            return combined, OLD_INDEX
+        return {"old_index": distinct}, OLD_INDEX
     if distinct is not None and len(distinct) == 1:
         only = json.loads(distinct[0])
-        now = scan_mod.current_basis(fresh, dict(zip(("src", "dst", "type", "extractor"), link.key)))
         if now is not None and db.canonical_basis(now) == distinct[0]:
             return only, AT_MIGRATION
         return only, OLD_INDEX
@@ -682,10 +728,32 @@ def reconcile(
 # -- retire (9.5 step 5) ------------------------------------------------------------------------
 
 
-def engine_running() -> bool:
-    """Whether an engine answers on the app's port (8.9: every real
-    install uses one fixed port). `RCE_ENGINE_PORT` overrides it; `0`
-    turns the probe off (the test suite never touches a real engine)."""
+#: What `GET /api/engine` answers with (`rce.webapp.server.engine_payload`):
+#: an engine that does not answer in this shape cannot say which project
+#: it serves, and so blocks a retirement (9.12).
+ENGINE_SHAPE = {"engine": "rce", "version": 5}
+ENGINE_ANSWER_TIMEOUT_S = 3.0
+
+
+@dataclass(frozen=True)
+class Holder:
+    """A process that holds the old index (9.12): its pid when it could be
+    learned, and what it is, in English for the CLI."""
+
+    pid: int | None
+    what: str
+
+    def describe(self) -> str:
+        return f"process {self.pid} ({self.what})" if self.pid is not None else self.what
+
+    def payload(self) -> dict[str, Any]:
+        return {"pid": self.pid, "what": self.what}
+
+
+def engine_port() -> int | None:
+    """The app's engine port (8.9: every real install uses one fixed port).
+    `RCE_ENGINE_PORT` overrides it; `0` turns the probe off (the test suite
+    never touches a real engine)."""
     from rce.webapp import macapp  # noqa: PLC0415
 
     raw = os.environ.get(ENGINE_PORT_ENV)
@@ -693,7 +761,13 @@ def engine_running() -> bool:
         port = int(raw) if raw is not None else macapp.DEFAULT_PORT
     except ValueError:
         port = macapp.DEFAULT_PORT
-    if port <= 0:
+    return port if port > 0 else None
+
+
+def engine_running() -> bool:
+    """Whether anything answers on the app's engine port."""
+    port = engine_port()
+    if port is None:
         return False
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.5):
@@ -702,27 +776,133 @@ def engine_running() -> bool:
         return False
 
 
-def holders(files: Iterable[Path]) -> set[int] | None:
-    """PIDs of OTHER processes holding any of `files` open; None when that
-    cannot be told (then nothing is retired)."""
+def ask_engine(port: int, *, timeout: float = ENGINE_ANSWER_TIMEOUT_S) -> dict[str, Any] | None:
+    """`GET /api/engine` on 127.0.0.1:`port`: which project the engine
+    serves. None unless it answers in the V5 shape (`ENGINE_SHAPE`)."""
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/engine", headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 -- loopback only
+            raw = response.read(65536)
+        answer = json.loads(raw.decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(answer, dict) or any(answer.get(k) != v for k, v in ENGINE_SHAPE.items()):
+        return None
+    if not isinstance(answer.get("project_root"), str):
+        return None
+    return answer
+
+
+def _same_path(a: str | Path | None, b: str | Path | None) -> bool:
+    """One file or folder, whatever the spelling (`paths._canonical_path`,
+    which falls back to the resolved spelling for a path that is gone)."""
+    if not a or not b:
+        return False
+    try:
+        return paths._canonical_path(a) == paths._canonical_path(b)
+    except (OSError, ValueError):
+        return False
+
+
+def _command_of(pid: int) -> str | None:
+    """A short description of process `pid` (its command line), or None."""
+    ps = shutil.which("ps") or ("/bin/ps" if os.path.exists("/bin/ps") else None)
+    if ps:
+        try:
+            done = subprocess.run([ps, "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is not None and done.returncode == 0 and done.stdout.strip():
+            text = done.stdout.strip().splitlines()[0]
+            return text if len(text) <= 160 else text[:157] + "..."
+    comm = Path("/proc") / str(pid) / "comm"
+    try:
+        return comm.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _listener_pid(port: int) -> int | None:
+    """The pid listening on 127.0.0.1:`port`, when lsof can tell."""
+    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+    if not lsof:
+        return None
+    try:
+        done = subprocess.run([lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids = [int(x) for x in done.stdout.split() if x.strip().isdigit()]
+    return pids[0] if pids else None
+
+
+def engine_holding(root: Path, project_id: str | None, db_path: Path) -> Holder | None:
+    """9.12: the engine on the app's port blocks the retirement only if it
+    serves THIS project or this old index -- compared canonically: its
+    project root is this folder, its project id is this id, or its graph
+    path is the old index. An engine that does not answer in the V5 shape
+    cannot say, and blocks. Nothing listening, an engine on another project
+    (another window, another RCE home), or the engine that runs this very
+    migration (same pid), does not."""
+    port = engine_port()
+    if port is None or not engine_running():
+        return None
+    answer = ask_engine(port)
+    if answer is None:
+        pid = _listener_pid(port)
+        command = _command_of(pid) if pid is not None else None
+        return Holder(
+            pid,
+            f"a program listening on the RCE engine port {port} that does not say which project it serves "
+            f"(an RCE engine running code from before V5?)" + (f": {command}" if command else ""),
+        )
+    served_root = answer.get("project_root")
+    graph_path = answer.get("graph_path") if isinstance(answer.get("graph_path"), str) else None
+    pid = answer.get("pid") if isinstance(answer.get("pid"), int) and not isinstance(answer.get("pid"), bool) else None
+    if pid == os.getpid():
+        return None  # the engine running this migration (`POST /api/migration/run`) is not another process
+    if (
+        _same_path(served_root, root)
+        or (project_id is not None and answer.get("project_id") == project_id)
+        or _same_path(graph_path, db_path)
+    ):
+        return Holder(pid, f"the RCE engine on port {port}, serving {served_root}")
+    return None
+
+
+def holders(files: Iterable[Path]) -> dict[int, str] | None:
+    """OTHER processes holding any of `files` open, {pid: what it is};
+    None when that cannot be told on this platform."""
     existing = [str(f) for f in files if f.exists()]
     if not existing:
-        return set()
+        return {}
     me = os.getpid()
     lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
     if lsof:
         try:
-            done = subprocess.run([lsof, "-t", "--", *existing], capture_output=True, text=True, timeout=20, check=False)
+            done = subprocess.run([lsof, "-F", "pc", "--", *existing], capture_output=True, text=True, timeout=20, check=False)
         except (OSError, subprocess.SubprocessError):
             done = None
         if done is not None and done.returncode in (0, 1):
-            # lsof exits 1 when nothing holds the files (and 0 with the pids).
-            pids = {int(x) for x in done.stdout.split() if x.strip().isdigit()}
-            return {p for p in pids if p != me}
+            # lsof exits 1 when nothing holds the files (and 0 with them);
+            # `-F pc` gives a `p<pid>` line, then `c<command>`, per process.
+            found: dict[int, str] = {}
+            pid: int | None = None
+            for line in done.stdout.splitlines():
+                if line.startswith("p") and line[1:].isdigit():
+                    pid = int(line[1:])
+                    found.setdefault(pid, "")
+                elif line.startswith("c") and pid is not None:
+                    found[pid] = line[1:]
+            return {p: (_command_of(p) or c or "unknown") for p, c in found.items() if p != me}
     proc = Path("/proc")
     if proc.is_dir():
         wanted = {os.path.realpath(f) for f in existing}
-        found = set()
+        found = {}
         for entry in proc.iterdir():
             if not entry.name.isdigit() or int(entry.name) == me:
                 continue
@@ -730,7 +910,7 @@ def holders(files: Iterable[Path]) -> set[int] | None:
                 for fd in (entry / "fd").iterdir():
                     try:
                         if os.path.realpath(fd) in wanted:
-                            found.add(int(entry.name))
+                            found[int(entry.name)] = _command_of(int(entry.name)) or "unknown"
                     except OSError:
                         continue
             except OSError:
@@ -774,18 +954,43 @@ def _move(source: Path, target: Path) -> None:
         shutil.move(str(source), str(target))
 
 
-def retire(root: Path, key: str, db_path: Path, *, engine_probe: Callable[[], bool] = engine_running,
-           holder_probe: Callable[[Iterable[Path]], set[int] | None] = holders) -> Path:
-    """Rename the old index into `.retired/` (never delete it), only when no
-    engine answers and no other process holds it open."""
+EngineProbe = Callable[[Path, "str | None", Path], "Holder | None"]
+HolderProbe = Callable[[Iterable[Path]], "dict[int, str] | set[int] | None"]
+
+
+def retire(root: Path, key: str, db_path: Path, *, engine_probe: EngineProbe = engine_holding,
+           holder_probe: HolderProbe = holders, project_id: str | None = None,
+           notes: list[str] | None = None) -> Path:
+    """Rename the old index into `.retired/` (never delete it), only when
+    no process holds it (9.12): no engine serving this project or this old
+    index (`engine_probe`), and no other process with its database file
+    open (`holder_probe`). Where the second cannot be told on this
+    platform, that is said in `notes` and the engine comparison stands
+    alone. The refusal names each process: its pid and what it is."""
     sidecars = [db_path, db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")]
-    if engine_probe():
-        raise MigrationRefused(f"{PLEASE_QUIT}: an RCE engine is running and may still be using {db_path}")
+    blocking: list[Holder] = []
+    engine = engine_probe(root, project_id, db_path)
+    if engine is not None:
+        blocking.append(engine)
     held = holder_probe(sidecars)
     if held is None:
-        raise MigrationRefused(f"{PLEASE_QUIT}: whether another process holds {db_path} open cannot be told here")
-    if held:
-        raise MigrationRefused(f"{PLEASE_QUIT}: process(es) {', '.join(map(str, sorted(held)))} hold {db_path} open")
+        if notes is not None:
+            notes.append(
+                f"whether another process holds {db_path} open cannot be told on this platform "
+                f"(no lsof, no /proc); only the RCE engine on the app's port was checked"
+            )
+    else:
+        described = held if isinstance(held, dict) else {pid: _command_of(pid) or "unknown" for pid in held}
+        for pid, what in sorted(described.items()):
+            if engine is not None and engine.pid == pid:
+                continue
+            blocking.append(Holder(pid, f"has {db_path.name} open: {what}"))
+    if blocking:
+        raise MigrationRefused(
+            f"{PLEASE_QUIT}: the old index {db_path} is still held by "
+            + "; ".join(h.describe() for h in blocking)
+            + " -- quit it, then run 'rce migrate' again (nothing was retired; the migration resumes)"
+        )
     target = retired_dir_for(key, root)
     target.parent.mkdir(parents=True, exist_ok=True)
     if _is_index_directory(key, db_path):
@@ -818,6 +1023,7 @@ class Migrated:
     stopped: str | None = None
     previews: list[Preview] = field(default_factory=list)
     resumed: bool = False
+    notes: list[str] = field(default_factory=list)
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -827,6 +1033,7 @@ class Migrated:
             "retired_to": str(self.retired_to) if self.retired_to else None,
             "stopped": self.stopped, "resumed": self.resumed,
             "previews": [p.payload() for p in self.previews],
+            "notes": list(self.notes),
         }
 
 
@@ -861,8 +1068,8 @@ def migrate_one(
     *,
     echo: Echo = lambda _l: None,
     fault: Fault | None = None,
-    engine_probe: Callable[[], bool] = engine_running,
-    holder_probe: Callable[[Iterable[Path]], set[int] | None] = holders,
+    engine_probe: EngineProbe = engine_holding,
+    holder_probe: HolderProbe = holders,
 ) -> Migrated:
     """Migrate one source into `root` (module docstring, steps 1-5)."""
     fault = fault or (lambda _p: None)
@@ -930,16 +1137,19 @@ def migrate_one(
             fault("after_verify")
             rebuild_mod.install(staging, target)
             fault("after_install")
+            notes: list[str] = []
             try:
-                retired = retire(root, key, source_db, engine_probe=engine_probe, holder_probe=holder_probe)
+                retired = retire(root, key, source_db, engine_probe=engine_probe, holder_probe=holder_probe,
+                                 project_id=ident.id, notes=notes)
             except MigrationRefused as exc:
                 return Migrated(root, key, ok=False, identity=ident, tally=tally, exported=exported, resumed=resumed,
-                                stopped=str(exc))
+                                stopped=str(exc), notes=notes)
             fault("after_retire")
             ident = _finish(root, ident)
     _follow_registry(root, ident)
     logger.warning("RCE: migrated %s into %s; the old index was retired to %s", key, root, retired)
-    return Migrated(root, key, ok=True, identity=ident, tally=tally, exported=exported, retired_to=retired, resumed=resumed)
+    return Migrated(root, key, ok=True, identity=ident, tally=tally, exported=exported, retired_to=retired, resumed=resumed,
+                    notes=notes)
 
 
 def _follow_registry(root: Path, ident: ProjectIdentity) -> None:
@@ -991,8 +1201,8 @@ def migrate(
     from_dir: str | Path | None = None,
     echo: Echo = lambda _l: None,
     fault: Fault | None = None,
-    engine_probe: Callable[[], bool] = engine_running,
-    holder_probe: Callable[[Iterable[Path]], set[int] | None] = holders,
+    engine_probe: EngineProbe = engine_holding,
+    holder_probe: HolderProbe = holders,
 ) -> list[Migrated]:
     """`rce migrate` / `POST /api/migration/run`: resume an unfinished
     migration, or -- after the explicit `yes` -- migrate every waiting

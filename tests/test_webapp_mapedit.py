@@ -108,7 +108,7 @@ def test_preview_append_returns_diff_and_writes_nothing(tmp_path):
     assert preview["old_row"] is None
     assert "| 17 |" in preview["new_row"] and "价格边际路径" in preview["new_row"]
     assert "+| 17 |" in preview["diff"] and "---" in preview["diff"]  # unified diff shape
-    assert not (tmp_path / ".rce" / "backups").exists()  # preview never backs up either
+    assert not [b for b in (tmp_path / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)  # preview never backs up either
 
 
 def test_preview_update_returns_old_and_new_row(tmp_path):
@@ -361,7 +361,7 @@ def test_apply_backs_up_original_before_writing(tmp_path):
 def test_backups_pruned_to_newest_20(tmp_path):
     _make_project(tmp_path)
     backups_dir = tmp_path / ".rce" / "backups"
-    backups_dir.mkdir(parents=True)
+    backups_dir.mkdir(parents=True, exist_ok=True)  # init keeps a snapshot of project.toml there (9.12)
     # 25 pre-existing backups with sortable (zero-padded) stamps, oldest first.
     for i in range(25):
         (backups_dir / f"00-项目地图.md.20260101T0000{i:02d}000000Z.md").write_text("old")
@@ -412,7 +412,7 @@ def test_out_of_root_config_file_refused(tmp_path, escape_shape):
         mapedit.apply_edit(root, "append", "17", _FIELDS_17)
 
     assert victim.read_text(encoding="utf-8") == victim_original  # untouched
-    assert not (root / ".rce" / "backups").exists()  # refused before any backup
+    assert not [b for b in (root / ".rce" / "backups").glob("*") if not b.name.startswith("project.toml.")]  # the identity keeps its own snapshots (9.12)  # refused before any backup
 
 
 def test_in_root_symlink_pointing_outside_refused(tmp_path):
