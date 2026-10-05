@@ -140,6 +140,14 @@ Endpoints (all GET unless noted):
                             conflict (待复核), held because their source could
                             not be read, or whose link the index lacks, plus
                             the judgment ledger's trust state.
+    GET  /api/variables, /api/variables/card?id=, /api/variables/code?id=&entry=,
+         /api/variables/frozen?id=&entry=  -- the 「变量」 view's reads (9.11;
+                            see `rce.webapp.variables_api`); a blocked
+                            project is read from its files alone.
+    POST /api/variables/<confirm|revise|reaffirm|abandon|revive|answer|
+         full-compare>   -- only what RCE authors on a card, through
+                            `rce.records.cards` (never the researcher's
+                            text); see `rce.webapp.variables_api`.
     GET  /api/history   -- `?src&dst&type&extractor`: every ledger entry
                             for one link, in order (9.9 #12), each with
                             the basis it was made on.
@@ -405,7 +413,8 @@ from rce.records import situation as records_situation
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import mappings as mappings_ingest
-from rce.webapp import canvas, mapedit
+from rce.webapp import canvas, mapedit, variables_api
+from rce.records import implementation as card_implementation
 from rce.webapp import registry as project_registry
 from rce.webapp import watcher as project_watcher
 
@@ -689,6 +698,18 @@ class MigrationRefusedError(ApiError):
     state = "migration_refused"
 
 
+class CardRefusedApiError(ApiError):
+    """A card action refused (`rce.webapp.variables_api.CardActionRefused`):
+    nothing was written. `state` is `card_<code>`; `message_zh` the page's
+    sentence."""
+
+    def __init__(self, exc: variables_api.CardActionRefused) -> None:
+        super().__init__(str(exc))
+        self.status = exc.status
+        self.state = exc.state
+        self.extra = exc.extra
+
+
 @dataclass(frozen=True)
 class ServedProject:
     """What this server serves (module docstring, "Project identity")."""
@@ -937,7 +958,7 @@ def summary_payload(conn: Connection, project_root: Path, served: ServedProject 
         "pending": len(db.pending_edges(conn)),
         # 9.6: links whose old judgment waits for the researcher (待复核);
         # never counted in `pending` (待确认).
-        "review": judgements.review_count(conn),
+        "review": judgements.review_count(conn) + card_implementation.review_groups(conn)["count"],
         # 9.3: whether the judgment ledger can be trusted right now.
         "records": db.get_record_status(conn, judgements.RECORD_STATUS_NAME),
         "attempts_config": _attempts_config_echo(project_root),
@@ -1849,6 +1870,49 @@ def judgement_payload(conn: Connection, served: ServedProject, body: dict[str, A
     return _judged_payload(conn, key, judged)
 
 
+def review_payload(conn: Connection) -> dict[str, Any]:
+    """`GET /api/review`: 9.6's list of links, plus the variable cards whose
+    implementation moved under a confirmed version (9.11 stage (b)) --
+    one list, one count."""
+    payload = judgements.review_items(conn)
+    card_items = card_implementation.review_groups(conn)
+    payload["cards"] = card_items
+    payload["count"] = payload["count"] + card_items["count"]
+    return payload
+
+
+def _variables_conn(served: ServedProject) -> Connection | None:
+    """The index for the 「变量」 reads, or None (a blocked project, an index
+    missing or in the cloud): the cards are then read from their files."""
+    if served.blocked is not None:
+        return None
+    try:
+        return db.connect(_served_db(served))
+    except ApiError:
+        return None
+
+
+def variables_get(served: ServedProject, path: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    """The 「变量」 view's GET endpoints (`rce.webapp.variables_api`)."""
+    arg = lambda name: (query.get(name) or [None])[0]  # noqa: E731
+    conn = _variables_conn(served)
+    try:
+        if path == "/api/variables":
+            return variables_api.list_payload(conn, served.root)
+        if path == "/api/variables/card":
+            return variables_api.card_payload(conn, served.root, arg("id"))
+        if path == "/api/variables/code":
+            return variables_api.code_payload(served.root, arg("id"), arg("entry"))
+        if path == "/api/variables/frozen":
+            return variables_api.frozen_payload(served.root, arg("id"), arg("entry"))
+        raise NotFoundError(f"no such endpoint: {path}")
+    except variables_api.CardActionRefused as exc:
+        raise CardRefusedApiError(exc) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def records_payload(served: ServedProject) -> dict[str, Any]:
     """`GET /api/records`: the inventory of 9.2 -- what `rce records`
     prints -- for the app's 「记录」 panel: each kind of human record, where
@@ -2229,7 +2293,11 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 scope = (query.get("scope") or [None])[0]
                 self._json_from_conn(lambda conn: canvas_payload(conn, self._project_root(), scope))
             elif path == "/api/review":
-                self._json_from_conn(judgements.review_items)
+                self._json_from_conn(review_payload)
+            elif path == "/api/variables" or path.startswith("/api/variables/"):
+                # The 「变量」 view (9.11). Read even for a blocked project --
+                # from the card files alone; nothing is written.
+                self._send_json(200, variables_get(self._served(), path, query))
             elif path == "/api/migration":
                 self._send_json(200, migration_payload(self._served()))
             elif path == "/api/history":
@@ -2373,6 +2441,22 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                     payload = records_answer_payload(served, body)
                 payload["generation"] = self.server.watcher.record_write(
                     {str(ledger_mod.judgements_path(served.root)), str(canvas.canvas_record_path(served.root))},
+                )
+                self._send_json(200, payload)
+            elif parsed.path.startswith("/api/variables/"):
+                # What RCE authors on a variable card (9.11 "In the app"):
+                # the card's log first, through `rce.records.cards`, then
+                # the index. 「完整比对」 writes the index only.
+                body = self._read_json_object()
+                served = self._served()
+                action = parsed.path[len("/api/variables/"):]
+                try:
+                    with self.server.write_guard(human=action != "full-compare"):
+                        payload = variables_api.act(served.root, served.project_id, action, body)
+                except variables_api.CardActionRefused as exc:
+                    raise CardRefusedApiError(exc) from exc
+                payload["generation"] = self.server.watcher.record_write(
+                    {str(p) for p, _subdir in inventory.card_file_paths(served.root)},
                 )
                 self._send_json(200, payload)
             elif parsed.path == "/api/migration/run":

@@ -170,6 +170,11 @@ class WatchSnapshot:
 
     files: dict[str, tuple[int, int]]
     steps_paths: frozenset[str]
+    # V5 phase 9 (9.11 stage (b)): the scripts and input datasets of the
+    # variable cards' versions in use. A change re-applies the record (which
+    # compares them again) and runs no ingest -- unless the file is also a
+    # steps_dir member, which keeps its own meaning.
+    impl_paths: frozenset[str] = frozenset()
 
 
 def _stat_entry(path: Path) -> tuple[int, int] | None:
@@ -200,6 +205,13 @@ def take_snapshot(project_root: Path) -> WatchSnapshot:
         if card_entry is not None:
             files[str(card_file)] = card_entry
 
+    impl: set[str] = set()
+    for impl_file in implementation_paths(project_root):
+        impl_entry = _stat_entry(impl_file)
+        if impl_entry is not None:
+            files[str(impl_file)] = impl_entry
+            impl.add(str(impl_file))
+
     config_path = project_root / attempts_ingest.CONFIG_RELATIVE_PATH
     entry = _stat_entry(config_path)
     if entry is not None:
@@ -211,7 +223,7 @@ def take_snapshot(project_root: Path) -> WatchSnapshot:
         # Missing or currently-unusable config: watch only the config file
         # itself. The moment a working one is saved, the snapshot changes
         # and the poll re-ingests -- no guessing at which file to watch.
-        return WatchSnapshot(files=files, steps_paths=frozenset())
+        return WatchSnapshot(files=files, steps_paths=frozenset(), impl_paths=frozenset(impl))
 
     source_entry = _stat_entry(project_root / config.file)
     if source_entry is not None:
@@ -230,7 +242,7 @@ def take_snapshot(project_root: Path) -> WatchSnapshot:
             if child_entry is not None:
                 files[str(child)] = child_entry
                 steps.add(str(child))
-    return WatchSnapshot(files=files, steps_paths=frozenset(steps))
+    return WatchSnapshot(files=files, steps_paths=frozenset(steps), impl_paths=frozenset(impl))
 
 
 def record_paths(project_root: Path) -> tuple[Path, Path, Path]:
@@ -250,6 +262,14 @@ def card_record_paths(project_root: Path) -> list[Path]:
     from rce import inventory  # noqa: PLC0415 -- leaf use
 
     return [path for path, _subdir in inventory.card_file_paths(project_root)]
+
+
+def implementation_paths(project_root: Path) -> list[Path]:
+    """The variable cards' implementing scripts and input datasets (9.11
+    stage (b), `rce.records.implementation.watched_paths`)."""
+    from rce.records import implementation  # noqa: PLC0415 -- leaf use
+
+    return implementation.watched_paths(project_root)
 
 
 def _is_card_file(path: str, project_root: Path) -> bool:
@@ -296,7 +316,7 @@ def _absorb_non_steps_only(old: WatchSnapshot, fresh: WatchSnapshot) -> WatchSna
     for path in steps:
         if path in old.files:
             files[path] = old.files[path]
-    return WatchSnapshot(files=files, steps_paths=frozenset(steps))
+    return WatchSnapshot(files=files, steps_paths=frozenset(steps), impl_paths=old.impl_paths | fresh.impl_paths)
 
 
 def _absorb_only(old: WatchSnapshot, fresh: WatchSnapshot, absorb: frozenset[str]) -> WatchSnapshot:
@@ -313,7 +333,8 @@ def _absorb_only(old: WatchSnapshot, fresh: WatchSnapshot, absorb: frozenset[str
         source = fresh if path in absorb else old
         if path in source.files:
             files[path] = source.files[path]
-    return WatchSnapshot(files=files, steps_paths=old.steps_paths | fresh.steps_paths)
+    return WatchSnapshot(files=files, steps_paths=old.steps_paths | fresh.steps_paths,
+                         impl_paths=old.impl_paths | fresh.impl_paths)
 
 
 def _graph_location(root: Path) -> str:
@@ -612,7 +633,8 @@ class ProjectWatcher:
         mappings_file, ledger_file, canvas_file = (str(p) for p in record_paths(root))
         mappings_changed = mappings_file in changed
         ledger_changed = ledger_file in changed
-        cards_changed = {path for path in changed if _is_card_file(path, root)}
+        impl_paths = (baseline.impl_paths | snapshot.impl_paths) - (baseline.steps_paths | snapshot.steps_paths)
+        cards_changed = {path for path in changed if _is_card_file(path, root) or path in impl_paths}
         attempts_changed = bool(changed - {mappings_file, ledger_file, canvas_file} - cards_changed)
         error: str | None = None
         try:

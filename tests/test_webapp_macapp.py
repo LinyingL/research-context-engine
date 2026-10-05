@@ -344,6 +344,44 @@ def test_shell_menus_match_the_design():
         assert snippet in _SHELL, f"menu item missing from RCEShell.swift: {snippet}"
 
 
+def test_shell_view_menu_has_the_variables_view_on_cmd_4():
+    """V5 phase 9 (9.11 "In the app"): 视图 gains 变量 ⌘4, a whitelisted
+    command name the page's dispatcher also accepts."""
+    assert 'cmd("变量", "variables", "4")' in _SHELL
+    whitelist = _SHELL[_SHELL.index("let shellCommands"):]
+    whitelist = whitelist[: whitelist.index("]")]
+    assert '"variables"' in whitelist
+    page = (Path(macapp.__file__).parent / "app.html").read_text(encoding="utf-8")
+    assert '"variables": () => activateView("variables")' in page
+
+
+def test_shell_choose_folder_answers_through_a_fixed_callback_with_arguments():
+    """V5 phase 9 (9.4 「选择新位置…」): `{type: "choose-folder", request}`
+    opens a one-directory NSOpenPanel; the answer goes back through the
+    fixed callback with the request id and the path passed as arguments --
+    never interpolated into script text; any other shape is ignored; the
+    page is told it may ask (RCEShellFeatures) at document start."""
+    handler = _SHELL[_SHELL.index("didReceive message: WKScriptMessage"):]
+    handler = handler[: handler.index("\n    }\n")]
+    assert 'body["type"] as? String == "choose-folder"' in handler
+    assert 'let request = body["request"] as? String' in handler and "isFolderRequest(request)" in handler
+    assert "body.count == 2" in handler and "message.frameInfo.isMainFrame" in handler
+    choose = _SHELL[_SHELL.index("func chooseFolder"):]
+    choose = choose[: choose.index("\n    }\n")]
+    assert "panel.canChooseDirectories = true" in choose and "panel.canChooseFiles = false" in choose
+    assert "panel.allowsMultipleSelection = false" in choose
+    answer = _SHELL[_SHELL.index("func answerFolder"):]
+    answer = answer[: answer.index("\n    }\n")]
+    assert 'callAsyncJavaScript("window.RCE && RCE.folderChosen(request, path)", arguments: arguments' in answer
+    assert '["request": request, "path": path ?? NSNull()]' in answer
+    assert "\\(" not in answer  # no string interpolation anywhere in the callback
+    assert 'let shellFeaturesScript = "window.RCEShellFeatures = [\\"choose-folder\\"];"' in _SHELL
+    assert "injectionTime: .atDocumentStart, forMainFrameOnly: true" in _SHELL
+    validator = _SHELL[_SHELL.index("func isFolderRequest"):]
+    validator = validator[: validator.index("\n}\n")]
+    assert "folderRequestLimit" in validator and '$0 == "-"' in validator and "isASCII" in validator
+
+
 def test_shell_window_geometry_and_quit_on_close():
     assert "width: 1280, height: 840" in _SHELL
     assert "NSSize(width: 900, height: 600)" in _SHELL

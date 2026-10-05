@@ -148,7 +148,7 @@ class CardRefused(V.VariableError):
     untrusted (the card may not be written now; `decision` says why),
     no_index, no_draft, incomplete, unresolvable, draft_open, no_question,
     question_open, copy_missing, nothing_confirmed, already_abandoned,
-    not_abandoned, would_lose, question_changed, changed."""
+    not_abandoned, would_lose, question_changed, changed, region_missing."""
 
     def __init__(self, code: str, message: str, *, message_zh: str | None = None, decision: TrustDecision | None = None) -> None:
         super().__init__(code, message, message_zh=message_zh)
@@ -308,14 +308,18 @@ def _cards_in_view(conn: Connection | None, root: Path) -> list[V.Card] | None:
     return cards
 
 
-def apply_cards(conn: Connection, project_root: str | Path, *, identity: ProjectIdentity | None = None) -> dict[str, Any]:
+def apply_cards(conn: Connection, project_root: str | Path, *, identity: ProjectIdentity | None = None,
+                full_for: set[str] | None = None) -> dict[str, Any]:
     """Refresh the index's copy of every card from its files (the record
     first, the index second): a trusted card's copy and applied entries are
     replaced; an untrusted one keeps what the index had, and its decision is
     stored for the views. A gone card the index never applied anything of is
     forgotten. Called under the project lock (from
     `judgements.apply_ledger`, i.e. at the end of every scan, by the watcher
-    and after every record write). Returns {card id: status payload}."""
+    and after every record write). Then stage (b): every trusted card's
+    version in use is compared with its implementation now
+    (`implementation.refresh`; `full_for` are card keys whose large inputs
+    are hashed, 「完整比对」). Returns {card id: status payload}."""
     from rce.records.judgements import entry_json  # noqa: PLC0415
 
     root = Path(project_root)
@@ -325,6 +329,7 @@ def apply_cards(conn: Connection, project_root: str | Path, *, identity: Project
     if cards is None:
         return {}
     out: dict[str, Any] = {}
+    trusted: set[str] = set()
     for card in cards:
         decision = assess_card(conn, root, card, identity)
         status = status_payload(card, decision)
@@ -334,11 +339,18 @@ def apply_cards(conn: Connection, project_root: str | Path, *, identity: Project
             db.forget_variable_card(conn, card.key)
             continue
         if decision.may_apply and not gone:
+            trusted.add(card.key)
             applied = {e.id: (e.seq, entry_json(e.data)) for e in card.entries}
             db.write_variable_card(conn, card.key, card.id, status=status, data=_card_copy(card), applied=applied)
         else:
             db.write_variable_card(conn, card.key, card.id, status=status)
     db.set_record_status(conn, RECORD_STATUS_NAME, {"cards": out})
+    from rce.records import implementation  # noqa: PLC0415 -- implementation imports this module lazily
+
+    try:
+        implementation.refresh(conn, root, cards, trusted=trusted, full_for=full_for)
+    except Exception:  # noqa: BLE001 -- a comparison never stops the record being applied
+        logger.exception("comparing the variable cards' implementations of %s failed", root)
     return out
 
 
@@ -629,9 +641,12 @@ def _field_check(root: Path, output: str | None, field_name: str) -> dict[str, A
     return {"result": V.MISMATCH, "reason": M_NO_FIELD}
 
 
-def fingerprint(root: Path, rel: str) -> dict[str, Any]:
+def fingerprint(root: Path, rel: str, *, full: bool = False) -> dict[str, Any]:
     """An observation of one file now (9.11): sha256 + size below 50 MB,
-    size + mtime above; a file in the cloud is not downloaded."""
+    size + mtime above -- plus the sha256 when `full` (an input at
+    confirmation: the scan compares a large input by size, and 「完整比对」
+    later needs the content hash to compare with); a file in the cloud is
+    not downloaded."""
     path = _confined(root, rel)
     if path is None:
         return {"result": V.UNCHECKED, "reason": R_OUTSIDE}
@@ -641,9 +656,12 @@ def fingerprint(root: Path, rel: str) -> dict[str, Any]:
         return {"result": V.UNCHECKED, "reason": R_FILE_ABSENT}
     if paths.is_dataless(path):
         return {"result": V.UNCHECKED, "reason": R_IN_CLOUD}
+    large: dict[str, Any] = {}
     if st.st_size >= V.LARGE_FILE_BYTES:
         mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="microseconds")
-        return {"size": st.st_size, "mtime": mtime}
+        if not full:
+            return {"size": st.st_size, "mtime": mtime}
+        large = {"mtime": mtime}
     digest = hashlib.sha256()
     try:
         with open(path, "rb") as handle:
@@ -651,7 +669,7 @@ def fingerprint(root: Path, rel: str) -> dict[str, Any]:
                 digest.update(block)
     except OSError:
         return {"result": V.UNCHECKED, "reason": R_UNREADABLE}
-    return {"sha256": digest.hexdigest(), "size": st.st_size}
+    return {"sha256": digest.hexdigest(), "size": st.st_size, **large}
 
 
 @dataclass
@@ -695,7 +713,8 @@ def inspect(root: Path, content: Mapping[str, Any]) -> _Inspection:
             else:
                 sha = _sha256(script_bytes)
                 copy = f"{V.CODE_DIRNAME}/{sha}{Path(script).suffix}"
-                checked["script"] = {"result": V.CHECKED, "sha256": sha, "size": len(script_bytes), "copy": copy}
+                checked["script"] = {"result": V.CHECKED, "sha256": sha, "size": len(script_bytes), "copy": copy,
+                                     **_code_fingerprint(script, script_bytes, impl)}
                 parse = _parse_script(root, script)
     checked["writes"] = (
         {"result": V.UNCHECKED, "reason": R_NO_OUTPUT} if output is None else _link_check(root, script, parse, output, "write")
@@ -713,12 +732,28 @@ def inspect(root: Path, content: Mapping[str, Any]) -> _Inspection:
     if output is not None:
         observed["output"] = {"path": output, **fingerprint(root, output)}
     inputs = [
-        {"dataset": d, **fingerprint(root, d)}
+        {"dataset": d, **fingerprint(root, d, full=True)}
         for d in ((i.get("dataset") or "").strip() for i in content.get("input") or []) if d
     ]
     if inputs:
         observed["inputs"] = inputs
     return _Inspection(checked, observed, script_bytes, copy)
+
+
+def _code_fingerprint(script: str, data: bytes, impl: Mapping[str, Any]) -> dict[str, Any]:
+    """The hash of the script's code as stage (b) compares it (comments and
+    blank lines removed; the named chunk or function only), recorded beside
+    the raw hash so a comparison still works when the code copy is gone.
+    Nothing when the code cannot be read that way (no outcome blocks)."""
+    from rce.records import implementation  # noqa: PLC0415
+
+    chunk, function = implementation.region_of(impl)
+    try:
+        code = implementation.code_hash(data.decode("utf-8-sig"), Path(script).suffix, chunk=chunk, function=function)
+    except (implementation.Unparseable, implementation.RegionMissing, UnicodeDecodeError):
+        return {}
+    region = implementation.region_text(chunk, function)
+    return {"code": code, **({"region": region} if region else {})}
 
 
 def _pin_upstream(root: Path, card: V.Card, content: Mapping[str, Any]) -> list[dict[str, Any]] | None:
@@ -928,6 +963,126 @@ def answer_edited(
             "upstream": upstream, "checked": ins.checked, "observed": ins.observed or None,
         }], now=now)[0]
         return EditAnswered(answer, view.number, entry=entry)
+
+
+# -- stage (b): the implementation moved under a confirmed version ------------------------------
+
+
+def _write_code_copy(w: _Writing, data: bytes, copy: str) -> None:
+    """A code copy, written durably and read back (snapshot first, entry last)."""
+    code = w.root / paths.RCE_DIRNAME / V.VARIABLES_DIRNAME / copy
+    files.ensure_dir_within(w.root, code.parent)
+    existing = files.read_record(code)
+    if existing.state is not RecordState.PRESENT or existing.data != data:
+        files.durable_write(code, data)
+    _read_back(code, data)
+
+
+def reaffirm(
+    project_root: str | Path,
+    card_id: str,
+    *,
+    version: int,
+    signature: str,
+    data_version: str | None = None,
+    note: str | None = None,
+    via: str = "cli",
+    expected_id: Any = READ_NOW,
+    timeout: float | None = None,
+    now: Clock | None = None,
+    fault: Fault | None = None,
+) -> LedgerEntry:
+    """「口径未变」: the researcher's answer that the definition in use still
+    holds after its implementation moved (9.11 stage (b)). Appends one
+    `reaffirmed` entry with the new fingerprints -- the script's raw and
+    code hashes and a fresh code copy (written and verified first), each
+    input's fingerprint -- the coverage they were taken under, the reasons
+    answered, and, after an input change, the researcher's new
+    `data_version` note (required then).
+
+    `signature` ties the answer to the comparison that was shown (9.12): if
+    the files moved again since, `question_changed`, nothing written."""
+    from rce.records import implementation  # noqa: PLC0415
+
+    if note is not None and not isinstance(note, str):
+        raise CardRefused("invalid", "note must be text")
+    with _writing(project_root, card_id, expected_id, timeout) as w:
+        card = w.card
+        if card.in_use != version:
+            raise CardRefused("no_question", f"v{version} of {card.id} is not the version in use; nothing to answer")
+        result = implementation.compare(w.root, card, implementation.load_cache(w.conn))
+        if result is None or not result["reasons"]:
+            raise CardRefused("no_question", f"the implementation of {card.id} v{version} has not moved since it was "
+                              "confirmed or last reaffirmed; there is nothing to answer")
+        if result["signature"] != signature:
+            raise CardRefused("question_changed", f"the implementation of {card.id} changed again since the question "
+                              "was shown; look again")
+        reasons = list(result["reasons"])
+        if set(reasons) & {implementation.CHUNK_MISSING, implementation.FUNCTION_MISSING}:
+            # The region the version names is not in the script: a
+            # reaffirmation could never settle that (the next comparison
+            # looks for it again). The card's text names it -- corrected
+            # there (「这是更正」), or the definition moves on (「口径已变」).
+            raise CardRefused(
+                "region_missing", f"the chunk or function {card.id} v{version} names cannot be found; correct the card "
+                "('chunk'/'function', then answer 'correct') or open the next draft",
+                message_zh="找不到这一版指定的代码块或函数，无法记为口径未变：请在卡片里改正 chunk / function 后回答「这是更正」，或选择「口径已变」",
+            )
+        if implementation.INPUT_CHANGED in reasons and not (data_version or "").strip():
+            raise CardRefused("incomplete", "the input data changed: write the new data_version note",
+                              message_zh="输入数据变了：请写下新的数据版本说明")
+        script = result["script"]
+        fields: dict[str, Any] = {
+            "act": "reaffirmed", "version": version, "via": via, "reaffirms": result["baseline"],
+            "reasons": reasons,
+            "data_version": (data_version or "").strip() or None,
+            "note": (note or "").strip() or None,
+        }
+        coverage: dict[str, Any] = {}
+        now_script = script.get("now")
+        if now_script and script.get("state") in ("same", "changed"):
+            _write_code_copy(w, script["bytes"], now_script["copy"])
+            if fault is not None:
+                fault("after_code_copy")
+            fields["checked"] = {"script": dict(now_script)}
+            coverage["script"] = implementation.RECORDED_REGION if script.get("region") else implementation.RECORDED_FULL
+        inputs = []
+        input_coverage = []
+        for item in result["inputs"]:
+            fp = item.get("now")
+            if not fp:
+                continue
+            inputs.append(dict(fp))
+            input_coverage.append({"dataset": item["dataset"], "coverage": implementation.RECORDED_FULL if "sha256" in fp
+                                   else implementation.RECORDED_SIZE})
+        if inputs:
+            fields["observed"] = {"inputs": inputs}
+            coverage["inputs"] = input_coverage
+        fields["coverage"] = coverage or None
+        return _append(w, [fields], now=now)[0]
+
+
+def full_compare(project_root: str | Path, card_id: str, *, expected_id: Any = READ_NOW,
+                 timeout: float | None = None) -> dict[str, Any] | None:
+    """「完整比对」: hash the card's large inputs now and compare them by
+    content (9.11). Writes the index only (its comparison and its cache of
+    hashes), under the project lock; returns the card's comparison."""
+    from rce.records import implementation  # noqa: PLC0415
+
+    root = Path(project_root)
+    with write_guard(root, expected_id, human=False, timeout=timeout):
+        identity = _identity_now(root)
+        if identity is None:
+            raise CardRefused("untrusted", f"{root} has no readable project identity", message_zh=V.MESSAGES["no_identity"])
+        conn = _open_index(identity)
+        try:
+            found = V.find_card_dirs(root, card_id)
+            if not found:
+                raise CardRefused("no_such_card", f"there is no variable card {card_id!r}")
+            apply_cards(conn, root, identity=identity, full_for={V.card_key(found[0].name)})
+            return implementation.stored(conn).get(found[0].name)
+        finally:
+            conn.close()
 
 
 # -- abandon, revive -----------------------------------------------------------------------------

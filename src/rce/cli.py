@@ -89,6 +89,7 @@ from rce.ingest import git as git_ingest  # noqa: F401
 from rce.ingest import mappings as mappings_ingest
 from rce.ingest import pipeline as ingest_pipeline
 from rce.records import cards as variable_cards
+from rce.records import implementation as card_implementation
 from rce.records import files as record_files
 from rce.records import judgements
 from rce.records import ledger as ledger_mod
@@ -675,6 +676,24 @@ def _confirm_target(args: argparse.Namespace, conn: Connection) -> tuple[str, st
     return positional  # type: ignore[return-value]
 
 
+def _print_card_reviews(card_items: dict[str, Any]) -> None:
+    """9.11 stage (b) in `rce review`: one item per changed script, naming
+    every card on it; RCE cannot tell whether a definition changed."""
+    groups = card_items["groups"]
+    if not groups:
+        return
+    print(f"Variable cards whose implementation moved: {card_items['count']} "
+          "(RCE cannot tell whether a definition changed; answer in the app's 变量 view, "
+          "or open the next draft with 'rce variable revise <id>')")
+    for group in groups:
+        head = f"{group['script']}: {len(group['cards'])} card(s)" if group["script"] else "input data"
+        print(f"  {head}")
+        for member in group["cards"]:
+            reasons = ", ".join(r["code"] for r in member["reasons"])
+            waiting = f" -- draft v{member['draft']} is open" if member.get("draft") is not None else ""
+            print(f"    {member['card']} v{member['version']}: {reasons}{waiting}")
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     """`rce review` (DESIGN.md 9.6, 9.8): the judgments not applied --
     under review (with the reason, the old verdict, its date and note, the
@@ -692,10 +711,11 @@ def cmd_review(args: argparse.Namespace) -> int:
         try:
             judgements.apply_ledger(conn, opened.root)
             items = judgements.review_items(conn)
+            card_items = card_implementation.review_groups(conn)
         finally:
             conn.close()
     if args.json:
-        print(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps({**items, "cards": card_items}, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     ledger_state = items["ledger"]
     if ledger_state and ledger_state.get("state") != "ok":
@@ -716,6 +736,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"Judged links the index does not hold: {len(items['not_in_index'])}")
         for item in items["not_in_index"]:
             print(f"  {_item_label(item)} ({item['verdict']} {_when(item)})")
+    _print_card_reviews(card_items)
     return 0
 
 

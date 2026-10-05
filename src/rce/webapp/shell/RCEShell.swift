@@ -43,7 +43,14 @@
 //   `rce`, accepting exactly `{type: "title", text: String}` from the main
 //   frame of the engine's own origin; the label is stripped of control
 //   characters and length-capped, then the window reads 「RCE — <label>」.
-//   Every other message shape is ignored.
+//   Since V5 phase 9 one more shape, `{type: "choose-folder", request:
+//   String}` (「选择新位置…」, DESIGN.md 9.4): an NSOpenPanel limited to one
+//   directory, whose answer goes back through the fixed callback
+//   `RCE.folderChosen(request, path)` -- called with callAsyncJavaScript,
+//   the request id and the path passed as ARGUMENTS (serialized by WebKit),
+//   never spliced into script text. The page learns it may ask from
+//   `window.RCEShellFeatures`, injected at document start. Every other
+//   message shape is ignored.
 // - Navigation: only http://127.0.0.1:<port> (and the placeholder's
 //   about:blank) load in the window. Any other http(s)/mailto link opens
 //   in the default browser; every other scheme is refused. Developer
@@ -58,7 +65,7 @@ import AppKit
 // The page-side dispatcher (app.html, "Native shell bridge") accepts the
 // same names. Only [a-z-] characters: safe inside a single-quoted JS string.
 let shellCommands: Set<String> = [
-    "tree", "lineage", "canvas", "new-attempt", "reload",
+    "tree", "lineage", "canvas", "variables", "new-attempt", "reload",
     "zoom-in", "zoom-out", "zoom-reset", "fit", "reveal-project", "open-map",
 ]
 
@@ -66,6 +73,16 @@ let defaultPort = 7357
 let probeTimeout: TimeInterval = 1.0
 let startupBudget: TimeInterval = 10.0
 let titleLimit = 60
+// What the page may ask the shell for (app.html, shellCan).
+let shellFeaturesScript = "window.RCEShellFeatures = [\"choose-folder\"];"
+// The page's own request ids ("folder-<time>-<random>"): anything else is ignored.
+let folderRequestLimit = 80
+
+func isFolderRequest(_ request: String) -> Bool {
+    !request.isEmpty && request.count <= folderRequestLimit
+        && request.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || $0 == "-" }
+        && request.allSatisfy { $0.isASCII }
+}
 
 let paperColor = NSColor(srgbRed: 0xF7 / 255.0, green: 0xF2 / 255.0, blue: 0xE9 / 255.0, alpha: 1)
 
@@ -187,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
     var showingLog = false
     var quitting = false
     var signalSources: [DispatchSourceSignal] = []
+    var choosingFolder = false
 
     lazy var session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -226,6 +244,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
 
         let config = WKWebViewConfiguration()
         config.userContentController.add(self, name: "rce")
+        config.userContentController.addUserScript(WKUserScript(
+            source: shellFeaturesScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         webView = WKWebView(frame: window.contentView!.bounds, configuration: config)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
@@ -451,6 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
             cmd("决策树", "tree", "1"),
             cmd("血缘", "lineage", "2"),
             cmd("画布", "canvas", "3"),
+            cmd("变量", "variables", "4"),
             .separator(),
             item("重新载入", #selector(reloadPage(_:)), "r"),
             .separator(),
@@ -570,10 +591,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
         guard message.name == "rce", message.frameInfo.isMainFrame else { return }
         let origin = message.frameInfo.securityOrigin
         guard origin.protocol == "http", origin.host == "127.0.0.1", origin.port == port else { return }
-        guard let body = message.body as? [String: Any], body.count == 2,
-              body["type"] as? String == "title", let text = body["text"] as? String else { return }
-        let label = sanitizedLabel(text)
-        window.title = label.isEmpty ? "RCE" : "RCE — " + label
+        guard let body = message.body as? [String: Any], body.count == 2 else { return }
+        if body["type"] as? String == "title", let text = body["text"] as? String {
+            let label = sanitizedLabel(text)
+            window.title = label.isEmpty ? "RCE" : "RCE — " + label
+        } else if body["type"] as? String == "choose-folder", let request = body["request"] as? String,
+                  isFolderRequest(request) {
+            chooseFolder(request)
+        }
+    }
+
+    // 「选择新位置…」: one directory, chosen in a sheet; the answer (or null
+    // when cancelled) goes back through the page's fixed callback.
+    func chooseFolder(_ request: String) {
+        guard !choosingFolder, appLoaded else {
+            answerFolder(request, nil)
+            return
+        }
+        choosingFolder = true
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "选择"
+        panel.message = "选择项目文件夹的新位置"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self = self else { return }
+            self.choosingFolder = false
+            let path = response == .OK ? panel.url?.path : nil
+            self.answerFolder(request, path)
+        }
+    }
+
+    func answerFolder(_ request: String, _ path: String?) {
+        let arguments: [String: Any] = ["request": request, "path": path ?? NSNull()]
+        webView.callAsyncJavaScript("window.RCE && RCE.folderChosen(request, path)", arguments: arguments,
+                                    in: nil, in: .page, completionHandler: nil)
     }
 }
 

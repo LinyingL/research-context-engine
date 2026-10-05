@@ -679,7 +679,8 @@ def test_served_app_tabs_read_in_product_language(live_server):
     mark stays RCE, and the old English tab labels are gone."""
     html = _get_raw(live_server[0], "/")[1].decode("utf-8")
     tabs = re.findall(r'<button class="tab[^"]*" data-view="(\w+)"[^>]*>([^<]+)</button>', html)
-    assert tabs == [("tree", "决策树"), ("lineage", "血缘"), ("canvas", "画布")]
+    # V5 phase 9 (9.11 "In the app"): a fourth tab, 「变量」.
+    assert tabs == [("tree", "决策树"), ("lineage", "血缘"), ("canvas", "画布"), ("variables", "变量")]
     assert '<span class="brand-mark">RCE</span>' in html
     assert ">Decision Tree<" not in html and ">Lineage<" not in html
 
@@ -2112,7 +2113,7 @@ def test_page_dispatcher_and_shell_whitelist_name_the_same_commands():
     whitelist_src = whitelist_src[: whitelist_src.index("]")]
     swift_names = set(re.findall(r'"([a-z-]+)"', whitelist_src))
     expected = {
-        "tree", "lineage", "canvas", "new-attempt", "reload", "zoom-in", "zoom-out",
+        "tree", "lineage", "canvas", "variables", "new-attempt", "reload", "zoom-in", "zoom-out",
         "zoom-reset", "fit", "reveal-project", "open-map",
     }
     assert _page_shell_commands(html) == expected

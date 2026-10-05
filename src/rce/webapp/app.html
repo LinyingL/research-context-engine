@@ -704,6 +704,54 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
 .records-problem { font-size: 0.8rem; color: var(--clay); margin-top: 0.2rem; }
 .pagefoot { gap: 1.2rem; }
 
+/* -- 变量 (DESIGN.md 9.11, task V5 phase 9): the cards, set as a readable
+   document. Ochre = waits for you (a question, a review), clay = wrong,
+   olive = 已核对; the formula in mono; long text wraps. */
+.var-intro { color: var(--ink-soft); font-size: 0.86rem; margin: 0 0 1rem; max-width: 720px; }
+.var-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; padding: 0.65rem 0.35rem; margin: 0 -0.35rem; border-bottom: 1px solid var(--line); cursor: pointer; }
+.var-row:hover { background: var(--paper-alt); }
+.var-name { font-family: var(--font-serif); font-size: 1.02rem; }
+.var-id { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-soft); }
+.var-chip { font-size: 0.72rem; line-height: 1.4; padding: 0 0.4rem; border: 1px solid var(--line-strong); background: var(--paper-alt); color: var(--ink); white-space: nowrap; }
+.var-chip.in-use { border-color: var(--olive); background: var(--olive-soft); }
+.var-chip.draft { border-color: var(--ochre); background: var(--ochre-soft); }
+.var-chip.dead { border-color: var(--gray); background: var(--gray-soft); color: var(--gray); }
+.var-chip.bad { border-color: var(--clay); background: var(--clay-soft); color: var(--clay); }
+.var-chip.wait { border-color: var(--ochre); background: var(--ochre-soft); color: var(--ochre); }
+.var-back { font: inherit; font-size: 0.82rem; color: var(--ink-soft); background: none; border: none; padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; margin-bottom: 0.9rem; }
+.var-back:hover { color: var(--ink); }
+.var-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.7rem; margin-bottom: 0.4rem; }
+.var-title { font-family: var(--font-serif); font-size: 1.35rem; margin: 0; font-weight: normal; }
+.var-aliases { font-size: 0.8rem; color: var(--ink-soft); margin-bottom: 0.9rem; }
+.var-versions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 1.2rem 0 0.9rem; }
+.var-version-btn { font: inherit; font-size: 0.78rem; padding: 0.22rem 0.6rem; background: var(--paper-alt); border: 1px solid var(--line-strong); cursor: pointer; color: var(--ink-soft); }
+.var-version-btn.active { color: var(--ink); border-color: var(--clay); box-shadow: inset 0 -2px 0 var(--clay); }
+.var-doc { border: 1px solid var(--line-strong); background: var(--paper); padding: 1.1rem 1.4rem; max-width: 820px; }
+.var-doc-label { font-size: 0.78rem; color: var(--ochre); margin-bottom: 0.5rem; }
+.var-block { margin: 0 0 1.1rem; }
+.var-block:last-child { margin-bottom: 0; }
+.var-block-title { font-family: var(--font-serif); font-size: 1rem; margin: 0 0 0.35rem; padding-bottom: 0.2rem; border-bottom: 1px solid var(--line); }
+.var-field { display: grid; grid-template-columns: 6.5rem 1fr; gap: 0.8rem; padding: 0.2rem 0; font-size: 0.88rem; }
+.var-field-label { color: var(--ink-soft); }
+.var-field-value { white-space: pre-wrap; word-break: break-word; }
+.var-field-value.formula { font-family: var(--font-mono); font-size: 0.84rem; background: var(--paper-alt); border: 1px solid var(--line); padding: 0.3rem 0.5rem; }
+.var-field-value.path { font-family: var(--font-mono); font-size: 0.8rem; }
+.var-empty-value { color: var(--ink-soft); }
+.var-input { border-left: 2px solid var(--line-strong); padding-left: 0.7rem; margin: 0.3rem 0 0.5rem; }
+.var-section { margin: 1.3rem 0 0; max-width: 820px; }
+.var-section-title { font-size: 0.8rem; color: var(--ink-soft); margin: 0 0 0.35rem; padding-bottom: 0.2rem; border-bottom: 1px solid var(--line); }
+.var-line { font-size: 0.84rem; padding: 0.18rem 0; word-break: break-word; }
+.var-line.ok { color: var(--olive); }
+.var-line.bad { color: var(--clay); }
+.var-line.soft { color: var(--ink-soft); }
+.var-line .btn-small { margin-left: 0.6rem; }
+.var-statement { font-size: 0.86rem; padding: 0.35rem 0.6rem; border-left: 2px solid var(--clay); background: var(--paper-alt); margin: 0.3rem 0; }
+.var-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.7rem; }
+.var-actions .form-input { flex: 1 1 16rem; font-size: 0.8rem; }
+.var-ask { border: 1px solid var(--ochre); background: var(--ochre-soft); padding: 0.7rem 0.9rem; margin-top: 0.7rem; font-size: 0.86rem; }
+.var-code { margin: 0; padding: 0.7rem 0.8rem; background: var(--paper-alt); border: 1px solid var(--line); font-family: var(--font-mono); font-size: 0.76rem; line-height: 1.5; white-space: pre; overflow-x: auto; }
+.var-member { border-top: 1px dashed var(--line); padding-top: 0.5rem; margin-top: 0.5rem; }
+
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
   .topbar { padding: 1rem 1rem 0.75rem; }
@@ -727,6 +775,7 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
       <button class="tab active" data-view="tree" role="tab" aria-selected="true">决策树</button>
       <button class="tab" data-view="lineage" role="tab" aria-selected="false">血缘</button>
       <button class="tab" data-view="canvas" role="tab" aria-selected="false">画布</button>
+      <button class="tab" data-view="variables" role="tab" aria-selected="false">变量</button>
     </nav>
     <div class="project-line" id="project-line"></div>
   </header>
@@ -738,6 +787,7 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
     <section id="view-tree" class="view"></section>
     <section id="view-lineage" class="view hidden"></section>
     <section id="view-canvas" class="view hidden"></section>
+    <section id="view-variables" class="view hidden"></section>
   </main>
   <footer class="pagefoot">
     <button id="records-btn" class="shutdown-btn" type="button" title="查看这个项目的人工记录放在哪里">记录</button>
@@ -835,6 +885,9 @@ function apiError(path, res, body) {
   const err = new Error((body && body.error) ? body.error : ("请求 " + path + " 失败：HTTP " + res.status));
   if (body && typeof body.state === "string") err.state = body.state;
   if (body && body.situation && typeof body.situation === "object") err.situation = body.situation;
+  // A refusal that names its own product sentence (a variable card's,
+  // `message_zh`): shown in place of the caller's framing.
+  if (body && typeof body.message_zh === "string" && body.message_zh) err.messageZh = body.message_zh;
   return err;
 }
 
@@ -1059,8 +1112,8 @@ const BLOCKING_ERROR_TEXT = {
 
 function blockingErrorText(framing, err) {
   const code = err && typeof err === "object" ? err.state : null;
-  return (typeof code === "string" && Object.prototype.hasOwnProperty.call(BLOCKING_ERROR_TEXT, code))
-    ? BLOCKING_ERROR_TEXT[code] : framing;
+  if (typeof code === "string" && Object.prototype.hasOwnProperty.call(BLOCKING_ERROR_TEXT, code)) return BLOCKING_ERROR_TEXT[code];
+  return (err && typeof err === "object" && typeof err.messageZh === "string" && err.messageZh) ? err.messageZh : framing;
 }
 
 // Replaces `el`'s content with the sentence, the 「详情」 toggle and the
@@ -1185,6 +1238,7 @@ const views = {
   tree: document.getElementById("view-tree"),
   lineage: document.getElementById("view-lineage"),
   canvas: document.getElementById("view-canvas"),
+  variables: document.getElementById("view-variables"),
 };
 let currentView = null;
 
@@ -1221,6 +1275,7 @@ function activateView(name) {
   document.body.classList.toggle("canvas-mode", name === "canvas");
   if (name === "tree" && !views.tree.dataset.loaded) loadTreeView();
   if (name === "lineage" && !views.lineage.dataset.loaded) loadLineageView();
+  if (name === "variables" && !views.variables.dataset.loaded) loadVariablesView();
   if (name === "canvas") {
     if (!views.canvas.dataset.loaded) return RCECanvas.load(views.canvas);
     RCECanvas.activate();
@@ -1432,6 +1487,10 @@ async function reloadAllViews() {
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
+  delete views.variables.dataset.loaded;
+  varState.card = null;
+  varState.version = null;
+  varState.asking = null;
   RCECanvas.reset();
   closePanel();
   // The switch itself bumped the server's generation (watcher.retarget);
@@ -1443,6 +1502,7 @@ async function reloadAllViews() {
   if (currentView === "tree") loadTreeView();
   else if (currentView === "lineage") loadLineageView();
   else if (currentView === "canvas") RCECanvas.load(views.canvas);
+  else if (currentView === "variables") loadVariablesView();
 }
 
 projectSwitcher.addEventListener("change", async () => {
@@ -1531,6 +1591,7 @@ async function revalidatePanel() {
   // V5: the 待复核 list and the 记录 inventory follow the record live.
   if (subject.kind === "review") { await renderReviewPanel(subject); return; }
   if (subject.kind === "records") { await renderRecordsPanel(subject); return; }
+  if (subject.kind === "variable-copy") return; // a kept copy does not change
   if (subject.kind !== "attempt") return;
   try {
     if (!(await ensureAttemptData())) return;
@@ -1551,6 +1612,7 @@ async function refreshCurrentView() {
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
+  delete views.variables.dataset.loaded;
   if (currentView === "tree") {
     await loadTreeView(true);
   } else if (currentView === "lineage") {
@@ -1559,6 +1621,8 @@ async function refreshCurrentView() {
     // Selection, camera, search and positions survive (RCECanvas.load
     // re-fetches /api/canvas and re-renders in place).
     await RCECanvas.load(views.canvas);
+  } else if (currentView === "variables") {
+    await loadVariablesView();
   }
   await revalidatePanel();
   loadProjectSummary(); // the pending count may have moved with the graph
@@ -2879,10 +2943,15 @@ async function renderReviewPanel(subject) {
     offerStatus.appendChild(undo);
   }
   panelBody.appendChild(offerStatus);
-  panelBody.appendChild(mk("p", "review-intro",
-    "这些判断做出时依据的事实，这次扫描看到的不一样了。判断没有被删掉，也没有被套用：连线暂时按机器的结果显示，等你决定。"));
-  if (!data.review.length) panelBody.appendChild(mk("p", "empty-note", "没有待复核的旧判断。"));
+  const cardGroups = (data.cards && data.cards.groups) || [];
+  if (data.review.length || !cardGroups.length) {
+    panelBody.appendChild(mk("p", "review-intro",
+      "这些判断做出时依据的事实，这次扫描看到的不一样了。判断没有被删掉，也没有被套用：连线暂时按机器的结果显示，等你决定。"));
+  }
+  if (!data.review.length && !cardGroups.length) panelBody.appendChild(mk("p", "empty-note", "没有待复核的旧判断。"));
   data.review.forEach((item) => panelBody.appendChild(renderReviewItem(item, subject)));
+  // 9.11 stage (b): variable cards whose implementation moved, in the same list.
+  if (cardGroups.length) renderCardReviewGroups(panelBody, data.cards);
   const held = data.source_unreadable || [], absent = data.not_in_index || [];
   if (held.length || absent.length) {
     panelBody.appendChild(mk("div", "review-quiet-title", "不计入待复核"));
@@ -3013,6 +3082,662 @@ async function renderRecordsPanel(subject) {
 }
 
 document.getElementById("records-btn").addEventListener("click", () => openRecordsPanel());
+
+// -- 变量 (9.11 "In the app"; task V5 phase 9) ------------------------------------
+// The cards, the version in use set as a readable document, the history
+// from the log, each check with its result, what is under review, the kept
+// code. The page writes only what RCE authors -- confirm (with the
+// researcher's own answer to the attestation question), 「口径未变」, open
+// the next draft, abandon / revive with a note, the two questions' answers
+// -- through POST /api/variables/<action>; never the researcher's text: a
+// card is written in its file (「在编辑器中打开」). Engine text and file
+// content are inserted as text, never as HTML.
+
+// -- Variable wording (pure; 9.11) -----------------------------------------------
+// tests/test_v5_phase9.py loads this block into node.
+const ATTESTED_WORDS = { yes: "是", no: "否", unknown: "不确定" };
+const CHECK_LABELS = { script: "实现脚本", writes: "写出输出文件", field: "表头字段" };
+const ACT_WORDS = {
+  confirmed: "确认", corrected: "更正", reaffirmed: "实现变动后确认口径未变",
+  abandoned: "弃用", revived: "恢复", removed: "以文件为准移除",
+};
+const VIA_WORDS_CARD = { app: "在应用里", cli: "在命令行里", mcp: "通过 MCP", recovered: "补回" };
+
+function atText(at) {
+  const s = at == null ? "" : String(at);
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s) ? s.slice(0, 10) + " " + s.slice(11, 16) : s;
+}
+
+// The researcher's own statement at confirmation -- worded as theirs, never
+// as RCE's finding. A 是 beside a 不符 is shown as exactly that.
+function attestedText(attested, checked) {
+  const base = "你当时的说明：输出按此口径生成 — " + (ATTESTED_WORDS[attested] || ATTESTED_WORDS.unknown);
+  if (attested !== "yes" || !checked) return base;
+  const items = [];
+  ["script", "writes", "field"].forEach((k) => { if (checked[k]) items.push([k, checked[k]]); });
+  (checked.reads || []).forEach((r) => items.push(["reads", r]));
+  const mismatch = items.filter(([, v]) => v && v.result === "不符");
+  if (!mismatch.length) return base;
+  return base + "；同时，确认时的核对是：" + mismatch.map(([k, v]) => checkLine(k, v)).join("；") +
+    "。两者并存，RCE 不替你判断哪一个对。";
+}
+
+// One check of a confirmation: 已核对 / 不符 / 未核对, with its reason.
+function checkLine(kind, item) {
+  const label = kind === "reads" ? "读取 " + (item.dataset || "") : (CHECK_LABELS[kind] || kind);
+  let text = label + " · " + (item.result || "未核对");
+  if (item.call) text += "（" + item.call + "）";
+  if (item.reason) text += " · " + item.reason;
+  return text;
+}
+
+// What was on disk at confirmation -- an observation, nothing more.
+function observedLine(kind, item) {
+  const head = kind === "output" ? "确认时磁盘上的输出文件：" + (item.path || "")
+    : "确认时磁盘上的输入文件：" + (item.dataset || "");
+  if (item.result === "未核对") return head + " · 未核对 · " + (item.reason || "");
+  const parts = [];
+  if (item.sha256) parts.push("内容指纹 " + String(item.sha256).slice(0, 8));
+  if (typeof item.size === "number") parts.push(item.size + " 字节");
+  if (!item.sha256 && item.mtime) parts.push("修改时间 " + atText(item.mtime) + "（未计算内容指纹）");
+  return head + (parts.length ? " · " + parts.join(" · ") : "");
+}
+
+// A stage-(b) comparison, always with how far it looked.
+function coverageLine(item, kind) {
+  if (kind === "script") return "实现脚本" + (item.path ? " " + item.path : "") + "：" + (item.text || "未比对");
+  return "输入 " + (item.dataset || "") + "：" + (item.text || "未比对");
+}
+
+function cardActText(entry) {
+  const what = (ACT_WORDS[entry.act] || entry.act) + (entry.version ? " v" + entry.version : "");
+  const via = VIA_WORDS_CARD[entry.via] ? "（" + VIA_WORDS_CARD[entry.via] + "）" : "";
+  return atText(entry.at) + " · " + what + via;
+}
+// -- end of variable wording ----------------------------------------------------
+
+const varState = {
+  card: null,      // the card page shown, or null for the list
+  version: null,   // the version shown on it
+  asking: null,    // "<id>:v<n>" while the attestation question is open
+  notes: new Map(), // typed notes, kept across re-renders
+};
+
+function varNote(key, placeholder) {
+  const input = mk("input", "form-input");
+  input.placeholder = placeholder;
+  input.value = varState.notes.get(key) || "";
+  input.addEventListener("input", () => varState.notes.set(key, input.value));
+  return input;
+}
+
+async function variableAction(action, body, statusEl, buttons, framing) {
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", "正在记录…");
+  let res;
+  try {
+    res = await apiPost("/api/variables/" + action, body);
+  } catch (err) {
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", framing, err);
+    return null;
+  }
+  if (res && typeof res.generation === "number") lastGeneration = res.generation;
+  await refreshCurrentView();
+  return res;
+}
+
+async function loadVariablesView() {
+  const host = views.variables;
+  const epoch = state.dataEpoch;
+  views.variables.dataset.loaded = "1";
+  if (!host.childElementCount) host.appendChild(mk("p", "empty-note", "载入中…"));
+  let data;
+  try {
+    data = varState.card
+      ? await apiGet("/api/variables/card?id=" + encodeURIComponent(varState.card))
+      : await apiGet("/api/variables");
+  } catch (err) {
+    if (epoch !== state.dataEpoch) return;
+    if (varState.card && err.state === "card_no_such_card") {
+      varState.card = null; // the card went away: back to the list
+      return loadVariablesView();
+    }
+    renderViewFailure(host, err);
+    return;
+  }
+  if (epoch !== state.dataEpoch || currentView !== "variables") {
+    if (epoch === state.dataEpoch) delete views.variables.dataset.loaded;
+    return;
+  }
+  const top = window.scrollY;
+  host.innerHTML = "";
+  if (varState.card) renderVariableCard(host, data);
+  else renderVariableList(host, data);
+  window.scrollTo(0, top);
+}
+
+function openVariableCard(id) {
+  varState.card = id;
+  varState.version = null;
+  varState.asking = null;
+  closePanel();
+  if (currentView !== "variables") activateView("variables");
+  else loadVariablesView();
+  if (currentView === "variables") window.scrollTo(0, 0);
+}
+
+function cardChips(row) {
+  const chips = [];
+  if (row.state && row.state !== "ok") chips.push(["无法读取", "bad"]);
+  if (row.abandoned) chips.push(["已弃用", "dead"]);
+  else if (row.in_use != null) chips.push(["使用 v" + row.in_use, "in-use"]);
+  if (row.draft != null) chips.push(["草稿 v" + row.draft, "draft"]);
+  if (row.in_use == null && row.draft == null && !row.abandoned && row.state === "ok") chips.push(["还没有版本", ""]);
+  return chips;
+}
+
+function renderVariableList(host, data) {
+  host.appendChild(mk("h2", "section-title", "变量定义卡"));
+  const rows = data.cards || [];
+  if (!rows.length) {
+    const card = mk("div", "guide-card");
+    card.appendChild(mk("h2", null, "还没有变量定义卡"));
+    (data.empty_help.lines || []).forEach((l) => card.appendChild(mk("p", null, l)));
+    card.appendChild(mk("pre", null, data.empty_help.command));
+    host.appendChild(card);
+    return;
+  }
+  host.appendChild(mk("p", "var-intro", "研究口径由你在卡片文件里书写；RCE 只记录确认、弃用等动作，并对照文件核对实现依据。"));
+  rows.forEach((row) => {
+    const div = mk("div", "var-row");
+    div.append(mk("span", "var-name", row.name), mk("span", "var-id", row.id));
+    cardChips(row).forEach(([text, cls]) => div.appendChild(mk("span", "var-chip " + cls, text)));
+    if (row.under_review) div.appendChild(mk("span", "var-chip wait", "待复核 · " + row.review_labels.join("、")));
+    if (row.questions) div.appendChild(mk("span", "var-chip wait", "有 " + row.questions + " 个版本在确认后被改动"));
+    if (row.state !== "ok" && row.message) div.appendChild(mk("span", "var-chip bad", row.message));
+    else if (row.trust_state && row.trust_state !== "ok" && row.message) div.appendChild(mk("span", "var-chip bad", row.message));
+    (row.dead_flags || []).forEach((f) => div.appendChild(mk("span", "var-chip wait", f.message)));
+    div.addEventListener("click", () => openVariableCard(row.id));
+    host.appendChild(div);
+  });
+}
+
+function versionLabel(v) {
+  if (v.status === "draft") return "v" + v.version + " · 草稿";
+  if (v.status === "in_use") return "v" + v.version + " · 使用中";
+  if (v.status === "superseded") return "v" + v.version + " · 已被 v" + v.superseded_by.version + " 取代（" + atText(v.superseded_by.at) + "）";
+  if (v.status === "removed") return "v" + v.version + " · 已移除";
+  if (v.status === "orphan_draft") return "v" + v.version + " · 未确认（不是最新编号）";
+  return "v" + v.version + " · 已确认";
+}
+
+function defaultVersion(card) {
+  const numbers = card.versions.map((v) => v.version);
+  if (varState.version != null && numbers.indexOf(varState.version) >= 0) return varState.version;
+  if (card.in_use != null) return card.in_use;
+  if (card.draft != null) return card.draft;
+  return numbers.length ? numbers[numbers.length - 1] : null;
+}
+
+function fieldRow(parent, label, value, cls) {
+  const row = mk("div", "var-field");
+  row.appendChild(mk("div", "var-field-label", label));
+  const blank = value == null || (typeof value === "string" && !value.trim()) || (Array.isArray(value) && !value.length);
+  const shown = blank ? "（未填写）" : Array.isArray(value) ? value.join("、") : String(value);
+  row.appendChild(mk("div", "var-field-value" + (blank ? " var-empty-value" : cls ? " " + cls : ""), shown));
+  parent.appendChild(row);
+}
+
+function varBlock(doc, title) {
+  const block = mk("div", "var-block");
+  block.appendChild(mk("h3", "var-block-title", title));
+  doc.appendChild(block);
+  return block;
+}
+
+// The five blocks of 9.11, as the researcher wrote them.
+function renderDefinition(doc, content) {
+  const c = content || {};
+  const meaning = varBlock(doc, "含义");
+  fieldRow(meaning, "含义", c.meaning);
+  fieldRow(meaning, "单位", c.unit);
+  fieldRow(meaning, "粒度", c.granularity);
+  const inputs = varBlock(doc, "输入");
+  if (!(c.input || []).length) inputs.appendChild(mk("div", "var-line soft", "（未填写）"));
+  (c.input || []).forEach((item) => {
+    const box = mk("div", "var-input");
+    if (item.variable) fieldRow(box, "变量", item.variable, "path");
+    else fieldRow(box, "数据文件", item.dataset, "path");
+    if (item.fields) fieldRow(box, "字段", item.fields, "path");
+    if (item.data_version != null) fieldRow(box, "数据版本", item.data_version);
+    inputs.appendChild(box);
+  });
+  const cons = varBlock(doc, "构建口径");
+  const k = c.construction || {};
+  fieldRow(cons, "公式", k.formula, "formula");
+  [["filter", "筛选"], ["aggregation", "聚合"], ["missing", "缺失处理"], ["transform", "变换"], ["params", "参数"]]
+    .forEach(([key, label]) => fieldRow(cons, label, k[key]));
+  const impl = varBlock(doc, "实现依据");
+  const m = c.implementation || {};
+  fieldRow(impl, "脚本", m.script, "path");
+  if (m.chunk) fieldRow(impl, "代码块", m.chunk, "path");
+  if (m.function) fieldRow(impl, "函数", m.function, "path");
+  fieldRow(impl, "输出文件", m.output, "path");
+  fieldRow(impl, "字段", m.field, "path");
+  if (m.code_version) fieldRow(impl, "代码版本", m.code_version);
+  const dec = varBlock(doc, "人工决策");
+  const d = c.decision || {};
+  fieldRow(dec, "理由", d.why);
+  fieldRow(dec, "决定人", d.decided_by);
+  fieldRow(dec, "采用日期", d.adopted_on);
+}
+
+async function openVariableCopy(cardId, entry, kind) {
+  const subject = { kind: "variable-copy" };
+  state.panelSubject = subject;
+  panelTitle.textContent = kind === "code" ? "当时的代码" : "当时的文字";
+  panelTitle.title = "";
+  panelSubtitle.textContent = cardId + " · " + cardActText(entry);
+  panelBody.innerHTML = "";
+  panelBody.appendChild(mk("p", "empty-note", "载入中…"));
+  openPanel();
+  let data;
+  try {
+    data = await apiGet("/api/variables/" + (kind === "code" ? "code" : "frozen") +
+      "?id=" + encodeURIComponent(cardId) + "&entry=" + encodeURIComponent(entry.id));
+  } catch (err) {
+    if (state.panelSubject !== subject) return;
+    panelBody.innerHTML = "";
+    const box = mk("div", "notice-status err");
+    renderBlockingError(box, kind === "code" ? "无法读取当时的代码副本" : "无法读取当时的文字副本", err);
+    panelBody.appendChild(box);
+    return;
+  }
+  if (state.panelSubject !== subject) return;
+  panelBody.innerHTML = "";
+  panelBody.appendChild(mk("div", "fact-line", kind === "code"
+    ? "确认时复制下来的脚本：.rce/variables/" + data.copy + "（不会被改动）"
+    : "确认时冻结的版本文字：" + data.frozen + "（不会被改动）"));
+  if (data.truncated) panelBody.appendChild(mk("div", "truncated-note", "只显示了开头的部分。"));
+  panelBody.appendChild(mk("pre", "var-code", data.text));
+}
+
+function confirmationSection(host, card, v) {
+  const sec = mk("div", "var-section");
+  sec.appendChild(mk("div", "var-section-title", "确认记录"));
+  const entry = v.entry || {};
+  sec.appendChild(mk("div", "var-line", "确认于 " + atText(v.confirmed_at) +
+    (entry.act === "corrected" ? "；当前文字来自 " + atText(entry.at) + " 的更正" : "")));
+  sec.appendChild(mk("div", "var-statement", attestedText(v.attested, v.checked)));
+  const checked = v.checked || {};
+  const lines = [];
+  ["script", "writes"].forEach((k) => { if (checked[k]) lines.push([k, checked[k]]); });
+  (checked.reads || []).forEach((r) => lines.push(["reads", r]));
+  if (checked.field) lines.push(["field", checked.field]);
+  if (lines.length) sec.appendChild(mk("div", "var-section-title", "确认时对照文件的核对"));
+  lines.forEach(([k, item]) => {
+    const cls = item.result === "已核对" ? " ok" : item.result === "不符" ? " bad" : " soft";
+    const line = mk("div", "var-line" + cls, checkLine(k, item));
+    if (k === "script" && item.copy) {
+      line.appendChild(mkButton("查看当时的代码", "btn btn-small", () => openVariableCopy(card.id, entry, "code")));
+    }
+    sec.appendChild(line);
+  });
+  const observed = v.observed || {};
+  if (observed.output || (observed.inputs || []).length) sec.appendChild(mk("div", "var-section-title", "观察（只说明当时磁盘上有什么，不说明文件由这一版生成）"));
+  if (observed.output) sec.appendChild(mk("div", "var-line soft", observedLine("output", observed.output)));
+  (observed.inputs || []).forEach((i) => sec.appendChild(mk("div", "var-line soft", observedLine("input", i))));
+  if (v.copy_missing) sec.appendChild(mk("div", "var-line bad", v.copy_missing));
+  if (v.reference) {
+    sec.appendChild(mk("div", "var-line soft", "引用这一版：" + v.reference.label +
+      (v.reference.resolves === false ? "（引用暂不可解析）" : "")));
+  }
+  (v.upstream || []).forEach((u) => sec.appendChild(mk("div", "var-line soft", "建立在 " + u.ref + " 之上" + (u.resolves ? "" : "（" + u.unresolvable + "）"))));
+  (v.upstream_notes || []).forEach((n) => sec.appendChild(mk("div", "var-line", n)));
+  host.appendChild(sec);
+}
+
+function draftActions(host, card, v) {
+  const actions = mk("div", "var-actions");
+  const status = mk("div", "notice-status");
+  const buttons = [];
+  const path = ".rce/variables/" + card.id + "/" + v.file;
+  const open = mkButton("在编辑器中打开", "btn", () => runOpenAction(path, false, status));
+  actions.appendChild(open);
+  const blocked = humanRecordsBlocked();
+  const key = card.id + ":v" + v.version;
+  if (blocked) {
+    actions.appendChild(mk("span", "review-note", blocked));
+  } else if (v.status === "draft") {
+    const ask = mkButton("确认这一版", "btn btn-primary", () => { varState.asking = key; loadVariablesView(); });
+    buttons.push(ask);
+    actions.appendChild(ask);
+  }
+  host.append(actions);
+  if (varState.asking === key && !blocked && v.status === "draft") {
+    const box = mk("div", "var-ask");
+    box.appendChild(mk("div", "notice-title", "确认之前，回答一个问题（只问这一次）"));
+    box.appendChild(mk("p", null, "输出文件现在的内容，是按这一版口径生成的吗？你的回答会作为你本人的说明记下来；RCE 不会凭文件指纹替你推断。"));
+    const row = mk("div", "var-actions");
+    [["yes", "是"], ["no", "否"], ["unknown", "不确定"]].forEach(([answer, label]) => {
+      const b = mkButton(label, "btn", async () => {
+        const res = await variableAction("confirm", { id: card.id, attested: answer }, status, buttons, "没能确认这一版");
+        if (res) { varState.asking = null; varState.version = res.version; }
+      });
+      buttons.push(b);
+      row.appendChild(b);
+    });
+    const cancel = mkButton("先不确认", "btn", () => { varState.asking = null; loadVariablesView(); });
+    row.appendChild(cancel);
+    box.appendChild(row);
+    host.appendChild(box);
+  }
+  host.appendChild(status);
+}
+
+function inUseActions(host, card, v) {
+  const blocked = humanRecordsBlocked();
+  const actions = mk("div", "var-actions");
+  const status = mk("div", "notice-status");
+  if (blocked) {
+    actions.appendChild(mk("span", "review-note", blocked));
+    host.append(actions);
+    return;
+  }
+  const buttons = [];
+  if (card.draft == null) {
+    const revise = mkButton("修订口径", "btn", () => variableAction("revise", { id: card.id }, status, buttons, "没能打开下一版草稿")
+      .then((res) => { if (res) { varState.version = res.version; loadVariablesView(); } }));
+    revise.title = "把这一版的文件原样复制为下一版草稿，在草稿里改";
+    buttons.push(revise);
+    actions.appendChild(revise);
+  } else {
+    actions.appendChild(mk("span", "review-note", "已有草稿 v" + card.draft + "：在草稿里改，确认后它取代这一版"));
+  }
+  const note = varNote("abandon:" + card.id, "弃用的理由（必填，用你自己的话）");
+  const abandon = mkButton("弃用", "btn", () => {
+    if (!note.value.trim()) { setStatus(status, "err", "请写下弃用的理由"); return; }
+    variableAction("abandon", { id: card.id, note: note.value }, status, buttons, "没能弃用这个变量")
+      .then((res) => { if (res) varState.notes.delete("abandon:" + card.id); });
+  });
+  buttons.push(abandon);
+  actions.append(note, abandon);
+  host.append(actions, status);
+}
+
+function renderVersion(host, card, v) {
+  const doc = mk("div", "var-doc");
+  if (v.status === "draft" || v.status === "orphan_draft") doc.appendChild(mk("div", "var-doc-label", v.label || "草稿 · 改动不留版本"));
+  if (v.error) {
+    const err = mk("div", "notice-status err");
+    renderBlockingError(err, v.file_state === "invalid"
+      ? "这个版本文件有一处无法读取" + (v.line ? "（第 " + v.line + " 行）" : "")
+      : "这个版本文件现在无法读取", v.error);
+    doc.appendChild(err);
+  }
+  if (v.question) {
+    doc.appendChild(mk("div", "var-doc-label", "文件在确认后被改动了；下面是确认时的文字，改动没有生效。"));
+  }
+  if (v.content) renderDefinition(doc, v.content);
+  else if (!v.error) doc.appendChild(mk("div", "var-line soft", "这个版本的文件不在了。"));
+  host.appendChild(doc);
+  if (v.status === "draft" || v.status === "orphan_draft") draftActions(host, card, v);
+  if (v.entry) confirmationSection(host, card, v);
+  if (v.status === "in_use" && !card.abandoned) inUseActions(host, card, v);
+}
+
+function questionNotice(card, q) {
+  const box = notice("warn");
+  noticeHead(box, q.message);
+  box.appendChild(mk("p", null, "RCE 没有采用改动后的文字，现在生效的仍是确认时的那一份。请告诉 RCE 这次改动是什么："));
+  const status = mk("div", "notice-status");
+  const buttons = [];
+  const help = {
+    new: "改动后的文字成为新草稿 v" + card.next_version + "；v" + q.version + " 的文件按冻结副本原样放回。",
+    correct: "这是更正（错字、表述更清楚、脚本换了位置）：记一条更正，前后两种文字都保留可读。",
+  };
+  if (humanRecordsBlocked()) {
+    box.appendChild(mk("p", null, humanRecordsBlocked()));
+    return box;
+  }
+  q.answers.forEach((answer) => {
+    const row = mk("div", "answer");
+    const b = mkButton(q.answer_labels[answer], "btn", () =>
+      variableAction("answer", { id: card.id, question: "edited", answer: answer, version: q.version }, status, buttons, "没能完成这个回答"));
+    buttons.push(b);
+    row.append(b, mk("span", "answer-help", help[answer] || ""));
+    box.appendChild(row);
+  });
+  box.appendChild(status);
+  return box;
+}
+
+function cardTrustNotice(card) {
+  const trust = card.trust || {};
+  if (card.state === "ok" && (!trust.state || trust.state === "ok")) return null;
+  if (trust.state === "shrunk") {
+    const missing = trust.missing || [];
+    const box = notice("warn");
+    noticeHead(box, trust.message || "变量卡的记录文件比图谱少了 " + missing.length + " 条记录");
+    box.appendChild(mk("p", null, "图谱记得下面这些记录，但卡片的 log.toml 里没有了。RCE 什么都没改，等你决定以哪一份为准。"));
+    const list = mk("ul", "entry-list");
+    missing.forEach((m) => list.appendChild(mk("li", null, cardActText(m) + (m.note ? " · " + m.note : ""))));
+    box.appendChild(list);
+    const ids = missing.map((m) => m.id);
+    const status = mk("div", "notice-status");
+    const buttons = [];
+    [["file", "以文件为准", "图谱忘掉这些记录；被移除的版本编号不再使用。"],
+     ["restore", "把缺少的补回文件", "把这些记录按原样追加回 log.toml 末尾（标为补回）。"]].forEach(([answer, label, help]) => {
+      const row = mk("div", "answer");
+      const b = mkButton(label, "btn", () =>
+        variableAction("answer", { id: card.id, question: "shrunk", answer: answer, missing: ids }, status, buttons, "没能完成这个回答"));
+      buttons.push(b);
+      row.append(b, mk("span", "answer-help", help));
+      box.appendChild(row);
+    });
+    box.appendChild(status);
+    return box;
+  }
+  const box = notice("bad");
+  noticeHead(box, card.message || trust.message || "这张变量卡当前无法读取");
+  box.appendChild(mk("p", null, "修好之前，这张卡的确认、弃用等动作都不会被记录；其他卡片照常。"));
+  const raw = [card.detail || trust.detail].concat(card.problems || []).filter(Boolean).join("\n");
+  if (raw) {
+    const d = mk("div", "notice-status");
+    renderBlockingError(d, "", raw);
+    box.appendChild(d);
+  }
+  return box;
+}
+
+function abandonedNotice(card) {
+  const a = card.abandoned;
+  const box = notice("");
+  noticeHead(box, "已弃用 · " + atText(a.at));
+  box.appendChild(mk("p", null, "你当时写下的理由：" + (a.note || "")));
+  box.appendChild(mk("p", null, "弃用期间没有版本在使用；每个确认过的版本仍可被引用、仍可阅读。"));
+  const status = mk("div", "notice-status");
+  const blocked = humanRecordsBlocked();
+  if (blocked) { box.appendChild(mk("p", null, blocked)); return box; }
+  const actions = mk("div", "var-actions");
+  const note = varNote("revive:" + card.id, "恢复的理由（必填）");
+  const buttons = [];
+  const revive = mkButton("恢复", "btn", () => {
+    if (!note.value.trim()) { setStatus(status, "err", "请写下恢复的理由"); return; }
+    variableAction("revive", { id: card.id, note: note.value }, status, buttons, "没能恢复这个变量")
+      .then((res) => { if (res) varState.notes.delete("revive:" + card.id); });
+  });
+  buttons.push(revive);
+  actions.append(note, revive);
+  box.append(actions, status);
+  return box;
+}
+
+// The stage-(b) comparison of one card's version in use: how far it looked,
+// and -- when something moved -- the two answers.
+function implementationSection(host, card, review) {
+  const sec = mk("div", "var-section");
+  sec.appendChild(mk("div", "var-section-title", "实现依据现在的样子（与 v" + review.version + " 最近一次" +
+    (review.baseline_act === "reaffirmed" ? "确认口径未变" : review.baseline_act === "corrected" ? "更正" : "确认") +
+    "时相比，" + atText(review.baseline_at) + "）"));
+  sec.appendChild(mk("div", "var-line" + (review.script.state === "same" ? "" : review.script.state === "changed" || review.script.state === "region_missing" ? " bad" : " soft"),
+    coverageLine(review.script, "script")));
+  review.inputs.forEach((i) => sec.appendChild(mk("div", "var-line" + (i.state === "changed" ? " bad" : i.state === "same" ? "" : " soft"), coverageLine(i, "input"))));
+  const large = review.inputs.some((i) => i.large && i.state === "same" && i.coverage !== "full");
+  const status = mk("div", "notice-status");
+  if (large && !humanRecordsBlocked()) {
+    const actions = mk("div", "var-actions");
+    const full = mkButton("完整比对", "btn btn-small", () =>
+      variableAction("full-compare", { id: card.id }, status, [full], "没能完成完整比对"));
+    full.title = "逐字节计算大文件的内容指纹，与确认时记下的比较（可能要一会儿）";
+    actions.append(full, mk("span", "answer-help", "大文件只比较了大小；需要时可以逐字节比对。"));
+    sec.appendChild(actions);
+  }
+  sec.appendChild(status);
+  if (review.under_review) sec.appendChild(cardReviewMember(review, true));
+  host.appendChild(sec);
+}
+
+// One card under review, with 「口径未变」 / 「口径已变」.
+function cardReviewMember(review, standalone) {
+  const box = mk("div", standalone ? "var-ask" : "var-member");
+  const title = mk("div", "review-link", (review.name || review.card) + " · " + review.card + " v" + review.version);
+  if (!standalone) {
+    title.classList.add("clickable");
+    title.addEventListener("click", () => openVariableCard(review.card));
+  }
+  box.appendChild(title);
+  review.reasons.forEach((r) => box.appendChild(mk("span", "review-reason", r.label)));
+  if (!standalone) {
+    box.appendChild(mk("div", "var-line soft", coverageLine(review.script, "script")));
+    review.inputs.forEach((i) => box.appendChild(mk("div", "var-line soft", coverageLine(i, "input"))));
+  }
+  box.appendChild(mk("p", "review-note", review.cannot_tell));
+  const status = mk("div", "notice-status");
+  const blocked = humanRecordsBlocked();
+  if (blocked) {
+    box.appendChild(mk("p", "review-note", blocked));
+    return box;
+  }
+  const actions = mk("div", "var-actions");
+  const buttons = [];
+  const region = review.reasons.some((r) => r.code === "chunk_missing" || r.code === "function_missing");
+  let dataVersion = null;
+  if (review.needs_data_version && !region) {
+    dataVersion = varNote("dv:" + review.card + ":" + review.signature, "新的数据版本说明（必填），例：2017-01 至 2024-12，2026-10 重新下载");
+    actions.appendChild(dataVersion);
+  }
+  if (region) {
+    box.appendChild(mk("p", "review-note", "卡片指定的代码块或函数找不到了：如果只是改了名字，在卡片文件里改正 chunk / function，再回答「这是更正」；否则选「口径已变」。"));
+  } else {
+    const same = mkButton("口径未变", "btn", () => {
+      if (dataVersion && !dataVersion.value.trim()) { setStatus(status, "err", "输入数据变了：请写下新的数据版本说明"); return; }
+      const item = { id: review.card, version: review.version, signature: review.signature };
+      if (dataVersion) item.data_version = dataVersion.value.trim();
+      variableAction("reaffirm", { items: [item] }, status, buttons, "没能记下口径未变");
+    });
+    same.title = "记下：实现变了，但这一版的口径没有变（附上现在的指纹）";
+    buttons.push(same);
+    actions.appendChild(same);
+  }
+  if (review.draft != null) {
+    actions.appendChild(mk("span", "review-note", review.draft_note));
+  } else {
+    const changed = mkButton("口径已变", "btn", () =>
+      variableAction("revise", { id: review.card }, status, buttons, "没能打开下一版草稿"));
+    changed.title = "打开下一版草稿，在草稿里写下新的口径";
+    buttons.push(changed);
+    actions.appendChild(changed);
+  }
+  box.append(actions, status);
+  return box;
+}
+
+// The cards' part of the 待复核 list: one item per changed script.
+function renderCardReviewGroups(host, cardItems) {
+  host.appendChild(mk("div", "review-quiet-title", "变量卡：实现依据有变化"));
+  cardItems.groups.forEach((group) => {
+    const box = mk("div", "review-item");
+    if (group.script) {
+      box.appendChild(mk("div", "review-link", group.script));
+      box.appendChild(mk("span", "review-reason", group.message));
+    } else {
+      box.appendChild(mk("div", "review-link", "输入数据"));
+    }
+    const status = mk("div", "notice-status");
+    const answerable = group.cards.filter((m) => m.draft == null);
+    const together = group.cards.length > 1 && answerable.length > 1 && !humanRecordsBlocked() &&
+      answerable.every((m) => !m.needs_data_version && !m.reasons.some((r) => r.code !== "script_changed"));
+    if (together) {
+      const actions = mk("div", "var-actions");
+      const all = mkButton("全部口径未变", "btn btn-primary", () => variableAction("reaffirm", {
+        items: answerable.map((m) => ({ id: m.card, version: m.version, signature: m.signature })),
+      }, status, [all], "没能全部记下口径未变"));
+      all.title = "为下面每张卡各记一条「口径未变」";
+      actions.append(all, mk("span", "answer-help", "下面 " + answerable.length + " 张卡各记一条；也可以逐个回答。"));
+      box.append(actions, status);
+    }
+    group.cards.forEach((m) => box.appendChild(cardReviewMember(m, false)));
+    host.appendChild(box);
+  });
+}
+
+function renderVariableCard(host, card) {
+  const back = mkButton("← 全部变量", "var-back", () => { varState.card = null; varState.version = null; loadVariablesView(); });
+  host.appendChild(back);
+  const head = mk("div", "var-head");
+  head.append(mk("h2", "var-title", card.name), mk("span", "var-id", card.id));
+  cardChips({ state: card.state, abandoned: !!card.abandoned, in_use: card.in_use, draft: card.draft })
+    .forEach(([text, cls]) => head.appendChild(mk("span", "var-chip " + cls, text)));
+  host.appendChild(head);
+  const shownVersion = card.versions.find((v) => v.version === card.in_use) || card.versions[card.versions.length - 1];
+  const aliases = shownVersion && shownVersion.content && shownVersion.content.aliases;
+  if (aliases && aliases.length) host.appendChild(mk("div", "var-aliases", "尝试表里的写法：" + aliases.join("、")));
+  const notes = mk("div", "notices");
+  const trust = cardTrustNotice(card);
+  if (trust) notes.appendChild(trust);
+  if (card.abandoned) notes.appendChild(abandonedNotice(card));
+  (card.questions || []).forEach((q) => notes.appendChild(questionNotice(card, q)));
+  (card.dead_flags || []).forEach((f) => {
+    const box = notice("warn");
+    noticeHead(box, f.message);
+    box.appendChild(mk("p", null, f.direction === "card_only"
+      ? "这张卡已弃用，但 .rce/attempts.toml 的已弃用变量列表里没有它的任何写法。"
+      : "attempts.toml 把「" + (f.dead || []).join("、") + "」列为已弃用，但这张卡没有弃用。两处说法不一致，RCE 不替你统一。"));
+    notes.appendChild(box);
+  });
+  if (notes.childElementCount) host.appendChild(notes);
+  if (!card.versions.length) {
+    host.appendChild(mk("p", "empty-note", "这张卡还没有版本文件。"));
+    return;
+  }
+  const selected = defaultVersion(card);
+  const tabs = mk("div", "var-versions");
+  card.versions.forEach((v) => {
+    const b = mkButton(versionLabel(v), "var-version-btn" + (v.version === selected ? " active" : ""), () => {
+      varState.version = v.version;
+      loadVariablesView();
+    });
+    tabs.appendChild(b);
+  });
+  host.appendChild(tabs);
+  const v = card.versions.find((x) => x.version === selected);
+  if (card.implementation && v && v.version === card.implementation.version) implementationSection(host, card, card.implementation);
+  if (v) renderVersion(host, card, v);
+  const hist = mk("div", "var-section");
+  hist.appendChild(mk("div", "var-section-title", "记录（log.toml，按追加顺序）"));
+  if (!(card.history || []).length) hist.appendChild(mk("div", "var-line soft", "还没有记录：草稿确认之前，log.toml 里什么都没有。"));
+  (card.history || []).forEach((e) => {
+    const line = mk("div", "var-line", cardActText(e));
+    if (e.attested) line.appendChild(mk("span", "var-id", " · 说明：输出按此口径生成 — " + (ATTESTED_WORDS[e.attested] || e.attested)));
+    if (e.note) line.appendChild(mk("div", "entry-sub", "理由：" + e.note));
+    if (e.frozen) line.appendChild(mkButton("查看这一版当时的文字", "btn btn-small", () => openVariableCopy(card.id, e, "frozen")));
+    hist.appendChild(line);
+  });
+  host.appendChild(hist);
+}
+// -- end of the 变量 view --------------------------------------------------------
 
 // -- Notices above the views ------------------------------------------------------
 // One place for what the record needs from the researcher, rebuilt from
@@ -3630,6 +4355,7 @@ const SHELL_COMMANDS = {
   "tree": () => activateView("tree"),
   "lineage": () => activateView("lineage"),
   "canvas": () => activateView("canvas"),
+  "variables": () => activateView("variables"),
   "new-attempt": () => openAttemptForm("append"),
   "reload": () => window.location.reload(),
   "zoom-in": () => shellZoom(1),

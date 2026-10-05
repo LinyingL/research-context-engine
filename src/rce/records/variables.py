@@ -454,7 +454,8 @@ CARD_LOG_SCHEMA = LedgerSchema(
     key_fields=(),
     field_order=(
         "id", "seq", "at", "act", "version", "via", "attested", "content", "previous", "corrects", "frozen",
-        "note", "recovered_from", "recovered_at", "upstream", "checked", "observed",
+        "note", "reaffirms", "reasons", "data_version", "recovered_from", "recovered_at", "upstream", "checked",
+        "observed", "coverage",
     ),
     header=_LOG_HEADER,
     validate=_validate_log_entry,
