@@ -143,7 +143,9 @@ Endpoints (all GET unless noted):
     GET  /api/variables, /api/variables/card?id=, /api/variables/code?id=&entry=,
          /api/variables/frozen?id=&entry=  -- the 「变量」 view's reads (9.11;
                             see `rce.webapp.variables_api`); a blocked
-                            project is read from its files alone.
+                            project answers 409 `project_blocked` with its
+                            situation, a folder moved under the engine 409
+                            `project_moved`.
     POST /api/variables/<confirm|revise|reaffirm|abandon|revive|answer|
          full-compare>   -- only what RCE authors on a card, through
                             `rce.records.cards` (never the researcher's
@@ -1892,9 +1894,30 @@ def _variables_conn(served: ServedProject) -> Connection | None:
         return None
 
 
+def _variables_served(served: ServedProject) -> None:
+    """The 「变量」 view answers for the project the page serves, or says why
+    it cannot -- never an empty list or a wrong reason for the researcher's
+    cards (9.4): a project with a question to answer first (a copy, a folder
+    that is gone: 「找不到项目文件夹（可能已移动）」 with 「选择新位置…」) is
+    409 `project_blocked` with its situation, as on every other view; a
+    folder that moved or was claimed under the running engine is 409
+    `project_moved` (「请重新打开」)."""
+    if served.blocked is not None:
+        raise ProjectBlockedError(served.blocked)
+    if served.project_id is None:
+        return
+    if not served.root.is_dir():
+        raise ProjectMovedApiError(f"{served.root} is not there any more; reopen the project")
+    got = records_situation.read_identity(served.root)
+    if got.state is records_situation.IdentityState.PRESENT and got.identity and got.identity.id != served.project_id:
+        raise ProjectMovedApiError(f"{served.root} now holds project {got.identity.id}, not {served.project_id}; reopen it")
+
+
 def variables_get(served: ServedProject, path: str, query: dict[str, list[str]]) -> dict[str, Any]:
-    """The 「变量」 view's GET endpoints (`rce.webapp.variables_api`)."""
+    """The 「变量」 view's GET endpoints (`rce.webapp.variables_api`), for a
+    project that is served as itself (`_variables_served`)."""
     arg = lambda name: (query.get(name) or [None])[0]  # noqa: E731
+    _variables_served(served)
     conn = _variables_conn(served)
     try:
         if path == "/api/variables":
@@ -2295,8 +2318,9 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/review":
                 self._json_from_conn(review_payload)
             elif path == "/api/variables" or path.startswith("/api/variables/"):
-                # The 「变量」 view (9.11). Read even for a blocked project --
-                # from the card files alone; nothing is written.
+                # The 「变量」 view (9.11): the cards are read from their files
+                # (the index adds the trust decision); a blocked or moved
+                # project answers 409 with what to do (`_variables_served`).
                 self._send_json(200, variables_get(self._served(), path, query))
             elif path == "/api/migration":
                 self._send_json(200, migration_payload(self._served()))

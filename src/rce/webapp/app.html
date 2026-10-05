@@ -912,7 +912,14 @@ async function apiGet(path) {
     }
   }
   if (!res.ok) {
-    throw apiError(path, res, body);
+    const err = apiError(path, res, body);
+    // 9.4: the folder moved (or was claimed) under this page -- said once,
+    // above the views, with 「重新打开」, whichever request found it.
+    if (err.state === "project_moved" && !state.projectMoved) {
+      state.projectMoved = true;
+      renderNotices();
+    }
+    throw err;
   }
   return body;
 }
@@ -975,6 +982,12 @@ const NODE_KIND_WORDS = { claim: "论断", experiment: "实验", commit: "提交
 const BASIS_RECORDED_WORDS = {
   "at-migration": "（迁移时核对过）", "last-known": "（最近一次读到时）", "old-index": "（旧索引里的记录）",
 };
+
+// A 9.6 candidate the old verdict was already applied to (its link now
+// carries that verdict): said, never offered again -- one click, one entry.
+function candidateApplied(candidate, verdict) {
+  return !!candidate && (verdict === "confirmed" || verdict === "rejected") && candidate.status === verdict;
+}
 
 function verdictWord(verdict) {
   return Object.prototype.hasOwnProperty.call(VERDICT_WORDS, verdict) ? VERDICT_WORDS[verdict] : String(verdict || "");
@@ -2804,7 +2817,10 @@ function reviewActions(item) {
   return [["仍然成立", item.verdict], opposite, ["撤回", "withdrawn"]];
 }
 
-async function judgeFromReview(target, verdict, note, statusEl, buttons, done) {
+// `origin`: the review item the act was made from -- the 「撤销」 offer is
+// shown inside it while it is still listed (never only at the top of a
+// scrolled panel, where it would expire unseen).
+async function judgeFromReview(target, verdict, note, statusEl, buttons, done, origin) {
   buttons.forEach((b) => { b.disabled = true; });
   setStatus(statusEl, "", "正在记录…");
   try {
@@ -2817,7 +2833,10 @@ async function judgeFromReview(target, verdict, note, statusEl, buttons, done) {
     return;
   }
   reviewNotes.delete(keyId(target));
-  state.reviewOffer = { text: done + "：" + linkText(target), key: keyOf(target), until: Date.now() + JUDGE_UNDO_MS };
+  state.reviewOffer = {
+    text: done + "：" + linkText(target), key: keyOf(target), until: Date.now() + JUDGE_UNDO_MS,
+    origin: origin || null, shown: false,
+  };
   setTimeout(() => {
     if (state.reviewOffer && state.reviewOffer.until <= Date.now()) {
       state.reviewOffer = null;
@@ -2885,10 +2904,16 @@ function renderReviewItem(item, subject) {
       const row = mk("div", "review-cand");
       const t = mk("span", "review-link", linkText(c));
       t.title = c.src + " → " + c.dst;
-      const b = mkButton("把这条旧判断用到它上面", "btn btn-small", () =>
-        judgeFromReview(c, item.verdict, noteInput.value, status, buttons, "已用到新关联上（" + verdictWord(item.verdict) + "）"));
-      buttons.push(b);
-      row.append(t, b);
+      row.appendChild(t);
+      if (candidateApplied(c, item.verdict)) {
+        // Applied already (9.6: one click, one entry): said, not offered again.
+        row.appendChild(mk("span", "review-note", "已用到这条关联上（" + verdictWord(item.verdict) + "）"));
+      } else {
+        const b = mkButton("把这条旧判断用到它上面", "btn btn-small", () =>
+          judgeFromReview(c, item.verdict, noteInput.value, status, buttons, "已用到新关联上（" + verdictWord(item.verdict) + "）", id));
+        buttons.push(b);
+        row.appendChild(b);
+      }
       cands.appendChild(row);
     });
     box.appendChild(cands);
@@ -2901,7 +2926,7 @@ function renderReviewItem(item, subject) {
     actions.appendChild(noteInput);
     reviewActions(item).forEach(([label, verdict]) => {
       const done = verdict === "withdrawn" ? "已撤回" : label === "仍然成立" ? "已记录：仍然成立" : "已" + label;
-      const b = mkButton(label, "btn btn-small", () => judgeFromReview(item, verdict, noteInput.value, status, buttons, done));
+      const b = mkButton(label, "btn btn-small", () => judgeFromReview(item, verdict, noteInput.value, status, buttons, done, id));
       buttons.push(b);
       actions.appendChild(b);
     });
@@ -2942,7 +2967,8 @@ async function renderReviewPanel(subject) {
     const undo = mkButton("撤销", "err-detail-toggle", () => undoFromReview(offer.key, offerStatus));
     offerStatus.appendChild(undo);
   }
-  panelBody.appendChild(offerStatus);
+  const offerAnchor = mk("div");
+  panelBody.appendChild(offerAnchor);
   const cardGroups = (data.cards && data.cards.groups) || [];
   if (data.review.length || !cardGroups.length) {
     panelBody.appendChild(mk("p", "review-intro",
@@ -2968,12 +2994,23 @@ async function renderReviewPanel(subject) {
       panelBody.appendChild(row);
     });
   }
+  // The 「撤销」 offer sits in the item the act was made from while it is
+  // listed (applying an old verdict to a candidate leaves it listed), else
+  // at the top; either way it is brought into view once.
+  const origin = offer && offer.origin
+    ? Array.from(panelBody.querySelectorAll(".review-item")).find((n) => n.dataset.key === offer.origin) : null;
+  if (origin) origin.appendChild(offerStatus);
+  else offerAnchor.appendChild(offerStatus);
   if (subject.focus && !subject.scrolled) {
     subject.scrolled = true;
     const target = Array.from(panelBody.querySelectorAll(".review-item")).find((n) => n.dataset.key === subject.focus);
     if (target && target.scrollIntoView) target.scrollIntoView({ block: "center" });
   } else {
     panelBody.scrollTop = top;
+  }
+  if (offer && offer.until > Date.now() && !offer.shown) {
+    offer.shown = true;
+    if (offerStatus.scrollIntoView) offerStatus.scrollIntoView({ block: "nearest" });
   }
 }
 
@@ -3131,16 +3168,36 @@ function checkLine(kind, item) {
   return text;
 }
 
-// What was on disk at confirmation -- an observation, nothing more.
-function observedLine(kind, item) {
-  const head = kind === "output" ? "确认时磁盘上的输出文件：" + (item.path || "")
-    : "确认时磁盘上的输入文件：" + (item.dataset || "");
+// What was on disk at confirmation (or at a correction: `moment`) -- an
+// observation, nothing more.
+function observedLine(kind, item, moment) {
+  const when = moment || "确认时";
+  const head = kind === "output" ? when + "磁盘上的输出文件：" + (item.path || "")
+    : when + "磁盘上的输入文件：" + (item.dataset || "");
   if (item.result === "未核对") return head + " · 未核对 · " + (item.reason || "");
   const parts = [];
   if (item.sha256) parts.push("内容指纹 " + String(item.sha256).slice(0, 8));
   if (typeof item.size === "number") parts.push(item.size + " 字节");
   if (!item.sha256 && item.mtime) parts.push("修改时间 " + atText(item.mtime) + "（未计算内容指纹）");
   return head + (parts.length ? " · " + parts.join(" · ") : "");
+}
+
+// How a confirmed version's record reads (9.11 "What each thing proves").
+// The attestation was the researcher's answer AT CONFIRMATION, about the
+// text confirmed and the output then on disk: it is set beside that
+// confirmation's own checks. When the text in force is a correction, the
+// checks and observations shown are the correction's, and say so -- with
+// its time -- never "确认时".
+function confirmationWording(v) {
+  const corrected = v.checked_act === "corrected";
+  const moment = corrected ? atText(v.checked_at) + " 更正时" : "确认时";
+  return {
+    moment: moment,
+    statement: attestedText(v.attested, corrected ? v.attested_checked : v.checked) +
+      (corrected ? "（这是确认时的说明，针对当时确认的文字和当时的输出，不针对后来的更正）" : ""),
+    checksTitle: moment + "对照文件的核对",
+    observedTitle: "观察（只说明" + moment + "磁盘上有什么，不说明文件由这一版生成）",
+  };
 }
 
 // A stage-(b) comparison, always with how far it looked.
@@ -3160,6 +3217,7 @@ const varState = {
   card: null,      // the card page shown, or null for the list
   version: null,   // the version shown on it
   asking: null,    // "<id>:v<n>" while the attestation question is open
+  askingHash: null, // the draft's content hash when that question opened
   notes: new Map(), // typed notes, kept across re-renders
 };
 
@@ -3210,6 +3268,7 @@ async function loadVariablesView() {
     if (epoch === state.dataEpoch) delete views.variables.dataset.loaded;
     return;
   }
+  clearProjectState(); // the project answered as itself: whatever was wrong is over
   const top = window.scrollY;
   host.innerHTML = "";
   if (varState.card) renderVariableCard(host, data);
@@ -3264,6 +3323,7 @@ function renderVariableList(host, data) {
 }
 
 function versionLabel(v) {
+  if (v.status === "unknown") return "v" + v.version + " · 状态暂不可知";
   if (v.status === "draft") return "v" + v.version + " · 草稿";
   if (v.status === "in_use") return "v" + v.version + " · 使用中";
   if (v.status === "superseded") return "v" + v.version + " · 已被 v" + v.superseded_by.version + " 取代（" + atText(v.superseded_by.at) + "）";
@@ -3369,25 +3429,30 @@ function confirmationSection(host, card, v) {
   const entry = v.entry || {};
   sec.appendChild(mk("div", "var-line", "确认于 " + atText(v.confirmed_at) +
     (entry.act === "corrected" ? "；当前文字来自 " + atText(entry.at) + " 的更正" : "")));
-  sec.appendChild(mk("div", "var-statement", attestedText(v.attested, v.checked)));
+  // The attestation was given at the confirmation, about the text confirmed
+  // and the output then on disk: it is set beside THAT confirmation's own
+  // checks, never beside a later correction's (9.11).
+  const words = confirmationWording(v);
+  const moment = words.moment;
+  sec.appendChild(mk("div", "var-statement", words.statement));
   const checked = v.checked || {};
   const lines = [];
   ["script", "writes"].forEach((k) => { if (checked[k]) lines.push([k, checked[k]]); });
   (checked.reads || []).forEach((r) => lines.push(["reads", r]));
   if (checked.field) lines.push(["field", checked.field]);
-  if (lines.length) sec.appendChild(mk("div", "var-section-title", "确认时对照文件的核对"));
+  if (lines.length) sec.appendChild(mk("div", "var-section-title", words.checksTitle));
   lines.forEach(([k, item]) => {
     const cls = item.result === "已核对" ? " ok" : item.result === "不符" ? " bad" : " soft";
     const line = mk("div", "var-line" + cls, checkLine(k, item));
-    if (k === "script" && item.copy) {
+    if (k === "script" && item.copy && !v.code_missing) {
       line.appendChild(mkButton("查看当时的代码", "btn btn-small", () => openVariableCopy(card.id, entry, "code")));
     }
     sec.appendChild(line);
   });
   const observed = v.observed || {};
-  if (observed.output || (observed.inputs || []).length) sec.appendChild(mk("div", "var-section-title", "观察（只说明当时磁盘上有什么，不说明文件由这一版生成）"));
-  if (observed.output) sec.appendChild(mk("div", "var-line soft", observedLine("output", observed.output)));
-  (observed.inputs || []).forEach((i) => sec.appendChild(mk("div", "var-line soft", observedLine("input", i))));
+  if (observed.output || (observed.inputs || []).length) sec.appendChild(mk("div", "var-section-title", words.observedTitle));
+  if (observed.output) sec.appendChild(mk("div", "var-line soft", observedLine("output", observed.output, moment)));
+  (observed.inputs || []).forEach((i) => sec.appendChild(mk("div", "var-line soft", observedLine("input", i, moment))));
   if (v.copy_missing) sec.appendChild(mk("div", "var-line bad", v.copy_missing));
   if (v.reference) {
     sec.appendChild(mk("div", "var-line soft", "引用这一版：" + v.reference.label +
@@ -3410,11 +3475,23 @@ function draftActions(host, card, v) {
   if (blocked) {
     actions.appendChild(mk("span", "review-note", blocked));
   } else if (v.status === "draft") {
-    const ask = mkButton("确认这一版", "btn btn-primary", () => { varState.asking = key; loadVariablesView(); });
+    const ask = mkButton("确认这一版", "btn btn-primary", () => {
+      varState.asking = key;
+      varState.askingHash = v.content_hash;
+      loadVariablesView();
+    });
     buttons.push(ask);
     actions.appendChild(ask);
   }
   host.append(actions);
+  // 9.12: an answer belongs to the question that was shown. The draft was
+  // saved again since the question opened: the question closes, and the
+  // researcher reads the new text before answering.
+  if (varState.asking === key && v.content_hash !== varState.askingHash) {
+    varState.asking = null;
+    varState.askingHash = null;
+    host.appendChild(mk("div", "notice-status err", "草稿在提问之后又被改动了：请先看一遍现在的内容，再点「确认这一版」。"));
+  }
   if (varState.asking === key && !blocked && v.status === "draft") {
     const box = mk("div", "var-ask");
     box.appendChild(mk("div", "notice-title", "确认之前，回答一个问题（只问这一次）"));
@@ -3422,13 +3499,14 @@ function draftActions(host, card, v) {
     const row = mk("div", "var-actions");
     [["yes", "是"], ["no", "否"], ["unknown", "不确定"]].forEach(([answer, label]) => {
       const b = mkButton(label, "btn", async () => {
-        const res = await variableAction("confirm", { id: card.id, attested: answer }, status, buttons, "没能确认这一版");
-        if (res) { varState.asking = null; varState.version = res.version; }
+        const res = await variableAction("confirm", { id: card.id, attested: answer, content_hash: varState.askingHash },
+          status, buttons, "没能确认这一版");
+        if (res) { varState.asking = null; varState.askingHash = null; varState.version = res.version; }
       });
       buttons.push(b);
       row.appendChild(b);
     });
-    const cancel = mkButton("先不确认", "btn", () => { varState.asking = null; loadVariablesView(); });
+    const cancel = mkButton("先不确认", "btn", () => { varState.asking = null; varState.askingHash = null; loadVariablesView(); });
     row.appendChild(cancel);
     box.appendChild(row);
     host.appendChild(box);
@@ -3469,6 +3547,9 @@ function inUseActions(host, card, v) {
 function renderVersion(host, card, v) {
   const doc = mk("div", "var-doc");
   if (v.status === "draft" || v.status === "orphan_draft") doc.appendChild(mk("div", "var-doc-label", v.label || "草稿 · 改动不留版本"));
+  // A card whose log.toml cannot be trusted: no status is derived from it
+  // -- never 「草稿」, which would say confirmed text may be edited freely.
+  if (v.status === "unknown") doc.appendChild(mk("div", "var-doc-label", v.label || "记录文件无法使用，这一版的状态暂不可知"));
   if (v.error) {
     const err = mk("div", "notice-status err");
     renderBlockingError(err, v.file_state === "invalid"
@@ -3476,7 +3557,9 @@ function renderVersion(host, card, v) {
       : "这个版本文件现在无法读取", v.error);
     doc.appendChild(err);
   }
-  if (v.question) {
+  if (v.question && v.question_kind === "absent") {
+    doc.appendChild(mk("div", "var-doc-label", "版本文件在确认后不见了；下面是确认时冻结的文字。"));
+  } else if (v.question) {
     doc.appendChild(mk("div", "var-doc-label", "文件在确认后被改动了；下面是确认时的文字，改动没有生效。"));
   }
   if (v.content) renderDefinition(doc, v.content);
@@ -3490,11 +3573,15 @@ function renderVersion(host, card, v) {
 function questionNotice(card, q) {
   const box = notice("warn");
   noticeHead(box, q.message);
-  box.appendChild(mk("p", null, "RCE 没有采用改动后的文字，现在生效的仍是确认时的那一份。请告诉 RCE 这次改动是什么："));
+  box.appendChild(mk("p", null, q.kind === "absent"
+    ? "现在生效的仍是确认时冻结的那一份文字。要把版本文件放回原处吗？"
+    : "RCE 没有采用改动后的文字，现在生效的仍是确认时的那一份。请告诉 RCE 这次改动是什么："));
   const status = mk("div", "notice-status");
   const buttons = [];
-  const help = {
-    new: "改动后的文字成为新草稿 v" + card.next_version + "；v" + q.version + " 的文件按冻结副本原样放回。",
+  const help = q.kind === "absent" ? {
+    new: "v" + q.version + " 的文件不在了，没有改动可以保留：按确认时冻结的副本原样放回。",
+  } : {
+    new: "改动后的文件原样成为新草稿 v" + card.next_version + "；v" + q.version + " 的文件按冻结副本原样放回。",
     correct: "这是更正（错字、表述更清楚、脚本换了位置）：记一条更正，前后两种文字都保留可读。",
   };
   if (humanRecordsBlocked()) {
@@ -3504,7 +3591,8 @@ function questionNotice(card, q) {
   q.answers.forEach((answer) => {
     const row = mk("div", "answer");
     const b = mkButton(q.answer_labels[answer], "btn", () =>
-      variableAction("answer", { id: card.id, question: "edited", answer: answer, version: q.version }, status, buttons, "没能完成这个回答"));
+      variableAction("answer", { id: card.id, question: "edited", answer: answer, version: q.version, content_hash: q.content_hash },
+        status, buttons, "没能完成这个回答"));
     buttons.push(b);
     row.append(b, mk("span", "answer-help", help[answer] || ""));
     box.appendChild(row);
@@ -3665,6 +3753,7 @@ function renderCardReviewGroups(host, cardItems) {
     } else {
       box.appendChild(mk("div", "review-link", "输入数据"));
     }
+    if (!group.counted) box.appendChild(mk("div", "review-note", "已为它打开下一版草稿，不计入待复核数；确认草稿之后这一项自然消失。"));
     const status = mk("div", "notice-status");
     const answerable = group.cards.filter((m) => m.draft == null);
     const together = group.cards.length > 1 && answerable.length > 1 && !humanRecordsBlocked() &&
@@ -3727,7 +3816,9 @@ function renderVariableCard(host, card) {
   if (v) renderVersion(host, card, v);
   const hist = mk("div", "var-section");
   hist.appendChild(mk("div", "var-section-title", "记录（log.toml，按追加顺序）"));
-  if (!(card.history || []).length) hist.appendChild(mk("div", "var-line soft", "还没有记录：草稿确认之前，log.toml 里什么都没有。"));
+  if (!(card.history || []).length) hist.appendChild(mk("div", "var-line soft", card.state === "ok"
+    ? "还没有记录：草稿确认之前，log.toml 里什么都没有。"
+    : "log.toml 现在无法读取，里面的记录暂时看不到（文件本身没有被改动）。"));
   (card.history || []).forEach((e) => {
     const line = mk("div", "var-line", cardActText(e));
     if (e.attested) line.appendChild(mk("span", "var-id", " · 说明：输出按此口径生成 — " + (ATTESTED_WORDS[e.attested] || e.attested)));
@@ -3923,11 +4014,14 @@ function migrationResultNote(res) {
     return { tone: "", title: "迁移完成", lines: lines };
   }
   if (last.holders && last.holders.length) {
+    // 8.8: the engine's own description of each holder is English -- it
+    // lives behind 「详情」, never in the notice's body.
     return {
       tone: "bad", title: "记录已经写好，但旧索引还被占用，没有移走",
-      lines: last.holders.map((h) => "占用它的进程" + (h.pid != null ? " " + h.pid : "") + "：" + h.what)
+      lines: last.holders.map((h) => "占用旧索引的进程" + (h.pid != null ? " " + h.pid : "") + "（它是什么，见「详情」）")
         .concat(["请先退出 RCE 与 MCP 服务（占用它的那一个），然后点「继续迁移」。"]),
-      detail: last.stopped,
+      detail: last.holders.map((h) => (h.pid != null ? h.pid + ": " : "") + (h.what || ""))
+        .concat([last.stopped]).filter(Boolean).join("\n"),
     };
   }
   return {

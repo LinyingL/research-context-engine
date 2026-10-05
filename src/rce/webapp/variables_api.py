@@ -18,15 +18,22 @@ Writes (POST) -- ONLY what RCE authors, each through `rce.records.cards`
 (`via="app"`, `expected_id` = the served id). Never the researcher's text:
 there is no endpoint that writes a `v<n>.toml` or creates a card.
 
-    /api/variables/confirm      {id, attested: yes|no|unknown}
+    /api/variables/confirm      {id, attested: yes|no|unknown, content_hash}
     /api/variables/revise       {id}                       (also 「口径已变」)
     /api/variables/reaffirm     {items: [{id, version, signature, data_version?}], note?}
                                 「口径未变」 / 「全部口径未变」: one entry per card
     /api/variables/abandon      {id, note}
     /api/variables/revive       {id, note}
-    /api/variables/answer       {id, question: "edited", answer: new|correct, version}
+    /api/variables/answer       {id, question: "edited", answer: new|correct, version, content_hash}
                                 {id, question: "shrunk", answer: file|restore, missing: [ids shown]}
     /api/variables/full-compare {id}                       「完整比对」 (the index only)
+
+`content_hash` is the hash the page showed for the version file (the
+draft's, or the edited file's `content_hash`; null for a file that could
+not be read): 9.12, "an answer belongs to the question that was shown" --
+if the file differs now, the act is refused (`card_question_changed`) and
+the page shows the file again. The attestation is recorded against the
+text the researcher saw, never against what reached the disk after.
 
 Paths: a card id is only ever compared with the names `.rce/variables/`
 lists (never joined into a path); a copy named by a log entry is resolved
@@ -258,6 +265,16 @@ def _note(body: dict[str, Any], *, required: bool) -> str | None:
     return note
 
 
+def _shown(body: dict[str, Any]) -> str | None:
+    """The version file's content hash as the page showed it (required)."""
+    if "content_hash" not in body:
+        raise _bad("'content_hash' must carry the content hash of the version file the page showed")
+    shown = body["content_hash"]
+    if shown is not None and (not isinstance(shown, str) or not shown.startswith(V.CONTENT_PREFIX)):
+        raise _bad("'content_hash' must be sha256:<hex> or null")
+    return shown
+
+
 def act(root: Path, project_id: str | None, action: str, body: dict[str, Any]) -> dict[str, Any]:
     """One POST action (module docstring). The caller holds the server's
     write guard; every write takes the project lock itself as well."""
@@ -272,7 +289,7 @@ def act(root: Path, project_id: str | None, action: str, body: dict[str, Any]) -
             attested = body.get("attested")
             if attested not in V.ATTESTED:
                 raise _bad("'attested' must be yes, no or unknown")
-            done = cards.confirm(root, card_id, attested=attested, via="app", **common)
+            done = cards.confirm(root, card_id, attested=attested, expected_content=_shown(body), via="app", **common)
             return {"ok": True, "id": done.reference.variable, "version": done.entry.get("version"),
                     "entry": done.entry.id, "reference": done.reference.label}
         if action == "revise":
@@ -324,7 +341,8 @@ def _answer(root: Path, card_id: str, body: dict[str, Any], common: dict[str, An
         version = body.get("version")
         if not isinstance(version, int):
             raise _bad("'version' must name the version asked about")
-        done = cards.answer_edited(root, card_id, answer, version=version, via="app", **common)
+        done = cards.answer_edited(root, card_id, answer, version=version, expected_content=_shown(body),
+                                   via="app", **common)
         return {"ok": True, "id": card_id, "answer": done.answer, "version": done.version,
                 "new_version": done.new_version, "entry": None if done.entry is None else done.entry.id}
     if question == "shrunk":

@@ -474,7 +474,11 @@ def test_the_app_writes_only_what_rce_authors(live):
     _write(root, "topicshift", 2, _text(formula="TS_t = JS(p_t, p_{t−1})"))
     status, data = _call(base, "POST", "/api/variables/confirm", {"id": "topicshift", "attested": "maybe"})
     assert status == 400 and data["state"] == "card_invalid"
+    shown = [v for v in _call(base, "GET", "/api/variables/card?id=topicshift")[1]["versions"] if v["version"] == 2][0]
     status, data = _call(base, "POST", "/api/variables/confirm", {"id": "topicshift", "attested": "no"})
+    assert status == 400 and data["state"] == "card_invalid"  # not tied to the draft the page showed
+    status, data = _call(base, "POST", "/api/variables/confirm",
+                         {"id": "topicshift", "attested": "no", "content_hash": shown["content_hash"]})
     assert status == 200 and data["version"] == 2
     status, data = _call(base, "POST", "/api/variables/abandon", {"id": "topicshift", "note": "  "})
     assert status == 400 and data["message_zh"] == "请写下理由"
@@ -496,7 +500,8 @@ def test_the_edited_question_and_the_review_are_answered_from_the_app(live):
     assert card["questions"][0]["message"] == "v1 的定义在确认后被改动了"
     assert card["questions"][0]["answer_labels"] == {"new": "另存为新版本", "correct": "这是更正"}
     status, data = _call(base, "POST", "/api/variables/answer",
-                         {"id": "topicshift", "question": "edited", "answer": "correct", "version": 1})
+                         {"id": "topicshift", "question": "edited", "answer": "correct", "version": 1,
+                          "content_hash": card["questions"][0]["content_hash"]})
     assert status == 200 and data["entry"]
     (root / "build.py").write_text((root / "build.py").read_text() + "df = df.dropna()\n")
     _apply(root)
@@ -539,7 +544,7 @@ def test_the_page_carries_the_variables_view_in_product_language(live):
     assert 'data-view="variables"' in html and ">变量</button>" in html
     for copy in (
         "草稿 · 改动不留版本", "在编辑器中打开", "确认这一版", "修订口径", "弃用", "恢复", "查看当时的代码",
-        "确认时磁盘上的输出文件：", "你当时的说明：输出按此口径生成 — ", "口径未变", "口径已变", "全部口径未变",
+        "磁盘上的输出文件：", "你当时的说明：输出按此口径生成 — ", "口径未变", "口径已变", "全部口径未变",
         "完整比对", "数据版本说明", "已核对", "不符", "未核对",
     ):
         assert copy in html, copy

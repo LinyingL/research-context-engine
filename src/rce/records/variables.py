@@ -55,6 +55,7 @@ called `v2` now.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import posixpath
@@ -91,9 +92,18 @@ MISMATCH = "不符"
 UNCHECKED = "未核对"
 DRAFT_LABEL = "草稿 · 改动不留版本"
 QUESTION_EDITED = "v{n} 的定义在确认后被改动了"
+QUESTION_ABSENT = "v{n} 的版本文件在确认后不见了"
 ANSWER_NEW = "new"
 ANSWER_CORRECT = "correct"
 ANSWER_LABELS = {ANSWER_NEW: "另存为新版本", ANSWER_CORRECT: "这是更正"}
+#: A confirmed version whose file is gone has one answer: put it back from
+#: its frozen copy (the restoring half of 「另存为新版本」; there is no edited
+#: text to keep).
+ABSENT_ANSWER_LABELS = {ANSWER_NEW: "按冻结副本放回"}
+#: Shown for every version of a card whose log cannot be trusted (9.11
+#: "Safety"): no status is derived from a log RCE does not obey -- above
+#: all never 「草稿」, which would say confirmed text may be edited freely.
+UNKNOWN_STATUS_LABEL = "记录文件无法使用，这一版的状态暂不可知"
 COPY_MISSING = "确认记录引用的副本缺失"
 UNRESOLVABLE = "引用暂不可解析"
 UPSTREAM_NEWER = "上游 {id} 已有 v{n}"
@@ -211,6 +221,14 @@ _KEY_RE = re.compile(r"""^\s*([A-Za-z0-9_\-]+|"[^"]*"|'[^']*')\s*=""")
 def _line_of(text: str, table: str, key: str) -> int | None:
     """The line where `key` is written under `table` ("" for the top), for
     an error to name. Multi-line strings are stepped over."""
+    return _line_table(text).get((table, key))
+
+
+@functools.lru_cache(maxsize=8)
+def _line_table(text: str) -> dict[tuple[str, str], int]:
+    """{(table, key): the first line it is written on}, in one pass over the
+    text (a version file is parsed on every read of its card)."""
+    found: dict[tuple[str, str], int] = {}
     current = ""
     in_multi: str | None = None
     for n, line in enumerate(text.split("\n"), start=1):
@@ -224,21 +242,25 @@ def _line_of(text: str, table: str, key: str) -> int | None:
             continue
         m = _KEY_RE.match(line)
         if m:
-            found = m.group(1).strip('"').strip("'")
-            if current == table and found == key:
-                return n
+            found.setdefault((current, m.group(1).strip('"').strip("'")), n)
         for quote in ("'''", '"""'):
             if line.count(quote) % 2 == 1:
                 in_multi = quote
                 break
-    return None
+    return found
+
+
+#: Control characters other than a newline (and the Unicode line/paragraph
+#: separators). One regex search, not a Python loop per character: a card
+#: is read on every application of the record and by the watcher.
+_CONTROL_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f\x85\u2028\u2029]")
 
 
 def _check_text(value: str, where: str, line: int | None) -> None:
-    for ch in value:
-        code = ord(ch)
-        if ch != "\n" and (code < 0x20 or code == 0x7F or ch in "\x85  "):
-            raise VersionInvalid(f"{where}: a control character (U+{code:04X}) is not allowed in the text", line)
+    m = _CONTROL_RE.search(value)
+    if m is not None:
+        code = ord(m.group(0))
+        raise VersionInvalid(f"{where}: a control character (U+{code:04X}) is not allowed in the text", line)
 
 
 def _str(value: Any, where: str, line: int | None) -> str:
@@ -417,6 +439,8 @@ def _validate_log_entry(entry: Mapping[str, Any]) -> None:
     if act == "corrected":
         _need(entry, "previous", str, act)
         _need(entry, "corrects", str, act)
+    if "removes" in entry and (act != "removed" or not isinstance(entry["removes"], str) or not entry["removes"]):
+        raise ValueError("'removes' names the lost entry a 'removed' entry stands for")
     if act in CARD_ACTS:
         note = _need(entry, "note", str, act)
         if not note.strip():
@@ -453,7 +477,7 @@ CARD_LOG_SCHEMA = LedgerSchema(
     undo_act=None,
     key_fields=(),
     field_order=(
-        "id", "seq", "at", "act", "version", "via", "attested", "content", "previous", "corrects", "frozen",
+        "id", "seq", "at", "act", "version", "via", "attested", "content", "previous", "corrects", "removes", "frozen",
         "note", "reaffirms", "reasons", "data_version", "recovered_from", "recovered_at", "upstream", "checked",
         "observed", "coverage",
     ),
@@ -470,8 +494,14 @@ CARD_LOG_SCHEMA = LedgerSchema(
 class VersionView:
     """One version as read now. `status`: draft, in_use, confirmed (not the
     highest), superseded, removed, orphan_draft (unconfirmed but not the
-    highest number). `question` is set when a confirmed version's file no
-    longer has the content its entry froze."""
+    highest number), or unknown (the card's log cannot be trusted, so no
+    status is derived). `question` is set when a confirmed version's file
+    no longer has the content its entry froze; `question_kind` says how:
+    edited (parsed, other content), invalid (no longer a valid version),
+    unreadable (not UTF-8, or not readable), absent (the file is gone; a
+    file still in the cloud asks nothing). `copy_missing`: the frozen copy
+    the current entry names is not there; `code_missing`: the code copy it
+    names is not there (9.11: either is 「确认记录引用的副本缺失」)."""
 
     number: int
     path: Path
@@ -486,7 +516,9 @@ class VersionView:
     confirmed: LedgerEntry | None = None  # the first confirmed entry
     superseded_by: tuple[int, str | None] | None = None
     question: bool = False
+    question_kind: str | None = None
     copy_missing: bool = False
+    code_missing: bool = False
     upstream_notes: tuple[str, ...] = ()
 
     @property
@@ -603,11 +635,15 @@ def read_version(path: Path) -> VersionView:
     return view
 
 
-def read_card(project_root: str | Path, directory: str | Path) -> Card:
-    """Read one card from its files (module docstring). Reads only."""
+def read_card(project_root: str | Path, directory: str | Path, *, siblings: list[Path] | None = None) -> Card:
+    """Read one card from its files (module docstring). Reads only.
+    `siblings` is `card_dirs(project_root)` when the caller has listed it
+    already (reading every card lists the directory once, not once per
+    card)."""
     root, directory = Path(project_root), Path(directory)
     card = Card(id=directory.name, key=card_key(directory.name), directory=directory)
-    twins = [p.name for p in card_dirs(root) or [] if card_key(p.name) == card.key and p.name != directory.name]
+    listed = card_dirs(root) if siblings is None else siblings
+    twins = [p.name for p in listed or [] if card_key(p.name) == card.key and p.name != directory.name]
     numbers = _version_numbers(directory)
     if twins:
         card.state, card.reason = "unreadable", "case_duplicate"
@@ -651,6 +687,8 @@ def read_card(project_root: str | Path, directory: str | Path) -> Card:
         card.detail = "two histories of log.toml were merged (seq repeats); nothing picks a winner"
     if card.state != "ok":
         card.problems.append(f"{card.reason}: {card.detail}")
+        for view in card.versions.values():
+            view.status = "unknown"
         return card
     _derive(card)
     return card
@@ -676,7 +714,11 @@ def _derive(card: Card) -> None:
             act = e.get("act")
             if act in ("confirmed", "corrected"):
                 current = e
-            elif act == "removed":
+            elif act == "removed" and not e.get("removes"):
+                # A `removed` entry naming the entry it stands for
+                # (`removes`) keeps a lost confirmation's wording referenced
+                # and its number used; it says nothing about the entries the
+                # file holds (another history's v<n>, 「以文件为准」).
                 current = None
         if current is not None:
             confirmed[number] = current
@@ -700,10 +742,18 @@ def _derive(card: Card) -> None:
         view.status = "confirmed"
         frozen = view.frozen_path
         view.copy_missing = frozen is None or not frozen.exists()
+        code = code_copy_of(entry)
+        view.code_missing = code is not None and not (card.directory.parent / code).is_file()
+        # 9.11: any change to the content of a confirmed v<n>.toml is asked
+        # about -- an edit, a file no longer valid or no longer readable
+        # (re-saved in another encoding), a file gone. Only a file still in
+        # the cloud asks nothing: it is on its way, not changed.
         if view.file_state == RecordState.PRESENT.value:
-            view.question = view.content_hash != entry.get("content")
-        elif view.file_state == RecordState.INVALID.value:
-            view.question = True
+            if view.content_hash != entry.get("content"):
+                view.question_kind = "edited"
+        elif view.file_state in (RecordState.INVALID.value, RecordState.UNREADABLE.value, RecordState.ABSENT.value):
+            view.question_kind = view.file_state
+        view.question = view.question_kind is not None
         if view.question:
             card.questions.append(number)
     ordered = sorted(confirmed)
@@ -727,8 +777,18 @@ def _derive(card: Card) -> None:
         card.versions[ordered[-1]].status = "in_use"
 
 
+def code_copy_of(entry: LedgerEntry | Mapping[str, Any] | None) -> str | None:
+    """The code copy (`_code/<sha>.<ext>`) an entry names, or None."""
+    if entry is None:
+        return None
+    script = (entry.get("checked") or {}).get("script")
+    copy = script.get("copy") if isinstance(script, Mapping) else None
+    return copy if isinstance(copy, str) and copy else None
+
+
 def read_cards(project_root: str | Path) -> list[Card]:
-    return [read_card(project_root, d) for d in card_dirs(project_root) or []]
+    dirs = card_dirs(project_root) or []
+    return [read_card(project_root, d, siblings=dirs) for d in dirs]
 
 
 def open_card(project_root: str | Path, card_id: str) -> Card:

@@ -884,9 +884,18 @@ def review_items(conn: Connection) -> dict[str, Any]:
     because their source could not be read, and judgments whose link the
     index does not hold -- plus the ledger's trust state."""
     states = db.judgement_states(conn)
+    live = db.edge_statuses(conn)
     review, held, absent = [], [], []
     for key, item in states.items():
         public = _public_item(key, item)
+        # A candidate's status as the index holds it NOW, not as it was when
+        # the item was evaluated: the old verdict may have been applied to it
+        # since (in the same application, or a later one) -- and a page must
+        # not offer that click again (9.6: one click, one entry).
+        public["candidates"] = [
+            {**c, "status": live.get((c["src"], c["dst"], c["type"], c["extractor"]), (c.get("status"),))[0]}
+            for c in public["candidates"]
+        ]
         if item["outcome"] in db.WAITING_OUTCOMES:
             review.append(public)
         elif item["outcome"] == "held" or (item.get("detail") or {}).get("source_unreadable"):

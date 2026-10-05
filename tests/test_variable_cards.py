@@ -73,6 +73,7 @@ def _write(root: Path, card: str, n: int, text: str) -> Path:
 def _new_confirmed(root: Path, card: str = "topicshift", text: str | None = None, **kw) -> cards.Confirmed:
     cards.new_card(root, card)
     _write(root, card, 1, text or _text())
+    kw.setdefault("attested", "unknown")
     return cards.confirm(root, card, **kw)
 
 
@@ -198,7 +199,8 @@ def test_scenario_13_life_of_a_card(tmp_path, capsys):
     assert _card(root).draft == 1
     _write(root, "topicshift", 1, _text(formula="first try"))
     _write(root, "topicshift", 1, _text(datasets=("Data/theme.csv", "Data/absent.csv"), output="Data/ts.parquet"))
-    assert cli.main(["variable", "confirm", "topicshift", str(root)]) == 0
+    assert cli.main(["variable", "confirm", "topicshift", str(root)]) == 1  # off a terminal the question must be answered
+    assert cli.main(["variable", "confirm", "topicshift", "--attest", "unknown", str(root)]) == 0
 
     card = _card(root)
     assert card.in_use == 1 and card.draft is None
@@ -258,11 +260,11 @@ def test_confirm_needs_a_complete_draft_and_refuses_an_invalid_one(tmp_path):
     _project(root)
     cards.new_card(root, "x")
     with pytest.raises(cards.CardRefused) as err:
-        cards.confirm(root, "x")
+        cards.confirm(root, "x", attested="unknown")
     assert err.value.code == "incomplete" and "decision.why" in str(err.value)
     _write(root, "x", 1, _text() + 'stray = "x"\n')
     with pytest.raises(cards.CardRefused, match="unknown key 'stray'"):
-        cards.confirm(root, "x")
+        cards.confirm(root, "x", attested="unknown")
     assert not (V.variables_dir(root) / "x" / "log.toml").exists()
 
 
@@ -295,7 +297,7 @@ root, card, point = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 def fault(name):
     if name == point:
         os._exit(17)
-cards.confirm(root, card, fault=fault)
+cards.confirm(root, card, attested="unknown", fault=fault)
 """
 
 
@@ -324,7 +326,7 @@ def test_scenario_13_a_kill_between_each_pair_of_writes(tmp_path, capsys):
     assert _card(root).draft == 1  # nothing confirmed: the card is still a draft, and not frozen
 
     _write(root, "topicshift", 1, _text(formula="settled"))
-    cards.confirm(root, "topicshift")
+    cards.confirm(root, "topicshift", attested="unknown")
     cards.revise(root, "topicshift")
     _write(root, "topicshift", 2, _text(formula="second"))
     _killed(root, "topicshift", "after_entry")  # the entry landed; the index not yet
@@ -350,7 +352,7 @@ def _two_versions(root: Path) -> None:
     _new_confirmed(root)
     cards.revise(root, "topicshift")
     _write(root, "topicshift", 2, _text(formula="TS_t = 1 − cos(p_t, p_{t−2})"))
-    cards.confirm(root, "topicshift")
+    cards.confirm(root, "topicshift", attested="unknown")
 
 
 def test_scenario_14_edit_a_confirmed_version_and_save_as_new(tmp_path, capsys):
@@ -449,7 +451,7 @@ def test_scenario_14_restored_card_makes_a_reference_unresolvable_and_a_new_v2_d
     shutil.copytree(V.variables_dir(root) / "topicshift", aside)
     cards.revise(root, "topicshift")
     _write(root, "topicshift", 2, _text(formula="v2 as first written"))
-    cards.confirm(root, "topicshift")
+    cards.confirm(root, "topicshift", attested="unknown")
     ref = V.reference_to(root, "topicshift")
     assert V.resolve(root, ref) is not None
 
@@ -460,7 +462,7 @@ def test_scenario_14_restored_card_makes_a_reference_unresolvable_and_a_new_v2_d
     assert cli.main(["status", "--path", str(root)]) == 0  # rebuilds the index
     cards.revise(root, "topicshift")
     _write(root, "topicshift", 2, _text(formula="v2 as first written"))  # even the same text
-    cards.confirm(root, "topicshift")
+    cards.confirm(root, "topicshift", attested="unknown")
     assert V.resolve(root, ref) is None
     assert V.reference_to(root, "topicshift").content == ref.content  # same wording, another entry
 
@@ -479,16 +481,16 @@ def test_variable_inputs_are_pinned_and_a_newer_upstream_is_only_a_note(tmp_path
     cards.new_card(root, "rv")
     _write(root, "rv", 1, _text(variable="returns@v2"))
     with pytest.raises(cards.CardRefused) as err:
-        cards.confirm(root, "rv")
+        cards.confirm(root, "rv", attested="unknown")
     assert err.value.code == "unresolvable"
     _write(root, "rv", 1, _text(variable="returns@v1"))
-    cards.confirm(root, "rv")
+    cards.confirm(root, "rv", attested="unknown")
     pinned = _card(root, "rv").versions[1].entry.get("upstream")[0]
     assert pinned["variable"] == "returns" and pinned["version"] == 1 and pinned["entry"].startswith("v-")
     assert cards.card_payload(root, _card(root, "rv"))["versions"][0]["upstream_notes"] == []
     cards.revise(root, "returns")
     _write(root, "returns", 2, _text(formula="log returns"))
-    cards.confirm(root, "returns")
+    cards.confirm(root, "returns", attested="unknown")
     rv = _card(root, "rv")
     assert rv.in_use == 1
     assert cards.card_payload(root, rv)["versions"][0]["upstream_notes"] == ["上游 returns 已有 v2"]
@@ -518,13 +520,13 @@ def _with_cards(root: Path) -> str:
     cards.confirm(root, "topicshift", attested="yes")
     cards.revise(root, "topicshift")
     _write(root, "topicshift", 2, text.replace("p_{t−1}", "p_{t−2}"))
-    cards.confirm(root, "topicshift")
+    cards.confirm(root, "topicshift", attested="unknown")
     _write(root, "topicshift", 2, text.replace("p_{t−1}", "p_{t−2} （更正）"))
     cards.answer_edited(root, "topicshift", "correct")
     cards.abandon(root, "topicshift", note="与 RV 的关系不稳定")
     cards.new_card(root, "rv")
     _write(root, "rv", 1, text.replace("TopicShift", "RV"))
-    cards.confirm(root, "rv")
+    cards.confirm(root, "rv", attested="unknown")
     return pid
 
 
@@ -606,7 +608,7 @@ def test_scenario_15_restore_asks_and_the_file_wins(tmp_path, capsys):
     shutil.copytree(root / ".rce", aside)
     cards.revise(root, "rv")
     _write(root, "rv", 2, _text(formula="rv v2", datasets=("data.csv",), output="out.csv", script="a.py"))
-    cards.confirm(root, "rv")
+    cards.confirm(root, "rv", attested="unknown")
     shutil.rmtree(root / ".rce")
     shutil.copytree(aside, root / ".rce")
 

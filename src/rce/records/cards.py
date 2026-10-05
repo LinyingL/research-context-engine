@@ -158,6 +158,11 @@ class CardRefused(V.VariableError):
 # -- small helpers -----------------------------------------------------------------------
 
 
+#: `expected_content` not given: the act is not tied to a shown text (the
+#: CLI reads the card at the moment it acts).
+ANY_CONTENT = object()
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -197,9 +202,26 @@ def _create_exclusively(path: Path, data: bytes) -> None:
             tmp.unlink()
 
 
+def _copy_dir(root: Path, directory: Path) -> Path:
+    """A directory that kept copies go into (`_code/`, a card's `frozen/`),
+    created inside the project if need be. Refused when it is a symlink --
+    as `card_dirs` and `rce records --clean` treat one: a copy written
+    through it would live wherever the link points, and the entry naming it
+    would claim it is in the project."""
+    try:
+        files.ensure_dir_within(root, directory)
+    except files.RecordFileError as exc:
+        raise CardRefused("invalid", f"not recorded: {exc}") from exc
+    if directory.is_symlink():
+        raise CardRefused("invalid", f"not recorded: {directory} is a symbolic link; the copies must live in the project")
+    return directory
+
+
 def _read_back(path: Path, data: bytes) -> None:
     got = files.read_record(path)
-    if got.state is not RecordState.PRESENT or got.data != data:
+    # By bytes: a researcher's file kept as they saved it (even not UTF-8,
+    # 「另存为新版本」 of a re-encoded file) reads back as those bytes.
+    if got.data is None or got.data != data:
         raise CardRefused("changed", f"{path} does not read back as written; nothing recorded")
 
 
@@ -299,12 +321,12 @@ def _cards_in_view(conn: Connection | None, root: Path) -> list[V.Card] | None:
     dirs = V.card_dirs(root)
     if dirs is None:
         return None
-    cards = [V.read_card(root, d) for d in dirs]
+    cards = [V.read_card(root, d, siblings=dirs) for d in dirs]
     seen = {c.key for c in cards}
     if conn is not None:
         for key, row in db.variable_cards(conn).items():
             if key not in seen:
-                cards.append(V.read_card(root, V.variables_dir(root) / row["id"]))
+                cards.append(V.read_card(root, V.variables_dir(root) / row["id"], siblings=dirs))
     return cards
 
 
@@ -356,7 +378,9 @@ def apply_cards(conn: Connection, project_root: str | Path, *, identity: Project
 
 def verify(conn: Connection, project_root: str | Path) -> list[str]:
     """`rce records --verify` for the cards: the index holds, for every card
-    that can be trusted, exactly the log entries the file holds."""
+    that can be trusted, exactly the log entries the file holds -- and every
+    frozen copy and code copy an entry names is there (9.11: an entry whose
+    copy is missing is 「确认记录引用的副本缺失」, never a passing record)."""
     root = Path(project_root)
     identity = _identity_now(root)
     cards = _cards_in_view(conn, root) or []
@@ -375,7 +399,22 @@ def verify(conn: Connection, project_root: str | Path) -> list[str]:
             )
         if card.key not in db.variable_cards(conn) and card.directory.is_dir():
             problems.append(f"variable card {card.id}: not in the index")
+        problems += [f"variable card {card.id}: {p}" for p in missing_copies(card)]
     return problems
+
+
+def missing_copies(card: V.Card) -> list[str]:
+    """Each copy an entry of `card` names that is not on disk (a sync that
+    has not delivered it, a hand deletion)."""
+    out = []
+    for e in card.entries:
+        frozen = e.get("frozen")
+        if isinstance(frozen, str) and not (card.directory / frozen).is_file():
+            out.append(f"entry {e.id} ({e.get('act')} v{e.get('version')}) names {frozen}, which is not there")
+        code = V.code_copy_of(e)
+        if code is not None and not (card.directory.parent / code).is_file():
+            out.append(f"entry {e.id} ({e.get('act')} v{e.get('version')}) names the code copy {code}, which is not there")
+    return out
 
 
 def rebuild_questions(conn: Connection, project_root: str | Path, identity: ProjectIdentity) -> list[str]:
@@ -783,15 +822,14 @@ def _write_copies(w: _Writing, view_bytes: bytes, content_h: str, ins: _Inspecti
     root, card = w.root, w.card
     if ins.script_bytes is not None and ins.script_copy is not None:
         code = root / paths.RCE_DIRNAME / V.VARIABLES_DIRNAME / ins.script_copy
-        files.ensure_dir_within(root, code.parent)
+        _copy_dir(root, code.parent)
         existing = files.read_record(code)
         if existing.state is not RecordState.PRESENT or _sha256(existing.data or b"") != _sha256(ins.script_bytes):
             files.durable_write(code, ins.script_bytes)
         _read_back(code, ins.script_bytes)
         if fault is not None:
             fault("after_code_copy")
-    frozen_dir = card.directory / V.FROZEN_DIRNAME
-    files.ensure_dir_within(root, frozen_dir)
+    frozen_dir = _copy_dir(root, card.directory / V.FROZEN_DIRNAME)
     hexd = content_h.removeprefix(V.CONTENT_PREFIX)
     target = frozen_dir / f"{hexd}.toml"
     existing = files.read_record(target)
@@ -825,7 +863,8 @@ def confirm(
     project_root: str | Path,
     card_id: str,
     *,
-    attested: str = "unknown",
+    attested: str,
+    expected_content: str | None | object = ANY_CONTENT,
     via: str = "cli",
     expected_id: Any = READ_NOW,
     timeout: float | None = None,
@@ -834,7 +873,12 @@ def confirm(
 ) -> Confirmed:
     """Confirm the card's draft (module docstring, "snapshot first, entry
     last"). `attested` is the researcher's answer to "was the output as it
-    stands built with this definition"; RCE never sets it from a hash."""
+    stands built with this definition" -- asked by every surface, never
+    defaulted here; RCE never sets it from a hash. `expected_content` ties
+    the confirmation (and that answer) to the draft the researcher was
+    shown (9.12, "an answer belongs to the question that was shown"): its
+    content hash, or None for a draft that could not be read; if the draft
+    differs now, `question_changed` and nothing is written."""
     if attested not in V.ATTESTED:
         raise CardRefused("invalid", f"attested must be one of {', '.join(V.ATTESTED)}, got {attested!r}")
     with _writing(project_root, card_id, expected_id, timeout) as w:
@@ -844,6 +888,7 @@ def confirm(
             extra = f" (v{orphans[0]}.toml is unconfirmed but not the highest version)" if orphans else ""
             raise CardRefused("no_draft", f"{card.id} has no draft to confirm{extra}; 'rce variable revise' opens one")
         view = card.versions[card.draft]
+        _same_as_shown(view, expected_content)
         data, content = _version_now(view)
         missing = V.missing_for_confirm(content)
         if missing:
@@ -860,6 +905,18 @@ def confirm(
             fault("after_entry")
         ref = V.Reference(card.id, view.number, entry.id, h)
     return Confirmed(V.read_card(w.root, card.directory), entry, ref)
+
+
+def _same_as_shown(view: V.VersionView, expected: str | None | object) -> None:
+    """9.12: an answer belongs to the question that was shown. The version
+    file must still hold the content (hash) the page showed."""
+    if expected is ANY_CONTENT:
+        return
+    if view.content_hash != expected:
+        raise CardRefused(
+            "question_changed", f"v{view.number}.toml changed since it was shown; look at it again -- nothing written",
+            message_zh=f"v{view.number} 的文件在你查看之后又被改动了，请重新查看后再回答",
+        )
 
 
 def _version_now(view: V.VersionView) -> tuple[bytes, dict[str, Any]]:
@@ -905,47 +962,64 @@ def answer_edited(
     answer: str,
     *,
     version: int | None = None,
+    expected_content: str | None | object = ANY_CONTENT,
     via: str = "cli",
     expected_id: Any = READ_NOW,
     timeout: float | None = None,
     now: Clock | None = None,
     fault: Fault | None = None,
 ) -> EditAnswered:
-    """Answer 「v<n> 的定义在确认后被改动了」.
+    """Answer 「v<n> 的定义在确认后被改动了」 (or, for a file that is gone,
+    「v<n> 的版本文件在确认后不见了」). `expected_content` ties the answer to
+    the file the question was raised for (`_same_as_shown`).
 
-    「另存为新版本」 (`new`): the edited text becomes draft v<next> (created
+    「另存为新版本」 (`new`): the edited bytes -- whatever they are, even a
+    file no longer valid or not UTF-8 -- become draft v<next> (created
     exclusively, read back), and only then is v<n>.toml put back byte for
-    byte from its frozen copy -- refused while a draft is open, or when the
-    frozen copy is missing (「确认记录引用的副本缺失」).
+    byte from its frozen copy. Refused while another draft is open, or when
+    the frozen copy is missing (「确认记录引用的副本缺失」). A draft that
+    already holds exactly the edited bytes is the same answer interrupted
+    after its first write: it is finished, not refused. A file that is gone
+    has no edit to keep: it is put back from its frozen copy.
 
     「这是更正」 (`correct`): a `corrected` entry with both hashes, the checks
-    made again, and a new frozen copy written first."""
+    made again, and a new frozen copy written first -- only for a file that
+    reads as a version (there is nothing else to record as the wording)."""
     if answer not in (V.ANSWER_NEW, V.ANSWER_CORRECT):
         raise CardRefused("invalid", f"answer must be {V.ANSWER_NEW} or {V.ANSWER_CORRECT}, got {answer!r}")
     with _writing(project_root, card_id, expected_id, timeout) as w:
         card = w.card
         view = _question_version(card, version)
+        _same_as_shown(view, expected_content)
         if answer == V.ANSWER_NEW:
-            if card.draft is not None:
-                raise CardRefused("draft_open", f"draft v{card.draft} is open; confirm it first, then answer again",
-                                  message_zh=f"已有草稿 v{card.draft}，请先确认它再回答")
             frozen = _verified_frozen(card, view)
             if frozen is None:
                 raise CardRefused("copy_missing", f"the frozen copy of v{view.number} is missing; it cannot be put back",
                                   message_zh=V.COPY_MISSING)
+            if view.question_kind == "absent":
+                _create_exclusively(view.path, frozen)
+                _read_back(view.path, frozen)
+                return EditAnswered(answer, view.number)
             edited = files.read_record(view.path)
-            if edited.state is not RecordState.PRESENT or edited.data is None:
-                raise CardRefused("invalid", f"{view.path.name} cannot be read now")
-            number = card.next_number
-            target = card.directory / f"v{number}.toml"
-            _create_exclusively(target, edited.data)
-            _read_back(target, edited.data)
+            if edited.data is None:
+                raise CardRefused("invalid", f"{view.path.name} cannot be read now ({edited.state.value}: {edited.error})")
+            draft = card.versions.get(card.draft) if card.draft is not None else None
+            if draft is not None and draft.data == edited.data:
+                number = draft.number  # saved by this same answer before it was interrupted
+            elif draft is not None:
+                raise CardRefused("draft_open", f"draft v{card.draft} is open; confirm it first, then answer again",
+                                  message_zh=f"已有草稿 v{card.draft}，请先确认它再回答")
+            else:
+                number = card.next_number
+                target = card.directory / f"v{number}.toml"
+                _create_exclusively(target, edited.data)
+                _read_back(target, edited.data)
             if fault is not None:
                 fault("after_new_version")
             again = files.read_record(view.path)
-            if again.state is not RecordState.PRESENT or again.data != edited.data:
+            if again.data != edited.data:
                 raise CardRefused("changed", f"{view.path.name} changed while answering; it was not put back "
-                                  f"(the earlier edit is kept in {target.name})")
+                                  f"(the earlier edit is kept in v{number}.toml)")
             files.durable_write(view.path, frozen)
             _read_back(view.path, frozen)
             return EditAnswered(answer, view.number, new_version=number)
@@ -971,7 +1045,7 @@ def answer_edited(
 def _write_code_copy(w: _Writing, data: bytes, copy: str) -> None:
     """A code copy, written durably and read back (snapshot first, entry last)."""
     code = w.root / paths.RCE_DIRNAME / V.VARIABLES_DIRNAME / copy
-    files.ensure_dir_within(w.root, code.parent)
+    _copy_dir(w.root, code.parent)
     existing = files.read_record(code)
     if existing.state is not RecordState.PRESENT or existing.data != data:
         files.durable_write(code, data)
@@ -1052,7 +1126,10 @@ def reaffirm(
             fp = item.get("now")
             if not fp:
                 continue
-            inputs.append(dict(fp))
+            # A hash 「完整比对」 took at this size and mtime is the one the
+            # answer was given about (it is in the comparison's signature).
+            fp = {k: v for k, v in fp.items() if k != "remembered"}
+            inputs.append(fp)
             input_coverage.append({"dataset": item["dataset"], "coverage": implementation.RECORDED_FULL if "sha256" in fp
                                    else implementation.RECORDED_SIZE})
         if inputs:
@@ -1138,10 +1215,15 @@ def answer_shrunk(
 
     「以文件为准」 (`file`): the missing entries are dropped from the index's
     copy -- refused (`would_lose`) when the file as it stands could still
-    not be applied. A version whose confirmation was among them leaves a
-    `removed` entry behind (with its content hash and frozen copy, so the
-    wording stays readable), so its number is not given to the next
-    revision. A card whose directory is gone is forgotten by the index.
+    not be applied. Every lost confirmation or correction whose wording the
+    file no longer holds (no entry with that version AND that content)
+    leaves one `removed` entry behind, naming it (`removes`), with its
+    content hash and frozen copy -- so the wording stays readable and
+    `rce records --clean` keeps the copy. That holds when another history's
+    entry now holds the same number (two Macs each confirmed a `v2`): the
+    file's `v2` stands, and the lost one's text is still kept. A number
+    that only the lost entries used is not given to the next revision. A
+    card whose directory is gone is forgotten by the index.
 
     「把缺少的补回文件」 (`restore`): missing frozen copies are put back from
     the index's copy first (verified against their hash), then every
@@ -1172,23 +1254,29 @@ def answer_shrunk(
                     f"{len(ids)} missing entr(y/ies) exist only in the index's copy -- restore the file, or answer restore",
                     decision=after,
                 )
-            known = {int(e.get("version")) for e in card.entries if e.get("act") in V.VERSION_ACTS}
+            numbers = {int(e.get("version")) for e in card.entries if e.get("act") in V.VERSION_ACTS}
+            kept = {
+                (int(e.get("version")), str(e.get("content")))
+                for e in card.entries if e.get("act") in V.VERSION_ACTS and e.get("content")
+            }
             lost = [
                 m for m in missing
                 if m.get("act") in ("confirmed", "corrected") and isinstance(m.get("version"), int)
-                and int(m["version"]) not in known
+                and (int(m["version"]), str(m.get("content"))) not in kept
             ]
-            # The text of a version the file no longer knows stays readable:
+            # The text of a version the file no longer holds stays readable:
             # its frozen copy is put back from the index's copy (RCE's own
             # file, verified against its hash) and named by the entry below.
             _restore_frozen(w, lost)
             removed: list[dict[str, Any]] = []
             for m in lost:
-                n = int(m["version"])
-                if any(r["version"] == n for r in removed):
+                n, content = int(m["version"]), str(m.get("content"))
+                if any(r["version"] == n and r["content"] == content for r in removed):
                     continue
-                entry: dict[str, Any] = {"act": "removed", "version": n, "via": via, "content": str(m.get("content")),
-                                         "note": "以文件为准：确认记录不在文件里，此编号不再使用"}
+                note = (f"以文件为准：这条 v{n} 的记录不在文件里（文件里的 v{n} 是另一份记录），当时的文字保留在冻结副本中"
+                        if n in numbers else "以文件为准：确认记录不在文件里，此编号不再使用")
+                entry: dict[str, Any] = {"act": "removed", "version": n, "via": via, "content": content,
+                                         "removes": str(m["id"]), "note": note}
                 if isinstance(m.get("frozen"), str) and (card.directory / m["frozen"]).is_file():
                     entry["frozen"] = m["frozen"]
                 removed.append(entry)
@@ -1229,7 +1317,7 @@ def _restore_frozen(w: _Writing, missing: Iterable[Mapping[str, Any]]) -> list[s
             ok = False
         if not ok:
             continue
-        files.ensure_dir_within(w.root, target.parent)
+        _copy_dir(w.root, target.parent)
         files.durable_write(target, data)
         _read_back(target, data)
         restored.append(rel)
@@ -1284,8 +1372,29 @@ def _frozen_content(card: V.Card, view: V.VersionView) -> dict[str, Any] | None:
     return None if data is None else V.parse_version(data.decode("utf-8").removeprefix("\ufeff"))
 
 
+def question_text(view: V.VersionView) -> str | None:
+    if not view.question:
+        return None
+    template = V.QUESTION_ABSENT if view.question_kind == "absent" else V.QUESTION_EDITED
+    return template.format(n=view.number)
+
+
+def question_answers(view: V.VersionView) -> tuple[list[str], dict[str, str]]:
+    """The answers that can be given: 「这是更正」 only for a file that reads
+    as a version; a file that is gone can only be put back."""
+    if view.question_kind == "absent":
+        return [V.ANSWER_NEW], dict(V.ABSENT_ANSWER_LABELS)
+    if view.question_kind == "edited":
+        return [V.ANSWER_NEW, V.ANSWER_CORRECT], dict(V.ANSWER_LABELS)
+    return [V.ANSWER_NEW], {V.ANSWER_NEW: V.ANSWER_LABELS[V.ANSWER_NEW]}
+
+
 def version_payload(root: Path, card: V.Card, view: V.VersionView) -> dict[str, Any]:
     entry = view.entry
+    # The definition in force: for a version edited after its confirmation,
+    # or whose file is gone or unreadable, the frozen text -- an edit is
+    # shown, not obeyed.
+    in_force = _frozen_content(card, view) if (view.question or (view.content is None and entry is not None)) else view.content
     out: dict[str, Any] = {
         "version": view.number,
         "file": view.path.name,
@@ -1293,22 +1402,36 @@ def version_payload(root: Path, card: V.Card, view: V.VersionView) -> dict[str, 
         "error": view.error,
         "line": view.line,
         "status": view.status,
-        "label": V.DRAFT_LABEL if view.status == "draft" else None,
-        # The definition in force: for a version edited after its
-        # confirmation, the frozen text -- the edit is shown, not obeyed.
-        "content": _frozen_content(card, view) if view.question else view.content,
+        "label": V.DRAFT_LABEL if view.status == "draft" else V.UNKNOWN_STATUS_LABEL if view.status == "unknown" else None,
+        "content": in_force,
+        "content_from_frozen": in_force is not None and in_force is not view.content,
         "edited_content": view.content if view.question else None,
         "content_hash": view.content_hash,
-        "question": V.QUESTION_EDITED.format(n=view.number) if view.question else None,
-        "copy_missing": V.COPY_MISSING if view.copy_missing else None,
+        "question": question_text(view),
+        "question_kind": view.question_kind,
+        "copy_missing": V.COPY_MISSING if (view.copy_missing or view.code_missing) else None,
+        "frozen_missing": view.copy_missing,
+        "code_missing": view.code_missing,
         "superseded_by": None if view.superseded_by is None else {"version": view.superseded_by[0], "at": view.superseded_by[1]},
         "upstream_notes": V.upstream_notes(root, entry),
     }
     if entry is not None:
+        confirmed = view.confirmed
         out.update(
             entry=_summary(entry.data),
-            confirmed_at=(view.confirmed or entry).at,
-            attested=(view.confirmed.get("attested", "unknown") if view.confirmed is not None else None),
+            confirmed_at=(confirmed or entry).at,
+            # The attestation is the researcher's answer AT CONFIRMATION, about
+            # the confirmed text and the output then on disk; it is shown with
+            # that confirmation's own checks and observations, never beside a
+            # correction's (9.11: RCE never attaches it to anything else).
+            attested=(confirmed.get("attested", "unknown") if confirmed is not None else None),
+            attested_at=(confirmed.at if confirmed is not None else None),
+            attested_checked=V.jsonable(confirmed.get("checked") or {}) if confirmed is not None else {},
+            attested_observed=V.jsonable(confirmed.get("observed") or {}) if confirmed is not None else {},
+            # The checks and observations of the entry in force, and WHEN they
+            # were made: at the confirmation, or at the correction.
+            checked_act=entry.get("act"),
+            checked_at=entry.at,
             checked=V.jsonable(entry.get("checked") or {}),
             observed=V.jsonable(entry.get("observed") or {}),
             reference=V.Reference(card.id, view.number, entry.id, str(entry.get("content"))).payload(),
@@ -1332,8 +1455,9 @@ def card_payload(project_root: str | Path, card: V.Card, decision: TrustDecision
         "next_version": card.next_number if card.readable else None,
         "abandoned": None if card.abandoned is None else _summary(card.abandoned.data),
         "questions": [
-            {"version": n, "message": V.QUESTION_EDITED.format(n=n), "answers": [V.ANSWER_NEW, V.ANSWER_CORRECT],
-             "answer_labels": V.ANSWER_LABELS}
+            {"version": n, "kind": card.versions[n].question_kind, "message": question_text(card.versions[n]),
+             "content_hash": card.versions[n].content_hash,
+             "answers": question_answers(card.versions[n])[0], "answer_labels": question_answers(card.versions[n])[1]}
             for n in card.questions
         ],
         "versions": [version_payload(root, card, card.versions[n]) for n in sorted(card.versions)],

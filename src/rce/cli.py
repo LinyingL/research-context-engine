@@ -682,8 +682,10 @@ def _print_card_reviews(card_items: dict[str, Any]) -> None:
     groups = card_items["groups"]
     if not groups:
         return
-    print(f"Variable cards whose implementation moved: {card_items['count']} "
-          "(RCE cannot tell whether a definition changed; answer in the app's 变量 view, "
+    waiting = sum(1 for g in groups if not g["counted"])
+    print(f"Variable cards whose implementation moved: {card_items['count']} under review"
+          + (f", {waiting} more waiting on a draft already opened (not counted)" if waiting else "")
+          + " (RCE cannot tell whether a definition changed; answer in the app's 变量 view, "
           "or open the next draft with 'rce variable revise <id>')")
     for group in groups:
         head = f"{group['script']}: {len(group['cards'])} card(s)" if group["script"] else "input data"
@@ -1536,8 +1538,9 @@ def _print_card_line(card: dict[str, Any]) -> None:
     draft = f", draft v{card['draft']} open" if card["draft"] is not None else ""
     print(f"  {card['id']}: {_card_status_word(card)}{draft}")
     for q in card["questions"]:
-        print(f"    ! v{q['version']} was changed after it was confirmed ({q['message']}): "
-              f"rce variable answer {card['id']} new|correct --version {q['version']}")
+        what = "is gone" if q.get("kind") == "absent" else "was changed"
+        print(f"    ! v{q['version']}.toml {what} after it was confirmed ({q['message']}): "
+              f"rce variable answer {card['id']} {'|'.join(q['answers'])} --version {q['version']}")
     for problem in card["problems"]:
         print(f"    ! {problem}")
     for flag in card["dead_flags"]:
@@ -1579,9 +1582,14 @@ def cmd_variable_show(args: argparse.Namespace) -> int:
             print(f"    ! {v['error']}")
         if v.get("entry"):
             print(f"    confirmed at {v['confirmed_at']}; reference {v['reference']['label']}")
-            print(f"    attested (the output was built with this definition, in your words): {v['attested']}")
+            print(f"    attested at that confirmation (the output then on disk was built with the text confirmed, "
+                  f"in your words): {v['attested']}")
             if v["superseded_by"]:
                 print(f"    superseded by v{v['superseded_by']['version']} from {v['superseded_by']['at']}")
+            moment = "confirmation" if v.get("checked_act") != "corrected" else "correction"
+            if moment == "correction":
+                print(f"    the text in force is the correction made at {v['checked_at']}; the checks and observations "
+                      f"below were taken then (your attestation above was not given about them)")
             checked = v.get("checked") or {}
             for name in ("script", "writes", "field"):
                 if name in checked:
@@ -1590,10 +1598,12 @@ def cmd_variable_show(args: argparse.Namespace) -> int:
                 _print_check(f"reads {item.get('dataset')}", item)
             observed = v.get("observed") or {}
             if observed.get("output"):
-                print(f"      observed output (on disk at confirmation; not a claim it was built by this version): "
-                      f"{json.dumps(observed['output'], ensure_ascii=False, sort_keys=True)}")
-            if v["copy_missing"]:
+                print(f"      observed output (on disk at the {moment} at {v['checked_at']}; not a claim it was built by "
+                      f"this version): {json.dumps(observed['output'], ensure_ascii=False, sort_keys=True)}")
+            if v.get("frozen_missing"):
                 print(f"    ! {v['copy_missing']}: the frozen copy is not there; this version cannot be restored from it")
+            if v.get("code_missing"):
+                print(f"    ! {v['copy_missing']}: the code copy is not there; the script as it was cannot be shown")
         for note in v["upstream_notes"]:
             print(f"    note: {note}")
     print("  history:")
@@ -1633,12 +1643,54 @@ def cmd_variable_revise(args: argparse.Namespace) -> int:
     return 0
 
 
+ATTEST_QUESTION = "Was the output file, as it stands now, built with THIS definition? [yes/no/unknown]: "
+
+
+def _ask_attestation(root: Path, card_id: str) -> tuple[str, Any]:
+    """9.11: the confirmation asks, once, whether the output as it stands
+    was built with this definition; the answer is recorded as the
+    researcher's. Returns (answer, the draft's content hash the answer was
+    given about -- the confirmation is refused if the draft changes before
+    it is written)."""
+    expected: Any = variable_cards.ANY_CONTENT
+    try:
+        card = variables_mod.open_card(root, card_id)
+    except variables_mod.VariableError:
+        card = None
+    if card is not None and card.readable and card.draft is not None:
+        view = card.versions[card.draft]
+        expected = view.content_hash
+        output = ((view.content or {}).get("implementation") or {}).get("output") or "(no output file named)"
+        print(f"Confirming {card.id} v{view.number}; output: {output}")
+    if not sys.stdin.isatty():
+        raise CliError(
+            "the confirmation asks whether the output file as it stands was built with this definition, and "
+            "records your answer as yours -- pass --attest yes|no|unknown (RCE never answers it for you)"
+        )
+    while True:
+        try:
+            answer = input(ATTEST_QUESTION).strip().lower()
+        except EOFError as exc:
+            raise CliError("no answer was given; nothing confirmed") from exc
+        if answer in variables_mod.ATTESTED:
+            return answer, expected
+        print("Please answer yes, no or unknown.")
+
+
 def cmd_variable_confirm(args: argparse.Namespace) -> int:
     """`rce variable confirm <id> [--attest yes|no|unknown]`: the draft
-    becomes a definition results may rely on (snapshot first, entry last)."""
+    becomes a definition results may rely on (snapshot first, entry last).
+    Without --attest the attestation question is asked at the terminal
+    (and the confirmation is tied to the draft it was asked about); off a
+    terminal, --attest is required."""
     opened = _open(args.path)
+    expected: Any = variable_cards.ANY_CONTENT
+    attested = args.attest
+    if attested is None:
+        attested, expected = _ask_attestation(opened.root, args.id)
     with _card_errors():
-        done = variable_cards.confirm(opened.root, args.id, attested=args.attest, expected_id=opened.project_id)
+        done = variable_cards.confirm(opened.root, args.id, attested=attested, expected_content=expected,
+                                      expected_id=opened.project_id)
     entry = done.entry
     print(f"Confirmed {done.reference.variable} v{entry.get('version')} as {entry.id} (seq {entry.seq}); "
           f"reference {done.reference.label}")
@@ -2104,8 +2156,9 @@ def build_parser() -> argparse.ArgumentParser:
             q.add_argument("--missing", default=None, metavar="ID[,ID...]",
                            help="with file|restore: the ids of the missing entries 'rce variable show' printed")
         if name == "confirm":
-            q.add_argument("--attest", choices=list(variables_mod.ATTESTED), default="unknown",
-                           help="your answer: was the output file as it stands built with THIS definition? (default unknown)")
+            q.add_argument("--attest", choices=list(variables_mod.ATTESTED), default=None,
+                           help="your answer: was the output file as it stands built with THIS definition? "
+                                "Asked when omitted at a terminal; required otherwise (RCE never answers for you)")
         if name in ("abandon", "revive"):
             q.add_argument("--note", required=True, help="the reason, in your words")
         if name == "show":

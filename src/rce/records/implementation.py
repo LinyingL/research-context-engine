@@ -20,9 +20,10 @@ version's implementation as it is NOW against what its latest
   「找不到该函数」). The baseline's code is read from the code copy the
   entry names (`_code/<sha>.<ext>`), normalized the same way; without a
   copy, the entry's recorded `code` hash, else its raw sha256.
-- each input dataset: hashed below `variables.LARGE_FILE_BYTES`, compared
-  by size above it (the mtime only chooses the wording). 「完整比对」
-  (`full=True`) hashes the large ones too.
+- each input dataset: hashed below `variables.LARGE_FILE_BYTES` -- read
+  in full on every comparison, so 「全文未变」 is only ever said of bytes
+  read now -- and compared by size above it (the mtime only chooses the
+  wording). 「完整比对」 (`full=True`) hashes the large ones too.
 
 A difference puts the version under review -- 「实现脚本在确认后有改动」 or
 「输入数据在确认后有变化」 -- and RCE says it cannot tell whether the
@@ -41,12 +42,15 @@ What the index keeps
 --------------------
 
 `db` record status `variables_implementation`: `{"cards": {id: review},
-"hashes": {dataset: {size, mtime, sha256}}}`. `hashes` is a cache of the
-content hashes computed for each input at a given size and mtime -- a file
-whose size and mtime are what they were when it was hashed is not hashed
-again; a large file hashed by 「完整比对」 stays compared by content until
-its size or mtime moves. The index may forget it; nothing in the record
-depends on it.
+"hashes": {dataset: {size, mtime, sha256}}}`. `hashes` remembers the hash
+「完整比对」 computed for a large input at a given size and mtime. It may
+only ever keep a CHANGE in view: while the size and mtime are what they
+were, a remembered hash that differs from the baseline keeps the input
+「有变化」 (the next scan does not forget what the full comparison found).
+It never stands in for reading: content can change at the same size and
+mtime, so a remembered hash that matches the baseline is worded by size
+(「大小未变（内容未比对）」), never 「全文未变」. The index may forget it;
+nothing in the record depends on it.
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ import json
 import logging
 import posixpath
 import re
+import threading
 import tokenize
 from datetime import datetime, timezone
 from pathlib import Path
@@ -509,25 +514,35 @@ def look_input(root: Path, dataset: str, base: Mapping[str, Any] | None, cache: 
         return out
     mtime = _mtime(st)
     now: dict[str, Any] = {"dataset": dataset, "size": st.st_size, "mtime": mtime}
-    cached = cache.get(rel)
     sha: str | None = None
-    if isinstance(cached, Mapping) and cached.get("size") == st.st_size and cached.get("mtime") == mtime:
-        sha = cached.get("sha256")
-    if sha is None and (st.st_size < large_bytes or full):
+    remembered: str | None = None
+    if st.st_size < large_bytes or full:
+        # Read now: only bytes read now may be called 「全文未变」.
         try:
             sha = _hash_file(path)
         except OSError as exc:
             out.update(state="unreadable", detail=str(exc))
             return out
-        cache[rel] = {"size": st.st_size, "mtime": mtime, "sha256": sha}
+        if st.st_size >= large_bytes:
+            cache[rel] = {"size": st.st_size, "mtime": mtime, "sha256": sha}
+    else:
+        cached = cache.get(rel)
+        if isinstance(cached, Mapping) and cached.get("size") == st.st_size and cached.get("mtime") == mtime:
+            remembered = cached.get("sha256") if isinstance(cached.get("sha256"), str) else None
     if sha is not None:
         now["sha256"] = sha
+    elif remembered is not None:
+        now["sha256"] = remembered  # what 「完整比对」 found at this size and mtime -- not read now
+        now["remembered"] = True
     out["now"] = now
     if not base or ("sha256" not in base and "size" not in base):
         out["state"] = "no_baseline"
         return out
     if sha is not None and isinstance(base.get("sha256"), str):
         out.update(state="same" if base["sha256"] == sha else "changed", coverage="full")
+        return out
+    if remembered is not None and isinstance(base.get("sha256"), str) and remembered != base["sha256"]:
+        out.update(state="changed", coverage="full")
         return out
     if base.get("size") != st.st_size:
         out.update(state="changed", coverage="size")
@@ -708,10 +723,64 @@ def review_groups(conn: Connection | None) -> dict[str, Any]:
     return {"groups": groups, "count": sum(1 for g in groups if g["counted"]), "cannot_tell": CANNOT_TELL}
 
 
+_WATCH_CACHE: dict[str, tuple[tuple[Any, ...], list[Path]]] = {}
+_WATCH_LOCK = threading.Lock()
+
+
+def _cards_signature(root: Path) -> tuple[Any, ...] | None:
+    """A stat of every file the watch set is derived from: each card
+    directory's files and its frozen copies (name, mtime, size). Cheap --
+    no file is opened -- and it moves whenever a card's text, log or copies
+    do. None when `.rce/variables/` cannot be listed."""
+    base = V.variables_dir(root)
+    out: list[Any] = []
+    try:
+        if not base.is_dir():
+            return ()
+        for card in sorted(base.iterdir()):
+            if card.name == V.CODE_DIRNAME or not card.is_dir():
+                continue
+            for directory in (card, card / V.FROZEN_DIRNAME):
+                if not directory.is_dir():
+                    continue
+                for f in sorted(directory.iterdir()):
+                    try:
+                        st = f.stat()
+                    except OSError:
+                        out.append((str(f), None))
+                        continue
+                    out.append((str(f), st.st_mtime_ns, st.st_size))
+    except OSError:
+        return None
+    return tuple(out)
+
+
 def watched_paths(root: Path) -> list[Path]:
     """The implementing scripts and input datasets of every card's version
     in use (the watcher's watch set: a change re-applies the record, which
-    re-runs these comparisons). Never raises."""
+    re-runs these comparisons). Never raises.
+
+    The watcher asks on every poll (every 2 s), so the cards are read --
+    parsed, every version file -- only when a stat of their files says
+    something moved (`_cards_signature`); otherwise the last answer
+    stands."""
+    root = Path(root)
+    signature = _cards_signature(root)
+    key = str(root)
+    with _WATCH_LOCK:
+        cached = _WATCH_CACHE.get(key)
+        if signature is not None and cached is not None and cached[0] == signature:
+            return list(cached[1])
+    out = _read_watched_paths(root)
+    if signature is not None:
+        with _WATCH_LOCK:
+            if len(_WATCH_CACHE) > 32:
+                _WATCH_CACHE.clear()
+            _WATCH_CACHE[key] = (signature, list(out))
+    return out
+
+
+def _read_watched_paths(root: Path) -> list[Path]:
     out: list[Path] = []
     try:
         for card in V.read_cards(root):

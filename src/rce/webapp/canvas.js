@@ -1518,6 +1518,15 @@ window.RCECanvas = (function () {
       b.type = "button";
       b.addEventListener("click", (e) => { e.stopPropagation(); opts.action.run(); });
       el.appendChild(b);
+    } else if (err) {
+      // An error stays until the researcher has read it -- and can always
+      // be put away with a visible control (its cause may be over by then:
+      // a ledger restored, a file back).
+      const close = htmlEl("button", "cv-status-action cv-status-close", "关闭");
+      close.type = "button";
+      close.setAttribute("aria-label", "关闭");
+      close.addEventListener("click", (e) => { e.stopPropagation(); hideStatus(); });
+      el.appendChild(close);
     }
     el.classList.remove("hidden");
     cv.statusKind = opts.kind || "save";
@@ -2743,6 +2752,7 @@ window.RCECanvas = (function () {
     _linkRules: LINK_RULES,
     _linkActions: linkActions,
     _layoutBlocked: layoutBlocked,
+    _showStatus: showStatus,
     _state: cv,
   };
 })();

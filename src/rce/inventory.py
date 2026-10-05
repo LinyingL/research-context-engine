@@ -45,6 +45,7 @@ unreferenced copies behind).
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -563,6 +564,34 @@ def _frozen_dirs(root: Path) -> Iterable[tuple[Path, set[str] | None]]:
         yield card / FROZEN_DIRNAME, names
 
 
+def _index_references(root: Path) -> set[str] | None:
+    """Every string in the entries the index applied, for every card it
+    knows -- including a card whose directory is not on this disk (a sync
+    that has not delivered it yet): the code copies its entries name are
+    shared in `_code/` and must not be taken for unreferenced. None when
+    the index exists and cannot be read."""
+    ident = read_identity(root)
+    if ident.state is not IdentityState.PRESENT or ident.identity is None:
+        return set()
+    path = paths.index_dir(ident.identity.id) / paths.DB_FILENAME
+    if not path.exists():
+        return set()
+    try:
+        conn = db.connect(path)
+    except Exception:  # noqa: BLE001 -- unreadable: nothing can be told
+        return None
+    try:
+        found: set[str] = set()
+        for key in db.variable_cards(conn):
+            for stored in db.applied_variable_rows(conn, key).values():
+                found |= set(_strings(json.loads(stored)))
+        return found
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        conn.close()
+
+
 def _code_dirs(root: Path) -> Iterable[tuple[Path, set[str] | None]]:
     directory = paths.project_rce_dir(root) / VARIABLES_DIRNAME / CODE_DIRNAME
     cards = _cards(root)
@@ -576,12 +605,41 @@ def _code_dirs(root: Path) -> Iterable[tuple[Path, set[str] | None]]:
             names = None
             break
         names |= {r.split("/", 1)[1] for r in refs if r.startswith(CODE_DIRNAME + "/")}
+    if names is not None:
+        indexed = _index_references(root)
+        if indexed is None:
+            names = None
+        else:
+            names |= {r.split("/", 1)[1] for r in indexed if r.startswith(CODE_DIRNAME + "/")}
     yield directory, names
+
+
+def _is_interrupted_write(name: str) -> bool:
+    """A temp file RCE's own durable writes leave behind when killed
+    (`files.temp_path_for`: hidden, ending `.rce-tmp`)."""
+    return name.startswith(".") and name.endswith(record_files._TMP_MARK)
+
+
+def _card_dir_leftovers(root: Path) -> Iterable[tuple[Path, set[str] | None]]:
+    """A card directory, its frozen/ and `_code/`, for the temp files of a
+    write that was killed (e.g. 「另存为新版本」 putting v<n>.toml back):
+    every name there is referenced except RCE's own temp files."""
+    base = paths.project_rce_dir(root) / VARIABLES_DIRNAME
+    directories = [base / CODE_DIRNAME]
+    for card in _cards(root) or []:
+        directories += [card, card / FROZEN_DIRNAME]
+    for directory in directories:
+        try:
+            names = {p.name for p in directory.iterdir()}
+        except OSError:
+            continue
+        yield directory, {n for n in names if not _is_interrupted_write(n)}
 
 
 COPY_STORES: list[CopyStore] = [
     CopyStore("variable frozen copies", _frozen_dirs),
     CopyStore("variable code copies", _code_dirs),
+    CopyStore("interrupted writes in the variable cards", _card_dir_leftovers),
 ]
 
 

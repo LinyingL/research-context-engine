@@ -218,6 +218,7 @@ def ensure_dir_within(project_root: str | Path, directory: str | Path) -> Path:
         rel = directory.relative_to(root)
     except ValueError as exc:
         raise RecordFileError(f"{directory} is not inside {root}") from exc
+    real_root = root.resolve()
     current = root
     for part in rel.parts:
         current = current / part
@@ -228,6 +229,13 @@ def ensure_dir_within(project_root: str | Path, directory: str | Path) -> Path:
                 raise RecordFileError(f"{current} exists and is not a folder") from None
         except FileNotFoundError as exc:
             raise RecordFileError(f"{current.parent} vanished; not re-creating it") from exc
+        # Resolve, then relative_to: a component that is a symlink leading
+        # out of the project would put a record outside it (and a copy of
+        # the project would carry only the dangling link).
+        try:
+            current.resolve().relative_to(real_root)
+        except (ValueError, OSError) as exc:
+            raise RecordFileError(f"{current} leads outside {root}; not writing there") from exc
     return directory
 
 
