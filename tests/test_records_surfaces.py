@@ -185,11 +185,41 @@ def test_http_shrunk_ledger_asks_and_the_answer_restores(live):
     status, payload = _call(base, "POST", "/api/edges/reject", BODY)
     assert (status, payload["state"]) == (409, "record_shrunk")
     assert payload["message"] == "记录文件比图谱少了 1 条判断" and len(payload["records"]["missing"]) == 1
+    shown = [m["id"] for m in payload["records"]["missing"]]
     status, payload = _call(base, "POST", "/api/records/answer", {"file": "judgements", "answer": "restore"})
+    assert status == 400  # the answer must name the question it answers
+    status, payload = _call(base, "POST", "/api/records/answer", {"file": "judgements", "answer": "restore", "missing": shown})
     assert status == 200 and payload["appended"] == 1
     assert [e.get("via") for e in _entries(root)] == ["recovered"]
-    status, _ = _call(base, "POST", "/api/records/answer", {"file": "judgements", "answer": "file"})
+    status, _ = _call(base, "POST", "/api/records/answer", {"file": "judgements", "answer": "file", "missing": shown})
     assert status == 409  # no question any more
+
+
+def test_http_shrunk_answer_refused_when_the_file_changed_after_the_question(live):
+    """9.3 (review finding): the answer carries the ids the page showed; a
+    file that changed between the question and the click (a sync service
+    swapping in an even older copy) refuses the answer and drops nothing."""
+    base, root, _ = live
+    path = ledger_mod.judgements_path(root)
+    _call(base, "POST", "/api/judgements", {**BODY, "verdict": "confirmed"})
+    one = path.read_bytes()
+    _call(base, "POST", "/api/judgements", {**BODY, "verdict": "rejected"})
+    two = path.read_bytes()
+    _call(base, "POST", "/api/judgements", {**BODY, "verdict": "confirmed", "note": "第三次"})
+    path.write_bytes(two)
+    status, payload = _call(base, "POST", "/api/edges/reject", BODY)
+    shown = [m["id"] for m in payload["records"]["missing"]]
+    assert len(shown) == 1
+    path.write_bytes(one)  # before the click, an even older copy arrives
+    status, payload = _call(base, "POST", "/api/records/answer", {"file": "judgements", "answer": "file", "missing": shown})
+    assert (status, payload["state"]) == (409, "record_question_changed")
+    assert payload["message"] == "记录文件在提问之后又变了，请重新查看问题再回答"
+    assert path.read_bytes() == one
+    conn = _conn(root)
+    try:
+        assert len(db.applied_judgement_rows(conn)) == 3  # the safety net kept every entry
+    finally:
+        conn.close()
 
 
 def test_http_corrupt_arrangement_refuses_layout_writes_until_set_aside(live):

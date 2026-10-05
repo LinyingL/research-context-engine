@@ -333,6 +333,24 @@ class Rebuilt:
         return self.swapped
 
 
+def _ledger_question(old: sqlite3.Connection, root: Path, identity: ProjectIdentity) -> list[str]:
+    """Why the record may not be rebuilt from now, judged against the
+    CURRENT index: a ledger it cannot apply. Above all SHRUNK -- the file
+    lacks entries this index applied and 9.3's question is open. A fresh
+    index has no copy of what was applied, so it would simply obey the
+    shrunk file: a rebuild would answer 「以文件为准」 for the researcher and
+    throw the safety net away. The question is answered first."""
+    _loaded, decision = judgements.assess(old, root, identity)
+    if decision.may_apply:
+        return []
+    if decision.verdict.value == "shrunk":
+        return [
+            f"the judgment ledger has {len(decision.missing)} entr(y/ies) fewer than this index applied "
+            f"({decision.message}); answer that first ('rce records --answer file|restore')"
+        ]
+    return [f"the judgment ledger cannot be applied now ({decision.reason}: {decision.detail or ''}); repair it first"]
+
+
 def _identity_for_rebuild(root: Path) -> ProjectIdentity:
     got = read_identity(root)
     if got.state is IdentityState.ABSENT:
@@ -375,6 +393,7 @@ def rebuild(
             blocked = list(producers.problems)
             if old is not None:
                 blocked += [f"source not readable: {s}" for s in evicted_sources(old, root)]
+                blocked += _ledger_question(old, root, identity)
             if blocked and enforce:
                 return Rebuilt(target, swapped=False, blocked=blocked)
             new = db.connect(staging)

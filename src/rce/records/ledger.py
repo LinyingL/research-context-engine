@@ -588,12 +588,46 @@ def append(
     trust rules (`rce.records.trust`), never this function. For an undo,
     `undoes` may be omitted: it is filled with the key's current act; if
     given, it must be that act. Snapshots the file first, once a day."""
+    return append_many(
+        path, schema, [fields], lock=lock, project_root=project_root, create=create, now=now,
+        snapshot_subdir=snapshot_subdir,
+    )[0]
+
+
+def append_many(
+    path: str | Path,
+    schema: LedgerSchema,
+    fields_list: Iterable[Mapping[str, Any]],
+    *,
+    lock: HeldLock,
+    project_root: str | Path,
+    create: bool = False,
+    now: Clock | None = None,
+    snapshot_subdir: str | None = None,
+    aliases: Iterable[str | None] | None = None,
+) -> list[LedgerEntry]:
+    """Append several entries as ONE write (`append`'s rules, applied to
+    each entry in turn against the file as it would be after the ones
+    before it). `aliases[i]`, when given, is a name for the i-th entry
+    before it has an id: a later entry of the batch whose `undoes` is that
+    name undoes it.
+
+    Why one write: an answer that restores several entries (9.3's
+    「把缺少的补回文件」) must land whole or not at all. Appended one by one,
+    a process killed in between leaves some of them in the file while the
+    question still lists all of them, and answering again appends the
+    first ones a second time -- which can flip a link's verdict. Any entry
+    refused refuses the batch; nothing is written then."""
     lock.require_held()
     path, project_root = Path(path), Path(project_root)
     _confine(project_root, path)
-    reserved = [f for f in ("id", "seq", "at", "settles") if f in fields]
-    if reserved:
-        raise LedgerWriteRefused(f"{', '.join(reserved)} are assigned by the ledger, not the caller")
+    batch = [dict(f) for f in fields_list]
+    if not batch:
+        raise LedgerWriteRefused("nothing to append")
+    for fields in batch:
+        reserved = [f for f in ("id", "seq", "at", "settles") if f in fields]
+        if reserved:
+            raise LedgerWriteRefused(f"{', '.join(reserved)} are assigned by the ledger, not the caller")
 
     loaded = load_ledger(path, schema)
     if loaded.state is RecordState.ABSENT:
@@ -609,6 +643,43 @@ def append(
         names = ", ".join(p.name for p in loaded.conflict_copies)
         raise LedgerWriteRefused(f"sync conflict copies sit beside {path.name}: {names}")
 
+    moment = (now or _local_now)()
+    if moment.tzinfo is None:
+        moment = moment.astimezone()
+    joint = b"\n" if old and not old.endswith(b"\n") else b""
+    new_bytes = schema.header.encode("utf-8") if not old else b""
+    current, written = ledger, ledger.entry_dicts()
+    names = list(aliases) if aliases is not None else [None] * len(batch)
+    if len(names) != len(batch):
+        raise LedgerWriteRefused("one alias per entry, or none")
+    assigned_ids: dict[str, str] = {}
+    for fields, name in zip(batch, names):
+        if fields.get("undoes") in assigned_ids:
+            fields = {**fields, "undoes": assigned_ids[fields["undoes"]]}
+        full = _prepare_entry(schema, current, fields, moment)
+        if name:
+            assigned_ids[name] = full["id"]
+        new_bytes += emit_entry(schema, full)
+        written.append(full)
+        try:
+            current = parse_ledger((old + joint + new_bytes).decode("utf-8").removeprefix("﻿"), schema)
+        except LedgerInvalidError as exc:
+            raise LedgerWriteRefused(f"the entry would not read back from {path.name} ({exc}); nothing written") from exc
+        if current.entry_dicts() != written:
+            raise LedgerWriteRefused(f"the entry would not read back exactly from {path.name}; nothing written")
+
+    if old:
+        files.snapshot_if_first_change_today(project_root, path, snapshot_subdir, now=now)
+    try:
+        files.append_bytes(path, new_bytes, expected_old=old, create=create)
+    except files.RecordFileError as exc:
+        raise LedgerWriteRefused(str(exc)) from exc
+    return list(current.entries[len(ledger.entries):])
+
+
+def _prepare_entry(schema: LedgerSchema, ledger: Ledger, fields: Mapping[str, Any], moment: datetime) -> dict[str, Any]:
+    """One entry as `append` writes it after `ledger`: validated, its undo
+    target resolved, `id` / `seq` / `at` / `settles` assigned."""
     entry: dict[str, Any] = {k: v for k, v in fields.items() if v is not None}
     try:
         probe = {**entry, "id": "x"}
@@ -633,9 +704,6 @@ def append(
             raise LedgerWriteRefused(f"only the last act ({state.entry.id}) can be undone, not {given}")
         entry["undoes"] = state.entry.id
 
-    moment = (now or _local_now)()
-    if moment.tzinfo is None:
-        moment = moment.astimezone()
     assigned: dict[str, Any] = {
         "id": schema.id_prefix + secrets.token_hex(16),
         "seq": ledger.max_seq + 1,
@@ -644,24 +712,7 @@ def append(
     full = {**assigned, **entry}
     if ledger.anomalies:
         full["settles"] = [a.entry.id for a in ledger.anomalies]
-
-    prefix = schema.header.encode("utf-8") if not old else b""
-    new_bytes = prefix + emit_entry(schema, full)
-    joint = b"\n" if old and not old.endswith(b"\n") else b""
-    try:
-        after = parse_ledger((old + joint + new_bytes).decode("utf-8").removeprefix("﻿"), schema)
-    except LedgerInvalidError as exc:
-        raise LedgerWriteRefused(f"the entry would not read back from {path.name} ({exc}); nothing written") from exc
-    if after.entry_dicts() != ledger.entry_dicts() + [full]:
-        raise LedgerWriteRefused(f"the entry would not read back exactly from {path.name}; nothing written")
-
-    if old:
-        files.snapshot_if_first_change_today(project_root, path, snapshot_subdir, now=now)
-    try:
-        files.append_bytes(path, new_bytes, expected_old=old, create=create)
-    except files.RecordFileError as exc:
-        raise LedgerWriteRefused(str(exc)) from exc
-    return after.entries[-1]
+    return full
 
 
 # -- the judgment ledger (9.3) ----------------------------------------------------------

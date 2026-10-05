@@ -166,6 +166,8 @@ def open_project(
     if c.blocked:
         raise ProjectBlocked(c)
     adopted = created = False
+    if c.situation is Situation.NORMAL and c.home is not None and c.home.claim_pending:
+        c = _finish_claim(root, c, probes)
     if c.situation is Situation.MOVED or (c.situation is Situation.NORMAL and c.respelled):
         c, adopted = _adopt(root, c, probes)
     elif c.situation is Situation.NO_INDEX and not c.needs_migration:
@@ -396,8 +398,6 @@ def claim(project_root: str | Path, *, probes: Probes | None = None, echo: Echo 
     previous index is the OTHER folder's, and a difference from it is the
     point of claiming. The id is kept: the other folder, still carrying
     it, is asked the same question when it is next opened."""
-    from rce import rebuild as rebuild_mod  # noqa: PLC0415 -- rebuild imports this module
-
     root = Path(project_root)
     c = classify(root, probes=probes)
     _require(c, (Situation.COPY, Situation.CANNOT_CHECK), "claim")
@@ -406,15 +406,42 @@ def claim(project_root: str | Path, *, probes: Probes | None = None, echo: Echo 
     build_error: str | None = None
     with project_lock(root, ident.id):
         c = _reclassify_same(root, c, probes)
-        write_home(ident.id, root)
-        if not index_db_path(ident.id).exists():
-            create_index(root, ident)
-        rebuilt = rebuild_mod.rebuild(root, expected_id=ident.id, echo=echo, enforce=False)
+        # Marked pending BEFORE the home moves here, cleared only after the
+        # rebuild: a claim killed in between is finished by the next open
+        # (`_finish_claim`), never left serving the other folder's index.
+        write_home(ident.id, root, claim_pending=True)
+        rebuilt = _rebuild_for_claim(root, ident, echo)
         if rebuilt.report is not None and rebuilt.report.ingest_error:
             build_error = rebuilt.report.ingest_error
     registry.relocate(ident.id, root)
     logger.warning("RCE: %s claimed project %s; the previous index was kept at %s", root, ident.id, rebuilt.previous)
     return Answered("claim", root, ident, ident.id, replaced_index=rebuilt.previous, build_error=build_error)
+
+
+def _rebuild_for_claim(root: Path, ident: ProjectIdentity, echo: Echo):
+    """The claim's rebuild, then the pending mark cleared. Hold the lock."""
+    from rce import rebuild as rebuild_mod  # noqa: PLC0415 -- rebuild imports this module
+
+    if not index_db_path(ident.id).exists():
+        create_index(root, ident)
+        write_home(ident.id, root, claim_pending=True)
+    rebuilt = rebuild_mod.rebuild(root, expected_id=ident.id, echo=echo, enforce=False)
+    write_home(ident.id, root)
+    return rebuilt
+
+
+def _finish_claim(root: Path, c: Classification, probes: Probes | None) -> Classification:
+    """A claim killed between moving the home here and rebuilding the index
+    (`Home.claim_pending`): finish it before anything else reads or writes
+    the index -- which until then is the OTHER folder's."""
+    assert c.identity is not None
+    with project_lock(root, c.project_id):
+        c = _reclassify_same(root, c, probes)
+        if c.home is None or not c.home.claim_pending:
+            return c
+        _rebuild_for_claim(root, c.identity, lambda _l: None)
+    logger.warning("RCE: finished the interrupted claim of project %s by %s", c.project_id, root)
+    return classify(root, probes=probes)
 
 
 def _move_records_aside(root: Path) -> tuple[str, ...]:

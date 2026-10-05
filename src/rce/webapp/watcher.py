@@ -572,15 +572,21 @@ class ProjectWatcher:
         with self._state_lock:
             epoch = self._epoch
             baseline, baseline_root = self._baseline, self._baseline_root
-            if baseline is None or baseline_root != root:
+            first_sight = baseline is None or baseline_root != root
+            if first_sight:
                 self._baseline, self._baseline_root = snapshot, root
-                return synced
-            if snapshot.files == baseline.files:
+            elif snapshot.files == baseline.files:
                 return False
-            self._refreshing = True
+            else:
+                self._refreshing = True
+        if first_sight:
+            # Edits made while the app was closed are seen now (9.2).
+            self._snapshot_records(root, None)
+            return synced
 
         steps_changed = _steps_changed(baseline, snapshot)
         changed = _changed_paths(baseline, snapshot)
+        self._snapshot_records(root, changed)
         mappings_file, ledger_file, canvas_file = (str(p) for p in record_paths(root))
         mappings_changed = mappings_file in changed
         ledger_changed = ledger_file in changed
@@ -612,6 +618,19 @@ class ProjectWatcher:
             self._last_error = error
             self._generation += 1
         return True
+
+    def _snapshot_records(self, root: Path, changed: set[str] | None) -> None:
+        """9.2: a snapshot the first time RCE sees a record file changed
+        each day -- the watcher is what sees hand edits (`inventory.
+        snapshot_records`; `changed` None: every record file, on first
+        sight). Under the write guard; never raises."""
+        from rce import inventory  # noqa: PLC0415 -- leaf use
+
+        try:
+            with self._guarded_ingest_lock:
+                inventory.snapshot_records(root, changed)
+        except Exception:  # noqa: BLE001 -- a snapshot never stops the watcher
+            logger.exception("snapshotting the record files of %s failed", root)
 
     def _apply_ledger(self, conn, root: Path) -> None:
         """Apply the judgment ledger (the last step of every ingest here)

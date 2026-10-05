@@ -63,7 +63,12 @@ stops and asks -- instead of a migration that resumes. So, in order:
    one), then retire the old index -- only if no engine answers on the
    app's port and no other process holds its `graph.db` open (「请先退出 RCE
    与 MCP 服务」) -- by renaming it into `~/.rce/graphs/.retired/<hash>-
-   <date>/`; then clear `migrating_from`.
+   <date>/` (a `~/.rce/graphs/<hash>/` directory whole; from anywhere
+   else -- a project's `.rce/` above all -- only `graph.db` and its
+   sidecars, never the records beside it); then clear `migrating_from`.
+   An old index that changed after an earlier attempt exported it (an
+   old-code engine kept writing while retire waited) is exported again as
+   a later migrated entry per changed link, never a wedge.
 
 A crash at any point leaves a folder whose next `rce migrate` resumes:
 step 1 is kept (the same source), leftovers of step 2 are removed, step 3
@@ -275,6 +280,9 @@ def sources_for(root: Path, from_dir: str | Path | None = None) -> list[tuple[st
         directory = Path(from_dir).expanduser().resolve()
         if not (directory / paths.DB_FILENAME).exists():
             raise MigrationRefused(f"{directory} holds no {paths.DB_FILENAME}")
+        if directory == paths.project_rce_dir(root).resolve():
+            # This folder's own pre-8.10 `.rce/graph.db`, named by hand.
+            return [(paths.IN_PROJECT_SOURCE, paths.legacy_graph_db_path(root))]
         key = paths.source_key_for_dir(directory)
         if key.startswith(paths.LEGACY_HASH_SOURCE_PREFIX):
             from rce.records.lock import PROJECT_ID_RE  # noqa: PLC0415
@@ -456,6 +464,7 @@ class Exported:
     already: int = 0
     copied_arrangement: bool = False
     problems: list[str] = field(default_factory=list)
+    changed: list[str] = field(default_factory=list)
 
 
 def _ledger_now(root: Path) -> ledger_mod.Ledger:
@@ -495,13 +504,30 @@ def export(
         mine = [e for e in state.history if e.get("via") == MIGRATED and e.get("migrated_from") == key]
         desired = _desired(link)
         done = [e.get("verdict") for e in mine]
+        contradicted = next((e.get("contradicts") for e in mine if e.get("contradicts")), None)
+        if contradicted:
+            # This source was exported in the contradiction form: ONE entry,
+            # the old index's final status (its remembered prior status is
+            # not replayed over another machine's history).
+            desired = [link.status]
         if done == desired:
             out.already += 1
             continue
         if done and done != desired[: len(done)]:
-            out.problems.append(f"{link.key}: this source's earlier entries ({done}) do not match the old index ({desired})")
-            continue
-        if not done and state.history:
+            # The old index changed after this source's earlier export: an
+            # engine still running old code wrote into it while the retire
+            # step waited (「请先退出 RCE 与 MCP 服务」). That click is a human
+            # act and must not be lost, nor may it wedge the migration: it is
+            # recorded as a later migrated entry -- still a contradiction when
+            # the earlier one was. The ledger keeps both.
+            if done[-1] == link.status:
+                out.already += 1
+                continue
+            to_write = [(link.status, contradicted)]
+            out.changed.append(f"{link.key}: the old index now says {link.status} (exported earlier: {done})")
+            logger.warning("RCE: migration of %s: %s changed in the old index since it was exported (%s -> %s)",
+                           root, link.key, done, link.status)
+        elif not done and state.history:
             standing = ledger_mod.judgement_status(state)
             if standing == link.status:
                 out.already += 1
@@ -729,6 +755,16 @@ def retired_dir_for(key: str, root: Path) -> Path:
     return target
 
 
+def _is_index_directory(key: str, db_path: Path) -> bool:
+    """Whether the old index's directory is RCE's own machine directory
+    `~/.rce/graphs/<hash>/` -- the only kind retired whole (with its
+    arrangement beside it)."""
+    if not key.startswith(paths.LEGACY_HASH_SOURCE_PREFIX):
+        return False
+    graphs = (paths.rce_home() / paths.GRAPHS_DIRNAME).resolve()
+    return db_path.parent.resolve().parent == graphs
+
+
 def _move(source: Path, target: Path) -> None:
     try:
         os.rename(source, target)
@@ -752,13 +788,17 @@ def retire(root: Path, key: str, db_path: Path, *, engine_probe: Callable[[], bo
         raise MigrationRefused(f"{PLEASE_QUIT}: process(es) {', '.join(map(str, sorted(held)))} hold {db_path} open")
     target = retired_dir_for(key, root)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if key == paths.IN_PROJECT_SOURCE:
+    if _is_index_directory(key, db_path):
+        _move(db_path.parent, target)
+    else:
+        # 9.5 step 5 retires "the old index", never the folder it sits in:
+        # an in-project `.rce/` (or any directory `--from` named) also holds
+        # the researcher's records -- project.toml, the ledger just written,
+        # attempts.toml, mappings.toml, backups/. Only the database moves.
         target.mkdir()
         for f in sidecars:
             if f.exists():
                 _move(f, target / f.name)
-    else:
-        _move(db_path.parent, target)
     record_files._fsync_dir(target.parent)
     return target
 
@@ -881,8 +921,12 @@ def migrate_one(
                 fresh.close()
             if not tally.balanced:
                 rebuild_mod.remove_database(staging)
+                serving = (
+                    "the new index installed by an earlier attempt keeps serving"
+                    if target.exists() else "the old index keeps serving"
+                )
                 return Migrated(root, key, ok=False, identity=ident, tally=tally, exported=exported, resumed=resumed,
-                                stopped="the tally did not balance; nothing was retired and the old index keeps serving")
+                                stopped=f"the tally did not balance; nothing was retired and {serving}")
             fault("after_verify")
             rebuild_mod.install(staging, target)
             fault("after_install")

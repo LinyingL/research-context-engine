@@ -507,6 +507,8 @@ def _cleanup_orphaned_claims(
     for node in db.get_nodes_by_type(conn, "claim"):
         if node["id"] in seen_ids or node["attrs"].get("tex_path") not in scanned_tex_paths:
             continue
+        if db.holds_unrecorded_judgment(conn, node["id"], extractor="claims"):
+            continue  # a pre-V5 index: its judgment is not in the record yet (9.5)
         removed_edges += db.delete_edges_for_node(conn, node["id"], extractor="claims")
         db.delete_node(conn, node["id"])
         removed_claims += 1

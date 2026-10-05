@@ -18,9 +18,13 @@ lock and after the write-time identity re-check (`situation.write_guard`,
    invalid, beside a conflict copy, or SHRUNK and unanswered refuses the
    write -- nothing is written anywhere;
 2. record the basis: the link's basis as the latest scan of a readable
-   source produced it (`basis_recorded = "at-judgment"`); a link that scan
-   did not produce is still judged, on the last basis known
-   (`"last-known"`), and the applier puts it under review at once;
+   source produced it (`basis_recorded = "at-judgment"`); a link that
+   scan read the source of and did NOT produce is judged on that absence
+   (`"not-produced"`, the last known basis kept for display) -- this is
+   how 「仍然成立」 or the opposite verdict settles a review whose reason
+   is 「机器不再得出这条关联」 or 「关联的一端不在本次扫描结果里」 (9.6), and it
+   applies while the link stays unproduced; a link whose source could
+   not be read is judged on the last basis known (`"last-known"`);
 3. append the entry (`ledger.append_judgement`: seq under the lock, a
    snapshot the first time the file changes each day);
 4. raise `ledger = true` in `project.toml` on the first entry -- AFTER the
@@ -135,6 +139,7 @@ CANDIDATE_HINT = "可能对应一条待复核的旧判断"
 #: `basis_recorded` values `judge` writes.
 AT_JUDGMENT = "at-judgment"
 LAST_KNOWN = "last-known"
+ON_ABSENCE = "not-produced"  # judged while an observing scan does not produce the link
 
 HUMAN_VERDICTS = ("confirmed", "rejected")
 
@@ -144,7 +149,10 @@ class JudgementRefused(Exception):
     ledger may not be written now; `decision` says why, `message` is its
     Chinese sentence), `mapping` (a hand-drawn link), `no_such_link`,
     `nothing_to_undo` / `not_rejected` (an undo with nothing, or not a
-    reject, to take back), `no_index`, `no_question`, `invalid`."""
+    reject, to take back), `no_index`, `no_question`, `question_changed`
+    (the 9.3 question changed since it was shown), `would_lose`
+    (「以文件为准」 would forget the only copy and still leave the ledger
+    unusable), `invalid`."""
 
     def __init__(self, code: str, message: str, *, decision: TrustDecision | None = None) -> None:
         super().__init__(message)
@@ -276,6 +284,16 @@ def _candidates(conn: Connection, key: Key) -> list[dict[str, Any]]:
     ]
 
 
+def _on_absence(entry: LedgerEntry) -> bool:
+    """Whether the entry was recorded while the scan did not produce its
+    link (`basis_recorded = "not-produced"`): 「仍然成立」 or the opposite
+    verdict on a link under review as 「机器不再得出这条关联」 / 「关联的一端
+    不在本次扫描结果里」. The basis as it is now (9.6) is "not produced";
+    so the judgment applies while the link stays unproduced, and is
+    reviewed again if the link comes back on another basis."""
+    return entry.get("basis_recorded") == ON_ABSENCE
+
+
 def _evaluate(
     conn: Connection,
     key: Key,
@@ -283,6 +301,7 @@ def _evaluate(
     current_status: str | None,
     previous: Mapping[str, Any] | None,
     scanned: bool,
+    project_root: Path | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """One judged link's outcome per 9.6, and the status the edge should
     have (None: leave it as it is)."""
@@ -293,7 +312,19 @@ def _evaluate(
     if row is None:
         # Neither a live edge nor the stamps of a removed one: the index
         # has never held this link (a fresh index, a migrated judgment).
-        ends = scan_mod.endpoints_present(conn, edge) if scanned else None
+        # "No longer produced" may only be said by a scan that read the
+        # link's source (9.6): a source of its extractor about one of its
+        # ends that could not be read makes it 「来源文件暂不可读」.
+        failed = scan_mod.failed_sources(conn, edge) if scanned else []
+        if failed:
+            failed_status = (db.scan_source_row(conn, key[3], failed[0]) or {}).get("status", scan_mod.UNREADABLE)
+            return _judged_item(
+                entry, "held", SOURCE_UNREADABLE, source_status=failed_status,
+                detail={"source_unreadable": True, "sources": failed},
+            ), None
+        ends = scan_mod.endpoints_present(conn, edge, project_root) if scanned else None
+        if ends is not None and _on_absence(entry):
+            return _judged_item(entry, "applied", None, source_status=source_status, basis_now=None), None
         if ends is False:
             return _judged_item(entry, "review", ENDPOINT_GONE, source_status=source_status), None
         if ends is True:
@@ -323,7 +354,9 @@ def _evaluate(
         if _same_basis(_basis_of(entry), now):
             return _judged_item(entry, "applied", None, source_status=source_status, basis_now=now), verdict
         return _judged_item(entry, "review", BASIS_CHANGED, source_status=source_status, basis_now=now), None
-    ends = scan_mod.endpoints_present(conn, edge)
+    if _on_absence(entry):
+        return _judged_item(entry, "applied", None, source_status=source_status, basis_now=None), verdict
+    ends = scan_mod.endpoints_present(conn, edge, project_root)
     reason = ENDPOINT_GONE if ends is False else NOT_PRODUCED
     return _judged_item(
         entry, "review", reason, source_status=source_status, basis_now=None,
@@ -386,8 +419,11 @@ class Plan:
     applied: dict[str, tuple[int | None, str]]
 
 
-def compute_plan(conn: Connection, ledger: ledger_mod.Ledger) -> Plan:
-    """The index's human state the trusted `ledger` implies (reads only)."""
+def compute_plan(conn: Connection, ledger: ledger_mod.Ledger, project_root: str | Path | None = None) -> Plan:
+    """The index's human state the trusted `ledger` implies (reads only).
+    `project_root` lets an end the inventory never listed be found on disk
+    (`scan.endpoints_present`)."""
+    root = Path(project_root) if project_root is not None else None
     previous = db.judgement_states(conn)
     edges = db.edge_statuses(conn)
     scanned = db.has_finished_scan(conn)
@@ -408,7 +444,7 @@ def compute_plan(conn: Connection, ledger: ledger_mod.Ledger) -> Plan:
                 statuses[key] = _machine(key, row)
             continue
         assert state.entry is not None
-        item, status = _evaluate(conn, key, state.entry, row[0] if row else None, previous.get(key), scanned)
+        item, status = _evaluate(conn, key, state.entry, row[0] if row else None, previous.get(key), scanned, root)
         states[key] = item
         if row is not None:
             statuses[key] = status if status is not None else _machine(key, row)
@@ -456,7 +492,7 @@ def apply_ledger(
         logger.warning("RCE: %s not applied (%s: %s)", loaded.path, decision.reason, decision.detail)
         return ApplyResult(applied=False, decision=decision)
     ledger = loaded.ledger if loaded.ledger is not None else parse_ledger("", JUDGEMENT_SCHEMA)
-    plan = compute_plan(conn, ledger)
+    plan = compute_plan(conn, ledger, root)
     db.write_judgement_state(conn, statuses=plan.statuses, states=plan.states, applied=plan.applied)
     outcomes = [s["outcome"] for s in plan.states.values()]
     return ApplyResult(
@@ -492,7 +528,7 @@ def verify(conn: Connection, project_root: str | Path) -> list[str]:
     if not decision.may_apply:
         return [f"the judgment ledger cannot be applied now ({decision.reason}: {decision.detail or ''})"]
     ledger = loaded.ledger if loaded.ledger is not None else parse_ledger("", JUDGEMENT_SCHEMA)
-    plan = compute_plan(conn, ledger)
+    plan = compute_plan(conn, ledger, root)
     problems = []
     edges = db.edge_statuses(conn)
     for key, status in sorted(plan.statuses.items()):
@@ -609,12 +645,21 @@ def judge(
             basis: dict[str, Any] | None = None
             recorded: str | None = None
             if verdict in HUMAN_VERDICTS and row is not None:
-                current = scan_mod.current_basis(conn, _edge(key))
+                produced = scan_mod.produced_in_latest_scan(conn, _edge(key))
+                current = scan_mod.current_basis(conn, _edge(key)) if produced else None
                 if current is not None:
                     basis, recorded = current, AT_JUDGMENT
+                elif produced is False:
+                    # 9.6: settled on "the basis as it is now" -- not produced
+                    # by a scan that read its source (`_on_absence`).
+                    basis, recorded = scan_mod.last_basis(conn, _edge(key)), ON_ABSENCE
                 else:
                     basis = scan_mod.last_basis(conn, _edge(key))
                     recorded = LAST_KNOWN if basis is not None else None
+            elif verdict in HUMAN_VERDICTS:
+                shown = db.judgement_states(conn).get(key)
+                if shown is not None and shown["outcome"] == "review" and shown.get("reason") in (NOT_PRODUCED, ENDPOINT_GONE):
+                    basis, recorded = shown.get("basis"), ON_ABSENCE
             if unless_standing and state.entry is not None and state.entry.get("verdict") == verdict:
                 applied = db.judgement_states(conn).get(key)
                 if applied is not None and applied["outcome"] == "applied" and applied.get("entry_id") == state.entry.id:
@@ -664,12 +709,30 @@ def answer_shrunk(
     project_root: str | Path,
     answer: str,
     *,
+    expected_missing: Iterable[str] | None = None,
     expected_id: Any = READ_NOW,
     timeout: float | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> Answered:
     """Answer 「记录文件比图谱少了 N 条判断」 (module docstring). Refused
-    (`no_question`) unless the ledger is SHRUNK right now."""
+    (`no_question`) unless the ledger is SHRUNK right now.
+
+    `expected_missing` -- the ids of the missing entries the researcher was
+    shown -- ties the answer to the question: if the file changed between
+    showing it and the click (a sync service, 9.3's own motivating case),
+    the answer is refused (`question_changed`) rather than applied to
+    entries nobody was asked about. The app always passes it.
+
+    「把缺少的补回文件」 appends every missing entry in ONE write
+    (`ledger.append_many`): a crash leaves all of them or none, and an
+    entry already restored (`recovered_from`) no longer counts as missing
+    (`trust.assess_ledger`), so answering again appends nothing twice.
+
+    「以文件为准」 is refused (`would_lose`) when the file as it is could not
+    be applied once the copy forgot the missing entries -- e.g. a zero-byte
+    ledger in a project whose `project.toml` records one: forgetting them
+    would delete the only copy RCE has of those judgments and still leave
+    every write refused. Restoring the file, or 「把缺少的补回文件」, remain."""
     if answer not in ANSWERS:
         raise JudgementRefused("invalid", f"answer must be one of {', '.join(ANSWERS)}, got {answer!r}")
     root = Path(project_root)
@@ -681,40 +744,75 @@ def answer_shrunk(
             if decision.verdict is not Trust.SHRUNK:
                 raise JudgementRefused("no_question", "the judgment ledger has not shrunk; there is nothing to answer")
             missing = decision.missing
+            missing_ids = [str(m["id"]) for m in missing]
+            if expected_missing is not None and sorted(set(map(str, expected_missing))) != sorted(missing_ids):
+                raise JudgementRefused(
+                    "question_changed",
+                    f"the judgment ledger changed since the question was shown (it now lacks {len(missing_ids)} "
+                    f"entr(y/ies) the index applied) -- nothing written; look at the question again",
+                    decision=decision,
+                )
             appended: list[LedgerEntry] = []
             if answer == ANSWER_FILE:
-                db.forget_applied_judgements(conn, [str(m["id"]) for m in missing])
+                remaining = {k: v for k, v in applied_copy(conn, loaded).items() if k not in set(missing_ids)}
+                after = assess_ledger(identity, loaded, remaining)
+                if not after.may_apply:
+                    raise JudgementRefused(
+                        "would_lose",
+                        f"taking the file as it is would leave a ledger RCE cannot apply ({after.reason}: "
+                        f"{after.detail or ''}); the {len(missing_ids)} missing judgment(s) exist only in the "
+                        f"index's copy -- nothing changed; restore the file, or answer 'restore'",
+                        decision=after,
+                    )
+                db.forget_applied_judgements(conn, missing_ids)
             else:
-                renamed: dict[str, str] = {}
-                create = loaded.state is RecordState.ABSENT
-                for old in missing:
-                    fields = {
-                        k: v for k, v in old.items()
-                        if k not in ("id", "seq", "at", "settles", "via", "undoes")
-                    }
-                    fields["via"] = "recovered"
-                    fields["recovered_from"] = str(old["id"])
-                    if old.get("at") is not None:
-                        fields["recovered_at"] = str(_jsonable(old["at"]))
-                    if old.get("undoes"):
-                        fields["undoes"] = renamed.get(str(old["undoes"]), str(old["undoes"]))
-                    try:
-                        entry = ledger_mod.append(
-                            ledger_mod.judgements_path(root), JUDGEMENT_SCHEMA, fields,
-                            lock=held, project_root=root, create=create, now=now,
-                        )
-                    except LedgerWriteRefused as exc:
-                        raise JudgementRefused("invalid", f"could not restore entry {old['id']}: {exc}") from exc
-                    create = False
-                    renamed[str(old["id"])] = entry.id
-                    appended.append(entry)
-                db.forget_applied_judgements(conn, list(renamed))
+                appended = _restore_missing(root, held, loaded, missing, now)
+                db.forget_applied_judgements(conn, missing_ids)
                 if appended and not identity.ledger:
                     identity = set_flag(root, identity, "ledger", True)
             result = apply_ledger(conn, root, identity=identity)
             return Answered(answer=answer, missing=tuple(missing), appended=tuple(appended), result=result)
         finally:
             conn.close()
+
+
+def _restore_missing(
+    root: Path, held: Any, loaded: LedgerLoad, missing: tuple[Mapping[str, Any], ...],
+    now: Callable[[], datetime] | None,
+) -> list[LedgerEntry]:
+    """「把缺少的补回文件」: every missing entry again, `via = "recovered"`,
+    in one write. An undo names the restored copy of its target -- one
+    restored in this batch, or one an earlier answer already restored."""
+    renamed: dict[str, str] = {}
+    if loaded.ledger is not None:
+        for e in loaded.ledger.entries:
+            source = e.get("recovered_from")
+            if isinstance(source, str):
+                renamed[source] = e.id
+    batch: list[dict[str, Any]] = []
+    for old in missing:
+        fields = {
+            k: v for k, v in old.items()
+            if k not in ("id", "seq", "at", "settles", "via", "undoes")
+        }
+        fields["via"] = "recovered"
+        fields["recovered_from"] = str(old["id"])
+        if old.get("at") is not None:
+            fields["recovered_at"] = str(_jsonable(old["at"]))
+        if old.get("undoes"):
+            # The restored copy of its target: restored earlier (`renamed`),
+            # or in this batch (the old id, resolved as an alias), or still
+            # in the file under its own id.
+            fields["undoes"] = renamed.get(str(old["undoes"]), str(old["undoes"]))
+        batch.append(fields)
+    try:
+        return ledger_mod.append_many(
+            ledger_mod.judgements_path(root), JUDGEMENT_SCHEMA, batch,
+            lock=held, project_root=root, create=loaded.state is RecordState.ABSENT, now=now,
+            aliases=[str(old["id"]) for old in missing],
+        )
+    except LedgerWriteRefused as exc:
+        raise JudgementRefused("invalid", f"could not restore the missing entries (nothing written): {exc}") from exc
 
 
 # -- what readers show ----------------------------------------------------------------------

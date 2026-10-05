@@ -193,6 +193,7 @@ def test_list_source_files_skips_and_logs_undecodable_path(monkeypatch, tmp_path
     rest of the listing down with it."""
     good = "ascii.png"
     bad = "bad\udcff.py"  # simulates a non-UTF-8-decodable path byte sequence
+    (tmp_path / good).write_bytes(b"")  # tracked files are listed only when in the working tree
     monkeypatch.setattr(
         git_ingest, "_run_git", lambda repo_path, args: f"{good}\x00{bad}\x00"
     )

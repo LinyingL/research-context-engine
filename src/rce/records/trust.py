@@ -144,7 +144,14 @@ def assess_ledger(
     ledger = loaded.ledger
     assert ledger is not None  # PRESENT always carries one
     in_file = {e.id: e.data for e in ledger.entries}
-    missing = tuple(sorted((v for k, v in applied.items() if k not in in_file), key=_seq_order))
+    # An entry 「把缺少的补回文件」 already appended again (`recovered_from`
+    # names the one it restores) is not missing: a process killed after
+    # that append and before the index forgot the old id must not ask the
+    # question again, nor append the entry a second time.
+    recovered = {e.get("recovered_from") for e in ledger.entries if isinstance(e.get("recovered_from"), str)}
+    missing = tuple(sorted(
+        (v for k, v in applied.items() if k not in in_file and k not in recovered), key=_seq_order,
+    ))
     if missing:
         return TrustDecision(Trust.SHRUNK, reason="shrunk", missing=missing)
     if expected and not ledger.entries:

@@ -59,8 +59,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import contextmanager
 from decimal import Decimal
+from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -274,10 +276,34 @@ class Scan:
         )
 
 
+class UnrecordedScan(Scan):
+    """A scan of an index from before scan reports (a pre-V5 index, schema
+    0001-0003, which a project keeps -- read-only for human records --
+    until `rce migrate`; 9.5, 9.10). Its extractors run exactly as before
+    0004: nothing is recorded, no link is stamped. Without this, every scan
+    of such a project died on the missing `scans` table."""
+
+    def __init__(self, conn: Connection, label: str) -> None:
+        super().__init__(conn, 0, label)
+
+    def prior_scan(self, extractor: str, source: str) -> int | None:
+        return None
+
+    def mark(self, extractor: str, source: str, basis_: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    def finish(self, *, failed: bool = False) -> None:
+        return None
+
+
 @contextmanager
 def scan(conn: Connection, label: str) -> Iterator[Scan]:
     """Open a scan, yield it, and finish it -- as `failed` if the body
-    raises (then only its failure statuses are written)."""
+    raises (then only its failure statuses are written). On an index that
+    predates scan reports, an `UnrecordedScan`."""
+    if not db._has_scan_stamps(conn):
+        yield UnrecordedScan(conn, label)
+        return
     current = Scan(conn, db.begin_scan(conn, label), label)
     try:
         yield current
@@ -371,7 +397,14 @@ def node_present(conn: Connection, node_id: str) -> bool | None:
     rows = db.node_source_rows(conn, node_id)
     in_index = db.get_node(conn, node_id) is not None
     if not rows:
-        return None if in_index else False
+        # Never produced by any recorded scan. A file's node is then known
+        # absent (a file inventory lists every project file); a node with no
+        # file -- an experiment, a commit -- may simply come from a store or
+        # history this index never read (a rebuild without `--mlruns`), and
+        # that cannot be told.
+        if in_index:
+            return None
+        return False if node_file(node_id) is not None else None
     if not in_index:
         rows = [row for row in rows if row["extractor"] == INVENTORY]
     for row in rows:
@@ -380,12 +413,67 @@ def node_present(conn: Connection, node_id: str) -> bool | None:
     return False
 
 
-def endpoints_present(conn: Connection, edge: Mapping[str, Any]) -> bool | None:
+#: Node types whose id names a project file (`<type>:<path>[#...]`).
+FILE_NODE_TYPES = frozenset({"script", "dataset", "figure", "claim", "section", "attempt"})
+
+
+def node_file(node_id: str) -> str | None:
+    """The project file a node's id names (`claim:paper.md#ab12` ->
+    `paper.md`), or None for a node that is not a file's (experiment,
+    commit, project, reference, contributor)."""
+    type_, _, rest = node_id.partition(":")
+    if type_ not in FILE_NODE_TYPES or not rest:
+        return None
+    return rest.split("#", 1)[0]
+
+
+def failed_sources(conn: Connection, edge: Mapping[str, Any]) -> list[str]:
+    """The sources of the link's extractor that concern one of its ends'
+    files and that the latest scan could NOT read (unreadable /
+    unparseable). For a link the index holds no row for -- a fresh index,
+    a migrated judgment -- this is how 「来源文件暂不可读」 is still told: a
+    source that could not be read cannot say the link is gone (9.6)."""
+    files = {f for f in (node_file(edge["src"]), node_file(edge["dst"])) if f}
+    if not files:
+        return []
+    return sorted(
+        row["source"] for row in db.scan_sources_of(conn, edge["extractor"])
+        if row["status"] in FAILED and file_of(row["source"]) in files
+    )
+
+
+#: Node types that ARE their file (a claim or a section is a part of one).
+WHOLE_FILE_NODE_TYPES = frozenset({"script", "dataset", "figure"})
+
+
+def _on_disk(node_id: str, project_root: Path | None) -> bool:
+    """A node that is a whole file, and that file is on disk. The scan may
+    not list it -- a git project's ignored `data/` is in no inventory, and
+    such a dataset is "in the scan" only through the calls naming it -- but
+    a file that is there was not renamed or removed (9.6's wording of
+    「关联的一端不在本次扫描结果里」), so a removed call is 「机器不再得出这条
+    关联」."""
+    type_ = node_id.partition(":")[0]
+    rel = node_file(node_id)
+    if project_root is None or rel is None or type_ not in WHOLE_FILE_NODE_TYPES or os.path.isabs(rel):
+        return False
+    return os.path.lexists(Path(project_root) / rel)
+
+
+def endpoints_present(
+    conn: Connection, edge: Mapping[str, Any], project_root: str | Path | None = None,
+) -> bool | None:
     """Are both ends of the link produced by the latest scans of THEIR
     sources (9.6: 「机器不再得出这条关联」 needs both; 「关联的一端不在本次
     扫描结果里」 is the other case)? False if either end is known absent,
-    True if both are present, None if either cannot be told."""
-    ends = [node_present(conn, edge["src"]), node_present(conn, edge["dst"])]
+    True if both are present, None if either cannot be told. With
+    `project_root`, a whole-file end whose file is on disk counts as
+    present (`_on_disk`)."""
+    root = Path(project_root) if project_root is not None else None
+    ends = [
+        True if present is False and _on_disk(node, root) else present
+        for node, present in ((n, node_present(conn, n)) for n in (edge["src"], edge["dst"]))
+    ]
     if False in ends:
         return False
     if None in ends:

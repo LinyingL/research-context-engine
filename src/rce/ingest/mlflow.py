@@ -66,8 +66,10 @@ def _parse_meta_yaml(text: str) -> dict[str, str]:
             result[key] = value
     return result
 
-def _read_flat_dir(dir_path: Path) -> dict[str, str]:
-    """One value per file (params/, tags/): filename -> stripped content."""
+def _read_flat_dir(dir_path: Path, problems: list[str] | None = None) -> dict[str, str]:
+    """One value per file (params/, tags/): filename -> stripped content.
+    A file that cannot be read is skipped + logged, and named in
+    `problems` (the scan report: the run was not fully read)."""
     result: dict[str, str] = {}
     for entry in sorted(dir_path.iterdir()) if dir_path.is_dir() else []:
         if not entry.is_file():
@@ -76,9 +78,11 @@ def _read_flat_dir(dir_path: Path) -> dict[str, str]:
             result[entry.name] = entry.read_text(errors="replace").strip()
         except OSError as exc:
             logger.warning("cannot read %s: %s", entry, exc)
+            if problems is not None:
+                problems.append(f"{entry}: {exc}")
     return result
 
-def _read_metrics_dir(dir_path: Path) -> dict[str, float]:
+def _read_metrics_dir(dir_path: Path, problems: list[str] | None = None) -> dict[str, float]:
     """metrics/<name>: one 'timestamp value step' line per logged point;
     last line is the final value. Unparseable file skipped + logged.
 
@@ -96,21 +100,30 @@ def _read_metrics_dir(dir_path: Path) -> dict[str, float]:
     `ingest_mlflow_dir`)."""
     result: dict[str, float] = {}
     skipped_dotfiles = 0
+    note = problems.append if problems is not None else (lambda _m: None)
     for entry in sorted(dir_path.iterdir()) if dir_path.is_dir() else []:
         if entry.name.startswith("."):
             skipped_dotfiles += 1
             continue
         if not entry.is_file():
             continue
-        lines = [l for l in entry.read_text(errors="replace").splitlines() if l.strip()]
+        try:
+            text = entry.read_text(errors="replace")
+        except OSError as exc:
+            logger.warning("cannot read metric file %s: %s", entry, exc)
+            note(f"{entry}: {exc}")
+            continue
+        lines = [l for l in text.splitlines() if l.strip()]
         parts = lines[-1].split() if lines else []
         if len(parts) < 2:
             logger.warning("skipping unparseable metric file %s", entry)
+            note(f"{entry}: no 'timestamp value step' line")
             continue
         try:
             result[entry.name] = float(parts[1])
         except ValueError:
             logger.warning("skipping non-numeric metric value in %s: %r", entry, parts[1])
+            note(f"{entry}: {parts[1]!r} is not a number")
     if skipped_dotfiles:
         logger.info(
             "skipped %d dot-prefixed entr%s in %s (MLflow temp/leftover files, "
@@ -210,7 +223,12 @@ def _ingest_mlflow(conn: Connection, mlruns_root: Path, store: str, sc: scan_mod
             continue
 
         run_id = run_dir.name
-        tags = _read_flat_dir(run_dir / "tags")
+        # A file of the run that could not be read or understood (a metric
+        # mid-write or partly synced, an unreadable tag) means the scan did
+        # not fully read this run: the store is UNPARSEABLE for this scan
+        # (9.6), so no link of it is said to be "no longer produced".
+        problems: list[str] = []
+        tags = _read_flat_dir(run_dir / "tags", problems)
         experiment_id = f"experiment:{run_id}"
         db.upsert_node(
             conn, experiment_id, "experiment",
@@ -222,13 +240,15 @@ def _ingest_mlflow(conn: Connection, mlruns_root: Path, store: str, sc: scan_mod
                 "start_time": meta.get("start_time"),
                 "end_time": meta.get("end_time"),
                 "artifact_uri": meta.get("artifact_uri"),
-                "params": _read_flat_dir(run_dir / "params"),
-                "metrics": _read_metrics_dir(run_dir / "metrics"),
+                "params": _read_flat_dir(run_dir / "params", problems),
+                "metrics": _read_metrics_dir(run_dir / "metrics", problems),
                 "tags": {k: v for k, v in tags.items() if k in _KEY_TAG_NAMES},
             },
         )
         counts["experiments"] += 1
         sc.node(experiment_id, "mlflow", store)
+        if problems:
+            status = scan_mod.UNPARSEABLE
 
         sha = tags.get("mlflow.source.git.commit", "").strip()
         if sha:

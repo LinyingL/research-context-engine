@@ -149,6 +149,12 @@ class Home:
     st_dev: int
     st_ino: int
     updated: str = ""
+    # Set by `rce project claim` before it rebuilds the index from this
+    # folder, cleared after: a claim killed in between must not leave the
+    # folder NORMAL while it is served by the OTHER folder's index (9.4:
+    # "nothing from the other folder's scans or record survives in it").
+    # `rce.project.open_project` finishes such a claim first.
+    claim_pending: bool = False
 
 
 def home_path(project_id: str) -> Path:
@@ -172,7 +178,7 @@ def read_home(project_id: str) -> Home | None:
     if not isinstance(canonical, str) or not canonical or not isinstance(dev, int) or not isinstance(ino, int):
         return None
     updated = data.get("updated") if isinstance(data.get("updated"), str) else ""
-    return Home(canonical, dev, ino, updated)
+    return Home(canonical, dev, ino, updated, claim_pending=data.get("claim_pending") is True)
 
 
 def home_of(project_root: str | Path) -> Home:
@@ -186,17 +192,20 @@ def home_of(project_root: str | Path) -> Home:
     )
 
 
-def write_home(project_id: str, project_root: str | Path) -> Home:
+def write_home(project_id: str, project_root: str | Path, *, claim_pending: bool = False) -> Home:
     """Record `project_root` as the home of `project_id`'s index. The index
     directory is under `rce_home()` (created here if needed); the project
-    folder must exist. Hold the project lock."""
+    folder must exist. Hold the project lock. `claim_pending` only from
+    `rce project claim` (see `Home`)."""
     home = home_of(project_root)
     directory = paths.index_dir(project_id)
     directory.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(
-        {"canonical_path": home.canonical_path, "st_dev": home.st_dev, "st_ino": home.st_ino, "updated": home.updated},
-        ensure_ascii=False, indent=2,
-    ) + "\n"
+    record: dict[str, Any] = {
+        "canonical_path": home.canonical_path, "st_dev": home.st_dev, "st_ino": home.st_ino, "updated": home.updated,
+    }
+    if claim_pending:
+        record["claim_pending"] = True
+    data = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
     files.durable_write(home_path(project_id), data.encode("utf-8"))
     return home
 
@@ -215,6 +224,34 @@ def is_home(project_root: str | Path, home: Home, *, stat: Callable[[Any], os.st
     except OSError:
         return False
     return (st.st_dev, st.st_ino) == (home.st_dev, home.st_ino)
+
+
+def home_path_twin(
+    project_root: str | Path, home: Home, project_id: str, *,
+    stat: Callable[[Any], os.stat_result] = os.stat,
+    read: Callable[[Any], IdentityRead] = read_identity,
+) -> bool:
+    """Whether the folder at `home`'s recorded PATH is another live
+    directory carrying the same id, while `project_root` is the home only
+    by (device, inode). That is "rename the original aside, copy it back to
+    the original path": two live folders, one identity (9.4's copy), each
+    matching `home.json` by one of its two criteria. Neither may be taken
+    for the home silently; the one found by inode is the one asked here
+    (the one at the path cannot find its twin -- nothing searches by inode
+    -- and is asked when the twin claims). A path that is the same
+    directory under another spelling, or holds nothing, is no twin."""
+    if paths._canonical_path(project_root) == home.canonical_path:
+        return False
+    there = Path(home.canonical_path)
+    try:
+        twin = stat(there)
+        mine = stat(project_root)
+    except OSError:
+        return False
+    if (twin.st_dev, twin.st_ino) == (mine.st_dev, mine.st_ino) or not stat_module.S_ISDIR(twin.st_mode):
+        return False
+    got = read(there)
+    return got.state is IdentityState.PRESENT and got.identity is not None and got.identity.id == project_id
 
 
 # -- probes ----------------------------------------------------------------------
@@ -444,6 +481,12 @@ def classify(project_root: str | Path, *, probes: Probes | None = None) -> Class
             detail=f"the index for {ident.id} does not say which folder is its home",
         )
     if is_home(root, home, stat=probes.stat):
+        if home_path_twin(root, home, ident.id, stat=probes.stat, read=probes.read_identity):
+            return Classification(
+                Situation.COPY, root, identity=ident, identity_read=got, home=home, reason="home_path_holds_a_copy",
+                detail=f"{home.canonical_path} still carries {ident.id} (this folder is the same directory "
+                       f"the home record names by inode, but another folder now sits at its path)",
+            )
         respelled = paths._canonical_path(root) != home.canonical_path
         return Classification(Situation.NORMAL, root, identity=ident, identity_read=got, home=home, respelled=respelled)
     old = _probe_old_home(Path(home.canonical_path), ident.id, probes)
@@ -484,7 +527,7 @@ def check_still_home(project_root: str | Path, expected_id: str | None) -> Proje
     if got.state is not IdentityState.PRESENT or got.identity is None or got.identity.id != expected_id:
         raise ProjectMovedError(f"{root} no longer carries the project {expected_id} -- nothing written")
     home = read_home(expected_id)
-    if home is None or not is_home(root, home):
+    if home is None or not is_home(root, home) or home_path_twin(root, home, expected_id):
         raise ProjectMovedError(
             f"{root} is no longer the home of {expected_id} (it was claimed or opened elsewhere) -- nothing written"
         )

@@ -1663,7 +1663,26 @@ def _judgement_error(exc: judgements.JudgementRefused) -> ApiError:
         return ProjectNotInitializedError(str(exc))
     if exc.code == "no_question":
         return NoQuestionError(str(exc))
+    if exc.code in ("question_changed", "would_lose"):
+        decision = exc.decision
+        return RecordRefusedError(
+            str(exc), state="record_" + exc.code,
+            extra={
+                "records": None if decision is None else {
+                    "state": decision.verdict.value, "reason": decision.reason, "message": decision.message,
+                    "missing": [judgements._summary(m) for m in decision.missing],
+                },
+                "message": RECORD_ANSWER_MESSAGES[exc.code],
+            },
+        )
     return MissingParamError(str(exc))
+
+
+# 8.8: what the page says when an answer to 9.3's question is refused.
+RECORD_ANSWER_MESSAGES = {
+    "question_changed": "记录文件在提问之后又变了，请重新查看问题再回答",
+    "would_lose": "记录文件当前为空或无法使用，以文件为准会丢掉仅存的判断副本；请先恢复文件，或选择「把缺少的补回文件」",
+}
 
 
 def _judge(served: ServedProject, key: tuple[str, str, str, str], verdict: str, **kwargs: Any) -> judgements.Judged:
@@ -1756,9 +1775,18 @@ def records_answer_payload(served: ServedProject, body: dict[str, Any]) -> dict[
     """`POST /api/records/answer` (module docstring)."""
     record, answer = _string_fields(body, ("file", "answer"))
     if record == "judgements":
+        # The ids of the missing entries the page showed (`records.missing[].id`):
+        # an answer is tied to the question the researcher saw (9.3), never
+        # applied to whatever is missing at click time.
+        shown = body.get("missing")
+        if not isinstance(shown, list) or not all(isinstance(i, str) and i for i in shown):
+            raise MissingParamError(
+                "request body must carry 'missing': the ids of the missing entries the question showed"
+            )
         try:
             answered = judgements.answer_shrunk(
-                served.root, answer, expected_id=served.project_id, timeout=WRITE_LOCK_TIMEOUT_S,
+                served.root, answer, expected_missing=shown, expected_id=served.project_id,
+                timeout=WRITE_LOCK_TIMEOUT_S,
             )
         except judgements.JudgementRefused as exc:
             raise _judgement_error(exc) from exc

@@ -548,6 +548,10 @@ def _cleanup_orphans(conn: Connection, file: str, seen_ids: set[str]) -> dict[st
         node_id = node["id"]
         if node_id in seen_ids or not node_id.startswith(prefix):
             continue
+        if db.holds_unrecorded_judgment(conn, node_id):
+            logger.warning("%s no longer present in %s, but a pre-V5 index holds a judgment on it that "
+                           "'rce migrate' has not moved into the record yet -- kept", node_id, file)
+            continue
         edges_removed += db.delete_edges_for_node(conn, node_id)
         db.delete_node(conn, node_id)
         removed += 1

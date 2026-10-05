@@ -58,6 +58,7 @@ never taking the rest of the listing/commit down with it.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -288,7 +289,8 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
 
     Uses `git ls-files` (tracked files only, .gitignore respected for free)
     instead of a filesystem walk -- no ignore-matching logic to maintain.
-    Creates no graph nodes.
+    A tracked file missing from the working tree is left out (it is not
+    there to read). Creates no graph nodes.
 
     `-z` NUL-terminates each path and unconditionally disables git's
     quoting of non-ASCII paths (independent of `core.quotepath` -- see
@@ -321,6 +323,13 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
                 "skipping git-tracked path with bytes that are not valid UTF-8 "
                 "(cannot resolve the real filename, not guessing): %r", path,
             )
+            continue
+        if not os.path.lexists(repo_path / path):
+            # Tracked, but not in the working tree: renamed in Finder or by
+            # `mv`, or deleted, and not committed yet. Listing it would make
+            # every extractor report it UNREADABLE for ever (its judgment
+            # stuck in 「来源文件暂不可读」, `rce rebuild` and migration
+            # refused) instead of what it is: not here -- ABSENT (9.6).
             continue
         suffix = Path(path).suffix.lower()
         if suffix == ".tex":

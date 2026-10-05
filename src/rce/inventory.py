@@ -293,6 +293,57 @@ def _variables_row(root: Path) -> Row:
     return Row("Variable definition cards", _shown(directory, root), f"{len(cards)} card(s)")
 
 
+def record_file_paths(root: Path) -> list[Path]:
+    """The single-file records of 9.2 that get a daily snapshot: the
+    judgment ledger, `mappings.toml`, `attempts.toml`, the arrangement,
+    and the attempt table `attempts.toml` names."""
+    root = Path(root)
+    rce_dir = paths.project_rce_dir(root)
+    found = [
+        ledger_mod.judgements_path(root),
+        mappings_ingest.mappings_path(root),
+        root / attempts_ingest.CONFIG_RELATIVE_PATH,
+        rce_dir / "canvas.json",
+    ]
+    try:
+        config = attempts_ingest.load_config(root)
+    except attempts_ingest.AttemptsConfigError:
+        return found
+    found.append(root / config.file)
+    return found
+
+
+def snapshot_records(root: Path, only: Iterable[str | Path] | None = None) -> list[Path]:
+    """9.2's "a snapshot the first time RCE sees the file changed each day
+    -- which is what covers hand edits": called by whatever sees a record
+    file (the watcher, on first sight of a project and on every change it
+    observes). `only` limits it to those paths. Each file is snapshotted at
+    most once a day and only when it differs from its newest snapshot
+    (`files.snapshot_if_first_change_today`). Only for a project with a V5
+    identity whose migration has finished: a pre-V5 folder is read-only.
+    Failures are logged and contained -- a snapshot never stops a scan.
+    The caller holds the project lock."""
+    import logging  # noqa: PLC0415 -- leaf use
+
+    root = Path(root)
+    got = read_identity(root)
+    if got.state is not IdentityState.PRESENT or got.identity is None or got.identity.migrating_from is not None:
+        return []
+    wanted = None if only is None else {str(p) for p in only}
+    made: list[Path] = []
+    for path in record_file_paths(root):
+        if wanted is not None and str(path) not in wanted:
+            continue
+        try:
+            snap = record_files.snapshot_if_first_change_today(root, path)
+        except Exception as exc:  # noqa: BLE001 -- contained (docstring)
+            logging.getLogger(__name__).warning("could not snapshot %s: %s", path, exc)
+            continue
+        if snap is not None:
+            made.append(snap)
+    return made
+
+
 def inventory(conn: Connection | None, root: Path) -> list[Row]:
     """The 9.2 inventory of `root` (module docstring). `conn` is the index,
     when there is one, for the shrink check; reads only."""
