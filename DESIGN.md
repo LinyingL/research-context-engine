@@ -2159,3 +2159,84 @@ data columns; replacing the dead-variable list; renaming a variable's id.
     for the narrowed card and 「大小未变（内容未比对）」 for an input above
     50 MB whose bytes changed at the same size — never an unqualified
     "unchanged" — and 「完整比对」 then finds the change.
+
+### 9.12 Rulings made while building V5
+
+Decisions the implementers took where this section was silent, or
+questions they sent back rather than guess; ruled on by the design lead
+and binding like the rest.
+
+*The ledger.*
+- **`settles`.** A new entry cannot be told from the other copy's later
+  entries by position alone. An entry RCE appends to a file that already
+  holds an anomaly names the anomalous entries it settles (`settles =
+  [ids]`); that, not its position, is what settles its link. The conflict
+  region begins where the two copies diverged, not at the first entry that
+  looks out of order — it can only mark more links as conflicted, never
+  decide more.
+- **An emptied ledger is not "no judgments".** Once a ledger has held an
+  entry, a file with none is a file that shrank (9.3) and is asked about.
+  The way to have no judgment in force is to withdraw each one: the record
+  is append-only in spirit as well as in bytes. 「以文件为准」 is refused
+  when the file as it stands could not be applied afterwards.
+- **An answer belongs to the question that was shown.** The shrink answer
+  names the entries the researcher saw; if the file has changed since, the
+  question is asked again.
+- **A judgment RCE cannot place** — its link is not in the index and no
+  scan speaks for it — is 「图谱里还没有这条关联」: kept, listed, not
+  counted as under review. One made while its source cannot be read is
+  held at the machine's status until a scan reads the source.
+
+*Identity.*
+- **A lost identity file has three answers**: restore `project.toml` from
+  its snapshot when one exists; 「沿用这些记录，建立新身份」 (`rce project
+  adopt`: a new id, every record kept, a fresh index built from them); or
+  「这是另一个项目」.
+- **A limit, stated.** When a copy is put at the home's recorded path and
+  the original is renamed aside, RCE can ask only the original (it
+  recognises it by inode); it has no way to go looking for the other
+  folder. Each folder's records are its own files either way.
+- 8.10's "a stable hash of the project's resolved path" and 8.11's "a
+  project that is moved gets a new graph id" are superseded by 9.4.
+
+*Evidence.*
+- **Candidates** (9.6) are links that first appeared in the scan in which
+  the judged link stopped being produced, with the same type and
+  extractor and the same basis, from the same source *or sharing an end
+  with it* — the second clause is what lets a renamed script's read be
+  offered at all. **For claims the basis clause is dropped**: a reworded
+  claim has, by construction, a different basis, so its candidates are
+  the new `backed_by` links from the same file to the same experiment.
+  A candidate is a prompt and nothing else.
+- **`pyfig` cannot meet 9.9 #8(a).** Its link runs from the *commit* that
+  last touched the `savefig` line, so committing any edit to that line
+  makes a different link. The judged one goes under review with the new
+  one as its candidate. Re-rooting that link on the script is extractor
+  work for later; the researcher's project has no such links today.
+- In a git project the inventory is what git tracks: a script renamed in
+  Finder is scanned again once it is tracked.
+
+*Migration.*
+- **On disk, identity comes first.** `project.toml` is created with
+  `migrating_from` before anything is exported, so a crash can never leave
+  records in a folder with no identity. Then the scan, the export on that
+  scan's bases, the verification, the retirement, and the flag cleared. A
+  migration that stopped resumes on the next `rce migrate`, not on every
+  open.
+- **"Exactly one basis"** means: the *set* of call names over the old
+  index's stored occurrences equals the fresh scan's basis. A link one
+  scan legitimately produces through two calls is not sent to review for
+  that.
+- The unreadable count stops the migration if either a judged link or any
+  scanned source is unreadable.
+- A link whose status changed in the old index after it was exported is
+  exported again as a later entry. There is no "abort": a migration that
+  cannot retire names the process holding the old index and waits.
+- **Only a process that actually holds the old index blocks its
+  retirement** — an engine serving *this* project, or any process with the
+  database file open. Another RCE window on another project does not.
+- A migrated entry's time is the migration's, and is shown as 「迁移自旧
+  索引（原判断时间未知）」, never as the time the judgment was made.
+
+*The command line.* Every subcommand takes the project either as a
+positional path or as `--path`.
