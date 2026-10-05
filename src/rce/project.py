@@ -62,9 +62,6 @@ from rce.webapp import registry
 
 logger = logging.getLogger(__name__)
 
-REPLACED_DIRNAME = ".replaced"
-
-
 class ProjectBlocked(Exception):
     """The folder is in a situation where nothing may be written until the
     researcher answers (COPY, CANNOT_CHECK, LOST_ID, UNREADABLE_ID)."""
@@ -171,7 +168,10 @@ def open_project(
     adopted = created = False
     if c.situation is Situation.MOVED or (c.situation is Situation.NORMAL and c.respelled):
         c, adopted = _adopt(root, c, probes)
-    elif c.situation is Situation.NO_INDEX:
+    elif c.situation is Situation.NO_INDEX and not c.needs_migration:
+        # A folder whose migration has not finished (`migrating_from`) is
+        # NOT given an index here: its old index keeps serving, read-only,
+        # until `rce migrate` resumes and the tally balances (9.5 step 3).
         c, created = _build_missing_index(root, c, probes)
     if register:
         if c.project_id is not None:
@@ -387,40 +387,34 @@ def fork(project_root: str | Path, *, probes: Probes | None = None, build: bool 
     return Answered("fork", root, new, old.id, git_tracked_identity=tracked, build_error=build_error)
 
 
-def _move_index_aside(project_id: str) -> Path | None:
-    """Keep, never delete, the index being replaced: `~/.rce/graphs/
-    .replaced/<id>-<UTC stamp>/`."""
-    current = paths.index_dir(project_id)
-    if not current.exists():
-        return None
-    target_parent = paths.rce_home() / paths.GRAPHS_DIRNAME / REPLACED_DIRNAME
-    target_parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    target = target_parent / f"{project_id}-{stamp}"
-    os.rename(current, target)
-    return target
-
-
 def claim(project_root: str | Path, *, probes: Probes | None = None, echo: Echo = lambda _l: None) -> Answered:
     """「这里才是原项目」: the index's home becomes this folder AND the index
-    is rebuilt from this folder, so nothing from the other folder's scans
-    survives in it (the old index is kept aside). The id is kept: the
-    other folder, still carrying it, is asked the same question when it
-    is next opened. (A later phase routes the rebuild through `rce
-    rebuild`, which also applies the record.)"""
+    is rebuilt from this folder through `rce rebuild` (9.4, 9.8), so
+    nothing from the other folder's scans or record survives in it; the
+    previous index is kept one generation (`graph.db.prev`). The rebuild's
+    per-link comparison is reported but does not stop the swap: the
+    previous index is the OTHER folder's, and a difference from it is the
+    point of claiming. The id is kept: the other folder, still carrying
+    it, is asked the same question when it is next opened."""
+    from rce import rebuild as rebuild_mod  # noqa: PLC0415 -- rebuild imports this module
+
     root = Path(project_root)
     c = classify(root, probes=probes)
     _require(c, (Situation.COPY, Situation.CANNOT_CHECK), "claim")
     ident = c.identity
     assert ident is not None
+    build_error: str | None = None
     with project_lock(root, ident.id):
         c = _reclassify_same(root, c, probes)
-        aside = _move_index_aside(ident.id)
-        create_index(root, ident)
-        build_error = _build_from_sources(root, ident, echo)
+        write_home(ident.id, root)
+        if not index_db_path(ident.id).exists():
+            create_index(root, ident)
+        rebuilt = rebuild_mod.rebuild(root, expected_id=ident.id, echo=echo, enforce=False)
+        if rebuilt.report is not None and rebuilt.report.ingest_error:
+            build_error = rebuilt.report.ingest_error
     registry.relocate(ident.id, root)
-    logger.warning("RCE: %s claimed project %s; the previous index was kept at %s", root, ident.id, aside)
-    return Answered("claim", root, ident, ident.id, replaced_index=aside, build_error=build_error)
+    logger.warning("RCE: %s claimed project %s; the previous index was kept at %s", root, ident.id, rebuilt.previous)
+    return Answered("claim", root, ident, ident.id, replaced_index=rebuilt.previous, build_error=build_error)
 
 
 def _move_records_aside(root: Path) -> tuple[str, ...]:

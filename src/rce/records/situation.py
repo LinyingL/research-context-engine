@@ -527,6 +527,19 @@ def write_guard(
             f"(`rce migrate`) -- nothing written"
         )
     with project_lock(root, expected_id, timeout=timeout) as held:
+        if expected_id is not None and root.is_dir():
+            # A folder whose migration has not finished (9.5): no human
+            # record, and -- until its new index is installed -- no index
+            # write either (the old index keeps serving, read-only; the
+            # migration itself is the one writer). Said as "migrating",
+            # never as "moved", although no home may be recorded yet.
+            got = read_identity(root)
+            mid = got.identity
+            if mid is not None and mid.id == expected_id and mid.migrating_from is not None:
+                if human or not index_db_path(expected_id).exists():
+                    raise NeedsMigrationError(
+                        f"the migration of {root} has not finished ('rce migrate' resumes it) -- nothing written"
+                    )
         ident = check_still_home(root, expected_id)
         if human and ident is not None and ident.migrating_from is not None:
             raise NeedsMigrationError(

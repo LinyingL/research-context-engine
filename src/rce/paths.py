@@ -41,8 +41,12 @@ path (`canonical_path_hash`). Those indexes still exist on the
 researcher's disk and still hold judgments, so the functions that find
 them are kept under `legacy_*` names: a folder with no `project.toml`
 whose path-hash index exists is a pre-V5 project, served read-only for
-human records until `rce migrate` (a later phase) moves its judgments
-into the record. `graph_dir(project_root)` -- what every caller asks --
+human records until `rce migrate` (`rce.migration`) moves its judgments
+into the record. Which pre-V5 databases wait for a folder, which one it
+is migrating from, and which ones the researcher declined as not this
+folder's are answered here too (`legacy_sources`, `migration_source_db`,
+`decline_source`), so `graph_dir` can serve the old index while a
+migration is unfinished and never serve a declined one. `graph_dir(project_root)` -- what every caller asks --
 answers with the id directory when the folder has an id and with the
 legacy directory when it has none, so read paths need not know which
 kind of project they serve. An identity file that exists but cannot be
@@ -253,8 +257,8 @@ def index_dir(project_id: str) -> Path:
     return rce_home() / GRAPHS_DIRNAME / project_id
 
 
-def _project_id_of(project_root: str | Path) -> str | None:
-    """The id `.rce/project.toml` names; None when the folder has no
+def _identity_of(project_root: str | Path):  # -> ProjectIdentity | None
+    """The identity `.rce/project.toml` holds; None when the folder has no
     identity file; `IdentityUnavailableError` when it has one that cannot
     be read."""
     from rce.records import identity  # noqa: PLC0415 -- records imports this module
@@ -263,11 +267,19 @@ def _project_id_of(project_root: str | Path) -> str | None:
     if got.state is identity.IdentityState.ABSENT:
         return None
     if got.state is identity.IdentityState.PRESENT and got.identity is not None:
-        return got.identity.id
+        return got.identity
     raise IdentityUnavailableError(
         f"the project identity file {got.path} cannot be read right now ({got.state.value}"
         f"{': ' + got.error if got.error else ''}); not guessing which index belongs to {project_root}"
     )
+
+
+def _project_id_of(project_root: str | Path) -> str | None:
+    """The id `.rce/project.toml` names; None when the folder has no
+    identity file; `IdentityUnavailableError` when it has one that cannot
+    be read."""
+    ident = _identity_of(project_root)
+    return ident.id if ident is not None else None
 
 
 def legacy_graph_dir(project_root: str | Path) -> Path:
@@ -286,10 +298,25 @@ def graph_dir(project_root: str | Path) -> Path:
     `index_dir(<id>)` when the folder carries an id, else the legacy
     path-hash directory (module docstring). Computing it never creates
     it; see `ensure_graph_dir`. Raises `IdentityUnavailableError` for an
-    identity file that exists but cannot be read."""
-    project_id = _project_id_of(project_root)
-    if project_id is not None:
-        return index_dir(project_id)
+    identity file that exists but cannot be read.
+
+    Two pre-V5 refinements (DESIGN.md 9.5). A folder whose migration has
+    not finished (`migrating_from`) and whose new index is not installed
+    yet is answered with the OLD index it is migrating from: "the old one
+    keeps serving" until the tally has balanced. And a folder with no id
+    whose path-hash index the researcher declined (「这不是这个项目的」)
+    is answered with a directory that does not exist: the declined index
+    is never served as this folder's -- it inherits nothing."""
+    ident = _identity_of(project_root)
+    if ident is not None:
+        own = index_dir(ident.id)
+        if ident.migrating_from is not None and not (own / DB_FILENAME).exists():
+            source = migration_source_db(project_root, ident.migrating_from)
+            if source is not None and source.exists():
+                return source.parent
+        return own
+    if LEGACY_HASH_SOURCE_PREFIX + legacy_graph_id(project_root) in declined_sources(project_root):
+        return rce_home() / GRAPHS_DIRNAME / DECLINED_DIRNAME / legacy_graph_id(project_root)
     return legacy_graph_dir(project_root)
 
 
@@ -329,8 +356,111 @@ def legacy_graph_db_path(project_root: str | Path) -> Path:
 def has_legacy_index(project_root: str | Path) -> bool:
     """Whether a pre-V5 database that may hold this folder's judgments
     exists: the index at this path's hash, or a pre-8.10 in-project
-    `.rce/graph.db` (DESIGN.md 9.5, "What is looked for")."""
-    return legacy_index_db_path(project_root).exists() or legacy_graph_db_path(project_root).exists()
+    `.rce/graph.db` (DESIGN.md 9.5, "What is looked for") -- not counting
+    one the researcher declined for this folder (`decline_source`)."""
+    return bool(legacy_sources(project_root))
+
+
+# -- pre-V5 databases waiting to be migrated (DESIGN.md 9.5) -------------------
+#
+# A source is named by a short key, which is also what `migrating_from` in
+# `.rce/project.toml` records while a migration is under way:
+#   "graphs/<name>"  -- an index directory under `~/.rce/graphs/` (the path
+#                       hash of this folder, or one named by `rce migrate
+#                       --from`);
+#   "in-project"     -- a pre-8.10 `.rce/graph.db` inside the folder;
+#   an absolute path -- `rce migrate --from` a directory elsewhere.
+# Retired indexes live in `~/.rce/graphs/.retired/`, so they are no longer
+# "un-retired" and nothing finds them again.
+
+LEGACY_HASH_SOURCE_PREFIX = GRAPHS_DIRNAME + "/"
+IN_PROJECT_SOURCE = "in-project"
+RETIRED_DIRNAME = ".retired"
+DECLINED_DIRNAME = ".declined"
+DECLINED_FILENAME = "migration-declined.json"
+
+
+def source_key_for_dir(directory: str | Path) -> str:
+    """The source key of an index directory: `graphs/<name>` under
+    `~/.rce/graphs/`, its absolute path anywhere else."""
+    directory = Path(directory).resolve()
+    graphs = (rce_home() / GRAPHS_DIRNAME).resolve()
+    if directory.parent == graphs:
+        return LEGACY_HASH_SOURCE_PREFIX + directory.name
+    return str(directory)
+
+
+def migration_source_db(project_root: str | Path, key: str) -> Path | None:
+    """The `graph.db` a source key names (None for a key that names
+    nothing this code can find -- an index that has already been retired
+    is not named any more)."""
+    if key == IN_PROJECT_SOURCE:
+        return legacy_graph_db_path(project_root)
+    if key.startswith(LEGACY_HASH_SOURCE_PREFIX):
+        name = key[len(LEGACY_HASH_SOURCE_PREFIX):]
+        if not name or "/" in name or name.startswith("."):
+            return None
+        return rce_home() / GRAPHS_DIRNAME / name / DB_FILENAME
+    if os.path.isabs(key):
+        return Path(key) / DB_FILENAME
+    return None
+
+
+def _declined_path() -> Path:
+    return rce_home() / DECLINED_FILENAME
+
+
+def _load_declined() -> dict[str, list[str]]:
+    import json  # noqa: PLC0415 -- leaf use
+
+    try:
+        data = json.loads(_declined_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: [x for x in v if isinstance(x, str)] for k, v in data.items() if isinstance(k, str) and isinstance(v, list)}
+
+
+def declined_sources(project_root: str | Path) -> set[str]:
+    """Source keys the researcher declined for this folder (「这不是这个项目
+    的」): remembered in `~/.rce/migration-declined.json`, keyed by the
+    folder's canonical path, so the question is not asked on every open.
+    The declined index itself is never touched."""
+    return set(_load_declined().get(_canonical_path(project_root), []))
+
+
+def decline_source(project_root: str | Path, key: str) -> None:
+    """Remember that the source `key` is not this folder's. Machine state
+    in `~/.rce` (not a human record of the project: it is about this
+    machine's old indexes), written durably. Hold the project lock."""
+    import json  # noqa: PLC0415 -- leaf use
+
+    from rce.records import files  # noqa: PLC0415 -- records imports this module
+
+    data = _load_declined()
+    folder = _canonical_path(project_root)
+    keys = set(data.get(folder, []))
+    keys.add(key)
+    data[folder] = sorted(keys)
+    path = _declined_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    files.durable_write(path, (json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def legacy_sources(project_root: str | Path) -> list[tuple[str, Path]]:
+    """The un-retired pre-V5 databases that may hold this folder's
+    judgments and that the researcher has not declined: `(key, graph.db)`
+    for the index at this path's hash and for an in-project `.rce/graph.db`.
+    Checked on every open, with or without an id (9.5)."""
+    declined = declined_sources(project_root)
+    found = []
+    hashed = LEGACY_HASH_SOURCE_PREFIX + legacy_graph_id(project_root)
+    if hashed not in declined and legacy_index_db_path(project_root).exists():
+        found.append((hashed, legacy_index_db_path(project_root)))
+    if IN_PROJECT_SOURCE not in declined and legacy_graph_db_path(project_root).exists():
+        found.append((IN_PROJECT_SOURCE, legacy_graph_db_path(project_root)))
+    return found
 
 
 def graph_exists(project_root: str | Path) -> bool:
@@ -581,6 +711,8 @@ def migrate_legacy_graph(project_root: str | Path) -> Path | None:
     legacy = legacy_graph_db_path(project_root)
     if not legacy.exists():
         return None
+    if IN_PROJECT_SOURCE in declined_sources(project_root):
+        return None  # declined (9.5): not this folder's; left exactly where it is
     if _project_id_of(project_root) is not None:
         # A folder with an id never gets a path-hash index: an in-project
         # graph inside it is a pre-V5 database for `rce migrate` to list

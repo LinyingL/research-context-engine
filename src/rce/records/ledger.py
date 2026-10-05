@@ -701,7 +701,7 @@ def _validate_judgement(entry: Mapping[str, Any]) -> None:
     via = entry.get("via")
     if via is not None and via not in VIAS:
         raise ValueError(f"'via' must be one of {', '.join(sorted(VIAS))}, got {via!r}")
-    for name in ("note", "basis_recorded"):
+    for name in ("note", "basis_recorded", "migrated_from", "contradicts"):
         if name in entry and not isinstance(entry[name], str):
             raise ValueError(f"{name!r} must be a string, got {entry[name]!r}")
     if "basis" in entry:
@@ -720,7 +720,10 @@ JUDGEMENT_SCHEMA = LedgerSchema(
     acts=VERDICTS,
     undo_act="undone",
     key_fields=("src", "dst", "type", "extractor"),
-    field_order=("id", "seq", "at", "verdict", "src", "dst", "type", "extractor", "via", "undoes", "note", "basis_recorded", "basis"),
+    field_order=(
+        "id", "seq", "at", "verdict", "src", "dst", "type", "extractor", "via", "undoes", "note",
+        "migrated_from", "contradicts", "basis_recorded", "basis",
+    ),
     header=_JUDGEMENT_HEADER,
     validate=_validate_judgement,
     validate_new=_validate_new_judgement,
@@ -774,11 +777,25 @@ def append_judgement(
     )
 
 
+def contradicts(state: KeyState) -> str | None:
+    """The id of the entry a link's current act contradicts, when that act
+    is a migrated judgment that disagreed with the state the ledger already
+    had (DESIGN.md 9.5 step 1: two machines disagreed, and a migration date
+    must not decide between them). Such a link is in conflict until the
+    researcher writes a new entry for it -- any later act replaces the
+    contradicting one as the link's current act."""
+    if state.entry is None:
+        return None
+    target = state.entry.get("contradicts")
+    return target if isinstance(target, str) and target else None
+
+
 def judgement_status(state: KeyState) -> str | None:
     """What the ledger says a link's human status is: "confirmed",
-    "rejected", "conflict", or None (no judgment stands, or it was
-    withdrawn -- the machine's status applies)."""
-    if state.conflict is not None:
+    "rejected", "conflict" (two merged histories, or a migrated judgment
+    contradicting the one already recorded), or None (no judgment stands,
+    or it was withdrawn -- the machine's status applies)."""
+    if state.conflict is not None or contradicts(state) is not None:
         return "conflict"
     if state.entry is None:
         return None

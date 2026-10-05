@@ -417,7 +417,8 @@ def test_fork_warns_when_the_identity_file_is_tracked_by_git(tmp_path: Path, cap
 
 def test_scenario_3_claim(tmp_path: Path, fake_home: Path) -> None:
     """9.9 scenario 3, claim: the index is rebuilt from the claiming
-    folder (the previous one kept aside), its home is now here, and the
+    folder through `rce rebuild` (the previous one kept one generation),
+    its home is now here, `rce records --verify` passes there, and the
     original is asked on its next open."""
     p, q = tmp_path / "p", tmp_path / "q"
     pid = _make(p)
@@ -428,8 +429,8 @@ def test_scenario_3_claim(tmp_path: Path, fake_home: Path) -> None:
     assert _pid(q) == pid
     assert situation.classify(q).situation is Situation.NORMAL
     assert situation.read_home(pid).canonical_path == paths._canonical_path(q)
-    replaced = list((paths.rce_home() / "graphs" / ".replaced").iterdir())
-    assert len(replaced) == 1 and replaced[0].name.startswith(pid)
+    assert (paths.index_dir(pid) / "graph.db.prev").exists()
+    assert cli.main(["records", "--verify", str(q)]) == 0
     conn = db.connect(paths.graph_db_path(q))
     try:
         assert db.get_node(conn, "script:c.py") is not None  # scanned from THIS folder

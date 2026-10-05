@@ -1319,6 +1319,16 @@ def scan_sources_of(conn: sqlite3.Connection, extractor: str) -> list[dict[str, 
     return [dict(row) for row in rows]
 
 
+def all_scan_sources(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every (extractor, source) any scan of this index reported, with its
+    latest status ([] on an index from before migration 0004)."""
+    try:
+        rows = conn.execute("SELECT * FROM scan_sources ORDER BY extractor, source").fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(row) for row in rows]
+
+
 def node_source_rows(conn: sqlite3.Connection, node_id: str) -> list[dict[str, Any]]:
     """Which sources produced `node_id` and in which scan, each joined with
     that source's latest observing scan (`observed_scan`, None if the

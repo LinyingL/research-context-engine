@@ -211,10 +211,13 @@ def status_payload(decision: TrustDecision, loaded: LedgerLoad) -> dict[str, Any
     }
 
 
-def assess(conn: Connection, project_root: str | Path, identity: ProjectIdentity | None) -> tuple[LedgerLoad, TrustDecision]:
-    """Read the ledger and decide (9.3) -- reads only."""
+def assess(
+    conn: Connection, project_root: str | Path, identity: ProjectIdentity | None, *, for_migration: bool = False,
+) -> tuple[LedgerLoad, TrustDecision]:
+    """Read the ledger and decide (9.3) -- reads only. `for_migration` only
+    from the migration (9.5), the one writer while `migrating_from` is set."""
     loaded = load_judgements(project_root)
-    return loaded, assess_ledger(identity, loaded, applied_copy(conn, loaded))
+    return loaded, assess_ledger(identity, loaded, applied_copy(conn, loaded), for_migration=for_migration)
 
 
 # -- the applier ----------------------------------------------------------------------
@@ -328,9 +331,35 @@ def _evaluate(
     ), None
 
 
+def _contradiction_item(state: ledger_mod.KeyState, target_id: str) -> dict[str, Any]:
+    """A migrated judgment that contradicts the one already recorded (9.5
+    step 1) is shown exactly like two merged histories: 「记录冲突，待处理」
+    with both sides, until the researcher writes a new entry."""
+    entry = state.entry
+    assert entry is not None
+    before = [e for e in state.history if e.index < entry.index]
+    return {
+        "outcome": "conflict",
+        "reason": RECORD_CONFLICT,
+        "verdict": None,
+        "entry_id": entry.id,
+        "at": entry.at,
+        "note": entry.get("note"),
+        "basis": None,
+        "detail": {
+            "common": [],
+            "branches": [[_summary(e.data) for e in before], [_summary(entry.data)]],
+            "contradicts": target_id,
+        },
+    }
+
+
 def _conflict_item(state: ledger_mod.KeyState) -> dict[str, Any]:
     conflict = state.conflict
-    assert conflict is not None
+    if conflict is None:
+        target = ledger_mod.contradicts(state)
+        assert target is not None
+        return _contradiction_item(state, target)
     last = state.history[-1] if state.history else None
     return {
         "outcome": "conflict",
@@ -407,17 +436,21 @@ def _identity_now(project_root: Path) -> ProjectIdentity | None:
     return got.identity if got.state is IdentityState.PRESENT else None
 
 
-def apply_ledger(conn: Connection, project_root: str | Path, *, identity: ProjectIdentity | None = None) -> ApplyResult:
+def apply_ledger(
+    conn: Connection, project_root: str | Path, *, identity: ProjectIdentity | None = None, for_migration: bool = False,
+) -> ApplyResult:
     """Recompute the index's whole human state from the ledger (module
     docstring). The caller holds the project lock (it is a scan's, a
     watcher's or `judge`'s last step). Without a V5 identity there is no
-    ledger to apply and nothing happens."""
+    ledger to apply and nothing happens. `for_migration=True` is the
+    migration's rebuild applying the record while `migrating_from` is
+    still set (9.5 step 4) -- nobody else passes it."""
     root = Path(project_root)
     if identity is None:
         identity = _identity_now(root)
         if identity is None:
             return ApplyResult(applied=False)
-    loaded, decision = assess(conn, root, identity)
+    loaded, decision = assess(conn, root, identity, for_migration=for_migration)
     db.set_record_status(conn, RECORD_STATUS_NAME, status_payload(decision, loaded))
     if not decision.may_apply:
         logger.warning("RCE: %s not applied (%s: %s)", loaded.path, decision.reason, decision.detail)

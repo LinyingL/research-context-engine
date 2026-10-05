@@ -139,6 +139,18 @@ Endpoints (all GET unless noted):
                             条判断」 (9.3); `{"file": "canvas", "answer":
                             "set_aside"}` moves an arrangement record RCE
                             cannot read into `.rce/backups/`.
+    GET  /api/migration -- 9.5: the pre-V5 indexes waiting for this folder,
+                            each with what it holds and its match (how many
+                            of its judged links' endpoints a scan of this
+                            folder produces -- a scan into a scratch index
+                            that is removed), and an unfinished migration.
+    POST /api/migration/run -- body `{"answer": "migrate"|"not_mine"}`: the
+                            explicit act of 9.5 (`rce.migration.migrate`,
+                            under the project lock from first step to last),
+                            or 「这不是这个项目的」 (the old index untouched,
+                            the refusal remembered for this folder). The
+                            folder is reopened afterwards (it may now have
+                            an id). `summary.migration` says what waits.
     POST /api/shutdown  -- respond `{"ok": true}`, then stop this server's
                             `serve_forever` loop from a separate thread
                             (task V3 phase 4) -- the app's 停止服务 button;
@@ -339,7 +351,9 @@ exists, still carries the id it was opened with and is still that id's
 home. A folder moved in Finder under a running engine therefore gets
 nothing written at its old path, and the page is told 「项目已移动或已在
 别处认领，请重新打开」 (`state: "project_moved"`). A pre-V5 project refuses
-human records (`needs_migration`); a project opened read-only refuses
+human records (`needs_migration`), and so does one whose migration has
+not finished -- whose old index keeps serving reads until the new one is
+installed (`_served_db`); a project opened read-only refuses
 every write (`read_only`); a lock held by another process for too long is
 `project_busy` (503), never a write without it.
 
@@ -368,7 +382,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable, Iterator
 
-from rce import db, lineage, paths
+from rce import db, lineage, migration, paths
 from rce import project as project_identity
 from rce.records import judgements
 from rce.records import ledger as ledger_mod
@@ -653,6 +667,14 @@ class NoQuestionError(ApiError):
     state = "no_question"
 
 
+class MigrationRefusedError(ApiError):
+    """`/api/migration[/run]`: nothing waits, or the folder cannot be
+    migrated as it is now (9.5). Nothing was written. 409."""
+
+    status = 409
+    state = "migration_refused"
+
+
 @dataclass(frozen=True)
 class ServedProject:
     """What this server serves (module docstring, "Project identity")."""
@@ -788,6 +810,10 @@ def _served_db(served: ServedProject) -> Path:
     if served.project_id is None:
         return _require_db(served.root)
     path = records_situation.index_db_path(served.project_id)
+    if not path.exists() and served.needs_migration:
+        # 9.5: until the migration's tally balances, the old index keeps
+        # serving (read-only for human records) -- `graph_db_path` names it.
+        return _require_db(served.root)
     if not path.exists():
         raise ProjectNotInitializedError(
             f"the index of project {served.project_id} is missing ({path}); reopen the project to rebuild it"
@@ -872,6 +898,9 @@ def summary_payload(conn: Connection, project_root: Path, served: ServedProject 
         "project_id": served.project_id if served else None,
         "needs_migration": bool(served and served.needs_migration),
         "read_only": bool(served and served.read_only),
+        # 9.5: pre-V5 indexes that may hold this folder's judgments, and an
+        # unfinished migration ("legacy records waiting").
+        "migration": migration.waiting_payload(project_root),
     }
 
 
@@ -1750,6 +1779,53 @@ def records_answer_payload(served: ServedProject, body: dict[str, Any]) -> dict[
 _APP_HTML_PATH = Path(__file__).parent / "app.html"
 
 
+def migration_payload(served: ServedProject) -> dict[str, Any]:
+    """`GET /api/migration` (9.5, for the app's question): what waits for
+    this folder -- each old index with what it holds and how many of its
+    judged links' endpoints a scan of THIS folder produces -- and an
+    unfinished migration. Reads only (the match is a scan into a scratch
+    index that is removed)."""
+    if served.blocked is not None:
+        raise ProjectBlockedError(served.blocked)
+    waiting = migration.waiting_payload(served.root)
+    previews: list[dict[str, Any]] = []
+    if waiting["waiting"] and waiting["migrating_from"] is None:
+        try:
+            previews = [p.payload() for p in migration.preview(served.root)]
+        except migration.MigrationRefused as exc:
+            raise MigrationRefusedError(str(exc)) from exc
+    return {**waiting, "previews": previews}
+
+
+MIGRATION_ANSWERS = ("migrate", "not_mine")
+
+
+def migration_run_payload(served: ServedProject, body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/migration/run {answer: migrate|not_mine}` -- the explicit
+    act of 9.5. `migrate` is the researcher's yes (resuming an unfinished
+    migration needs none); `not_mine` is 「这不是这个项目的」, which leaves
+    the old indexes untouched and remembers the refusal for this folder.
+    The engine answering on the app's port is this one, so the retire
+    step's engine probe is skipped here; other processes holding the old
+    index open still stop it."""
+    if served.blocked is not None:
+        raise ProjectBlockedError(served.blocked)
+    answer = body.get("answer")
+    if answer not in MIGRATION_ANSWERS:
+        raise MissingParamError(f"request body 'answer' must be one of {', '.join(MIGRATION_ANSWERS)}")
+    try:
+        if answer == "not_mine":
+            return {"declined": migration.decline(served.root)}
+        results = migration.migrate(served.root, yes=True, engine_probe=lambda: False)
+    except migration.MigrationRefused as exc:
+        raise MigrationRefusedError(str(exc)) from exc
+    except project_identity.ProjectBlocked as exc:
+        raise ProjectBlockedError(exc.classification.payload()) from exc
+    except records_lock.ProjectLockTimeout as exc:
+        raise ProjectBusyError(str(exc)) from exc
+    return {"results": [r.payload() for r in results], "ok": all(r.ok for r in results)}
+
+
 def _app_html() -> str:
     """`src/rce/webapp/app.html` verbatim -- read fresh on every request
     rather than cached in memory, since this is a local single-user tool
@@ -2010,6 +2086,8 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._json_from_conn(lambda conn: canvas_payload(conn, self._project_root(), scope))
             elif path == "/api/review":
                 self._json_from_conn(judgements.review_items)
+            elif path == "/api/migration":
+                self._send_json(200, migration_payload(self._served()))
             elif path == "/api/history":
                 self._send_json(200, history_payload(self._require_unblocked(), query))
             elif path == "/api/file":
@@ -2141,6 +2219,17 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 payload["generation"] = self.server.watcher.record_write(
                     {str(ledger_mod.judgements_path(served.root)), str(canvas.canvas_record_path(served.root))},
                 )
+                self._send_json(200, payload)
+            elif parsed.path == "/api/migration/run":
+                # 9.5's explicit act. Not inside `write_guard`: the migration
+                # takes the project lock itself, from first step to last,
+                # and is the one writer allowed while `migrating_from` is set.
+                body = self._read_json_object()
+                served = self._served()
+                payload = migration_run_payload(served, body)
+                # Who this folder is may have changed (a pre-V5 folder now has
+                # an id): reopen it, and let every page re-fetch.
+                self._switch_to(served_for(served.root, label=served.label))
                 self._send_json(200, payload)
             elif parsed.path == "/api/canvas/layout":
                 # UI state beside the graph (8.6) -- origin-checked like

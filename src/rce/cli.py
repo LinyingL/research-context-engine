@@ -48,6 +48,13 @@ extra uninstalled (see pyproject.toml); (2) `trace` exists here so multi-hop
 provenance is a full CLI feature, not something only reachable through an AI
 client's MCP tool calls.
 
+V5 phase 5 (DESIGN.md 9.5, 9.8): `rce rebuild` (`rce.rebuild`: a fresh
+index beside the current one, compared per link before the swap), `rce
+records [--verify|--clean [--yes]]` (`rce.inventory`) and `rce migrate
+[--list|--yes|--not-mine|--from DIR]` (`rce.migration`: pre-V5 judgments
+moved into the record, an explicit act). `rce status` reports pre-V5
+indexes waiting for the folder.
+
 F3 (Blocker C): `status --pending`/`confirm` give the zero-dependency
 baseline its own human-confirmation path -- previously the sole writer of
 `edges.status` was the optional `mcp` extra's `rce_confirm_edge`,
@@ -66,8 +73,9 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import consistency, db, lineage, paths, query
+from rce import consistency, db, inventory, lineage, migration, paths, query
 from rce import project as project_identity
+from rce import rebuild as rebuild_mod
 from rce.ingest import attempts as attempts_ingest
 # `git_ingest` stays importable as `rce.cli.git_ingest` (tests patch it);
 # the scan itself is `rce.ingest.pipeline`.
@@ -341,11 +349,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         # longer where a user would think to look for it.
         print(f"Graph: {db_path}")
         _print_graph_counts(conn)
+        _print_migration_waiting(project_root)
         if args.pending:  # purely additive -- omitting it reproduces the prior output exactly
             _print_pending_queue(conn, args.limit)
     finally:
         conn.close()
     return 0
+
+
+def _print_migration_waiting(project_root: Path) -> None:
+    """9.5 "What is looked for": checked on every open, with or without an
+    id -- pre-V5 indexes that may hold this folder's judgments."""
+    waiting = migration.waiting_payload(project_root)
+    if waiting["migrating_from"]:
+        print(f"  Migration from {waiting['migrating_from']} not finished: human records are read-only until 'rce migrate' resumes it")
+    elif waiting["waiting"]:
+        where = ", ".join(w["db_path"] for w in waiting["waiting"])
+        print(f"  Legacy records waiting: a pre-V5 index may hold this project's judgments ({where}); see 'rce migrate'")
 
 
 def _print_attempts_listing(conn: Connection, config: attempts_ingest.AttemptsConfig) -> None:
@@ -673,9 +693,12 @@ def _print_review_item(item: dict[str, Any]) -> None:
 
 def cmd_records(args: argparse.Namespace) -> int:
     """`rce records` (DESIGN.md 9.2, 9.8): where each kind of human labor
-    lives for this project, how many, the newest snapshot; `--verify`
+    lives for this project, how many, the newest snapshot, and anything
+    that stands between RCE and trusting it (`rce.inventory`). `--verify`
     checks, per link, that the index's human state is what the record
-    implies (exit 1 if not); `--answer file|restore` answers 9.3's
+    implies -- judgments, hand-drawn links, attempt verdicts -- and exits 1
+    with the differences if not. `--clean` lists copies nothing refers to
+    and, with `--yes`, removes them. `--answer file|restore` answers 9.3's
     question when the judgment ledger has fewer entries than the index
     applied."""
     opened = _open(args.path)
@@ -691,15 +714,21 @@ def cmd_records(args: argparse.Namespace) -> int:
             print(f"Took the file as it is: {len(answered.missing)} entr(y/ies) dropped from the index's copy")
         else:
             print(f"Appended {len(answered.appended)} missing entr(y/ies) to .rce/judgements.toml (via = recovered)")
-    conn = db.connect(_require_db(root))
+    if args.clean:
+        return _records_clean(opened, apply=args.yes)
+    db_path = paths.graph_db_path(root)
+    conn = db.connect(db_path) if db_path.exists() else None
     try:
         for line in records_inventory_lines(conn, root):
             print(line)
         if not args.verify:
             return 0
-        problems = judgements.verify(conn, root)
+        if conn is None:
+            raise CliError(f"there is no index to verify ({db_path}); open the project to build it")
+        problems = inventory.verify(conn, root)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     if problems:
         print(f"Verify: {len(problems)} mismatch(es)")
         for problem in problems:
@@ -709,50 +738,153 @@ def cmd_records(args: argparse.Namespace) -> int:
     return 0
 
 
-def records_inventory_lines(conn: Connection, root: Path) -> list[str]:
-    """The 9.2 inventory, one line per kind of human labor."""
-    lines = [f"Records of {root}:"]
-    identity = records_situation.read_identity(root).identity
-    loaded, decision = judgements.assess(conn, root, identity)  # as it is now, not as last applied
-    state = judgements.status_payload(decision, loaded)
-    if loaded.ledger is not None:
-        n = len(loaded.ledger.entries)
-        stands = sum(
-            1 for key in loaded.ledger.keys()
-            if ledger_mod.judgement_status(loaded.ledger.state(key)) in ("confirmed", "rejected")
-        )
-        detail = f"{n} entr(y/ies), {stands} judgment(s) standing"
-    else:
-        detail = f"{loaded.state.value}" + (f" ({loaded.error})" if loaded.error else "")
-    trust = f"; {state['state']}: {state['reason']} ({state['detail'] or ''})" if state["state"] != "ok" else ""
-    if state["state"] == "shrunk":
-        trust = f"; shrunk: the file lacks {len(state['missing'])} entr(y/ies) the index applied"
-    if state["state"] == "shrunk":
-        trust += " -- answer with 'rce records --answer file|restore'"
-    lines.append(_inventory_line("Confirm/reject of machine links", loaded.path, root, detail + trust))
-    mappings_file = mappings_ingest.mappings_path(root)
-    mapping_count = sum(1 for e in db.query_edges(conn) if e["extractor"] == mappings_ingest.EXTRACTOR)
-    lines.append(_inventory_line("Hand-drawn links", mappings_file, root, f"{mapping_count} in the index"))
+def _records_clean(opened: project_identity.Opened, *, apply: bool) -> int:
     try:
-        config = attempts_ingest.load_config(root)
-    except attempts_ingest.AttemptsConfigError:
-        lines.append("  Attempt verdicts: no .rce/attempts.toml")
-    else:
-        attempts = db.get_nodes_by_type(conn, "attempt")
-        lines.append(_inventory_line("Attempt verdicts", root / config.file, root, f"{len(attempts)} attempt(s) in the index"))
-    layout = canvas_mod.layout_record(root)
-    lines.append(_inventory_line("Canvas arrangement", layout.path, root, layout.describe()))
+        report = inventory.clean(opened.root, apply=apply, expected_id=opened.project_id)
+    except records_situation.WriteRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_lock.ProjectLockError as exc:
+        raise CliError(f"could not take the project lock: {exc}") from exc
+    for directory in report.undecidable:
+        print(f"  left alone: {directory} (its references cannot all be read)")
+    if apply:
+        print(f"Removed {len(report.removed)} copy/copies nothing refers to")
+        for path in report.removed:
+            print(f"  removed {path}")
+        return 0
+    print(f"Copies nothing refers to: {len(report.removable)}" + (" (dry run; --yes removes them)" if report.removable else ""))
+    for path in report.removable:
+        print(f"  {path}")
+    return 0
+
+
+def records_inventory_lines(conn: Connection | None, root: Path) -> list[str]:
+    """The 9.2 inventory (`rce.inventory.inventory`), one line per kind of
+    human labor, plus its problems."""
+    lines = [f"Records of {root}:"]
+    for row in inventory.inventory(conn, root):
+        snap = f"; newest snapshot {row.snapshot}" if row.snapshot else ""
+        lines.append(f"  {row.kind}: {row.path} -- {row.count}{snap}")
+        for problem in row.problems:
+            lines.append(f"    ! {problem}")
     return lines
 
 
-def _inventory_line(kind: str, path: Path, root: Path, detail: str) -> str:
+def cmd_rebuild(args: argparse.Namespace) -> int:
+    """`rce rebuild` (DESIGN.md 9.8): a fresh index beside the current one,
+    the record applied, human state compared per link; swapped only when
+    the comparison is clean and every source could be read. The previous
+    index is kept one generation (`graph.db.prev`)."""
+    opened = _open(args.path)
+    print(f"Rebuilding the index of {opened.root}")
     try:
-        shown = path.relative_to(root).as_posix()
-    except ValueError:
-        shown = str(path)
-    newest = record_files.newest_snapshot(root, path) if path.exists() else None
-    snap = f"; newest snapshot {newest.name}" if newest is not None else ""
-    return f"  {kind}: {shown} -- {detail}{snap}"
+        result = rebuild_mod.rebuild(opened.root, expected_id=opened.project_id, echo=print)
+    except rebuild_mod.RebuildRefused as exc:
+        raise CliError(str(exc)) from exc
+    except rebuild_mod.SwapRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_situation.WriteRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_lock.ProjectLockError as exc:
+        raise CliError(f"could not take the project lock: {exc}") from exc
+    tally = result.tally
+    if tally:
+        print(
+            f"Per-link comparison: {tally.get('applied_before', 0)} judgment(s) applied before, "
+            f"{tally.get('applied_after', 0)} still applied after, {tally.get('changed_source', 0)} on a changed source"
+        )
+    for item in result.blocked:
+        print(f"  blocked: {item}")
+    for item in result.failures:
+        print(f"  failure: {item}")
+    if not result.swapped:
+        print("Not swapped: the current index is unchanged and keeps serving")
+        return 1
+    print(f"Swapped in the new index at {result.db_path}" + (f"; the previous one is kept at {result.previous}" if result.previous else ""))
+    return 0
+
+
+def _print_preview(view: migration.Preview) -> None:
+    index = view.index
+    print(f"  {index.db_path}")
+    if index.error:
+        print(f"    cannot be read: {index.error}")
+        return
+    came = index.recorded_path or "(not recorded)"
+    exists = "" if index.path_exists is None else (" (exists)" if index.path_exists else " (no longer exists)")
+    print(f"    came from: {came}{exists}")
+    print(
+        f"    holds: confirmed {index.confirmed}, rejected {index.rejected} "
+        f"({index.remembered} remembering a prior status), arranged views {index.arranged_views}, "
+        f"hand-drawn links {index.mapping_links} (skipped: their truth is mappings.toml)"
+    )
+    if index.judged:
+        print(f"    match: a scan of {view.root} produces both ends of {view.produced} of {index.judged} judged link(s)")
+    if view.scan_error:
+        print(f"    (the scan of this folder failed: {view.scan_error})")
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """`rce migrate` (DESIGN.md 9.5): an explicit act, never a side effect
+    of opening. `--list`: every un-retired pre-V5 index on this machine.
+    Without `--yes`: what waits for this folder and how well it matches,
+    nothing written. `--yes`: migrate (export, basis, identity, rebuild
+    and verify against the old index's own count, retire). `--not-mine`:
+    「这不是这个项目的」 -- the old index is left alone and not offered to
+    this folder again. `--from DIR`: a stranded index. An unfinished
+    migration resumes without being asked again."""
+    if args.list:
+        found = migration.list_old_indexes()
+        print(f"Un-retired pre-V5 indexes under {paths.rce_home() / paths.GRAPHS_DIRNAME}: {len(found)}")
+        for index in found:
+            exists = "?" if index.path_exists is None else ("exists" if index.path_exists else "missing")
+            print(
+                f"  {index.db_path.parent} -- {index.recorded_path or '(no project path recorded)'} [{exists}]; "
+                f"confirmed {index.confirmed}, rejected {index.rejected}, remembered prior status {index.remembered}, "
+                f"arranged views {index.arranged_views}" + (f"; cannot be read: {index.error}" if index.error else "")
+            )
+        return 0
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        raise CliError(f"{root} is not a directory")
+    try:
+        project_identity.open_project(root)
+    except (project_identity.ProjectBlocked, project_identity.AnswerRefused) as exc:
+        raise CliError(str(exc)) from exc
+    try:
+        if args.not_mine:
+            declined = migration.decline(root, from_dir=args.from_dir)
+            print(f"Not this project's: {', '.join(declined) or 'nothing waiting'} -- left untouched, and not offered to {root} again")
+            return 0
+        results = migration.migrate(root, yes=args.yes, from_dir=args.from_dir, echo=print if args.verbose else (lambda _l: None))
+    except migration.MigrationRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_lock.ProjectLockError as exc:
+        raise CliError(f"could not take the project lock: {exc}") from exc
+    if results and results[0].previews:
+        print(f"Pre-V5 index(es) that may hold the judgments of {root}:")
+        for view in results[0].previews:
+            _print_preview(view)
+        print("Nothing was written. To move these judgments into .rce/judgements.toml: rce migrate --yes; "
+              "if this is not this project's index: rce migrate --not-mine")
+        return 1
+    status = 0
+    for result in results:
+        print(f"Migration of {result.key}" + (" (resumed)" if result.resumed else "") + ":")
+        if result.tally is not None:
+            for line in result.tally.lines():
+                print(f"  {line}")
+        if result.exported is not None:
+            print(f"  ledger entries appended: {result.exported.appended}"
+                  + ("; arrangement copied to .rce/canvas.json" if result.exported.copied_arrangement else ""))
+        if result.ok:
+            if result.retired_to is not None:
+                print(f"  the old index was retired to {result.retired_to}")
+            print(f"  project id: {result.identity.id if result.identity else '?'}")
+        else:
+            print(f"  stopped: {result.stopped}")
+            status = 1
+    return status
 
 
 def cmd_judge(args: argparse.Namespace) -> int:
@@ -1578,8 +1710,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="when the judgment ledger has fewer entries than the index applied: 'file' takes the file as "
              "truth (以文件为准), 'restore' appends the missing entries back (把缺少的补回文件)",
     )
+    p.add_argument("--clean", action="store_true", help="list kept copies nothing refers to (dry run)")
+    p.add_argument("--yes", action="store_true", help="with --clean: remove them")
     p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
     p.set_defaults(func=cmd_records)
+
+    p = sub.add_parser(
+        "rebuild",
+        help="Build a fresh index beside the current one, apply the record, compare per link, then swap "
+             "(the previous index is kept one generation)",
+    )
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_rebuild)
+
+    p = sub.add_parser(
+        "migrate",
+        help="Move the judgments of a pre-V5 index into .rce/judgements.toml (explicit; --list shows every old index)",
+    )
+    p.add_argument("--list", action="store_true", help="list every un-retired pre-V5 index on this machine")
+    p.add_argument("--yes", action="store_true", help="migrate (without it, only show what waits and how well it matches)")
+    p.add_argument("--not-mine", action="store_true", help="this is not this project's index: leave it, and do not offer it again")
+    p.add_argument("--from", dest="from_dir", default=None, metavar="DIR", help="migrate from this index directory (a stranded index)")
+    p.add_argument("-v", "--verbose", action="store_true", help="print the scan's progress")
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser(
         "judge",

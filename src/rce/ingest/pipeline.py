@@ -94,6 +94,7 @@ def ingest_sources(
     mlruns: str | None = None,
     wandb: str | None = None,
     echo: Echo = lambda _line: None,
+    apply: bool = True,
 ) -> int:
     """Run every source extractor over `project_root`; returns how many
     warnings (skips/unresolved) the run logged. The caller holds the
@@ -106,9 +107,12 @@ def ingest_sources(
 
     Then the judgment ledger is applied (DESIGN.md 9.1, 9.6): the human
     state of the index is recomputed against what this scan saw, AFTER the
-    scan finished (its source and node stamps are written at finish)."""
+    scan finished (its source and node stamps are written at finish).
+    `apply=False` leaves that to the caller: a rebuild or a migration
+    building a fresh index applies the record once, at the end, itself."""
     warnings = _scan_sources(conn, project_root, mlruns=mlruns, wandb=wandb, echo=echo)
-    judgements.apply_after_scan(conn, project_root, echo)
+    if apply:
+        judgements.apply_after_scan(conn, project_root, echo)
     return warnings
 
 
@@ -208,17 +212,21 @@ def _scan_sources(
         return warnings.count
 
 
-def ingest_records(conn: Connection, project_root: Path, *, echo: Echo = lambda _line: None) -> None:
+def ingest_records(
+    conn: Connection, project_root: Path, *, echo: Echo = lambda _line: None, apply: bool = True,
+) -> None:
     """Mirror the researcher's own files into the index: `.rce/mappings.toml`
     (as `rce mappings`) and, when `.rce/attempts.toml` loads, the attempt
     table (as `rce attempts`). A file that cannot be read is reported and
     skipped, never treated as a deletion (Section 4). Each is its own
     partial scan, as when the watcher or the CLI runs it alone. The
-    judgment ledger is applied last, whatever was read."""
+    judgment ledger is applied last, whatever was read (unless `apply=False`,
+    as for `ingest_sources`)."""
     try:
         _ingest_record_files(conn, project_root, echo)
     finally:
-        judgements.apply_after_scan(conn, project_root, echo)
+        if apply:
+            judgements.apply_after_scan(conn, project_root, echo)
 
 
 def _ingest_record_files(conn: Connection, project_root: Path, echo: Echo) -> None:

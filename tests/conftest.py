@@ -43,3 +43,12 @@ def isolated_rce_home(tmp_path_factory, monkeypatch) -> Path:
     home = tmp_path_factory.mktemp("rce-home")
     monkeypatch.setenv("RCE_HOME", str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def no_engine_probe(monkeypatch) -> None:
+    """The migration's retire step asks whether an RCE engine answers on
+    the app's fixed port (DESIGN.md 9.5 step 5). No test may ever touch a
+    real engine on this machine, so the probe is off (`RCE_ENGINE_PORT=0`)
+    for every test; the tests of the probe itself bind their own port."""
+    monkeypatch.setenv("RCE_ENGINE_PORT", "0")
