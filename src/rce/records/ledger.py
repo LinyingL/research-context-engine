@@ -159,10 +159,23 @@ def _toml_value(value: Any, where: str) -> str:
             raise LedgerWriteRefused(f"{where}: {value!r} is not a finite number")
         return repr(value)
     if isinstance(value, (list, tuple)):
-        if not all(isinstance(v, str) for v in value):
-            raise LedgerWriteRefused(f"{where}: a list may only hold strings")
-        return "[" + ", ".join(toml_string(v) for v in value) + "]"
+        if all(isinstance(v, str) for v in value):
+            return "[" + ", ".join(toml_string(v) for v in value) + "]"
+        if all(isinstance(v, Mapping) for v in value):
+            # A list of inline tables (a variable card's `reads` / `inputs`,
+            # 9.11); each table holds plain values only.
+            return "[" + ", ".join(_inline_table(v, f"{where}[{i}]") for i, v in enumerate(value)) + "]"
+        raise LedgerWriteRefused(f"{where}: a list may only hold strings, or only tables")
     raise LedgerWriteRefused(f"{where}: {type(value).__name__} is not a value this ledger stores")
+
+
+def _inline_table(table: Mapping[str, Any], where: str) -> str:
+    parts = []
+    for key, value in table.items():
+        if isinstance(value, Mapping) or (isinstance(value, (list, tuple)) and not all(isinstance(v, str) for v in value)):
+            raise LedgerWriteRefused(f"{where}.{key}: an inline table holds plain values only")
+        parts.append(f"{toml_key(key)} = {_toml_value(value, where + '.' + key)}")
+    return "{ " + ", ".join(parts) + " }" if parts else "{}"
 
 
 def _emit_table(lines: list[str], header: str, table: Mapping[str, Any], depth: int) -> None:

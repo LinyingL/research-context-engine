@@ -253,7 +253,7 @@ def test_records_clean_removes_only_copies_nothing_refers_to(tmp_path, capsys):
     cannot be read keeps everything (and so does the shared code store)."""
     root = tmp_path / "p"
     _make(root)
-    card = _card(root, "topicshift", '[[entry]]\nid = "v-1"\nact = "confirmed"\nfrozen = "frozen/aaa.toml"\n'
+    card = _card(root, "topicshift", '[[entry]]\nid = "v-1"\nact = "confirmed"\nversion = 1\ncontent = "sha256:aaa"\nfrozen = "frozen/aaa.toml"\n'
                  '[entry.checked]\nscript = { result = "已核对", copy = "_code/bbb.py" }\n')
     (card / "frozen" / "aaa.toml").write_text("kept")
     (card / "frozen" / "zzz.toml").write_text("left over by a crash")

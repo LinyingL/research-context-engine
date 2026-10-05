@@ -65,7 +65,10 @@ end of a scan), and the first poll that sees a root applies it once, beside
 the mappings sync, so a judgment made while the app was closed reaches the
 index without the file having to be touched again. A ledger RCE cannot
 trust (refused, unreadable, shrunk) is never applied; its state is reported
-under `records` in the status payload, and polling goes on.
+under `records` in the status payload, and polling goes on. The variable
+cards' files (each card's `log.toml` and `v<n>.toml`, 9.11) are watched
+the same way: a change re-applies the record -- which refreshes the index's
+copy of the cards -- and runs no ingest.
 
 A vanished graph is not a transient failure (DESIGN.md section 8.10
 rule 2). Observed in real use: the graph disappeared mid-serve and this
@@ -128,6 +131,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,6 +195,10 @@ def take_snapshot(project_root: Path) -> WatchSnapshot:
         record_entry = _stat_entry(record)
         if record_entry is not None:
             files[str(record)] = record_entry
+    for card_file in card_record_paths(project_root):
+        card_entry = _stat_entry(card_file)
+        if card_entry is not None:
+            files[str(card_file)] = card_entry
 
     config_path = project_root / attempts_ingest.CONFIG_RELATIVE_PATH
     entry = _stat_entry(config_path)
@@ -233,6 +241,20 @@ def record_paths(project_root: Path) -> tuple[Path, Path, Path]:
         ledger_mod.judgements_path(project_root),
         canvas_record_path(project_root),
     )
+
+
+def card_record_paths(project_root: Path) -> list[Path]:
+    """The variable cards' files (9.11): each card's `log.toml` and version
+    files. A change re-applies the record -- the cards' copy in the index --
+    and nothing else."""
+    from rce import inventory  # noqa: PLC0415 -- leaf use
+
+    return [path for path, _subdir in inventory.card_file_paths(project_root)]
+
+
+def _is_card_file(path: str, project_root: Path) -> bool:
+    prefix = str(project_root / paths.RCE_DIRNAME / "variables") + os.sep
+    return path.startswith(prefix)
 
 
 def canvas_record_path(project_root: Path) -> Path:
@@ -590,10 +612,11 @@ class ProjectWatcher:
         mappings_file, ledger_file, canvas_file = (str(p) for p in record_paths(root))
         mappings_changed = mappings_file in changed
         ledger_changed = ledger_file in changed
-        attempts_changed = bool(changed - {mappings_file, ledger_file, canvas_file})
+        cards_changed = {path for path in changed if _is_card_file(path, root)}
+        attempts_changed = bool(changed - {mappings_file, ledger_file, canvas_file} - cards_changed)
         error: str | None = None
         try:
-            if attempts_changed or mappings_changed or ledger_changed:
+            if attempts_changed or mappings_changed or ledger_changed or cards_changed:
                 with self._guarded_ingest_lock:
                     self._reingest(
                         root, steps_changed, attempts=attempts_changed, mappings=mappings_changed,

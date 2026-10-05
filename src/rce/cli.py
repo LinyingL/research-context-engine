@@ -88,11 +88,13 @@ from rce.ingest import attempts as attempts_ingest
 from rce.ingest import git as git_ingest  # noqa: F401
 from rce.ingest import mappings as mappings_ingest
 from rce.ingest import pipeline as ingest_pipeline
+from rce.records import cards as variable_cards
 from rce.records import files as record_files
 from rce.records import judgements
 from rce.records import ledger as ledger_mod
 from rce.records import lock as records_lock
 from rce.records import situation as records_situation
+from rce.records import variables as variables_mod
 # S2: `rce judge`, the optional semantic layer. Unlike rce.mcp_server
 # (behind a lazy import because it needs the third-party 'mcp' extra),
 # rce.semantic.{backend,judge} use only stdlib urllib -- importing them
@@ -1462,6 +1464,220 @@ def cmd_project_other(args: argparse.Namespace) -> int:
     return _answer(args, project_identity.other)
 
 
+# -- variable definition cards (DESIGN.md 9.11) ---------------------------------------
+
+
+@contextmanager
+def _card_errors():
+    try:
+        yield
+    except variables_mod.VariableError as exc:
+        raise CliError(f"not written: {exc}") from exc
+    except records_situation.WriteRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_lock.ProjectLockError as exc:
+        raise CliError(f"could not take the project lock: {exc}") from exc
+
+
+def _card_overview(root: Path, card_id: str | None = None) -> list[dict[str, Any]]:
+    db_path = paths.graph_db_path(root)
+    conn = db.connect(db_path) if db_path.exists() else None
+    try:
+        found = variable_cards.overview(conn, root)
+    finally:
+        if conn is not None:
+            conn.close()
+    if card_id is None:
+        return found
+    key = variables_mod.card_key(card_id)
+    match = [c for c in found if variables_mod.card_key(c["id"]) == key]
+    if not match:
+        raise CliError(f"there is no variable card {card_id!r} in {variables_mod.variables_dir(root)}")
+    return match[:1]
+
+
+def _card_status_word(card: dict[str, Any]) -> str:
+    trust = card.get("trust") or {}
+    if card["state"] == "unreadable":
+        return f"UNREADABLE ({card['reason']}: {card['detail']})"
+    if trust.get("state") not in (None, "ok"):
+        missing = len(trust.get("missing") or [])
+        what = f"{missing} entr(y/ies) fewer than the index applied" if trust["state"] == "shrunk" else (trust.get("detail") or "")
+        return f"FROZEN -- {trust.get('reason')}: {what}; writes to this card are refused"
+    if card["abandoned"]:
+        return f"abandoned at {card['abandoned'].get('at')} ({card['abandoned'].get('note')})"
+    if card["in_use"] is not None:
+        return f"v{card['in_use']} in use"
+    return "no confirmed version"
+
+
+def _print_card_line(card: dict[str, Any]) -> None:
+    draft = f", draft v{card['draft']} open" if card["draft"] is not None else ""
+    print(f"  {card['id']}: {_card_status_word(card)}{draft}")
+    for q in card["questions"]:
+        print(f"    ! v{q['version']} was changed after it was confirmed ({q['message']}): "
+              f"rce variable answer {card['id']} new|correct --version {q['version']}")
+    for problem in card["problems"]:
+        print(f"    ! {problem}")
+    for flag in card["dead_flags"]:
+        print(f"    ! dead-variable list disagrees: {flag['direction']} ({flag['message']})")
+
+
+def cmd_variable_list(args: argparse.Namespace) -> int:
+    """`rce variable list`: every card, the version in use, its draft, and
+    what stands between RCE and trusting it."""
+    root = _open(args.path).root
+    found = _card_overview(root)
+    if args.json:
+        print(json.dumps(found, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(f"Variable cards of {root}: {len(found)}")
+    for card in found:
+        _print_card_line(card)
+    return 0
+
+
+def _print_check(name: str, item: dict[str, Any]) -> None:
+    extra = ", ".join(f"{k}={v}" for k, v in item.items() if k not in ("result", "dataset"))
+    print(f"      {name}: {item.get('result', '')} {extra}".rstrip())
+
+
+def cmd_variable_show(args: argparse.Namespace) -> int:
+    """`rce variable show <id>`: one card -- each version with its status,
+    checks and observations, the history from the log, references."""
+    root = _open(args.path).root
+    card = _card_overview(root, args.id)[0]
+    if args.json:
+        print(json.dumps(card, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    _print_card_line(card)
+    for v in card["versions"]:
+        label = f" [{v['label']}]" if v["label"] else ""
+        print(f"  v{v['version']} ({v['file']}): {v['status']}{label}, file {v['file_state']}")
+        if v["error"]:
+            print(f"    ! {v['error']}")
+        if v.get("entry"):
+            print(f"    confirmed at {v['confirmed_at']}; reference {v['reference']['label']}")
+            print(f"    attested (the output was built with this definition, in your words): {v['attested']}")
+            if v["superseded_by"]:
+                print(f"    superseded by v{v['superseded_by']['version']} from {v['superseded_by']['at']}")
+            checked = v.get("checked") or {}
+            for name in ("script", "writes", "field"):
+                if name in checked:
+                    _print_check(name, checked[name])
+            for item in checked.get("reads") or []:
+                _print_check(f"reads {item.get('dataset')}", item)
+            observed = v.get("observed") or {}
+            if observed.get("output"):
+                print(f"      observed output (on disk at confirmation; not a claim it was built by this version): "
+                      f"{json.dumps(observed['output'], ensure_ascii=False, sort_keys=True)}")
+            if v["copy_missing"]:
+                print(f"    ! {v['copy_missing']}: the frozen copy is not there; this version cannot be restored from it")
+        for note in v["upstream_notes"]:
+            print(f"    note: {note}")
+    print("  history:")
+    for e in card["history"]:
+        what = f" v{e['version']}" if "version" in e else ""
+        note = f" -- {e['note']}" if e.get("note") else ""
+        print(f"    seq {e.get('seq')} {e.get('act')}{what} at {e.get('at')} via {e.get('via')}{note}")
+    trust = card.get("trust") or {}
+    if trust.get("state") == "shrunk":
+        ids = ",".join(str(m["id"]) for m in trust["missing"])
+        print(f"  log.toml has {len(trust['missing'])} fewer entr(y/ies) than the index applied:")
+        for m in trust["missing"]:
+            print(f"    {m.get('id')}: {m.get('act')}{' v' + str(m['version']) if 'version' in m else ''}")
+        print(f"  answer: rce variable answer {card['id']} file --missing {ids} {root}     (take the file as it is)")
+        print(f"      or: rce variable answer {card['id']} restore --missing {ids} {root}  (append the missing ones back)")
+    return 0
+
+
+def cmd_variable_new(args: argparse.Namespace) -> int:
+    """`rce variable new <id>`: a card directory, created exclusively, with
+    v1.toml from the commented template. RCE never writes the definition."""
+    opened = _open(args.path)
+    with _card_errors():
+        path = variable_cards.new_card(opened.root, args.id, expected_id=opened.project_id)
+    print(f"Created {path.relative_to(opened.root)} from the template. Write the definition in it, then: "
+          f"rce variable confirm {args.id}")
+    return 0
+
+
+def cmd_variable_revise(args: argparse.Namespace) -> int:
+    """`rce variable revise <id>`: the current confirmed version copied byte
+    for byte to the next number, as the draft."""
+    opened = _open(args.path)
+    with _card_errors():
+        path = variable_cards.revise(opened.root, args.id, expected_id=opened.project_id)
+    print(f"Opened draft {path.relative_to(opened.root)} (a copy of the version in use). Edit it, then confirm it.")
+    return 0
+
+
+def cmd_variable_confirm(args: argparse.Namespace) -> int:
+    """`rce variable confirm <id> [--attest yes|no|unknown]`: the draft
+    becomes a definition results may rely on (snapshot first, entry last)."""
+    opened = _open(args.path)
+    with _card_errors():
+        done = variable_cards.confirm(opened.root, args.id, attested=args.attest, expected_id=opened.project_id)
+    entry = done.entry
+    print(f"Confirmed {done.reference.variable} v{entry.get('version')} as {entry.id} (seq {entry.seq}); "
+          f"reference {done.reference.label}")
+    print(f"  attested: {entry.get('attested')} (your answer to: was the output as it stands built with this definition?)")
+    checked = entry.get("checked") or {}
+    for name in ("script", "writes", "field"):
+        if name in checked:
+            _print_check(name, dict(checked[name]))
+    for item in checked.get("reads") or []:
+        _print_check(f"reads {item.get('dataset')}", dict(item))
+    return 0
+
+
+def cmd_variable_answer(args: argparse.Namespace) -> int:
+    """`rce variable answer <id> new|correct [--version N]`: the question
+    「v<n> 的定义在确认后被改动了」. `file|restore [--missing ids]`: the 9.3
+    question when the card's log has fewer entries than the index applied."""
+    opened = _open(args.path)
+    with _card_errors():
+        if args.answer in (variables_mod.ANSWER_NEW, variables_mod.ANSWER_CORRECT):
+            if args.missing is not None:
+                raise CliError("--missing goes with the answers file|restore")
+            done = variable_cards.answer_edited(opened.root, args.id, args.answer, version=args.version,
+                                                expected_id=opened.project_id)
+            if done.answer == variables_mod.ANSWER_NEW:
+                print(f"Saved the edited text as draft v{done.new_version}; v{done.version}.toml was put back from its "
+                      f"frozen copy, byte for byte.")
+            else:
+                print(f"Recorded a correction of v{done.version} as {done.entry.id}: both wordings stay readable.")
+            return 0
+        shown = None if args.missing is None else [i.strip() for i in args.missing.split(",") if i.strip()]
+        done = variable_cards.answer_shrunk(opened.root, args.id, args.answer, expected_missing=shown,
+                                            expected_id=opened.project_id)
+    if done.answer == "file":
+        print(f"Took log.toml as it is: {len(done.missing)} entr(y/ies) dropped from the index's copy"
+              + (f"; {len(done.appended)} version number(s) marked removed" if done.appended else ""))
+    else:
+        print(f"Appended {len(done.appended)} missing entr(y/ies) to log.toml (via = recovered)"
+              + (f"; put back {len(done.restored_copies)} frozen cop(y/ies)" if done.restored_copies else ""))
+    return 0
+
+
+def cmd_variable_abandon(args: argparse.Namespace) -> int:
+    """`rce variable abandon <id> --note "..."`: why the variable died."""
+    opened = _open(args.path)
+    with _card_errors():
+        entry = variable_cards.abandon(opened.root, args.id, note=args.note, expected_id=opened.project_id)
+    print(f"Recorded: {args.id} abandoned at {entry.at} ({entry.id}).")
+    return 0
+
+
+def cmd_variable_revive(args: argparse.Namespace) -> int:
+    """`rce variable revive <id> --note "..."`."""
+    opened = _open(args.path)
+    with _card_errors():
+        entry = variable_cards.revive(opened.root, args.id, note=args.note, expected_id=opened.project_id)
+    print(f"Recorded: {args.id} revived at {entry.at} ({entry.id}).")
+    return 0
+
+
 def cmd_projects_remove(args: argparse.Namespace) -> int:
     """`rce projects remove <path>`: drop one registry entry. Removes a
     bookmark, never a project -- nothing on disk is touched and nothing is
@@ -1838,6 +2054,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_project_path(p)
     p.set_defaults(func=cmd_records)
+
+    p = sub.add_parser(
+        "variable",
+        help="Variable definition cards in .rce/variables/ (DESIGN.md 9.11): "
+             "'rce variable new|list|show|revise|confirm|answer|abandon|revive'",
+    )
+    variable_sub = p.add_subparsers(dest="variable_command", required=True)
+    q = variable_sub.add_parser("list", help="every card, the version in use, its draft and its problems")
+    q.add_argument("--json", action="store_true", help="print the cards as JSON")
+    add_project_path(q)
+    q.set_defaults(func=cmd_variable_list)
+    for name, func, text in (
+        ("new", cmd_variable_new, "create .rce/variables/<id>/v1.toml from the commented template"),
+        ("show", cmd_variable_show, "one card: versions, checks, observations, history, references"),
+        ("revise", cmd_variable_revise, "copy the version in use, byte for byte, to the next number as the draft"),
+        ("confirm", cmd_variable_confirm, "confirm the draft: checks, copies, then the log entry"),
+        ("abandon", cmd_variable_abandon, "record why the variable died (--note is required)"),
+        ("revive", cmd_variable_revive, "record why an abandoned variable is back (--note is required)"),
+        ("answer", cmd_variable_answer, "answer a card's question: new|correct (a confirmed version was edited), "
+                                        "file|restore (its log has fewer entries than the index applied)"),
+    ):
+        q = variable_sub.add_parser(name, help=text)
+        q.add_argument("id", help="the variable's id (its directory name; compared case-folded)")
+        if name == "answer":
+            q.add_argument("answer", choices=["new", "correct", "file", "restore"])
+            q.add_argument("--version", type=int, default=None, help="with new|correct: which edited version")
+            q.add_argument("--missing", default=None, metavar="ID[,ID...]",
+                           help="with file|restore: the ids of the missing entries 'rce variable show' printed")
+        if name == "confirm":
+            q.add_argument("--attest", choices=list(variables_mod.ATTESTED), default="unknown",
+                           help="your answer: was the output file as it stands built with THIS definition? (default unknown)")
+        if name in ("abandon", "revive"):
+            q.add_argument("--note", required=True, help="the reason, in your words")
+        if name == "show":
+            q.add_argument("--json", action="store_true", help="print the card as JSON")
+        add_project_path(q)
+        q.set_defaults(func=func)
 
     p = sub.add_parser(
         "rebuild",

@@ -394,6 +394,10 @@ def rebuild(
             if old is not None:
                 blocked += [f"source not readable: {s}" for s in evicted_sources(old, root)]
                 blocked += _ledger_question(old, root, identity)
+                from rce.records import cards as cards_mod  # noqa: PLC0415 -- leaf use
+
+                if db.has_variable_tables(old):
+                    blocked += cards_mod.rebuild_questions(old, root, identity)
             if blocked and enforce:
                 return Rebuilt(target, swapped=False, blocked=blocked)
             new = db.connect(staging)

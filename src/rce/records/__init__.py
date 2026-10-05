@@ -23,4 +23,10 @@ wired to it by later phases, through these modules only:
                 link, the applier that derives the index's human state
                 from the ledger (9.6's review states), the SHRUNK answers,
                 and what readers need to mark a link under review
+- `variables` -- the variable definition cards' files (9.11): the strict
+                version schema, the card log as a ledger schema, reading a
+                card with no index, references
+- `cards`    -- the one write path for every act on a card (new, revise,
+                confirm, the edited-in-place question, abandon, revive,
+                the SHRUNK answers), the checks, the index's copy
 """

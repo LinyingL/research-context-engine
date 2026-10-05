@@ -1224,6 +1224,90 @@ def set_record_status(conn: sqlite3.Connection, name: str, state: dict[str, Any]
     conn.commit()
 
 
+# -- variable definition cards (DESIGN.md 9.11, migration 0006) ---------------------
+# The SQL half of `rce.records.cards`: that module decides what the copy
+# holds; these functions store and fetch it.
+
+
+def has_variable_tables(conn: sqlite3.Connection) -> bool:
+    """Whether this index has migration 0006 (an index made before it is
+    migrated by the first card application, which holds the lock)."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'applied_variable_entries'"
+    ).fetchone()
+    return row is not None
+
+
+def variable_cards(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """{card key: {"id", "data", "status"}} -- JSON columns decoded."""
+    if not has_variable_tables(conn):
+        return {}
+    found = {}
+    for row in conn.execute("SELECT card, id, data, status FROM variable_cards ORDER BY card").fetchall():
+        found[row["card"]] = {
+            "id": row["id"],
+            "data": None if row["data"] is None else json.loads(row["data"]),
+            "status": None if row["status"] is None else json.loads(row["status"]),
+        }
+    return found
+
+
+def applied_variable_rows(conn: sqlite3.Connection, card: str) -> dict[str, str]:
+    """{entry id: the entry's JSON as the index applied it} for one card."""
+    if not has_variable_tables(conn):
+        return {}
+    rows = conn.execute("SELECT id, data FROM applied_variable_entries WHERE card = ?", (card,)).fetchall()
+    return {r["id"]: r["data"] for r in rows}
+
+
+def write_variable_card(
+    conn: sqlite3.Connection,
+    card: str,
+    card_id: str,
+    *,
+    status: dict[str, Any],
+    data: dict[str, Any] | None = None,
+    applied: dict[str, tuple[int | None, str]] | None = None,
+) -> None:
+    """One card's copy, in one transaction: its status always; its `data`
+    and its whole applied copy ({id: (seq, json)}) only when given -- an
+    untrusted card keeps what the index had."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT INTO variable_cards (card, id, data, status) VALUES (?, ?, NULL, ?) "
+            "ON CONFLICT(card) DO UPDATE SET id = excluded.id, status = excluded.status",
+            (card, card_id, json.dumps(status, ensure_ascii=False, sort_keys=True)),
+        )
+        if data is not None:
+            conn.execute(
+                "UPDATE variable_cards SET data = ? WHERE card = ?",
+                (json.dumps(data, ensure_ascii=False, sort_keys=True), card),
+            )
+        if applied is not None:
+            conn.execute("DELETE FROM applied_variable_entries WHERE card = ?", (card,))
+            conn.executemany(
+                "INSERT INTO applied_variable_entries (card, id, seq, data) VALUES (?, ?, ?, ?)",
+                [(card, entry_id, seq, blob) for entry_id, (seq, blob) in applied.items()],
+            )
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def forget_variable_card(conn: sqlite3.Connection, card: str, ids: list[str] | None = None) -> None:
+    """Drop entries from one card's applied copy (9.3's 「以文件为准」); with
+    `ids` None, the card's whole copy (a card whose directory is gone and
+    whose missing entries the researcher let go)."""
+    if ids is None:
+        conn.execute("DELETE FROM applied_variable_entries WHERE card = ?", (card,))
+        conn.execute("DELETE FROM variable_cards WHERE card = ?", (card,))
+    else:
+        conn.executemany("DELETE FROM applied_variable_entries WHERE card = ? AND id = ?", [(card, i) for i in ids])
+    conn.commit()
+
+
 def has_finished_scan(conn: sqlite3.Connection) -> bool:
     """Whether any scan of this index ran to the end."""
     try:

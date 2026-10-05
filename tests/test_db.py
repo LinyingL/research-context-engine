@@ -127,7 +127,7 @@ def test_0002_migration_preserves_data_from_0001_only_db(tmp_path):
         # Now upgrade with the package's real migrations dir: 0001 is already
         # recorded, so this applies [2, 3] (migration 0003 -- task W2 -- now
         # also ships in DEFAULT_MIGRATIONS_DIR).
-        assert db.migrate(conn) == [2, 3, 4, 5]
+        assert db.migrate(conn) == [2, 3, 4, 5, 6]
 
         for node_id, before in nodes_before.items():
             assert db.get_node(conn, node_id) == before
@@ -147,7 +147,7 @@ def test_0002_migration_applies_cleanly_on_a_fresh_empty_db(tmp_path):
     conn = db.connect(tmp_path / "fresh.db")
     try:
         # Migration 0003 (task W2) now also ships in DEFAULT_MIGRATIONS_DIR.
-        assert db.migrate(conn) == [1, 2, 3, 4, 5]
+        assert db.migrate(conn) == [1, 2, 3, 4, 5, 6]
         tables = {
             row[0]
             for row in conn.execute(
@@ -208,7 +208,7 @@ def test_0003_migration_preserves_data_from_0001_0002_db(tmp_path):
 
         # Upgrade with the package's real migrations dir: 0001/0002 already
         # recorded, so this applies exactly [3].
-        assert db.migrate(conn) == [3, 4, 5]
+        assert db.migrate(conn) == [3, 4, 5, 6]
 
         for node_id, before in nodes_before.items():
             assert db.get_node(conn, node_id) == before

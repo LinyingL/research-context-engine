@@ -110,6 +110,7 @@ def assess_ledger(
     applied: Mapping[str, Mapping[str, Any]],
     *,
     for_migration: bool = False,
+    expected: bool | None = None,
 ) -> TrustDecision:
     """Decide whether the ledger may be written and obeyed.
 
@@ -125,7 +126,8 @@ def assess_ledger(
     if loaded.conflict_copies:
         names = ", ".join(p.name for p in loaded.conflict_copies)
         return TrustDecision(Trust.CONFLICT_COPY, reason="conflict_copy", detail=names)
-    expected = identity.ledger
+    if expected is None:
+        expected = identity.ledger
 
     if loaded.state is RecordState.DATALESS:
         return _refuse("dataless", loaded.error)

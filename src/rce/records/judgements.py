@@ -507,6 +507,7 @@ def apply_ledger(
         identity = _identity_now(root)
         if identity is None:
             return ApplyResult(applied=False)
+    _apply_cards(conn, root, identity)
     loaded, decision = assess(conn, root, identity, for_migration=for_migration)
     db.set_record_status(conn, RECORD_STATUS_NAME, status_payload(decision, loaded))
     if not decision.may_apply:
@@ -520,6 +521,20 @@ def apply_ledger(
         applied=True, decision=decision, review=outcomes.count("review"),
         conflict=outcomes.count("conflict"), held=outcomes.count("held"),
     )
+
+
+def _apply_cards(conn: Connection, root: Path, identity: ProjectIdentity) -> None:
+    """The variable cards are the other record the index derives a copy of
+    (9.11); every application of the record refreshes it, so whatever
+    applies the ledger -- a scan's end, the watcher, a rebuild, a write --
+    applies the cards too. Contained: a card that fails never stops the
+    judgments being applied (each card's own trust state is stored)."""
+    from rce.records import cards  # noqa: PLC0415 -- cards imports this module
+
+    try:
+        cards.apply_cards(conn, root, identity=identity)
+    except Exception:  # noqa: BLE001 -- see docstring
+        logger.exception("applying the variable cards of %s failed", root)
 
 
 def apply_after_scan(conn: Connection, project_root: str | Path, echo: Callable[[str], None] = lambda _l: None) -> ApplyResult | None:

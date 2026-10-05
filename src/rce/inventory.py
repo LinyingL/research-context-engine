@@ -142,8 +142,11 @@ def verify_mirrors(conn: Connection, root: Path) -> list[str]:
 def verify(conn: Connection, root: Path) -> list[str]:
     """`rce records --verify`: per link, the index's human state is exactly
     what the record implies -- the judgment ledger (`judgements.verify`),
-    the hand-drawn links and the attempt verdicts."""
-    return [*judgements.verify(conn, root), *verify_mirrors(conn, root)]
+    the hand-drawn links and the attempt verdicts -- and the index holds
+    every trusted variable card's log entries (`cards.verify`)."""
+    from rce.records import cards as cards_mod  # noqa: PLC0415
+
+    return [*judgements.verify(conn, root), *verify_mirrors(conn, root), *cards_mod.verify(conn, root)]
 
 
 # -- the inventory -----------------------------------------------------------------
@@ -341,18 +344,82 @@ def _canvas_row(root: Path) -> Row:
                code="canvas", facts=facts)
 
 
-def _variables_row(root: Path) -> Row:
-    directory = paths.project_rce_dir(root) / VARIABLES_DIRNAME
-    if not directory.is_dir():
-        return Row("Variable definition cards", _shown(directory, root), "none yet", code="variables",
-                   facts={"exists": False, "cards": 0, "issues": []})
-    try:
-        cards = sorted(p.name for p in directory.iterdir() if p.is_dir() and p.name != CODE_DIRNAME)
-    except OSError as exc:
-        return Row("Variable definition cards", _shown(directory, root), "cannot be listed", None, (str(exc),),
+def _variables_row(conn: Connection | None, root: Path) -> Row:
+    """9.11's cards: how many, how many drafts, and per card what stands
+    between RCE and trusting it -- unreadable (two ids equal up to case, a
+    sync conflict copy), frozen (a log missing, in the cloud, invalid, or
+    with fewer entries than the index applied), a confirmed version edited
+    after confirmation, a frozen copy missing, the dead-variable list
+    disagreeing."""
+    from rce.records import cards as cards_mod  # noqa: PLC0415 -- cards imports judgements, as this module does
+    from rce.records import variables as variables_mod  # noqa: PLC0415
+
+    directory = variables_mod.variables_dir(root)
+    shown = _shown(directory, root)
+    if variables_mod.card_dirs(root) is None:
+        return Row("Variable definition cards", shown, "cannot be listed", None, ("the folder cannot be listed",),
                    code="variables", facts={"exists": True, "issues": ["unreadable"]})
-    return Row("Variable definition cards", _shown(directory, root), f"{len(cards)} card(s)", code="variables",
-               facts={"exists": True, "cards": len(cards), "issues": []})
+    found = cards_mod.overview(conn, root)
+    if not found and not directory.is_dir():
+        return Row("Variable definition cards", shown, "none yet", code="variables",
+                   facts={"exists": False, "cards": 0, "issues": []})
+    problems: list[str] = []
+    issues: list[str] = []
+    for card in found:
+        trust = card.get("trust") or {}
+        if card["state"] == "unreadable":
+            problems.append(f"{card['id']}: unreadable -- {card['detail']}")
+            issues.append(card["reason"] or "unreadable")
+        elif trust.get("state") == "shrunk":
+            problems.append(
+                f"{card['id']}: log.toml lacks {len(trust['missing'])} entr(y/ies) the index applied "
+                f"-- answer with 'rce variable answer {card['id']} file|restore'"
+            )
+            issues.append("shrunk")
+        elif trust.get("state") not in (None, "ok"):
+            problems.append(f"{card['id']}: frozen -- {trust.get('reason')}: {trust.get('detail') or ''}".rstrip(": "))
+            issues.append(trust.get("reason") or "refuse_writes")
+        for q in card["questions"]:
+            problems.append(f"{card['id']}: v{q['version']} was changed after it was confirmed "
+                            f"-- 'rce variable answer {card['id']} new|correct'")
+            issues.append("edited_after_confirmation")
+        for v in card["versions"]:
+            if v["copy_missing"]:
+                problems.append(f"{card['id']}: the frozen copy of v{v['version']} is missing")
+                issues.append("copy_missing")
+        problems += [f"{card['id']}: {p}" for p in card["problems"] if card["state"] != "unreadable"]
+        for flag in card["dead_flags"]:
+            problems.append(f"{card['id']}: the dead-variable list disagrees ({flag['direction']})")
+            issues.append("dead_variable_disagreement")
+    drafts = sum(1 for c in found if c["draft"] is not None)
+    count = f"{len(found)} card(s), {drafts} draft(s)"
+    newest = None
+    for card in found:
+        snap = record_files.newest_snapshot(root, directory / card["id"] / variables_mod.LOG_FILENAME,
+                                            variables_mod.snapshot_subdir(card["id"]))
+        if snap is not None and (newest is None or snap.name > newest):
+            newest = snap.name
+    return Row("Variable definition cards", shown, count, newest, tuple(dict.fromkeys(problems)), code="variables",
+               facts={"exists": True, "cards": len(found), "drafts": drafts, "issues": list(dict.fromkeys(issues))})
+
+
+def card_file_paths(root: Path) -> list[tuple[Path, str]]:
+    """The files of every card that get a daily snapshot, each with its
+    snapshot subdirectory (`.rce/backups/variables/<id>/`, 9.11): the log
+    and the version files. Frozen and code copies are never rotated, and
+    need none."""
+    from rce.records import variables as variables_mod  # noqa: PLC0415
+
+    found: list[tuple[Path, str]] = []
+    for card in variables_mod.card_dirs(root) or []:
+        sub = variables_mod.snapshot_subdir(card.name)
+        found.append((card / variables_mod.LOG_FILENAME, sub))
+        try:
+            names = sorted(p.name for p in card.iterdir())
+        except OSError:
+            continue
+        found += [(card / n, sub) for n in names if variables_mod.VERSION_FILE_RE.match(n)]
+    return found
 
 
 def record_file_paths(root: Path) -> list[Path]:
@@ -393,11 +460,12 @@ def snapshot_records(root: Path, only: Iterable[str | Path] | None = None) -> li
         return []
     wanted = None if only is None else {str(p) for p in only}
     made: list[Path] = []
-    for path in record_file_paths(root):
+    targets: list[tuple[Path, str | None]] = [(p, None) for p in record_file_paths(root)] + list(card_file_paths(root))
+    for path, subdir in targets:
         if wanted is not None and str(path) not in wanted:
             continue
         try:
-            snap = record_files.snapshot_if_first_change_today(root, path)
+            snap = record_files.snapshot_if_first_change_today(root, path, subdir)
         except Exception as exc:  # noqa: BLE001 -- contained (docstring)
             logging.getLogger(__name__).warning("could not snapshot %s: %s", path, exc)
             continue
@@ -410,7 +478,7 @@ def inventory(conn: Connection | None, root: Path) -> list[Row]:
     """The 9.2 inventory of `root` (module docstring). `conn` is the index,
     when there is one, for the shrink check; reads only."""
     root = Path(root)
-    rows = [_judgement_row(conn, root), _mapping_row(root), *_attempt_rows(root), _canvas_row(root), _variables_row(root)]
+    rows = [_judgement_row(conn, root), _mapping_row(root), *_attempt_rows(root), _canvas_row(root), _variables_row(conn, root)]
     waiting = paths.legacy_sources(root)
     if waiting:
         rows.append(Row(
@@ -448,13 +516,33 @@ def _strings(value: Any) -> Iterable[str]:
 
 def _log_references(card: Path) -> set[str] | None:
     """Every string a card's `log.toml` holds (its entries name their copies
-    as `frozen/<hash>.toml` and `_code/<hash>.<ext>`), or None when the log
-    exists and cannot be read: then no copy is known to be unreferenced."""
+    as `frozen/<hash>.toml` and `_code/<hash>.<ext>`), or None when that
+    cannot be told: the log exists and cannot be read, or the card cannot
+    be trusted -- unreadable, its log missing though expected, or (against
+    the index) lacking entries the index applied, whose copies may be the
+    only text left of them."""
+    from rce.records import cards as cards_mod  # noqa: PLC0415
+    from rce.records import variables as variables_mod  # noqa: PLC0415
+
     got = record_files.read_record(card / LOG_FILENAME)
+    if got.state not in (RecordState.ABSENT, RecordState.PRESENT) or record_files.conflict_copies(card / LOG_FILENAME):
+        return None
+    root = card.parent.parent.parent
+    read = variables_mod.read_card(root, card)
+    ident = read_identity(root)
+    identity = ident.identity if ident.state is IdentityState.PRESENT else None
+    conn = None
+    if identity is not None and paths.index_dir(identity.id).joinpath(paths.DB_FILENAME).exists():
+        conn = db.connect(paths.index_dir(identity.id) / paths.DB_FILENAME)
+    try:
+        decision = cards_mod.assess_card(conn, root, read, identity) if identity is not None else None
+    finally:
+        if conn is not None:
+            conn.close()
+    if decision is None or not decision.may_apply or read.state != "ok":
+        return None
     if got.state is RecordState.ABSENT:
         return set()
-    if got.state is not RecordState.PRESENT or record_files.conflict_copies(card / LOG_FILENAME):
-        return None
     try:
         data = tomllib.loads(got.text or "")
     except tomllib.TOMLDecodeError:
@@ -463,13 +551,9 @@ def _log_references(card: Path) -> set[str] | None:
 
 
 def _cards(root: Path) -> list[Path] | None:
-    directory = paths.project_rce_dir(root) / VARIABLES_DIRNAME
-    if not directory.is_dir():
-        return []
-    try:
-        return sorted(p for p in directory.iterdir() if p.is_dir() and not p.is_symlink() and p.name != CODE_DIRNAME)
-    except OSError:
-        return None
+    from rce.records import variables as variables_mod  # noqa: PLC0415
+
+    return variables_mod.card_dirs(root)
 
 
 def _frozen_dirs(root: Path) -> Iterable[tuple[Path, set[str] | None]]:
