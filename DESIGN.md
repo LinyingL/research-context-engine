@@ -2240,3 +2240,41 @@ and binding like the rest.
 
 *The command line.* Every subcommand takes the project either as a
 positional path or as `--path`.
+
+*Found in acceptance on the researcher's project, 2026-10-05.*
+- **A pre-V5 project is frozen until it is migrated, scans included.** The
+  old index is at an older schema and nothing new may land in it before
+  the migration reads its own count: the watcher does not run for such a
+  project, `rce ingest` / `attempts` / `mappings` refuse with "migrate
+  first", and the page does not try to save a viewport. Reading works.
+- **A lost identity file is recognised by its snapshot too.** A folder
+  with no `project.toml` and no record files, but with a snapshot of
+  `project.toml` under `.rce/backups/`, is asked (restore / new identity)
+  rather than silently given a fresh id by `rce init`.
+- **A confirmed version file that has vanished or cannot be read** has no
+  edited text to keep, so its question has other answers: a vanished file
+  offers 「按冻结副本放回」; an unreadable one offers only "keep these bytes
+  as the next draft and put the frozen text back".
+- **Two histories in a card's log are settled by naming what stands.**
+  `rce variable settle <id> --keep <entry id>…` (and the same from the
+  card's page, 「以这一条为准」 beside each disputed entry) appends a
+  `settled` entry that names the anomalous entries it settles and, for
+  each version number in dispute, the one confirmation that stands. The
+  others stay in the history, not in force. Nothing is chosen by position
+  or by time.
+- **`.rce/README` says where things are now.** It is rewritten whenever
+  the identity check adopts, migrates or builds an index: the index's
+  current location and the record files this folder holds.
+- **The first launch after an install asks for the Documents folder.**
+  macOS treats a rebuilt, ad-hoc-signed `RCE.app` as a new application
+  and suspends the engine's first read under `~/Documents` until the
+  researcher answers its prompt — observed as an engine that starts and
+  never listens while the screen is locked. The shell's waiting page says
+  so (「如果系统询问是否允许 RCE 访问"文稿"文件夹，请点"允许"」) instead of
+  showing a log tail that has nothing in it, and the engine's output is
+  unbuffered so that its startup line reaches `serve.log` at once. `rce
+  app` does not rebuild a bundle whose sources have not changed, so the
+  question is asked once per real change of the shell, not per install.
+- **RCE runs on Python 3.11 and on Linux as it says it does.** The path
+  convention must not depend on a later argparse; naming the process that
+  holds an index must work from `/proc` where there is no `lsof`.
