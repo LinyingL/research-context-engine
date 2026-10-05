@@ -236,6 +236,39 @@ def test_scenario_1_move_opened_from_the_cli(tmp_path: Path, fake_home: Path) ->
     assert served.blocked and served.blocked["situation"] == "missing"
 
 
+def test_readme_is_rewritten_when_the_identity_check_adopts_builds_or_migrates(tmp_path: Path, fake_home: Path) -> None:
+    """9.12 (acceptance, 2026-10-05): `.rce/README` says where things are
+    now -- rewritten on adoption of a move, on building a missing index, and
+    on a migration -- naming the index's location and the record files the
+    folder holds. Nothing else in .rce/ is touched by it."""
+    old, new = tmp_path / "a" / "p", tmp_path / "b" / "p"
+    pid = _make(old)
+    readme = new / ".rce" / "README"
+    _move(old, new)
+    readme.write_text("stale: the index is somewhere else\n", encoding="utf-8")
+    others = {p.name: p.read_bytes() for p in (new / ".rce").iterdir() if p.is_file() and p.name != "README"}
+    assert cli.main(["status", "--path", str(new)]) == 0  # adopts the move
+    text = readme.read_text(encoding="utf-8")
+    assert str(paths.index_dir(pid)) in text and "stale" not in text
+    for name in ("project.toml", "judgements.toml", "canvas.json", "mappings.toml", "attempts.toml", "backups/"):
+        assert name in text, name
+    assert {p.name: p.read_bytes() for p in (new / ".rce").iterdir() if p.is_file() and p.name != "README"} == others
+    readme.unlink()
+    shutil.rmtree(paths.index_dir(pid))
+    assert cli.main(["status", "--path", str(new)]) == 0  # builds the missing index
+    assert str(paths.index_dir(pid)) in readme.read_text(encoding="utf-8")
+
+    from test_migration import _folder, build_pre_v5_index
+
+    legacy = _folder(tmp_path / "m")
+    build_pre_v5_index(legacy)
+    (legacy / ".rce" / "README").unlink(missing_ok=True)
+    assert cli.main(["migrate", "--yes", str(legacy)]) == 0
+    text = (legacy / ".rce" / "README").read_text(encoding="utf-8")
+    mid = identity.read_identity(legacy).identity.id
+    assert str(paths.index_dir(mid)) in text and "project.toml" in text and "judgements.toml" in text
+
+
 def test_scenario_1_move_reattached_from_the_app(tmp_path: Path, fake_home: Path) -> None:
     """9.9 scenario 1 (app): the app starts with no path, its last project's
     folder is gone -- it starts anyway and says so; 「选择新位置…」 adopts the
@@ -598,7 +631,9 @@ def test_pre_v5_project_is_readable_and_refuses_human_records(tmp_path: Path, ca
     root = tmp_path / "old"
     _legacy(root)
     assert situation.classify(root).situation is Situation.LEGACY
-    assert cli.main(["ingest", str(root)]) == 0  # scans still write the old index
+    # 9.12: frozen until migrated, scans included.
+    assert cli.main(["ingest", str(root)]) == 1
+    assert "migrate first: rce migrate" in capsys.readouterr().err
     assert cli.main(["confirm", *READ, "--status", "confirmed", "--path", str(root)]) == 1
     assert "before V5" in capsys.readouterr().err
     with pytest.raises(situation.NeedsMigrationError):
@@ -606,6 +641,8 @@ def test_pre_v5_project_is_readable_and_refuses_human_records(tmp_path: Path, ca
     with _serving(root) as (base, _httpd):
         status, summary = _get(base, "/api/summary")
         assert status == 200 and summary["needs_migration"] is True and summary["project_id"] is None
+        status, picture = _get(base, "/api/canvas")
+        assert status == 200 and picture["frozen"] is True  # the page saves no viewport or layout for it
         status, body = _post(base, "/api/mappings/add", {"from": "a.py", "to": "f.png", "type": "generates"})
         assert (status, body["state"]) == (409, "needs_migration")
         status, body = _post(base, "/api/edges/reject", dict(zip(("src", "dst", "type", "extractor"), READ)))

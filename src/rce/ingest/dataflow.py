@@ -132,7 +132,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Connection
-from typing import Any
+from typing import Any, Iterable
 
 from rce import db
 from rce.ingest import git as git_ingest
@@ -1128,6 +1128,29 @@ def ingest_dataflow_repo(
         for path, outcome in outcomes.items():
             sc.source("dataflow", path, outcome.status)
     return counts
+
+
+def reaches_outside(repo_root: Path, script_paths: Iterable[str]) -> list[str]:
+    """The scripts (project-relative paths) that read or write at least one
+    ABSOLUTE path not under `repo_root` -- exactly the literals
+    `_ingest_call` skips because `_remap_absolute_path` cannot map them into
+    the project. A project moved or copied away from where its scripts
+    point has many such scripts, which is why its pre-V5 judgments match
+    poorly (9.12, acceptance 2026-10-05). Reads only."""
+    found: list[str] = []
+    for path in sorted(set(script_paths)):
+        lower = path.lower()
+        if lower.endswith(".py"):
+            outcome = scan_py_file(repo_root, path)
+        elif lower.endswith(".rmd"):
+            outcome = scan_rmd_file(repo_root, path)
+        elif lower.endswith(".r"):
+            outcome = scan_r_file(repo_root, path)
+        else:
+            continue
+        if any(posixpath.isabs(c.literal) and _remap_absolute_path(c.literal, repo_root) is None for c in outcome.calls):
+            found.append(path)
+    return found
 
 
 def _ingest_call(

@@ -380,6 +380,7 @@ def rebuild(
     Raises `RebuildRefused` (nothing written), the write guard's refusals,
     or `SwapRefused`."""
     root = Path(project_root)
+    _identity_for_rebuild(root)  # reads only: a pre-V5 folder is told about 'rce migrate' before the guard refuses it
     with write_guard(root, expected_id, human=False, timeout=timeout):
         identity = _identity_for_rebuild(root)
         target = index_db_path(identity.id)

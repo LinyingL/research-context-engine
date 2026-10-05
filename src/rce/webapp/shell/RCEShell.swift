@@ -23,10 +23,14 @@
 //   --no-browser` as a child Process, output appended to serve.log in the
 //   RCE home ($RCE_HOME when set -- the same override rce.paths.rce_home
 //   honours -- else ~/.rce), and show a placeholder page (paper, the serif
-//   mark, 「正在启动引擎…」) until the probe answers. After 10 seconds, or
-//   at once if the child exits, the placeholder shows the log's tail AS
-//   TEXT: every character is HTML-escaped, so a log line can never become
-//   markup. On quit, and only if THIS app spawned the engine and it is
+//   mark, 「正在启动引擎…」) until the probe answers. After a few seconds
+//   without an answer it adds that macOS may be asking for the Documents
+//   folder (9.12: a rebuilt app's first read under ~/Documents waits for
+//   that answer, and the log has nothing in it then). Only if the child
+//   EXITS does the placeholder show the log's tail, AS TEXT: every
+//   character is HTML-escaped, so a log line can never become markup. The
+//   child runs with PYTHONUNBUFFERED=1, so its startup line and any error
+//   reach serve.log at once. On quit, and only if THIS app spawned the engine and it is
 //   still running, POST /api/shutdown with body {"pid": <child's pid>} and
 //   wait for it to exit (terminate it after a grace period). The pid is
 //   what keeps a terminal-started engine safe: the child may still be
@@ -71,7 +75,12 @@ let shellCommands: Set<String> = [
 
 let defaultPort = 7357
 let probeTimeout: TimeInterval = 1.0
-let startupBudget: TimeInterval = 10.0
+// After this long without an answer the waiting page names the likeliest
+// cause on a first launch after an install (DESIGN.md 9.12): macOS asking
+// whether RCE may read the Documents folder, which suspends the engine's
+// first read there until the researcher answers.
+let startupBudget: TimeInterval = 4.0
+let documentsHint = "正在启动引擎… 如果系统询问是否允许 RCE 访问\"文稿\"文件夹，请点\"允许\"。"
 let titleLimit = 60
 // What the page may ask the shell for (app.html, shellCan).
 let shellFeaturesScript = "window.RCEShellFeatures = [\"choose-folder\"];"
@@ -202,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
     var launchStarted = Date()
     var appLoaded = false
     var showingLog = false
+    var hintShown = false
     var quitting = false
     var signalSources: [DispatchSourceSignal] = []
     var choosingFolder = false
@@ -286,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
     func startEngine() {
         probeTimer?.invalidate()
         showingLog = false
+        hintShown = false
         launchStarted = Date()
         showPlaceholder("正在启动引擎…")
         probe { [weak self] ok in
@@ -359,9 +370,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
             if ok {
                 self.probeTimer?.invalidate()
                 self.loadApp()
-            } else if !self.showingLog && Date().timeIntervalSince(self.launchStarted) > startupBudget {
-                // Keep polling afterwards: a slow start still recovers.
-                self.showLog(headline: "引擎没有在 10 秒内启动")
+            } else if !self.showingLog && !self.hintShown
+                        && Date().timeIntervalSince(self.launchStarted) > startupBudget {
+                // Keep polling afterwards: a slow start still recovers. No
+                // log tail here -- a suspended engine has written nothing;
+                // the log is shown only once the engine has EXITED.
+                self.hintShown = true
+                self.showPlaceholder(documentsHint)
             }
         }
     }

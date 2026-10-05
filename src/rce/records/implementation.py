@@ -376,7 +376,7 @@ def baseline_entry(card: V.Card, number: int):
     """The latest confirmed, corrected or reaffirmed entry for `number`, in
     file order (the clock decides nothing)."""
     found = None
-    for e in card.entries:
+    for e in card.entries_in_force:
         if e.get("act") in ("confirmed", "corrected", "reaffirmed") and e.get("version") == number:
             found = e
     return found

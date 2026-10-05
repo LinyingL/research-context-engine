@@ -131,6 +131,13 @@ _MESSAGES = {
 }
 
 
+# A folder with no identity file and no records, but a snapshot of its
+# identity file in .rce/backups/ (9.12): the question, and its "new
+# identity" answer (there are no records to keep under it).
+SNAPSHOT_ONLY_MESSAGE = "项目身份文件不见了，但 .rce/backups/ 里有它的备份。RCE 不会悄悄给它新身份。"
+NEW_IDENTITY_LABEL = "建立新身份"
+
+
 class WriteRefused(Exception):
     """A write that must not happen; nothing was written. `state` is the
     machine-readable name the app has its own sentence for."""
@@ -411,6 +418,9 @@ class Classification:
 
     @property
     def answers(self) -> tuple[str, ...]:
+        if self.reason == "identity_snapshot_only":
+            # No records to keep or to move aside: restore, or a new identity.
+            return (RESTORE, "adopt")
         found = ANSWERS.get(self.situation, ())
         if self.situation is Situation.LOST_ID and self.extra.get("snapshot"):
             return (RESTORE, *found)
@@ -418,7 +428,14 @@ class Classification:
 
     @property
     def message(self) -> str:
+        if self.reason == "identity_snapshot_only":
+            return SNAPSHOT_ONLY_MESSAGE
         return _MESSAGES.get(self.situation, "")
+
+    def answer_label(self, answer: str) -> str | None:
+        if self.reason == "identity_snapshot_only" and answer == "adopt":
+            return NEW_IDENTITY_LABEL
+        return ANSWER_LABELS.get(answer)
 
     def payload(self) -> dict[str, Any]:
         """Machine-readable, for the app (and `--json` consumers)."""
@@ -432,7 +449,7 @@ class Classification:
             "detail": self.detail,
             "other_id": self.other_id,
             "answers": list(self.answers),
-            "answer_labels": {a: ANSWER_LABELS[a] for a in self.answers if a in ANSWER_LABELS},
+            "answer_labels": {a: self.answer_label(a) for a in self.answers if self.answer_label(a)},
             "message": self.message,
             "blocked": self.blocked,
             "needs_migration": self.needs_migration,
@@ -495,6 +512,17 @@ def classify(project_root: str | Path, *, probes: Probes | None = None) -> Class
                 Situation.LOST_ID, root, identity_read=got, reason="records_without_identity",
                 detail=f".rce/ holds {', '.join(records)} but no project.toml",
                 extra={"records": records, "snapshot": _identity_snapshot(root)},
+            )
+        snapshot = _identity_snapshot(root)
+        if snapshot is not None:
+            # 9.12 (acceptance, 2026-10-05): a lost identity file is
+            # recognised by its snapshot too -- a folder whose project.toml
+            # was snapshotted once had an identity, and is asked about
+            # (restore / new identity), never silently given a fresh id.
+            return Classification(
+                Situation.LOST_ID, root, identity_read=got, reason="identity_snapshot_only",
+                detail=f".rce/ holds no project.toml and no record files, but {snapshot['file']} is a snapshot of one",
+                extra={"records": [], "snapshot": snapshot},
             )
         if paths.has_legacy_index(root):
             return Classification(
@@ -587,11 +615,13 @@ def write_guard(
     timeout: float | None = None,
 ) -> Iterator[HeldLock]:
     """Hold the project lock and re-check identity (9.4) for one write to a
-    record file or to the index. `human=True` additionally refuses a
-    pre-V5 project -- no id, but a pre-V5 index that may hold its
-    judgments (`NeedsMigrationError`): nothing new lands in the old store
-    before it is migrated. A folder with neither (never indexed) has no
-    store to protect; its own files may still be written.
+    record file or to the index. A pre-V5 project -- no id, but a pre-V5
+    index that may hold its judgments -- refuses every write, a scan as
+    much as a human record (`NeedsMigrationError`, 9.12): nothing new
+    lands in the old store before it is migrated. `human=True`
+    additionally refuses a folder whose migration has not finished. A
+    folder with neither (never indexed) has no store to protect; its own
+    files may still be written.
 
     `expected_id` is the id the caller opened the project with; left out,
     it is read from the folder now (for writers called outside a serving
@@ -608,10 +638,13 @@ def write_guard(
             expected_id = got.identity.id
         else:
             raise ProjectMovedError(f"the identity file of {root} cannot be read ({got.state.value}) -- nothing written")
-    if human and expected_id is None and paths.has_legacy_index(root):
+    if expected_id is None and paths.has_legacy_index(root):
+        # 9.12 (acceptance, 2026-10-05): frozen until migrated, scans
+        # included -- the old index is at an older schema, and nothing new
+        # may land in it before the migration reads its own count.
         raise NeedsMigrationError(
-            f"{root} was indexed before V5: it is read-only for human records until it is migrated "
-            f"(`rce migrate`) -- nothing written"
+            f"{root} was indexed before V5: it is frozen until it is migrated -- human records and scans "
+            f"alike; migrate first: rce migrate -- nothing written"
         )
     with project_lock(root, expected_id, timeout=timeout) as held:
         if expected_id is not None and root.is_dir():

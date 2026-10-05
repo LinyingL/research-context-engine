@@ -74,7 +74,7 @@ import argparse
 import json
 import logging
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
@@ -230,6 +230,26 @@ def _open(path_str: str, *, register: bool = False) -> project_identity.Opened:
 
 def _resolve_project_root(path_str: str) -> Path:
     return _open(path_str).root
+
+
+def _refuse_frozen(opened: project_identity.Opened, command: str) -> None:
+    """DESIGN.md 9.12 (acceptance, 2026-10-05): a pre-V5 project -- or one
+    whose migration has not finished -- is frozen until it is migrated,
+    scans included. Its old index is at an older schema, and nothing new
+    may land in it before the migration reads its own count. Reading
+    works; `rce ingest`, `rce attempts` and `rce mappings` refuse."""
+    if not opened.needs_migration:
+        return
+    why = (
+        "its migration has not finished"
+        if opened.situation is not records_situation.Situation.LEGACY
+        else "it was indexed before V5 and its old index may hold judgments"
+    )
+    raise CliError(
+        f"'{command}' refused: {opened.root} is frozen until it is migrated ({why}); nothing new may land in "
+        f"the old index before the migration counts it -- migrate first: rce migrate {opened.root}  "
+        f"(reading -- rce status, rce query, rce records -- still works). Nothing written."
+    )
 
 
 @contextmanager
@@ -407,6 +427,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     project lock with the identity re-checked (9.7, 9.4): a scan is an
     index write like any other."""
     opened = _open(args.path)
+    _refuse_frozen(opened, "rce ingest")
     project_root = opened.root
     db_path = _require_db(project_root)
     with _write_guard(opened, human=False):
@@ -576,6 +597,7 @@ def cmd_attempts(args: argparse.Namespace) -> int:
     pre-commit pipeline.
     """
     opened = _open(_resolve_attempts_path(args))
+    _refuse_frozen(opened, "rce attempts")
     project_root = opened.root
     db_path = _require_db(project_root)
     with _write_guard(opened, human=False):
@@ -613,6 +635,7 @@ def cmd_mappings(args: argparse.Namespace) -> int:
     error: there is simply nothing to ingest, and existing mapping edges
     are left as they are."""
     opened = _open(args.path)
+    _refuse_frozen(opened, "rce mappings")
     project_root = opened.root
     db_path = _require_db(project_root)
     with _write_guard(opened, human=False):
@@ -742,11 +765,18 @@ def cmd_review(args: argparse.Namespace) -> int:
     db_path = _require_db(opened.root)
     # The ledger may have changed since anything last applied it (a hand
     # edit, a sync, no engine running): apply it first -- an index write,
-    # so under the project lock like a scan.
-    with _write_guard(opened, human=False):
+    # so under the project lock like a scan. A project frozen until it is
+    # migrated (9.12) is only read: nothing lands in its old index.
+    frozen = opened.needs_migration
+    with nullcontext() if frozen else _write_guard(opened, human=False):
         conn = db.connect(db_path)
         try:
-            judgements.apply_ledger(conn, opened.root)
+            if frozen and not db._has_machine_status(conn):
+                print(f"{opened.root} is read from its pre-V5 index, which keeps no review: its judgments move "
+                      f"into the record when it is migrated (rce migrate {opened.root}). Under review: 0")
+                return 0
+            if not frozen:
+                judgements.apply_ledger(conn, opened.root)
             items = judgements.review_items(conn)
             card_items = card_implementation.review_groups(conn)
         finally:
@@ -976,6 +1006,9 @@ def _print_preview(view: migration.Preview) -> None:
     )
     if index.judged:
         print(f"    match: a scan of {view.root} produces both ends of {view.produced} of {index.judged} judged link(s)")
+        if view.produced < index.judged and view.outside:
+            print(f"    {view.outside} script(s) in this folder read or write absolute paths outside it -- a low match "
+                  f"here is what a moved or copied project looks like (those paths cannot be mapped into this folder)")
     if view.scan_error:
         print(f"    (the scan of this folder failed: {view.scan_error})")
 
@@ -1060,6 +1093,7 @@ def cmd_judge(args: argparse.Namespace) -> int:
     anything from rce.semantic to begin with.
     """
     opened = _open(args.path)
+    _refuse_frozen(opened, "rce judge")
     db_path = _require_db(opened.root)
     with _write_guard(opened, human=False):
         return _judge(args, db.connect(db_path))
@@ -1573,9 +1607,14 @@ def _print_card_line(card: dict[str, Any]) -> None:
     draft = f", draft v{card['draft']} open" if card["draft"] is not None else ""
     print(f"  {card['id']}: {_card_status_word(card)}{draft}")
     for q in card["questions"]:
-        what = "is gone" if q.get("kind") == "absent" else "was changed"
+        kind = q.get("kind")
+        what = {"absent": "is gone", "unreadable": "can no longer be read"}.get(kind, "was changed")
         print(f"    ! v{q['version']}.toml {what} after it was confirmed ({q['message']}): "
               f"rce variable answer {card['id']} {'|'.join(q['answers'])} --version {q['version']}")
+        if kind == "absent":
+            print("      new = put it back from its frozen copy, byte for byte (there is no edited text to keep)")
+        elif kind == "unreadable":
+            print("      new = keep these bytes, as they are, as the next draft and put the frozen text back")
     for problem in card["problems"]:
         print(f"    ! {problem}")
     for flag in card["dead_flags"]:
@@ -1641,11 +1680,14 @@ def cmd_variable_show(args: argparse.Namespace) -> int:
                 print(f"    ! {v['copy_missing']}: the code copy is not there; the script as it was cannot be shown")
         for note in v["upstream_notes"]:
             print(f"    note: {note}")
+    _print_dispute(card)
     print("  history:")
     for e in card["history"]:
         what = f" v{e['version']}" if "version" in e else ""
         note = f" -- {e['note']}" if e.get("note") else ""
-        print(f"    seq {e.get('seq')} {e.get('act')}{what} at {e.get('at')} via {e.get('via')}{note}")
+        kept = f" keeps {', '.join(e['keeps'])}" if e.get("keeps") else ""
+        off = "" if e.get("in_force", True) else " [not in force: left out by a settlement]"
+        print(f"    seq {e.get('seq')} {e.get('act')}{what} at {e.get('at')} via {e.get('via')} ({e.get('id')}){kept}{note}{off}")
     trust = card.get("trust") or {}
     if trust.get("state") == "shrunk":
         ids = ",".join(str(m["id"]) for m in trust["missing"])
@@ -1750,9 +1792,12 @@ def cmd_variable_answer(args: argparse.Namespace) -> int:
                 raise CliError("--missing goes with the answers file|restore")
             done = variable_cards.answer_edited(opened.root, args.id, args.answer, version=args.version,
                                                 expected_id=opened.project_id)
-            if done.answer == variables_mod.ANSWER_NEW:
-                print(f"Saved the edited text as draft v{done.new_version}; v{done.version}.toml was put back from its "
-                      f"frozen copy, byte for byte.")
+            if done.answer == variables_mod.ANSWER_NEW and done.new_version is None:
+                print(f"Put v{done.version}.toml back from its frozen copy, byte for byte (the file had vanished; "
+                      f"there was no edited text to keep).")
+            elif done.answer == variables_mod.ANSWER_NEW:
+                print(f"Kept the file's bytes as they were as draft v{done.new_version}; v{done.version}.toml was put "
+                      f"back from its frozen copy, byte for byte.")
             else:
                 print(f"Recorded a correction of v{done.version} as {done.entry.id}: both wordings stay readable.")
             return 0
@@ -1765,6 +1810,59 @@ def cmd_variable_answer(args: argparse.Namespace) -> int:
     else:
         print(f"Appended {len(done.appended)} missing entr(y/ies) to log.toml (via = recovered)"
               + (f"; put back {len(done.restored_copies)} frozen cop(y/ies)" if done.restored_copies else ""))
+    return 0
+
+
+def _entry_line(e: dict[str, Any]) -> str:
+    what = f" v{e['version']}" if "version" in e else ""
+    content = f" content {str(e['content'])[7:15]}" if e.get("content") else ""
+    attested = f" attested {e['attested']}" if e.get("attested") else ""
+    return f"{e.get('id')}  seq {e.get('seq')} {e.get('act')}{what} at {e.get('at')} via {e.get('via')}{content}{attested}"
+
+
+def _print_dispute(card: dict[str, Any]) -> None:
+    """9.12: two histories in a card's log -- both, side by side in order,
+    each disputed confirmation with its id, and the command that settles."""
+    d = card.get("dispute")
+    if not d:
+        return
+    print("  two histories of log.toml were merged; nothing is in force until you name what stands:")
+    for e in d["common"]:
+        print(f"    both:        {_entry_line(e)}")
+    for i, branch in enumerate(d["branches"], 1):
+        for e in branch:
+            print(f"    history {i}:   {_entry_line(e)}")
+        if not branch:
+            print(f"    history {i}:   (no entry about this card)")
+    for v in d["versions"]:
+        print(f"    v{v['version']} is in dispute; the confirmations that may stand: {', '.join(v['candidates'])}")
+    keeps = " ".join(f"--keep <v{v['version']} entry>" for v in d["versions"])
+    print(f"  settle: rce variable settle {card['id']} {keeps}   (the others stay in the history, not in force)")
+
+
+def cmd_variable_settle(args: argparse.Namespace) -> int:
+    """`rce variable settle <id> --keep <entry id>...` (DESIGN.md 9.12): a
+    card whose log holds two merged histories is settled by naming, for
+    each version number in dispute, the one confirmation that stands. One
+    `settled` entry is appended; the other entries stay in the history, not
+    in force. Nothing is chosen by position or time."""
+    opened = _open(args.path)
+    if not args.keep:
+        card = _card_overview(opened.root, args.id)[0]
+        if card.get("dispute"):
+            _print_dispute(card)
+            raise CliError("name, with --keep, the confirmation that stands for each version in dispute")
+    with _card_errors():
+        done = variable_cards.settle(opened.root, args.id, args.keep, note=args.note, expected_id=opened.project_id)
+    print(f"Settled {done.card.id}'s two histories as {done.entry.id} (seq {done.entry.seq}). What stands:")
+    by_id = {e.id: e for e in done.card.entries}
+    for entry_id in done.keeps:
+        print(f"  v{by_id[entry_id].get('version')}: {entry_id}")
+    if done.not_in_force:
+        print(f"Kept in the history, not in force: {', '.join(done.not_in_force)}")
+    for n in done.card.questions:
+        print(f"  ! v{n}.toml does not hold the text that stands for v{n}: rce variable answer {done.card.id} "
+              f"new|correct --version {n}")
     return 0
 
 
@@ -1841,9 +1939,15 @@ def cmd_app(args: argparse.Namespace) -> int:
             )
         target_dir = Path.home() / "Applications"
     try:
-        result = macapp.build_app(target_dir, port=args.port)
+        result = macapp.build_app(target_dir, port=args.port, force=args.force)
     except macapp.MacAppError as exc:
         raise CliError(str(exc)) from exc
+    if result.up_to_date:
+        # 9.12: an unchanged shell is not rebuilt -- a rebuilt, re-signed
+        # app is a new application to macOS, which asks for Documents again.
+        print(f"RCE.app is up to date: {result.bundle} (built from these same sources; left untouched, so macOS "
+              f"keeps the permissions it gave it). 'rce app --force' rebuilds it anyway.")
+        return 0
     for notice in result.notices:
         print(notice)
     print(f"RCE.app written to {result.bundle}")
@@ -2073,6 +2177,10 @@ def build_parser() -> argparse.ArgumentParser:
     # Hidden: for tests and trial builds, never for the researcher's own
     # install (one fixed port is how every app finds the one engine).
     p.add_argument("--port", type=_tcp_port, default=macapp.DEFAULT_PORT, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--force", action="store_true",
+        help="rebuild RCE.app even when it is up to date (macOS may then ask again for the Documents folder)",
+    )
     p.set_defaults(func=cmd_app)
 
     p = sub.add_parser(
@@ -2166,7 +2274,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "variable",
         help="Variable definition cards in .rce/variables/ (DESIGN.md 9.11): "
-             "'rce variable new|list|show|revise|confirm|answer|abandon|revive'",
+             "'rce variable new|list|show|revise|confirm|answer|abandon|revive|settle'",
     )
     variable_sub = p.add_subparsers(dest="variable_command", required=True)
     q = variable_sub.add_parser("list", help="every card, the version in use, its draft and its problems")
@@ -2182,6 +2290,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("revive", cmd_variable_revive, "record why an abandoned variable is back (--note is required)"),
         ("answer", cmd_variable_answer, "answer a card's question: new|correct (a confirmed version was edited), "
                                         "file|restore (its log has fewer entries than the index applied)"),
+        ("settle", cmd_variable_settle, "settle two merged histories in a card's log by naming, with --keep, the "
+                                        "confirmation that stands for each version in dispute"),
     ):
         q = variable_sub.add_parser(name, help=text)
         q.add_argument("id", help="the variable's id (its directory name; compared case-folded)")
@@ -2196,6 +2306,10 @@ def build_parser() -> argparse.ArgumentParser:
                                 "Asked when omitted at a terminal; required otherwise (RCE never answers for you)")
         if name in ("abandon", "revive"):
             q.add_argument("--note", required=True, help="the reason, in your words")
+        if name == "settle":
+            q.add_argument("--keep", action="append", default=[], metavar="ENTRY_ID",
+                           help="an entry that stands (one per version in dispute; 'rce variable show' lists them)")
+            q.add_argument("--note", default=None, help="optional: why, in your words")
         if name == "show":
             q.add_argument("--json", action="store_true", help="print the card as JSON")
         add_project_path(q)

@@ -888,3 +888,128 @@ def test_an_entry_whose_copy_is_missing_still_detects_an_edit_but_cannot_restore
     assert err.value.code == "copy_missing" and err.value.message_zh == "确认记录引用的副本缺失"
     assert (V.variables_dir(root) / "topicshift" / "v1.toml").read_text(encoding="utf-8") == _text(formula="edited")
     assert not (V.variables_dir(root) / "topicshift" / "v2.toml").exists()
+
+
+# -- 9.12 (acceptance, 2026-10-05): two histories settled by naming what stands ------------------
+
+
+TEXT_A = _text(formula="TS_t = 1 − cos(p_t, p_{t−2})")
+TEXT_B = _text(formula="TS_t = JS(p_t, p_{t−1})")
+
+
+def _merged_two_v2(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """Two copies of a card each confirming a different v2, merged the way
+    a sync merges them: the logs concatenated (seq 2 twice), both frozen
+    copies and code copies present, and v2.toml as copy A wrote it.
+    Returns (root, v1's entry id, A's v2 entry id, B's v2 entry id)."""
+    root = tmp_path / "p"
+    _project(root)
+    v1 = _new_confirmed(root).entry.id
+    cards.revise(root, "topicshift")
+    other = tmp_path / "other"
+    shutil.copytree(root, other)
+    project_identity.fork(other)
+    _write(root, "topicshift", 2, TEXT_A)
+    a = cards.confirm(root, "topicshift", attested="yes").entry.id
+    _write(other, "topicshift", 2, TEXT_B)
+    b = cards.confirm(other, "topicshift", attested="no").entry.id
+    mine, theirs = (V.variables_dir(r) / "topicshift" for r in (root, other))
+    tail = (theirs / "log.toml").read_text(encoding="utf-8").split("\n[[entry]]")[-1]
+    (mine / "log.toml").write_text((mine / "log.toml").read_text(encoding="utf-8") + "\n[[entry]]" + tail, encoding="utf-8")
+    for sub in ("frozen",):
+        for f in (theirs / sub).iterdir():
+            if not (mine / sub / f.name).exists():
+                shutil.copy2(f, mine / sub / f.name)
+    for f in V.code_dir(other).iterdir():
+        if not (V.code_dir(root) / f.name).exists():
+            shutil.copy2(f, V.code_dir(root) / f.name)
+    return root, v1, a, b
+
+
+def test_two_merged_v2_confirmations_freeze_the_card_and_ask_which_stands(tmp_path, capsys):
+    root, v1, a, b = _merged_two_v2(tmp_path)
+    card = _card(root)
+    assert card.state == "frozen" and card.reason == "conflict" and card.in_use is None
+    d = cards.dispute_payload(card)
+    assert [[e["id"] for e in br] for br in d["branches"]] == [[a], [b]]
+    assert [e["id"] for e in d["common"]][:1] == [v1]
+    assert d["versions"] == [{"version": 2, "candidates": [a, b]}]
+    assert set(d["shown"]) == {a, b}
+    # Writes other than settling stay refused.
+    with pytest.raises(cards.CardRefused):
+        cards.abandon(root, "topicshift", note="x")
+    # The CLI shows both histories with their ids and the command.
+    assert cli.main(["variable", "show", "topicshift", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert a in out and b in out and "rce variable settle topicshift --keep" in out
+
+
+def test_settle_refuses_any_answer_that_does_not_name_exactly_one_per_disputed_version(tmp_path):
+    root, v1, a, b = _merged_two_v2(tmp_path)
+    log = V.variables_dir(root) / "topicshift" / "log.toml"
+    before = log.read_bytes()
+    for keeps in ([], [a, b], [v1], ["v-nope"], [a, a]):
+        with pytest.raises(cards.CardRefused):
+            cards.settle(root, "topicshift", keeps)
+    with pytest.raises(cards.CardRefused, match="changed since"):
+        cards.settle(root, "topicshift", [a], expected_shown=[a])
+    assert log.read_bytes() == before  # nothing written, nothing chosen by position or time
+
+
+def test_settle_keeping_the_file_s_history_puts_v2_in_use_and_marks_the_other_not_in_force(tmp_path, capsys):
+    root, v1, a, b = _merged_two_v2(tmp_path)
+    log = V.variables_dir(root) / "topicshift" / "log.toml"
+    before = log.read_bytes()
+    assert cli.main(["variable", "settle", "topicshift", "--keep", a, str(root)]) == 0
+    out = capsys.readouterr().out
+    assert f"v2: {a}" in out and b in out
+    after = log.read_bytes()
+    assert after.startswith(before)  # appended, never rewritten
+    card = _card(root)
+    settled = card.entries[-1]
+    assert settled.get("act") == "settled" and settled.get("keeps") == [a] and b in settled.settles
+    assert card.state == "ok" and card.in_use == 2 and not card.questions
+    assert card.versions[1].status == "superseded" and card.versions[2].entry.id == a
+    assert card.not_in_force == {b}
+    payload = cards.card_payload(root, card)
+    assert {h["id"]: h["in_force"] for h in payload["history"]}[b] is False
+    assert {h["id"]: h["in_force"] for h in payload["history"]}[a] is True
+    assert payload["dispute"] is None
+    # Unfrozen: an ordinary act is written again, and needs no settles of its own to read.
+    cards.abandon(root, "topicshift", note="试一下")
+    assert _card(root).abandoned is not None
+    assert cli.main(["records", "--verify", str(root)]) == 0
+    assert _decision(root).verdict is Trust.OK
+
+
+def test_settle_keeping_the_other_history_asks_the_edited_in_place_question(tmp_path):
+    """A kept entry whose content hash differs from v2.toml as it stands
+    raises the ordinary 「v2 的定义在确认后被改动了」 question; answering
+    「另存为新版本」 puts B's frozen text back and keeps A's as draft v3."""
+    root, v1, a, b = _merged_two_v2(tmp_path)
+    done = cards.settle(root, "topicshift", [b], expected_shown=[a, b], via="app")
+    assert done.keeps == (b,) and done.not_in_force == (a,)
+    card = _card(root)
+    assert card.in_use == 2 and card.versions[2].entry.id == b
+    assert card.questions == [2] and card.versions[2].question_kind == "edited"
+    assert cards.card_payload(root, card)["versions"][1]["content"]["construction"]["formula"] == "TS_t = JS(p_t, p_{t−1})"
+    cards.answer_edited(root, "topicshift", "new", version=2)
+    card = _card(root)
+    assert not card.questions and card.draft == 3
+    v2 = (V.variables_dir(root) / "topicshift" / "v2.toml").read_text(encoding="utf-8")
+    v3 = (V.variables_dir(root) / "topicshift" / "v3.toml").read_text(encoding="utf-8")
+    assert "JS(p_t" in v2 and "p_{t−2}" in v3
+
+
+def test_a_second_merge_after_a_settlement_asks_again(tmp_path):
+    """A settlement settles the histories it saw; a later merge of another
+    history is a new conflict, asked again -- never decided by the old one."""
+    root, v1, a, b = _merged_two_v2(tmp_path)
+    cards.settle(root, "topicshift", [a])
+    log = V.variables_dir(root) / "topicshift" / "log.toml"
+    text = log.read_text(encoding="utf-8")
+    blocks = text.split("\n[[entry]]")
+    stray = blocks[1].replace('id = "v-', 'id = "v-9', 1)  # a third copy's seq-1 entry
+    log.write_text(text + "\n[[entry]]" + stray, encoding="utf-8")
+    card = _card(root)
+    assert card.state == "frozen" and card.reason == "conflict"

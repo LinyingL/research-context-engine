@@ -276,34 +276,24 @@ class Scan:
         )
 
 
-class UnrecordedScan(Scan):
-    """A scan of an index from before scan reports (a pre-V5 index, schema
-    0001-0003, which a project keeps -- read-only for human records --
-    until `rce migrate`; 9.5, 9.10). Its extractors run exactly as before
-    0004: nothing is recorded, no link is stamped. Without this, every scan
-    of such a project died on the missing `scans` table."""
-
-    def __init__(self, conn: Connection, label: str) -> None:
-        super().__init__(conn, 0, label)
-
-    def prior_scan(self, extractor: str, source: str) -> int | None:
-        return None
-
-    def mark(self, extractor: str, source: str, basis_: dict[str, Any]) -> dict[str, Any]:
-        return {}
-
-    def finish(self, *, failed: bool = False) -> None:
-        return None
+class PreScanReportsIndex(Exception):
+    """A scan was asked of an index from before scan reports (a pre-V5
+    index, schema 0001-0003). Such a project is frozen until it is migrated,
+    scans included (DESIGN.md 9.12, acceptance 2026-10-05): nothing new may
+    land in the old index before the migration reads its own count. The
+    entry points refuse first ("migrate first"); this is the backstop."""
 
 
 @contextmanager
 def scan(conn: Connection, label: str) -> Iterator[Scan]:
     """Open a scan, yield it, and finish it -- as `failed` if the body
-    raises (then only its failure statuses are written). On an index that
-    predates scan reports, an `UnrecordedScan`."""
+    raises (then only its failure statuses are written). An index that
+    predates scan reports is never scanned (`PreScanReportsIndex`)."""
     if not db._has_scan_stamps(conn):
-        yield UnrecordedScan(conn, label)
-        return
+        raise PreScanReportsIndex(
+            "this index predates V5 (it has no scan reports); the project is frozen until it is migrated, "
+            "scans included -- migrate first: rce migrate"
+        )
     current = Scan(conn, db.begin_scan(conn, label), label)
     try:
         yield current

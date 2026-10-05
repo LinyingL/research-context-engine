@@ -100,6 +100,8 @@ value, so they cannot drift.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import platform
 import plistlib
 import shlex
@@ -118,6 +120,13 @@ EXECUTABLE_NAME = "RCE"
 ICON_NAME = "RCE"  # Resources/RCE.icns; CFBundleIconFile names it without the extension
 RCE_PATH_SIDECAR = "rce-path"
 RCE_PORT_SIDECAR = "rce-port"
+#: Contents/Resources/build-id: a hash of everything a native build is made
+#: from (DESIGN.md 9.12, acceptance 2026-10-05). macOS treats a rebuilt,
+#: ad-hoc-signed RCE.app as a new application and asks again for the
+#: Documents folder; so `rce app` leaves a bundle whose inputs have not
+#: changed exactly as it is -- the question is asked once per real change
+#: of the shell, not per install.
+BUILD_ID_SIDECAR = "build-id"
 
 # The lowest macOS the compiled shell targets (swiftc -target), and what
 # Info.plist declares -- the two come from this one constant.
@@ -270,6 +279,9 @@ class AppBuild:
     bundle: Path
     native: bool
     notices: list[str] = field(default_factory=list)
+    #: True when the bundle in place was built from the same inputs and was
+    #: left untouched (nothing compiled, nothing re-signed).
+    up_to_date: bool = False
 
 
 def find_swiftc() -> str | None:
@@ -354,11 +366,48 @@ def _build_icon(swiftc: str, work: Path, resources: Path) -> bool:
     return _run([iconutil, "-c", "icns", "-o", str(icns), str(iconset)]).returncode == 0 and icns.is_file()
 
 
+def build_id(rce_executable: Path, port: int) -> str:
+    """The native bundle's inputs, hashed: the Swift sources (shell and
+    icon), the rce path, the port, the Info.plist fields and the compile
+    target. Each part is length-prefixed, so no two different sets of
+    inputs can run together into the same bytes."""
+    digest = hashlib.sha256()
+    parts = (
+        SHELL_SOURCE.read_bytes(),
+        ICON_SOURCE.read_bytes(),
+        str(rce_executable).encode("utf-8"),
+        str(port).encode("ascii"),
+        json.dumps(_native_info_plist(port, True), sort_keys=True, ensure_ascii=False).encode("utf-8"),
+        _swift_target().encode("ascii"),
+    )
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return "sha256:" + digest.hexdigest()
+
+
+def is_up_to_date(bundle: Path, wanted: str) -> bool:
+    """Whether `bundle` is a native RCE.app built from exactly these inputs
+    (its build-id says so and its executable is there). A symlink, the V3
+    launcher (no build-id) or a damaged bundle is not."""
+    if bundle.is_symlink() or not bundle.is_dir():
+        return False
+    contents = bundle / "Contents"
+    try:
+        recorded = (contents / "Resources" / BUILD_ID_SIDECAR).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return recorded == wanted and (contents / "MacOS" / EXECUTABLE_NAME).is_file()
+
+
 def _write_sidecars(resources: Path, rce_executable: Path, port: int) -> None:
     """Byte-exact: no trailing newline, no quoting -- the shell reads the
-    file whole and uses it only as an executable URL (module docstring)."""
+    file whole and uses it only as an executable URL (module docstring).
+    The build-id is written here too, before signing: the signature covers
+    it."""
     (resources / RCE_PATH_SIDECAR).write_bytes(str(rce_executable).encode("utf-8"))
     (resources / RCE_PORT_SIDECAR).write_text(str(port), encoding="utf-8")
+    (resources / BUILD_ID_SIDECAR).write_text(build_id(rce_executable, port), encoding="utf-8")
 
 
 def _swap_into_place(staged: Path, final: Path) -> None:
@@ -399,17 +448,24 @@ def build_app(
     target_dir: Path,
     rce_executable: Path | None = None,
     port: int = DEFAULT_PORT,
+    force: bool = False,
 ) -> AppBuild:
     """Build `<target_dir>/RCE.app`: the native shell when `swiftc` is
     available and compiles, else the V3 launcher bundle plus a one-line
     notice. Either way the result replaces any existing bundle in place
     (module docstring, "Build discipline"). `rce_executable` defaults to
     `resolve_rce_executable()`; resolved first, so a missing entry point
-    refuses before any compiling."""
+    refuses before any compiling.
+
+    A native bundle already in place whose build-id matches these inputs
+    is left untouched -- not recompiled, not re-signed -- so macOS keeps
+    the permission it granted it (9.12); `force` rebuilds anyway."""
     if rce_executable is None:
         rce_executable = resolve_rce_executable()
     target_dir.mkdir(parents=True, exist_ok=True)
     final = target_dir / BUNDLE_NAME
+    if not force and is_up_to_date(final, build_id(rce_executable, port)):
+        return AppBuild(bundle=final, native=True, up_to_date=True)
     notices: list[str] = []
     swiftc = find_swiftc()
     if swiftc is None:

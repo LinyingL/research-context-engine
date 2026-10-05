@@ -281,14 +281,20 @@ def test_write_guard_refuses_another_id(tmp_path: Path) -> None:
     assert ident.id != other
 
 
-def test_write_guard_human_refuses_legacy_but_index_writes_pass(tmp_path: Path) -> None:
+def test_write_guard_refuses_every_write_to_a_legacy_project(tmp_path: Path) -> None:
+    """9.12 (acceptance, 2026-10-05): a pre-V5 project is frozen until it is
+    migrated, scans included -- an index write is refused like a human one.
+    A never-indexed folder (no old store to protect) is not."""
     paths.legacy_graph_dir(tmp_path).mkdir(parents=True)
     paths.legacy_index_db_path(tmp_path).write_bytes(b"")
-    with pytest.raises(situation.NeedsMigrationError) as err:
-        with situation.write_guard(tmp_path, human=True):
-            pass
-    assert err.value.state == "needs_migration"
-    with situation.write_guard(tmp_path, human=False):
+    for human in (True, False):
+        with pytest.raises(situation.NeedsMigrationError, match="migrate first") as err:
+            with situation.write_guard(tmp_path, human=human):
+                pass
+        assert err.value.state == "needs_migration"
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    with situation.write_guard(fresh, human=False):
         pass
 
 

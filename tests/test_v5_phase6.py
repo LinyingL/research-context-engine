@@ -508,14 +508,16 @@ def test_lost_identity_adopt_keeps_every_record_under_a_new_id(tmp_path, capsys)
     root, pid = _project(tmp_path)
     _three_judgments(root)
     (root / ".rce" / "canvas.json").write_text('{"views": {"all": {"positions": {"script:s.py": [1, 2]}}}}')
-    before = {p.name: p.read_bytes() for p in (root / ".rce").iterdir() if p.is_file() and p.name != "project.toml"}
+    # README is RCE's own signpost, rewritten on adoption (9.12); the records are compared.
+    before = {p.name: p.read_bytes() for p in (root / ".rce").iterdir() if p.is_file() and p.name not in ("project.toml", "README")}
     _lose_identity(root)
     shutil.rmtree(paths.index_dir(pid))
     assert cli.main(["project", "adopt", str(root)]) == 0
     capsys.readouterr()
     new = identity.read_identity(root).identity
     assert new.id != pid and new.ledger is True and new.forked_from is None
-    after = {p.name: p.read_bytes() for p in (root / ".rce").iterdir() if p.is_file() and p.name != "project.toml"}
+    after = {p.name: p.read_bytes() for p in (root / ".rce").iterdir() if p.is_file() and p.name not in ("project.toml", "README")}
+    assert str(paths.index_dir(new.id)) in (root / ".rce" / "README").read_text(encoding="utf-8")
     assert after == before  # every record kept, byte for byte
     assert index_db_path(new.id).exists()
     assert _status(root, READ) == "confirmed" and _status(root, WRITE) == "auto"
@@ -533,6 +535,46 @@ def test_restore_is_not_offered_without_a_snapshot(tmp_path):
     with pytest.raises(project_identity.AnswerRefused):
         project_identity.restore(root)
     assert not (root / ".rce" / "project.toml").exists()
+
+
+@pytest.mark.parametrize("answer", ["restore", "adopt"])
+def test_lost_identity_is_recognised_by_its_snapshot_alone(tmp_path, capsys, answer):
+    """9.12 (acceptance, 2026-10-05): no project.toml and no record files,
+    but a snapshot of project.toml under .rce/backups/ -- the folder is
+    asked (restore / new identity); `rce init` refuses with the same
+    question instead of minting a fresh id; and each answer works."""
+    root, pid = _project(tmp_path)
+    assert list((root / ".rce" / "backups").glob("project.toml.*"))  # init kept one
+    assert not any(os.path.lexists(root / ".rce" / n) for n in situation.V5_RECORD_NAMES)
+    (root / ".rce" / "project.toml").unlink()
+    c = situation.classify(root)
+    assert (c.situation, c.reason) == (Situation.LOST_ID, "identity_snapshot_only")
+    assert c.answers == ("restore", "adopt") and c.extra["records"] == []
+    payload = c.payload()
+    assert payload["snapshot"]["project_id"] == pid
+    assert payload["answer_labels"] == {"restore": "从备份恢复项目身份文件", "adopt": "建立新身份"}
+    assert ".rce/backups/" in payload["message"]
+    assert cli.main(["init", str(root)]) == 1
+    err = capsys.readouterr().err
+    assert "snapshot" in err and "rce project restore" in err and "rce project adopt" in err
+    assert "rce project other" not in err
+    assert not (root / ".rce" / "project.toml").exists()  # nothing minted
+    served = server.served_for(root)
+    assert served.blocked["situation"] == "lost_id" and served.blocked["answers"] == ["restore", "adopt"]
+    assert cli.main(["project", answer, str(root)]) == 0
+    capsys.readouterr()
+    now = identity.read_identity(root).identity
+    assert (now.id == pid) is (answer == "restore")
+    assert situation.classify(root).situation is Situation.NORMAL
+
+
+def test_a_never_initialised_folder_is_still_not_a_project(tmp_path):
+    """The snapshot rule does not reach folders that never had an identity:
+    an empty .rce/backups/ (or none) is NOT_A_PROJECT, and `rce init` works."""
+    root = tmp_path / "fresh"
+    (root / ".rce" / "backups").mkdir(parents=True)
+    assert situation.classify(root).situation is Situation.NOT_A_PROJECT
+    assert cli.main(["init", str(root)]) == 0
 
 
 @pytest.mark.parametrize("answer", ["restore", "adopt"])

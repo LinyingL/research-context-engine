@@ -107,6 +107,7 @@ from rce import db, paths
 from rce import project as project_mod
 from rce import rebuild as rebuild_mod
 from rce.ingest import claims as claims_ingest
+from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import pipeline
 from rce.ingest import scan as scan_mod
 from rce.inventory import attempt_differences, mapping_differences, verify_mirrors
@@ -311,6 +312,10 @@ class Preview:
     index: OldIndex
     produced: int
     scan_error: str | None = None
+    #: When judged links' endpoints are not produced: how many scripts in
+    #: this folder read or write absolute paths outside it (9.12) -- what a
+    #: moved or copied project looks like.
+    outside: int = 0
 
     @property
     def match(self) -> float | None:
@@ -319,7 +324,7 @@ class Preview:
     def payload(self) -> dict[str, Any]:
         return {
             **self.index.payload(), "produced": self.produced, "match": self.match, "scan_error": self.scan_error,
-            "this_folder": str(self.root),
+            "this_folder": str(self.root), "outside": self.outside,
         }
 
 
@@ -342,6 +347,23 @@ def _scratch_scan(root: Path, echo: Echo) -> tuple[Path, str | None]:
     return db_path, error
 
 
+def _scripts_of(root: Path) -> list[str]:
+    """The scripts a scan of `root` reads (the scan's own inventory: what
+    git tracks, else a walk of the folder)."""
+    from rce.ingest import files as files_ingest  # noqa: PLC0415
+    from rce.ingest import git as git_ingest  # noqa: PLC0415
+
+    try:
+        try:
+            inventory = git_ingest.list_source_files(root)
+        except git_ingest.NotAGitRepositoryError:
+            inventory = files_ingest.list_source_files(root)
+    except Exception:  # noqa: BLE001 -- an explanation line is never worth failing the preview
+        logger.exception("could not list the scripts of %s", root)
+        return []
+    return [*inventory.get("py", []), *inventory.get("r", []), *inventory.get("rmd", [])]
+
+
 def preview(root: str | Path, *, from_dir: str | Path | None = None, echo: Echo = lambda _l: None) -> list[Preview]:
     """What waits for this folder and how well it matches (reads the
     project and the old indexes; writes only a scratch index it removes)."""
@@ -355,6 +377,8 @@ def preview(root: str | Path, *, from_dir: str | Path | None = None, echo: Echo 
         conn = db.connect(scratch)
         try:
             out = []
+            scripts: list[str] | None = None
+            reaching = 0
             for index in indexes:
                 produced = 0
                 if index.error is None:
@@ -367,7 +391,13 @@ def preview(root: str | Path, *, from_dir: str | Path | None = None, echo: Echo 
                         1 for link in links
                         if db.get_node(conn, link.key[0]) is not None and db.get_node(conn, link.key[1]) is not None
                     )
-                out.append(Preview(root, index, produced, error))
+                outside = 0
+                if index.judged and produced < index.judged:
+                    if scripts is None:
+                        scripts = _scripts_of(root)
+                        reaching = len(dataflow_ingest.reaches_outside(root, scripts))
+                    outside = reaching
+                out.append(Preview(root, index, produced, error, outside=outside))
             return out
         finally:
             conn.close()
@@ -1148,6 +1178,7 @@ def migrate_one(
             if not source_db.exists():
                 if resumed and target.exists():
                     ident = _finish(root, ident)
+                    project_mod._signpost(root)  # 9.12: .rce/README says where things are now
                     return Migrated(root, key, ok=True, identity=ident, resumed=True,
                                     stopped=None, retired_to=None)
                 raise MigrationRefused(f"the old index {source_db} is not on this machine; nothing to resume from")
@@ -1196,6 +1227,7 @@ def migrate_one(
                                 stopped=f"the tally did not balance; nothing was retired and {serving}")
             fault("after_verify")
             rebuild_mod.install(staging, target)
+            project_mod._signpost(root)  # 9.12: the new index serves from here on -- say where it is
             fault("after_install")
             notes: list[str] = []
             try:

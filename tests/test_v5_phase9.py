@@ -450,6 +450,7 @@ def test_a_copy_that_leads_outside_its_folder_is_refused(live, tmp_path):
     ("POST", "/api/variables/revive", {"id": "topicshift", "note": "x"}),
     ("POST", "/api/variables/answer", {"id": "topicshift", "question": "edited", "answer": "new", "version": 1}),
     ("POST", "/api/variables/full-compare", {"id": "topicshift"}),
+    ("POST", "/api/variables/settle", {"id": "topicshift", "keeps": ["v-x"], "shown": ["v-x"]}),
 ])
 def test_every_variables_endpoint_refuses_a_foreign_origin_and_a_wrong_host(live, method, path, body):
     base, root = live
@@ -602,3 +603,36 @@ def test_every_comparison_is_worded_with_how_far_it_looked():
     assert lines == ["实现脚本 build.py：全文未变", "输入 Data/x.csv：大小未变（内容未比对）"]
     html = APP_HTML.read_text(encoding="utf-8")
     assert "实现及数据未变化" not in html
+
+
+def test_http_settle_of_two_merged_histories_is_tied_to_what_the_page_showed(tmp_path):
+    """9.12: POST /api/variables/settle {id, keeps, shown} -- origin-checked
+    like every write, refused when the log changed since the page showed it,
+    and then the card reads as settled: v2 in use from the kept entry, the
+    other in the history not in force."""
+    from test_variable_cards import _merged_two_v2
+
+    root, _v1, a, b = _merged_two_v2(tmp_path)
+    httpd = server.build_server(root, 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        status, card = _call(base, "GET", "/api/variables/card?id=topicshift")
+        assert status == 200 and card["state"] == "frozen" and card["reason"] == "conflict"
+        shown = card["dispute"]["shown"]
+        assert card["dispute"]["versions"] == [{"version": 2, "candidates": [a, b]}]
+        status, data = _call(base, "POST", "/api/variables/settle", {"id": "topicshift", "keeps": [a], "shown": [a]})
+        assert status == 409 and data["state"] == "card_question_changed" and data["message_zh"]
+        status, data = _call(base, "POST", "/api/variables/settle", {"id": "topicshift", "keeps": [a, b], "shown": shown})
+        assert status == 400 and data["state"] == "card_invalid"
+        status, data = _call(base, "POST", "/api/variables/settle", {"id": "topicshift", "keeps": [b], "shown": shown})
+        assert status == 200 and data["keeps"] == [b] and data["not_in_force"] == [a] and data["questions"] == [2]
+        status, card = _call(base, "GET", "/api/variables/card?id=topicshift")
+        assert card["state"] == "ok" and card["in_use"] == 2 and card["dispute"] is None
+        assert {h["id"]: h["in_force"] for h in card["history"]}[a] is False
+        assert card["history"][-1]["act"] == "settled" and card["history"][-1]["keeps"] == [b]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)

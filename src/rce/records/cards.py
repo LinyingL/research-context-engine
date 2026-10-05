@@ -277,7 +277,8 @@ def _message(decision: TrustDecision) -> str | None:
 
 
 def _summary(data: Mapping[str, Any]) -> dict[str, Any]:
-    keep = ("id", "seq", "at", "act", "version", "via", "attested", "content", "previous", "corrects", "frozen", "note")
+    keep = ("id", "seq", "at", "act", "version", "via", "attested", "content", "previous", "corrects", "frozen", "note",
+            "keeps", "settles")
     return {k: V.jsonable(data[k]) for k in keep if k in data}
 
 
@@ -458,6 +459,7 @@ def _open_index(identity: ProjectIdentity) -> Connection:
 @contextlib.contextmanager
 def _writing(
     project_root: str | Path, card_id: str, expected_id: Any, timeout: float | None, *, allow_shrunk: bool = False,
+    allow_conflict: bool = False,
 ) -> Iterator[_Writing]:
     root = Path(project_root)
     with write_guard(root, expected_id, human=True, timeout=timeout) as held:
@@ -476,6 +478,10 @@ def _writing(
                     raise CardRefused("no_such_card", f"there is no variable card {card_id!r}")
                 card = V.read_card(root, V.variables_dir(root) / known["id"])
             decision = assess_card(conn, root, card, identity)
+            if allow_conflict and card.state == "frozen" and card.reason == "conflict":
+                # Settling (9.12) is the one write a card in conflict takes;
+                # every other 9.3 rule still holds for its log.
+                decision = assess_ledger(identity, card.log, applied_copy(conn, card), expected=card.log_expected)
             if not decision.may_write and not (allow_shrunk and decision.verdict is Trust.SHRUNK):
                 db.write_variable_card(conn, card.key, card.id, status=status_payload(card, decision))
                 raise CardRefused(
@@ -1189,6 +1195,99 @@ def revive(project_root: str | Path, card_id: str, *, note: str, via: str = "cli
     return _card_act("revived", project_root, card_id, note, via=via, expected_id=expected_id, timeout=timeout, now=now)
 
 
+# -- two histories: settled by naming what stands (9.12) -------------------------------------------
+
+
+@dataclass(frozen=True)
+class Settled:
+    entry: LedgerEntry
+    keeps: tuple[str, ...]
+    not_in_force: tuple[str, ...]
+    card: V.Card
+
+
+def settle(
+    project_root: str | Path,
+    card_id: str,
+    keeps: Iterable[str],
+    *,
+    expected_shown: Iterable[str] | None = None,
+    note: str | None = None,
+    via: str = "cli",
+    expected_id: Any = READ_NOW,
+    timeout: float | None = None,
+    now: Clock | None = None,
+) -> Settled:
+    """「以这一条为准」 (`rce variable settle <id> --keep <entry id>...`,
+    DESIGN.md 9.12): a card whose log holds two merged histories is settled
+    by naming, for each version number in dispute, the one confirmation
+    that stands. Appends one `settled` entry -- `settles` (the anomalous
+    entries, assigned by the ledger engine) and `keeps` -- after which the
+    card is no longer frozen, in-use and superseded are derived from what
+    stands, and every other entry of the two histories stays in the file,
+    not in force. Nothing is chosen by position or time: a disputed version
+    left without a kept entry, or given two, is refused; so is an entry
+    that is not a confirmation in dispute. `expected_shown` ties the answer
+    to the entries the question showed (9.12, "an answer belongs to the
+    question that was shown")."""
+    wanted = list(keeps)
+    if len(set(wanted)) != len(wanted):
+        raise CardRefused("invalid", "an entry is named twice in --keep")
+    with _writing(project_root, card_id, expected_id, timeout, allow_conflict=True) as w:
+        card = w.card
+        dispute = V.dispute_of(card)
+        if dispute is None:
+            raise CardRefused("no_conflict", f"the log of {card.id} holds no unsettled second history; nothing to settle",
+                              message_zh="这张卡的记录里没有需要处理的两份历史")
+        if expected_shown is not None and sorted(set(expected_shown)) != list(dispute.shown):
+            raise CardRefused("question_changed", f"the log of {card.id} changed since the question was shown; "
+                              "look at it again -- nothing written",
+                              message_zh="记录文件在你查看之后又变了，请重新查看后再选择")
+        chosen: dict[int, str] = {}
+        for entry_id in wanted:
+            number = dispute.version_of(entry_id)
+            if number is None:
+                raise CardRefused("invalid", f"{entry_id} is not a confirmation in dispute in {card.id}'s log "
+                                  f"(the disputed versions: {', '.join(f'v{n}' for n in dispute.disputed)})",
+                                  message_zh="选中的记录不是有争议的那几条确认之一")
+            if number in chosen:
+                raise CardRefused("invalid", f"v{number} is given two entries that stand ({chosen[number]}, {entry_id}); "
+                                  "name exactly one", message_zh=f"v{number} 只能以一条确认为准")
+            chosen[number] = entry_id
+        left = [n for n in dispute.disputed if n not in chosen]
+        if left:
+            raise CardRefused("invalid", f"name the entry that stands for {', '.join(f'v{n}' for n in left)} too "
+                              "(nothing is chosen by position or by time)",
+                              message_zh="每个有争议的版本都要选一条为准：" + "、".join(f"v{n}" for n in left))
+        kept = tuple(chosen[n] for n in sorted(chosen))
+        fields: dict[str, Any] = {"act": V.SETTLED_ACT, "keeps": list(kept), "via": via}
+        if note:
+            fields["note"] = note
+        entry = _append(w, [fields], now=now)[0]
+        after = V.read_card(w.root, card.directory)
+    return Settled(entry, kept, tuple(sorted(after.not_in_force)), after)
+
+
+def dispute_payload(card: V.Card) -> dict[str, Any] | None:
+    """The question a conflicted card asks, for the CLI (`--json`) and the
+    page: what both histories share, each history, and for each version in
+    dispute the confirmations that may stand."""
+    dispute = V.dispute_of(card)
+    if dispute is None:
+        return None
+
+    def item(e: LedgerEntry) -> dict[str, Any]:
+        return {**_summary(e.data), "attested": V.jsonable(e.get("attested")) if e.get("act") == "confirmed" else None}
+
+    return {
+        "anomalies": list(dispute.anomalies),
+        "common": [item(e) for e in dispute.common],
+        "branches": [[item(e) for e in b] for b in dispute.branches],
+        "versions": [{"version": n, "candidates": [e.id for e in dispute.candidates[n]]} for n in dispute.disputed],
+        "shown": list(dispute.shown),
+    }
+
+
 # -- the SHRUNK question for a card's log (9.3) ----------------------------------------------------
 
 
@@ -1375,15 +1474,20 @@ def _frozen_content(card: V.Card, view: V.VersionView) -> dict[str, Any] | None:
 def question_text(view: V.VersionView) -> str | None:
     if not view.question:
         return None
-    template = V.QUESTION_ABSENT if view.question_kind == "absent" else V.QUESTION_EDITED
+    template = {"absent": V.QUESTION_ABSENT, "unreadable": V.QUESTION_UNREADABLE}.get(view.question_kind or "",
+                                                                                   V.QUESTION_EDITED)
     return template.format(n=view.number)
 
 
 def question_answers(view: V.VersionView) -> tuple[list[str], dict[str, str]]:
     """The answers that can be given: 「这是更正」 only for a file that reads
-    as a version; a file that is gone can only be put back."""
+    as a version; a file that is gone can only be put back (「按冻结副本放
+    回」); one that cannot be read can only have its bytes kept as the next
+    draft and the frozen text put back (9.12)."""
     if view.question_kind == "absent":
         return [V.ANSWER_NEW], dict(V.ABSENT_ANSWER_LABELS)
+    if view.question_kind == "unreadable":
+        return [V.ANSWER_NEW], dict(V.UNREADABLE_ANSWER_LABELS)
     if view.question_kind == "edited":
         return [V.ANSWER_NEW, V.ANSWER_CORRECT], dict(V.ANSWER_LABELS)
     return [V.ANSWER_NEW], {V.ANSWER_NEW: V.ANSWER_LABELS[V.ANSWER_NEW]}
@@ -1461,7 +1565,8 @@ def card_payload(project_root: str | Path, card: V.Card, decision: TrustDecision
             for n in card.questions
         ],
         "versions": [version_payload(root, card, card.versions[n]) for n in sorted(card.versions)],
-        "history": [_summary(e.data) for e in card.entries],
+        "history": [{**_summary(e.data), "in_force": e.id not in card.not_in_force} for e in card.entries],
+        "dispute": dispute_payload(card) if card.reason == "conflict" else None,
         "dead_flags": [f for f in (dead or []) if f["card"] == card.id],
     }
     if decision is not None:

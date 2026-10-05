@@ -2136,8 +2136,12 @@ class RceHTTPServer(ThreadingHTTPServer):
         self.set_served(served_for(Path(project_root)))
 
     def _watcher_active(self) -> bool:
+        """Not for a blocked or read-only project, and not for one frozen
+        until it is migrated (9.12, acceptance 2026-10-05): a pre-V5 or
+        still-migrating project is read from its old index, and no scan
+        may land in it -- no re-ingest, and so no error chip either."""
         served = self.get_served()
-        return served.blocked is None and not served.read_only
+        return served.blocked is None and not served.read_only and not served.needs_migration
 
     @contextlib.contextmanager
     def write_guard(self, *, human: bool, timeout: float | None = WRITE_LOCK_TIMEOUT_S) -> Iterator[None]:
@@ -2314,7 +2318,12 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, self.server.watcher.status_payload())
             elif path == "/api/canvas":
                 scope = (query.get("scope") or [None])[0]
-                self._json_from_conn(lambda conn: canvas_payload(conn, self._project_root(), scope))
+                served = self._served()
+                # 9.12 (acceptance, 2026-10-05): the page saves no viewport
+                # or layout for a project frozen until it is migrated (nor
+                # for one opened read-only) -- it would only be refused.
+                frozen = served.needs_migration or served.read_only
+                self._json_from_conn(lambda conn: {**canvas_payload(conn, self._project_root(), scope), "frozen": frozen})
             elif path == "/api/review":
                 self._json_from_conn(review_payload)
             elif path == "/api/variables" or path.startswith("/api/variables/"):

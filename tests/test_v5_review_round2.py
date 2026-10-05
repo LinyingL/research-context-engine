@@ -249,12 +249,18 @@ def test_scenario_14_a_confirmed_version_file_that_is_gone_is_asked_about_and_pu
     assert q["answer_labels"] == {"new": "按冻结副本放回"}
     with pytest.raises(cards.CardRefused):
         cards.answer_edited(root, "topicshift", "correct", version=1)
-    done = cards.answer_edited(root, "topicshift", "new", version=1)
-    assert done.new_version is None and path.read_bytes() == original
+    # 9.12: the CLI words it so -- and says what it did, never "draft vNone".
+    assert cli.main(["variable", "list", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "v1.toml is gone" in out and "put it back from its frozen copy" in out
+    assert cli.main(["variable", "answer", "topicshift", "new", "--version", "1", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "Put v1.toml back from its frozen copy" in out and "None" not in out
+    assert path.read_bytes() == original
     assert not _card(root).questions and _card(root).next_number == 2
 
 
-def test_scenario_14_a_confirmed_version_resaved_in_another_encoding_is_asked_about(tmp_path):
+def test_scenario_14_a_confirmed_version_resaved_in_another_encoding_is_asked_about(tmp_path, capsys):
     """9.11 #14: v1.toml re-saved as GBK (no longer UTF-8) is a change of its
     content: asked; 「另存为新版本」 keeps the re-saved bytes as draft v2 and
     puts v1 back; 「这是更正」 is not offered (there is no text to record)."""
@@ -267,9 +273,15 @@ def test_scenario_14_a_confirmed_version_resaved_in_another_encoding_is_asked_ab
     path.write_bytes(gbk)
     card = _card(root)
     assert card.questions == [1] and card.versions[1].question_kind == "unreadable"
-    assert cards.card_payload(root, card)["questions"][0]["answers"] == ["new"]
-    done = cards.answer_edited(root, "topicshift", "new", version=1)
-    assert done.new_version == 2
+    (q,) = cards.card_payload(root, card)["questions"]
+    # 9.12: the one answer is worded as what it does.
+    assert q["answers"] == ["new"] and q["message"] == "v1 的版本文件在确认后无法读取了"
+    assert q["answer_labels"] == {"new": "把这些内容原样存为下一版草稿，并按冻结副本放回"}
+    assert cli.main(["variable", "list", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "v1.toml can no longer be read" in out and "keep these bytes, as they are, as the next draft" in out
+    assert cli.main(["variable", "answer", "topicshift", "new", "--version", "1", str(root)]) == 0
+    assert "as draft v2; v1.toml was put back from its frozen copy" in capsys.readouterr().out
     assert path.read_bytes() == original and (path.parent / "v2.toml").read_bytes() == gbk
 
 

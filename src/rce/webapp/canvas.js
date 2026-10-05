@@ -1418,6 +1418,9 @@ window.RCECanvas = (function () {
     cv.save = emptySave();
     if (!slot.scope) return;
     if (layoutBlocked()) return; // nothing is written over a record RCE cannot read (9.2)
+    // A project frozen until it is migrated (9.12), or opened read-only:
+    // the arrangement lives in this page only -- no POST, so no chip.
+    if (layoutFrozen()) return;
     const body = { project: slot.project, scope: slot.scope };
     if (slot.reset) body.reset = true;
     if (Object.keys(slot.positions).length) body.positions = slot.positions;
@@ -2633,6 +2636,10 @@ window.RCECanvas = (function () {
 
   // 9.2: an arrangement record RCE cannot read is said, left untouched,
   // and nothing is saved over it until it is repaired or set aside.
+  function layoutFrozen() {
+    return !!(cv.data && cv.data.frozen);
+  }
+
   function layoutBlocked() {
     const layout = cv.data && cv.data.layout;
     return !!(layout && layout.state && ["ok", "absent", "legacy"].indexOf(layout.state) < 0);
@@ -2752,6 +2759,7 @@ window.RCECanvas = (function () {
     _linkRules: LINK_RULES,
     _linkActions: linkActions,
     _layoutBlocked: layoutBlocked,
+    _queueViewport: queueViewport,
     _showStatus: showStatus,
     _state: cv,
   };

@@ -973,25 +973,6 @@ def _remember_removed_edges(conn: sqlite3.Connection, where: str, params: list[A
     )
 
 
-def holds_unrecorded_judgment(conn: sqlite3.Connection, node_id: str, *, extractor: str | None = None) -> bool:
-    """Whether deleting `node_id` would destroy a judgment that exists
-    nowhere else: this index predates the judgment ledger (no migration
-    0005 -- a pre-V5 index, kept read-only for human records until `rce
-    migrate` moves its judgments into the record, 9.5) and an edge touching
-    the node (of `extractor`, if given) is confirmed or rejected. Orphan
-    cleanup keeps such a node, as pre-V5 code did; in a V5 index the ledger
-    keeps the judgment and the orphan goes (9.1)."""
-    if _has_machine_status(conn):
-        return False
-    clause = " AND extractor = ?" if extractor is not None else ""
-    params: list[Any] = [node_id, node_id] + ([extractor] if extractor is not None else [])
-    row = conn.execute(
-        f"SELECT 1 FROM edges WHERE (src = ? OR dst = ?) AND status IN ('confirmed', 'rejected'){clause} LIMIT 1",
-        params,
-    ).fetchone()
-    return row is not None
-
-
 def delete_edges_for_node(
     conn: sqlite3.Connection, node_id: str, *, extractor: str | None = None
 ) -> int:

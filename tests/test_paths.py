@@ -333,7 +333,20 @@ def test_write_project_readme_names_the_graph_directory(tmp_path):
     assert readme == project / ".rce" / "README"
     text = readme.read_text(encoding="utf-8")
     assert str(paths.graph_dir(project)) in text
-    assert text.count("\n") == 1  # one line, as the design says
+    assert "（还没有）" in text  # no record files yet, and none invented
+
+
+def test_readme_lists_exactly_the_record_files_the_folder_holds(tmp_path):
+    """9.12 (acceptance, 2026-10-05): the index's current location and the
+    record files this folder holds NOW -- and nothing it does not."""
+    project = tmp_path / "proj"
+    (project / ".rce" / "variables").mkdir(parents=True)
+    (project / ".rce" / "judgements.toml").write_text("")
+    (project / ".rce" / "mappings.toml").write_text("")
+    text = paths.write_project_readme(project).read_text(encoding="utf-8")
+    listed = [line.split()[0] for line in text.splitlines() if line.startswith("  ") and not line.startswith("  /")]
+    assert listed == ["judgements.toml", "mappings.toml", "variables/"]
+    assert "attempts.toml" not in text and "canvas.json" not in text
 
 
 def test_migration_leaves_the_same_readme_rce_init_writes(tmp_path):

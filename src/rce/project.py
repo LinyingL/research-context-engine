@@ -122,10 +122,20 @@ def describe_blocked(c: Classification) -> str:
     elif c.situation is Situation.LOST_ID:
         records = ", ".join(c.extra.get("records", []))
         snap = c.extra.get("snapshot")
-        lines = [
-            f"{root} has no .rce/project.toml, but .rce/ holds records ({records}); RCE never gives "
-            f"existing records a new identity silently. Nothing was written. Choose one:"
-        ]
+        snapshot_only = c.reason == "identity_snapshot_only"
+        if snapshot_only:
+            # 9.12: no record files, but a snapshot of project.toml -- this
+            # folder had an identity; `rce init` does not mint a new one.
+            lines = [
+                f"{root} has no .rce/project.toml, but .rce/backups/ holds a snapshot of one: this folder had "
+                f"an identity, and RCE never gives it a new one silently (not even 'rce init'). Nothing was "
+                f"written. Choose one:"
+            ]
+        else:
+            lines = [
+                f"{root} has no .rce/project.toml, but .rce/ holds records ({records}); RCE never gives "
+                f"existing records a new identity silently. Nothing was written. Choose one:"
+            ]
         if snap:
             known = (
                 f"; this machine has its index, home {snap['index_home'] or '(not recorded)'}"
@@ -135,6 +145,9 @@ def describe_blocked(c: Classification) -> str:
                 f"  rce project restore {root}   -- put back .rce/project.toml from {snap['file']} "
                 f"(project {snap['project_id']}, created {snap['created']}{known})"
             )
+        if snapshot_only:
+            lines.append(f"  rce project adopt {root}     -- give this folder a new identity; build a fresh index from its sources")
+            return "\n".join(lines)
         lines.append(f"  rce project adopt {root}     -- keep every record here under a new identity; build a fresh index from them")
         lines.append(f"  rce project other {root}     -- this .rce/ was copied in from another project: new id, copied records moved into .rce/backups/")
         if not snap:
@@ -215,6 +228,7 @@ def _adopt(root: Path, c: Classification, probes: Probes | None) -> tuple[Classi
         old = c.home.canonical_path if c.home else "?"
         write_home(c.project_id, root)
         _touch_project_node(root, c.identity)
+        _signpost(root)
     # The spelling as the file system stores it: after a case-only rename
     # the registry shows the folder's new name, not the one typed.
     registry.relocate(c.project_id, Path(paths._canonical_path(root)))
@@ -246,6 +260,7 @@ def create_index(project_root: Path, ident: ProjectIdentity) -> Path:
         _upsert_project_node(conn, project_root, ident)
     finally:
         conn.close()
+    _signpost(Path(project_root))
     return db_path
 
 
@@ -264,6 +279,17 @@ def _touch_project_node(project_root: Path, ident: ProjectIdentity) -> None:
         _upsert_project_node(conn, project_root, ident)
     finally:
         conn.close()
+
+
+def _signpost(root: Path) -> None:
+    """`.rce/README` rewritten (9.12): the index's current location and the
+    record files this folder holds -- whenever the identity check adopts,
+    migrates or builds an index. A signpost that cannot be written never
+    undoes what it describes: logged, not raised."""
+    try:
+        paths.write_project_readme(root)
+    except (OSError, files.RecordFileError, paths.IdentityUnavailableError) as exc:
+        logger.warning("could not write %s (%s)", paths.project_rce_dir(root) / paths.README_FILENAME, exc)
 
 
 def project_node_id(project_id: str) -> str:
@@ -430,6 +456,7 @@ def claim(project_root: str | Path, *, probes: Probes | None = None, echo: Echo 
         # (`_finish_claim`), never left serving the other folder's index.
         write_home(ident.id, root, claim_pending=True)
         rebuilt = _rebuild_for_claim(root, ident, echo)
+        _signpost(root)
         if rebuilt.report is not None and rebuilt.report.ingest_error:
             build_error = rebuilt.report.ingest_error
     registry.relocate(ident.id, root)

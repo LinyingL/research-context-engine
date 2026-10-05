@@ -18,7 +18,7 @@ SQLite under a file-provider sync is a documented corruption path besides.
 So the derived half of `.rce/` moves out of the project entirely, to
 `~/.rce/graphs/<id>/`, and `.rce/` inside the project keeps only what the
 researcher owns and may want under git: `attempts.toml`, `mappings.toml`
-(section 8.5), `backups/`, and the one-line `README` (`write_project_readme`)
+(section 8.5), `backups/`, and the short `README` (`write_project_readme`)
 that says where the graph went. Since V5 (section 9.2) the human records
 live there too: `project.toml`, `judgements.toml` and the canvas
 arrangement `canvas.json` (`rce.webapp.canvas.canvas_record_path`);
@@ -489,23 +489,55 @@ def ensure_graph_dir(project_root: str | Path) -> Path:
     return directory
 
 
-# -- The project's own one-line signpost ---------------------------------------
+# -- The project's own signpost: .rce/README ------------------------------------
 
-_README_TEMPLATE = (
-    "此目录只保留你自己维护的文件（attempts.toml / mappings.toml / backups/）；"
-    "RCE 派生的图谱数据库在 {graph_dir}，不放在项目里，以免被云同步损坏。\n"
+#: The record files `.rce/README` lists when the folder holds them (9.12,
+#: acceptance 2026-10-05), each with what it keeps -- in the order a person
+#: reads them.
+README_RECORDS = (
+    ("project.toml", "项目身份"),
+    ("judgements.toml", "你对机器提取结果的判断"),
+    ("canvas.json", "画布上卡片的位置"),
+    ("mappings.toml", "你手画的连线"),
+    ("attempts.toml", "尝试表的配置"),
+    ("variables/", "变量定义卡"),
+    ("backups/", "以上记录的快照"),
 )
 
 
+def project_readme_text(project_root: str | Path) -> str:
+    """What `.rce/README` says now: where the index is, and which record
+    files this folder holds (9.12). Short, in the app's product language."""
+    rce_dir = project_rce_dir(project_root)
+    held = [
+        f"  {name:<17}{what}"
+        for name, what in README_RECORDS
+        if os.path.lexists(rce_dir / name.rstrip("/"))
+    ]
+    return (
+        "这个 .rce/ 目录保存这个项目的记录。本说明由 RCE 自动改写，请不要在这里记东西。\n"
+        "\n"
+        f"RCE 从你的文件派生的索引（图谱数据库）现在在：\n  {graph_dir(project_root)}\n"
+        "它不放在项目里，以免被云同步损坏；删掉它，RCE 会从这里的记录重建。\n"
+        "\n"
+        "这个文件夹现在保存的记录：\n"
+        + ("\n".join(held) if held else "  （还没有）")
+        + "\n"
+    )
+
+
 def write_project_readme(project_root: str | Path) -> Path:
-    """Write `<project>/.rce/README`: one line, in the app's own product
-    language, saying where the graph went (DESIGN.md section 8.10 rule 1 --
-    "so nothing is hidden"). Rewritten on every `rce init` so a project
-    that was initialized before the move gets the signpost too, and so a
-    stale path from a moved project is corrected rather than left lying."""
+    """(Re)write `<project>/.rce/README` -- an RCE-owned file, written
+    durably and replaced whole: where the index is now and the record files
+    this folder holds (DESIGN.md 8.10 rule 1, "so nothing is hidden"; 9.12:
+    rewritten whenever the identity check adopts, migrates or builds an
+    index, so a moved project's stale path is corrected rather than left
+    lying). Touches nothing else."""
+    from rce.records import files  # noqa: PLC0415 -- records imports this module
+
     rce_dir = ensure_project_rce_dir(project_root)
     readme = rce_dir / README_FILENAME
-    readme.write_text(_README_TEMPLATE.format(graph_dir=graph_dir(project_root)), encoding="utf-8")
+    files.durable_write(readme, project_readme_text(project_root).encode("utf-8"))
     return readme
 
 

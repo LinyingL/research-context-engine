@@ -751,6 +751,12 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
 .var-ask { border: 1px solid var(--ochre); background: var(--ochre-soft); padding: 0.7rem 0.9rem; margin-top: 0.7rem; font-size: 0.86rem; }
 .var-code { margin: 0; padding: 0.7rem 0.8rem; background: var(--paper-alt); border: 1px solid var(--line); font-family: var(--font-mono); font-size: 0.76rem; line-height: 1.5; white-space: pre; overflow-x: auto; }
 .var-member { border-top: 1px dashed var(--line); padding-top: 0.5rem; margin-top: 0.5rem; }
+/* 9.12: two histories of a card's log, side by side, and what will stand */
+.var-histories { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 0.8rem; margin: 0.6rem 0; }
+.var-history { border: 1px solid var(--line-strong); background: var(--paper); padding: 0.55rem 0.7rem; min-width: 0; }
+.var-history-title { font-size: 0.78rem; color: var(--ink-soft); margin-bottom: 0.3rem; }
+.var-history .var-line.chosen { box-shadow: inset 2px 0 0 var(--olive); padding-left: 0.45rem; }
+.var-line.off { color: var(--ink-soft); text-decoration: line-through; text-decoration-color: var(--line-strong); }
 
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
@@ -3136,7 +3142,7 @@ const ATTESTED_WORDS = { yes: "是", no: "否", unknown: "不确定" };
 const CHECK_LABELS = { script: "实现脚本", writes: "写出输出文件", field: "表头字段" };
 const ACT_WORDS = {
   confirmed: "确认", corrected: "更正", reaffirmed: "实现变动后确认口径未变",
-  abandoned: "弃用", revived: "恢复", removed: "以文件为准移除",
+  abandoned: "弃用", revived: "恢复", removed: "以文件为准移除", settled: "两份记录合并后，指明以哪几条为准",
 };
 const VIA_WORDS_CARD = { app: "在应用里", cli: "在命令行里", mcp: "通过 MCP", recovered: "补回" };
 
@@ -3288,7 +3294,7 @@ function openVariableCard(id) {
 
 function cardChips(row) {
   const chips = [];
-  if (row.state && row.state !== "ok") chips.push(["无法读取", "bad"]);
+  if (row.state && row.state !== "ok") chips.push([row.reason === "conflict" ? "两份历史待处理" : "无法读取", "bad"]);
   if (row.abandoned) chips.push(["已弃用", "dead"]);
   else if (row.in_use != null) chips.push(["使用 v" + row.in_use, "in-use"]);
   if (row.draft != null) chips.push(["草稿 v" + row.draft, "draft"]);
@@ -3575,11 +3581,15 @@ function questionNotice(card, q) {
   noticeHead(box, q.message);
   box.appendChild(mk("p", null, q.kind === "absent"
     ? "现在生效的仍是确认时冻结的那一份文字。要把版本文件放回原处吗？"
-    : "RCE 没有采用改动后的文字，现在生效的仍是确认时的那一份。请告诉 RCE 这次改动是什么："));
+    : q.kind === "unreadable"
+      ? "这个文件现在读不出文字，RCE 没有采用它，现在生效的仍是确认时冻结的那一份。"
+      : "RCE 没有采用改动后的文字，现在生效的仍是确认时的那一份。请告诉 RCE 这次改动是什么："));
   const status = mk("div", "notice-status");
   const buttons = [];
   const help = q.kind === "absent" ? {
     new: "v" + q.version + " 的文件不在了，没有改动可以保留：按确认时冻结的副本原样放回。",
+  } : q.kind === "unreadable" ? {
+    new: "读不出的文件内容原样存为新草稿 v" + card.next_version + "（不丢任何字节）；v" + q.version + " 的文件按冻结副本原样放回。",
   } : {
     new: "改动后的文件原样成为新草稿 v" + card.next_version + "；v" + q.version + " 的文件按冻结副本原样放回。",
     correct: "这是更正（错字、表述更清楚、脚本换了位置）：记一条更正，前后两种文字都保留可读。",
@@ -3604,6 +3614,7 @@ function questionNotice(card, q) {
 function cardTrustNotice(card) {
   const trust = card.trust || {};
   if (card.state === "ok" && (!trust.state || trust.state === "ok")) return null;
+  if (card.state === "frozen" && card.reason === "conflict" && card.dispute) return disputeNotice(card);
   if (trust.state === "shrunk") {
     const missing = trust.missing || [];
     const box = notice("warn");
@@ -3636,6 +3647,93 @@ function cardTrustNotice(card) {
     renderBlockingError(d, "", raw);
     box.appendChild(d);
   }
+  return box;
+}
+
+// 9.12: two histories in a card's log are settled by naming what stands.
+// Both histories side by side; 「以这一条为准」 beside each disputed
+// confirmation; one confirm step that lists what will stand. Nothing is
+// chosen for the researcher -- not by position, not by time.
+const settleChoice = new Map(); // card id -> {version: entry id}
+
+function disputeNotice(card) {
+  const d = card.dispute;
+  const box = notice("warn");
+  noticeHead(box, "这张卡的记录里有两份历史（两处的记录被合并了）");
+  box.appendChild(mk("p", null, "两台电脑（或两个副本）各自记下了不同的确认，同步后合在了一个 log.toml 里。" +
+    "RCE 不按先后、不按时间替你选：请为每个有争议的版本指明以哪一条为准。其余记录留在历史里，标为不再生效。"));
+  const chosen = settleChoice.get(card.id) || {};
+  settleChoice.set(card.id, chosen);
+  const candidateOf = {};
+  d.versions.forEach((v) => v.candidates.forEach((id) => { candidateOf[id] = v.version; }));
+  const status = mk("div", "notice-status");
+  const blocked = humanRecordsBlocked();
+  const entryLine = (e) => {
+    const line = mk("div", "var-line" + (chosen[candidateOf[e.id]] === e.id ? " chosen" : ""), cardActText(e));
+    if (e.content) line.appendChild(mk("span", "var-id", " · 内容 " + String(e.content).slice(7, 15)));
+    if (e.attested) line.appendChild(mk("span", "var-id", " · 说明：输出按此口径生成 — " + (ATTESTED_WORDS[e.attested] || e.attested)));
+    if (e.frozen) line.appendChild(mkButton("查看这一条的文字", "btn btn-small", () => openVariableCopy(card.id, e, "frozen")));
+    if (candidateOf[e.id] != null && !blocked) {
+      const pick = mkButton(chosen[candidateOf[e.id]] === e.id ? "已选：以这一条为准" : "以这一条为准", "btn btn-small", () => {
+        chosen[candidateOf[e.id]] = e.id;
+        loadVariablesView();
+      });
+      line.appendChild(pick);
+    }
+    return line;
+  };
+  if (d.common.length) {
+    const shared = mk("div", "var-history");
+    shared.appendChild(mk("div", "var-history-title", "两份历史共有的记录"));
+    d.common.forEach((e) => shared.appendChild(entryLine(e)));
+    box.appendChild(shared);
+  }
+  const cols = mk("div", "var-histories");
+  d.branches.forEach((branch, i) => {
+    const col = mk("div", "var-history");
+    col.appendChild(mk("div", "var-history-title", "第 " + (i + 1) + " 份历史（分开之后）"));
+    if (!branch.length) col.appendChild(mk("div", "var-line soft", "这份历史在分开之后没有关于这张卡的记录"));
+    branch.forEach((e) => col.appendChild(entryLine(e)));
+    cols.appendChild(col);
+  });
+  box.appendChild(cols);
+  if (blocked) { box.appendChild(mk("p", null, blocked)); return box; }
+  const byId = {};
+  const where = {};
+  d.common.forEach((e) => { byId[e.id] = e; where[e.id] = "两份历史共有"; });
+  d.branches.forEach((branch, i) => branch.forEach((e) => { byId[e.id] = e; where[e.id] = "第 " + (i + 1) + " 份历史"; }));
+  const label = (id) => where[id] + "：" + cardActText(byId[id]) + (byId[id].content ? " · 内容 " + String(byId[id].content).slice(7, 15) : "");
+  const missing = d.versions.filter((v) => !chosen[v.version]).map((v) => "v" + v.version);
+  if (missing.length) {
+    box.appendChild(mk("p", null, "还需要选：" + missing.join("、")));
+  } else {
+    const keeps = d.versions.map((v) => chosen[v.version]);
+    const confirmBox = mk("div", "var-ask");
+    confirmBox.appendChild(mk("div", "notice-title", "确认之后，以这些为准："));
+    const list = mk("ul", "entry-list");
+    d.versions.forEach((v) => list.appendChild(mk("li", null, "v" + v.version + " — " + label(chosen[v.version]))));
+    confirmBox.appendChild(list);
+    const off = d.shown.filter((id) => keeps.indexOf(id) < 0 && byId[id] && d.common.indexOf(byId[id]) < 0);
+    // Shown in file order, as both histories list them.
+    off.sort((x, y) => (byId[x].seq || 0) - (byId[y].seq || 0));
+    if (off.length) {
+      confirmBox.appendChild(mk("div", null, "这些记录留在历史里，但不再生效："));
+      const offList = mk("ul", "entry-list");
+      off.forEach((id) => offList.appendChild(mk("li", null, label(id))));
+      confirmBox.appendChild(offList);
+    }
+    const buttons = [];
+    const actions = mk("div", "var-actions");
+    const go = mkButton("确认，以这些为准", "btn", () =>
+      variableAction("settle", { id: card.id, keeps: keeps, shown: d.shown }, status, buttons, "没能记下这个选择")
+        .then((res) => { if (res) settleChoice.delete(card.id); }));
+    const clear = mkButton("重新选", "btn", () => { settleChoice.delete(card.id); loadVariablesView(); });
+    buttons.push(go, clear);
+    actions.append(go, clear);
+    confirmBox.appendChild(actions);
+    box.appendChild(confirmBox);
+  }
+  box.appendChild(status);
   return box;
 }
 
@@ -3777,7 +3875,7 @@ function renderVariableCard(host, card) {
   host.appendChild(back);
   const head = mk("div", "var-head");
   head.append(mk("h2", "var-title", card.name), mk("span", "var-id", card.id));
-  cardChips({ state: card.state, abandoned: !!card.abandoned, in_use: card.in_use, draft: card.draft })
+  cardChips({ state: card.state, reason: card.reason, abandoned: !!card.abandoned, in_use: card.in_use, draft: card.draft })
     .forEach(([text, cls]) => head.appendChild(mk("span", "var-chip " + cls, text)));
   host.appendChild(head);
   const shownVersion = card.versions.find((v) => v.version === card.in_use) || card.versions[card.versions.length - 1];
@@ -3820,7 +3918,7 @@ function renderVariableCard(host, card) {
     ? "还没有记录：草稿确认之前，log.toml 里什么都没有。"
     : "log.toml 现在无法读取，里面的记录暂时看不到（文件本身没有被改动）。"));
   (card.history || []).forEach((e) => {
-    const line = mk("div", "var-line", cardActText(e));
+    const line = mk("div", "var-line" + (e.in_force === false ? " off" : ""), cardActText(e) + (e.in_force === false ? "（不再生效）" : ""));
     if (e.attested) line.appendChild(mk("span", "var-id", " · 说明：输出按此口径生成 — " + (ATTESTED_WORDS[e.attested] || e.attested)));
     if (e.note) line.appendChild(mk("div", "entry-sub", "理由：" + e.note));
     if (e.frozen) line.appendChild(mkButton("查看这一版当时的文字", "btn btn-small", () => openVariableCopy(card.id, e, "frozen")));
@@ -3947,6 +4045,9 @@ function previewLines(p) {
   if (p.judged) {
     lines.push(p.judged + " 条里有 " + p.produced + " 条的两端能在这个文件夹里扫到");
     if (p.produced / p.judged < 0.5) lines.push("匹配很低：这些判断可能属于另一个项目。");
+    if (p.produced < p.judged && p.outside) {
+      lines.push("这个文件夹里有 " + p.outside + " 个脚本读写的是文件夹以外的绝对路径——项目被移动或复制过时，匹配就会这样偏低。");
+    }
   }
   if (p.scan_error) lines.push("扫描这个文件夹时出了错，能扫到的数目可能偏低。");
   return lines;

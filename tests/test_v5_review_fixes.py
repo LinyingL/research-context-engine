@@ -407,40 +407,74 @@ def test_migrating_from_another_folders_dot_rce_leaves_its_records(tmp_path):
     assert not (elsewhere / ".rce" / "graph.db").exists()
 
 
-# -- finding: a pre-V5 project's scans crashed on the missing `scans` table --------------
+# -- 9.12 (acceptance, 2026-10-05): a pre-V5 project is frozen until migrated, scans included
+
+def _db_bytes(path):
+    import hashlib
+
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(path.parent.glob(path.name + "*"))}
 
 
-def test_pre_v5_project_scans_without_reports_and_keeps_every_old_judgment(tmp_path, capsys):
-    """9.5 / 9.10 (review finding 11): a pre-V5 project opens for reading
-    until migrated. `rce ingest`, `rce mappings`, `rce attempts` and the
-    watcher run (nothing recorded about the scan, as before 0004) instead
-    of dying on 'no such table: scans' -- and the judged orphans pre-V5
-    code preserved (the claim and the attempt) are still preserved, since
-    their judgment is not in any record yet."""
-    from test_migration import ORPHAN_ATTEMPT, ORPHAN_CLAIM
-
+def test_pre_v5_project_is_frozen_scans_included_until_migrated(tmp_path, capsys):
+    """9.12 (supersedes review finding 11's workaround): a pre-V5 project
+    opens for reading, but nothing new lands in its old index before the
+    migration reads its own count. `rce ingest`, `rce mappings`, `rce
+    attempts` (with and without --check) and `rce judge` refuse with
+    "migrate first" and exit non-zero; the old index is byte-identical
+    afterwards; reads still work; and the engine's watcher does not poll
+    such a project (no re-ingest into the old index, no error chip)."""
     from rce import cli
-    from rce.webapp import watcher as watcher_mod
+    from rce.ingest import scan as scan_mod
+    from rce.webapp import server as server_mod
 
     root, old = _migration_fixture(tmp_path)
-    for command in (["ingest", str(root)], ["mappings", str(root)], ["attempts", str(root)]):
-        assert cli.main(command) == 0, capsys.readouterr()
+    before = _db_bytes(old)
+    for command in (["ingest", str(root)], ["mappings", str(root)], ["attempts", str(root)],
+                    ["attempts", "--check", str(root)], ["judge", str(root)]):
+        assert cli.main(command) == 1, command
+        err = capsys.readouterr().err
+        assert "migrate first: rce migrate" in err and "Nothing written" in err, err
+    assert _db_bytes(old) == before
+    # Reading works, from the old index, and writes nothing into it.
+    for command in (["status", str(root)], ["review", str(root)], ["records", str(root)], ["query", "s.py", str(root)]):
+        assert cli.main(command) in (0, 1), command
+        assert "Traceback" not in capsys.readouterr().err
+    assert cli.main(["status", str(root)]) == 0
+    assert _db_bytes(old) == before
+    # The backstop: an index without scan reports is never scanned.
     conn = db.connect(old)
     try:
-        judged = {
-            (r[0], r[1], r[2], r[3]): r[4]
-            for r in conn.execute("SELECT src, dst, type, extractor, status FROM edges WHERE status IN ('confirmed','rejected')")
-        }
-        assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'scans'").fetchone() is None
+        with pytest.raises(scan_mod.PreScanReportsIndex, match="migrate first"):
+            with scan_mod.scan(conn, "test"):
+                pass
     finally:
         conn.close()
-    assert judged[ORPHAN_ATTEMPT] == "rejected" and judged[ORPHAN_CLAIM] == "confirmed"
-    assert len(judged) == 8  # the seven machine judgments and the hand-drawn link
-    w = watcher_mod.ProjectWatcher(lambda: root, interval=0.01)
-    w.poll_once()
-    (root / "map.md").write_text((root / "map.md").read_text() + "| 2 | 2026-07-02 | 第二条路 | Y | 0.6 | ❌ |\n")
-    w.poll_once()
-    assert w.status_payload()["last_error"] is None
+    # The watcher: inactive for the frozen project, whatever changes.
+    httpd = server_mod.build_server(root, 0)
+    try:
+        assert httpd.get_served().needs_migration
+        w = httpd.watcher
+        assert w.poll_once() is False
+        (root / "map.md").write_text((root / "map.md").read_text() + "| 2 | 2026-07-02 | 第二条路 | Y | 0.6 | ❌ |\n")
+        assert w.poll_once() is False
+        assert w.status_payload()["last_error"] is None
+    finally:
+        httpd.server_close()
+    assert _db_bytes(old) == before
+
+
+def test_pre_v5_index_is_writable_again_once_migrated(tmp_path, capsys):
+    """The freeze lasts exactly until the migration: afterwards `rce ingest`
+    runs against the new index."""
+    from rce import cli
+
+    root, _old = _migration_fixture(tmp_path)
+    assert cli.main(["ingest", str(root)]) == 1
+    capsys.readouterr()
+    assert cli.main(["migrate", "--yes", str(root)]) == 0
+    capsys.readouterr()
+    assert cli.main(["ingest", str(root)]) == 0, capsys.readouterr().err
 
 
 # -- finding: a link the index never held was reviewed without asking whether
@@ -708,3 +742,96 @@ def test_watcher_snapshots_hand_edited_record_files_once_a_day(tmp_path):
     w.poll_once()
     [snap] = [p for p in backups.iterdir() if p.name.startswith("judgements")]
     assert snap.read_bytes() == ledger.read_bytes()
+
+
+# -- defect (i), acceptance 2026-10-05: no card and no kind printed twice, in any state ---------
+
+
+def _printed_twice(text: str) -> list[str]:
+    heads = [line.split(":")[0] for line in text.splitlines() if line.startswith("  ") and not line.startswith("   ")]
+    return sorted({h for h in heads if heads.count(h) > 1})
+
+
+@pytest.mark.parametrize("state", ["legacy", "migrating", "migrated", "fresh"])
+def test_variable_list_and_records_print_each_card_and_kind_once(tmp_path, capsys, state):
+    """`rce variable list` and `rce records` -- legacy, a migration stopped
+    before retiring, migrated (with cards made after it, two of them equal
+    but for a suffix), and a fresh project: each card and each kind of
+    record is one line."""
+    from test_migration import _folder, build_pre_v5_index
+
+    from rce import cli, migration
+    from rce.records import cards
+
+    if state == "fresh":
+        root = tmp_path / "fresh"
+        root.mkdir()
+        assert cli.main(["init", str(root)]) == 0
+    else:
+        root = _folder(tmp_path)
+        build_pre_v5_index(root)
+        if state == "migrating":
+            [stopped] = migration.migrate(root, yes=True, holder_probe=lambda _files: {4242})
+            assert not stopped.ok
+        if state == "migrated":
+            assert cli.main(["migrate", "--yes", str(root)]) == 0
+    if state in ("migrated", "fresh"):
+        cards.new_card(root, "topicshift")
+        cards.new_card(root, "TopicShift2")
+    capsys.readouterr()
+    for command in (["variable", "list", str(root)], ["records", str(root)]):
+        assert cli.main(command) == 0, command
+        out = capsys.readouterr().out
+        assert _printed_twice(out) == [], out
+    # At the source, not only after the listing's own guard: one row per
+    # kind, one card per id, each problem once.
+    from rce import inventory, paths
+
+    db_path = paths.graph_db_path(root)
+    conn = db.connect(db_path) if db_path.exists() else None
+    try:
+        rows = inventory.inventory(conn, root)
+        found = cards.overview(conn, root)
+    finally:
+        if conn is not None:
+            conn.close()
+    kinds = [r.kind for r in rows]
+    assert len(kinds) == len(set(kinds)), kinds
+    assert all(len(r.problems) == len(set(r.problems)) for r in rows), [r.problems for r in rows]
+    ids = [c["id"] for c in found]
+    assert len(ids) == len(set(ids)), ids
+
+
+# -- defect (ii), acceptance 2026-10-05: a low match caused by a moved or copied project ---------
+
+
+def test_migrate_preview_says_how_many_scripts_reach_outside_the_folder(tmp_path, capsys):
+    """`rce migrate` on a folder whose scripts hard-code absolute paths
+    OUTSIDE it (the project was copied away from where its scripts point):
+    the judged links' endpoints are not produced, and one line says how many
+    scripts read or write paths outside this folder -- so the low match is
+    recognisable as that. A folder whose scripts stay inside says nothing."""
+    from test_migration import _folder, build_pre_v5_index
+
+    from rce import cli
+
+    root = _folder(tmp_path)
+    build_pre_v5_index(root)
+    elsewhere = tmp_path / "the-old-place"
+    (root / "s.py").write_text(
+        "import pandas as pd\n"
+        f"df = pd.read_csv('{elsewhere}/data/in.csv')\n"
+        f"df.to_csv('{elsewhere}/data/out.csv')\n"
+    )
+    (root / "s2.py").write_text(f"import pandas as pd\npd.read_csv('{elsewhere}/data/c.csv')\n")
+    shutil.rmtree(root / "data")  # the copy brought the scripts, not the data
+    cli.main(["migrate", str(root)])  # the preview: nothing written
+    out = capsys.readouterr().out
+    assert "match: a scan of" in out
+    assert "2 script(s) in this folder read or write absolute paths outside it" in out, out
+
+    inside = _folder(tmp_path / "inside")
+    build_pre_v5_index(inside)
+    cli.main(["migrate", str(inside)])
+    out = capsys.readouterr().out
+    assert "match: a scan of" in out and "outside it" not in out

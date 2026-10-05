@@ -27,6 +27,9 @@ there is no endpoint that writes a `v<n>.toml` or creates a card.
     /api/variables/answer       {id, question: "edited", answer: new|correct, version, content_hash}
                                 {id, question: "shrunk", answer: file|restore, missing: [ids shown]}
     /api/variables/full-compare {id}                       「完整比对」 (the index only)
+    /api/variables/settle       {id, keeps: [entry ids], shown: [entry ids the page showed]}
+                                「以这一条为准」 (9.12): two merged histories settled
+                                by naming, per version in dispute, what stands
 
 `content_hash` is the hash the page showed for the version file (the
 draft's, or the edited file's `content_hash`; null for a file that could
@@ -86,6 +89,7 @@ REFUSED_ZH = {
     "changed": "文件在写入时被改动了，没有记录任何东西；请重试",
     "region_missing": "找不到这一版指定的代码块或函数",
     "not_confirmed": "只有确认过的版本才能被引用",
+    "no_conflict": "这张卡的记录里没有需要处理的两份历史",
 }
 
 STATUS = {"invalid": 400, "incomplete": 400, "no_such_card": 404}
@@ -176,6 +180,7 @@ def list_payload(conn: Connection | None, root: Path) -> dict[str, Any]:
             "id": card["id"],
             "name": _name(card),
             "state": card["state"],
+            "reason": card.get("reason"),
             "message": card.get("message") or trust.get("message"),
             "trust_state": trust.get("state"),
             "in_use": card["in_use"],
@@ -253,7 +258,7 @@ def frozen_payload(root: Path, card_id: str, entry_id: str) -> dict[str, Any]:
 
 # -- writes ------------------------------------------------------------------------------------
 
-ACTIONS = ("confirm", "revise", "reaffirm", "abandon", "revive", "answer", "full-compare")
+ACTIONS = ("confirm", "revise", "reaffirm", "abandon", "revive", "answer", "full-compare", "settle")
 
 
 def _note(body: dict[str, Any], *, required: bool) -> str | None:
@@ -303,6 +308,15 @@ def act(root: Path, project_id: str | None, action: str, body: dict[str, Any]) -
         if action == "full-compare":
             review = cards.full_compare(root, card_id, **common)
             return {"ok": True, "id": card_id, "implementation": review}
+        if action == "settle":
+            keeps, shown = body.get("keeps"), body.get("shown")
+            for name, value in (("keeps", keeps), ("shown", shown)):
+                if not isinstance(value, list) or not value or len(value) > 500 or not all(isinstance(i, str) and i for i in value):
+                    raise _bad(f"'{name}' must list entry ids")
+            done = cards.settle(root, card_id, keeps, expected_shown=shown, note=_note(body, required=False),
+                                via="app", **common)
+            return {"ok": True, "id": card_id, "entry": done.entry.id, "keeps": list(done.keeps),
+                    "not_in_force": list(done.not_in_force), "questions": list(done.card.questions)}
         return _answer(root, card_id, body, common)
     except V.VariableError as exc:
         raise _refused(exc) from exc

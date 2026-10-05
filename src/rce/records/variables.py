@@ -30,9 +30,12 @@ incomplete; `missing_for_confirm` says what a confirmation needs.
 The log is a 9.3 ledger (`rce.records.ledger`, not a fork of it)
 ---------------------------------------------------------------
 
-Acts: confirmed, reaffirmed, corrected, abandoned, revived, removed. Every
-entry speaks about the one card, so the ledger key is empty: two merged
-histories (seq repeating) put the whole card in conflict. A confirmed
+Acts: confirmed, reaffirmed, corrected, abandoned, revived, removed,
+settled. Every entry speaks about the one card, so the ledger key is empty:
+two merged histories (seq repeating) put the whole card in conflict, until
+a `settled` entry names what stands (9.12: `keeps`, one confirmation per
+version number in dispute; the other entries of both histories stay in the
+file, not in force -- nothing is chosen by position or time). A confirmed
 version is frozen by the content hash in its own entry: on every read, a
 version file whose parsed content differs from it is not obeyed and the
 card asks 「v<n> 的定义在确认后被改动了」 -- comments and layout are free, so
@@ -100,6 +103,12 @@ ANSWER_LABELS = {ANSWER_NEW: "另存为新版本", ANSWER_CORRECT: "这是更正
 #: its frozen copy (the restoring half of 「另存为新版本」; there is no edited
 #: text to keep).
 ABSENT_ANSWER_LABELS = {ANSWER_NEW: "按冻结副本放回"}
+#: A confirmed version whose file can no longer be read (not UTF-8, not
+#: readable) has no edited TEXT to keep either (9.12, acceptance
+#: 2026-10-05): its one answer keeps the bytes as they are as the next
+#: draft and puts the frozen text back.
+QUESTION_UNREADABLE = "v{n} 的版本文件在确认后无法读取了"
+UNREADABLE_ANSWER_LABELS = {ANSWER_NEW: "把这些内容原样存为下一版草稿，并按冻结副本放回"}
 #: Shown for every version of a card whose log cannot be trusted (9.11
 #: "Safety"): no status is derived from a log RCE does not obey -- above
 #: all never 「草稿」, which would say confirmed text may be edited freely.
@@ -399,7 +408,13 @@ def missing_for_confirm(content: Mapping[str, Any]) -> list[str]:
 
 # -- the log (a 9.3 ledger) ------------------------------------------------------------
 
-ACTS = frozenset({"confirmed", "reaffirmed", "corrected", "abandoned", "revived", "removed"})
+ACTS = frozenset({"confirmed", "reaffirmed", "corrected", "abandoned", "revived", "removed", "settled"})
+#: 9.12 (acceptance, 2026-10-05): two histories in a card's log are settled
+#: by naming what stands -- a `settled` entry whose `settles` (assigned by
+#: the ledger engine) names the anomalous entries and whose `keeps` names,
+#: for each version number in dispute, the one confirmation that stands.
+SETTLED_ACT = "settled"
+KEEPABLE_ACTS = frozenset({"confirmed", "corrected"})
 VERSION_ACTS = frozenset({"confirmed", "reaffirmed", "corrected", "removed"})
 CARD_ACTS = frozenset({"abandoned", "revived"})
 ATTESTED = ("yes", "no", "unknown")
@@ -439,6 +454,12 @@ def _validate_log_entry(entry: Mapping[str, Any]) -> None:
     if act == "corrected":
         _need(entry, "previous", str, act)
         _need(entry, "corrects", str, act)
+    if act == SETTLED_ACT:
+        keeps = entry.get("keeps", [])
+        if not isinstance(keeps, list) or not all(isinstance(k, str) and k for k in keeps):
+            raise ValueError(f"'keeps' must list the ids of the entries that stand, got {keeps!r}")
+    elif "keeps" in entry:
+        raise ValueError("only a 'settled' entry names entries it keeps")
     if "removes" in entry and (act != "removed" or not isinstance(entry["removes"], str) or not entry["removes"]):
         raise ValueError("'removes' names the lost entry a 'removed' entry stands for")
     if act in CARD_ACTS:
@@ -478,7 +499,7 @@ CARD_LOG_SCHEMA = LedgerSchema(
     key_fields=(),
     field_order=(
         "id", "seq", "at", "act", "version", "via", "attested", "content", "previous", "corrects", "removes", "frozen",
-        "note", "reaffirms", "reasons", "data_version", "recovered_from", "recovered_at", "upstream", "checked",
+        "note", "keeps", "reaffirms", "reasons", "data_version", "recovered_from", "recovered_at", "upstream", "checked",
         "observed", "coverage",
     ),
     header=_LOG_HEADER,
@@ -555,6 +576,9 @@ class Card:
     draft: int | None = None
     abandoned: LedgerEntry | None = None
     questions: list[int] = field(default_factory=list)
+    #: Entries a `settled` entry left out of force (9.12): still in the
+    #: history, shown as 「不再生效」, never derived from.
+    not_in_force: set[str] = field(default_factory=set)
 
     @property
     def message(self) -> str | None:
@@ -563,6 +587,13 @@ class Card:
     @property
     def entries(self) -> tuple[LedgerEntry, ...]:
         return self.log.ledger.entries if self.log is not None and self.log.ledger is not None else ()
+
+    @property
+    def entries_in_force(self) -> tuple[LedgerEntry, ...]:
+        """The entries every status is derived from: all of them, except
+        those a settlement left out of force (and the `settled` entries
+        themselves, which say which is which)."""
+        return tuple(e for e in self.entries if e.id not in self.not_in_force and e.get("act") != SETTLED_ACT)
 
     @property
     def next_number(self) -> int:
@@ -682,30 +713,128 @@ def read_card(project_root: str | Path, directory: str | Path, *, siblings: list
     elif state is RecordState.PRESENT and card.log_expected and not card.entries:
         card.state, card.reason = "frozen", "empty_but_expected"
         card.detail = "log.toml holds no entries, and the card has more than one version or an earlier log"
-    elif card.log.ledger is not None and card.log.ledger.anomalies:
+    elif card.log.ledger is not None and card.log.ledger.anomalies and card.log.ledger.conflict(()) is not None:
         card.state, card.reason = "frozen", "conflict"
-        card.detail = "two histories of log.toml were merged (seq repeats); nothing picks a winner"
+        card.detail = ("two histories of log.toml were merged (seq repeats); nothing picks a winner -- "
+                       "settle it by naming what stands: rce variable settle")
     if card.state != "ok":
         card.problems.append(f"{card.reason}: {card.detail}")
         for view in card.versions.values():
             view.status = "unknown"
         return card
+    if card.log.ledger is not None and card.log.ledger.anomalies:
+        card.not_in_force = settled_out(card.log.ledger)
     _derive(card)
     return card
+
+
+# -- two histories, and naming what stands (9.12) -----------------------------------------
+
+
+def settled_out(ledger: Any, *, before: int | None = None) -> set[str]:
+    """The ids a `settled` entry left out of force: every entry of the
+    region it settled (from where the two histories diverged up to the
+    settlement) except those it keeps. Settlements are taken in file order,
+    each over the anomalies no earlier one settled. `before`: only the
+    settlements at an index below it. Positions decide nothing here -- the
+    region is both histories, and only `keeps` says what stands."""
+    by_id = {a.entry.id: a for a in ledger.anomalies}
+    handled: set[str] = set()
+    out: set[str] = set()
+    for e in ledger.entries:
+        if before is not None and e.index >= before:
+            break
+        if e.get("act") != SETTLED_ACT:
+            continue
+        fresh = [by_id[i] for i in e.settles if i in by_id and i not in handled]
+        if not fresh:
+            continue
+        keeps = set(e.get("keeps") or ())
+        start = min(a.start for a in fresh)
+        for x in ledger.entries[start:e.index]:
+            if x.get("act") != SETTLED_ACT and x.id not in keeps:
+                out.add(x.id)
+        handled |= {a.entry.id for a in fresh}
+    return out
+
+
+@dataclass(frozen=True)
+class Dispute:
+    """What a card whose log holds two merged histories asks (9.12). `common`
+    are the entries both histories share, `branches` each history's entries
+    after they diverged (file order within each), `candidates` for each
+    version number in dispute -- one confirmed or corrected in the diverged
+    part -- the confirmations that may stand: the one that stood before the
+    histories diverged (if any) and each one made in either history.
+    `shown` are the ids of every entry the question shows; an answer is tied
+    to them."""
+
+    anomalies: tuple[str, ...]
+    common: tuple[LedgerEntry, ...]
+    branches: tuple[tuple[LedgerEntry, ...], ...]
+    candidates: dict[int, tuple[LedgerEntry, ...]]
+
+    @property
+    def region(self) -> tuple[LedgerEntry, ...]:
+        return tuple(e for branch in self.branches for e in branch)
+
+    @property
+    def shown(self) -> tuple[str, ...]:
+        return tuple(sorted({e.id for e in self.region} | {e.id for c in self.candidates.values() for e in c}))
+
+    @property
+    def disputed(self) -> list[int]:
+        return sorted(self.candidates)
+
+    def version_of(self, entry_id: str) -> int | None:
+        for number, found in self.candidates.items():
+            if any(e.id == entry_id for e in found):
+                return number
+        return None
+
+
+def dispute_of(card: Card) -> Dispute | None:
+    """The question a conflicted card asks, or None when its log holds no
+    unsettled histories. Reads only."""
+    ledger = card.log.ledger if card.log is not None else None
+    if ledger is None or not ledger.anomalies:
+        return None
+    conflict = ledger.conflict(())
+    if conflict is None:
+        return None
+    earlier_out = settled_out(ledger, before=min(e.index for b in conflict.branches for e in b) if any(conflict.branches) else None)
+    common = tuple(e for e in conflict.common if e.id not in earlier_out and e.get("act") != SETTLED_ACT)
+    branches = tuple(tuple(e for e in b if e.get("act") != SETTLED_ACT) for b in conflict.branches)
+    region = [e for b in branches for e in b]
+    candidates: dict[int, tuple[LedgerEntry, ...]] = {}
+    for number in sorted({int(e.get("version")) for e in region if e.get("act") in KEEPABLE_ACTS}):
+        before: LedgerEntry | None = None
+        for e in common:
+            if e.get("version") != number:
+                continue
+            if e.get("act") in KEEPABLE_ACTS:
+                before = e
+            elif e.get("act") == "removed" and not e.get("removes"):
+                before = None
+        mine = [e for e in region if e.get("version") == number and e.get("act") in KEEPABLE_ACTS]
+        candidates[number] = tuple(([before] if before is not None else []) + mine)
+    return Dispute(anomalies=conflict.anomalies, common=common, branches=branches, candidates=candidates)
 
 
 def _derive(card: Card) -> None:
     """Versions, the version in use, the draft, the questions -- from the
     log in file order (the clock decides nothing)."""
     by_version: dict[int, list[LedgerEntry]] = {}
-    for e in card.entries:
+    for e in card.entries_in_force:
         if e.get("act") in VERSION_ACTS:
             by_version.setdefault(int(e.get("version")), []).append(e)
         elif e.get("act") == "abandoned":
             card.abandoned = e
         elif e.get("act") == "revived":
             card.abandoned = None
-    card.numbers_seen |= set(by_version)
+    # Numbers are not reused (9.11), not even one only a history left out of
+    # force by a settlement confirmed.
+    card.numbers_seen |= set(by_version) | {int(e.get("version")) for e in card.entries if e.get("act") in VERSION_ACTS}
     confirmed: dict[int, LedgerEntry] = {}
     removed: set[int] = set()
     for number, entries in by_version.items():

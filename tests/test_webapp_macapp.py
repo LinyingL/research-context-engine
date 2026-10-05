@@ -475,7 +475,7 @@ def test_cli_app_without_dir_on_non_macos_errors_cleanly(monkeypatch, capsys):
 def _stub_build_app(monkeypatch) -> list[tuple[Path, int]]:
     calls: list[tuple[Path, int]] = []
 
-    def fake(target_dir, rce_executable=None, port=macapp.DEFAULT_PORT):
+    def fake(target_dir, rce_executable=None, port=macapp.DEFAULT_PORT, force=False):
         calls.append((target_dir, port))
         return macapp.AppBuild(bundle=target_dir / "RCE.app", native=True)
 
@@ -527,3 +527,86 @@ def test_cli_app_reports_missing_entry_point_as_clean_error(tmp_path, monkeypatc
     assert cli.main(["app", "--dir", str(tmp_path / "apps")]) == 1
     err = capsys.readouterr().err
     assert err.startswith("Error:") and "rce" in err
+
+
+# -- 9.12: an unchanged shell is not rebuilt (macOS would ask for Documents again) ----
+
+
+def _fake_native_build(monkeypatch) -> list[str]:
+    """A stand-in toolchain: `swiftc` "compiles" by writing a file, codesign
+    succeeds, no iconutil. Returns the list of programs run, in order."""
+    ran: list[str] = []
+
+    def run(args):
+        ran.append(Path(args[0]).name)
+        if "-o" in args:
+            out = Path(args[args.index("-o") + 1])
+            out.write_bytes(b"\xcf\xfa\xed\xfe fake binary")
+            out.chmod(0o755)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(macapp, "find_swiftc", lambda: "/usr/bin/swiftc")
+    monkeypatch.setattr(macapp, "_run", run)
+    monkeypatch.setattr(macapp.shutil, "which", lambda name: "/usr/bin/codesign" if name == "codesign" else None)
+    return ran
+
+
+def test_build_id_hashes_every_input_of_a_native_build(tmp_path, monkeypatch):
+    rce = _fake_rce(tmp_path)
+    base = macapp.build_id(rce, 7357)
+    assert base.startswith("sha256:") and base == macapp.build_id(rce, 7357)
+    assert macapp.build_id(rce, 7358) != base
+    assert macapp.build_id(rce.parent / "other-rce", 7357) != base
+    shell = tmp_path / "RCEShell.swift"
+    shell.write_text(macapp.SHELL_SOURCE.read_text(encoding="utf-8") + "\n// changed\n", encoding="utf-8")
+    monkeypatch.setattr(macapp, "SHELL_SOURCE", shell)
+    assert macapp.build_id(rce, 7357) != base
+    monkeypatch.undo()
+    icon = tmp_path / "RCEIcon.swift"
+    icon.write_text("// another icon\n", encoding="utf-8")
+    monkeypatch.setattr(macapp, "ICON_SOURCE", icon)
+    assert macapp.build_id(rce, 7357) != base
+    monkeypatch.undo()
+    monkeypatch.setattr(macapp, "_rce_version", lambda: "99.0")  # a plist field
+    assert macapp.build_id(rce, 7357) != base
+
+
+def test_an_unchanged_bundle_is_left_untouched_and_force_rebuilds_it(tmp_path, monkeypatch, capsys):
+    rce = _fake_rce(tmp_path)
+    monkeypatch.setattr(macapp.sys, "executable", str(rce.parent / "python"))
+    ran = _fake_native_build(monkeypatch)
+    target = tmp_path / "apps"
+    first = macapp.build_app(target, rce_executable=rce, port=_TRIAL_PORT)
+    assert first.native and not first.up_to_date and "swiftc" in ran and "codesign" in ran
+    bundle = target / "RCE.app"
+    binary = bundle / "Contents" / "MacOS" / "RCE"
+    recorded = (bundle / "Contents" / "Resources" / macapp.BUILD_ID_SIDECAR).read_text(encoding="utf-8")
+    assert recorded == macapp.build_id(rce, _TRIAL_PORT)
+    stamp = (binary.stat().st_ino, binary.stat().st_mtime_ns)
+    ran.clear()
+    again = macapp.build_app(target, rce_executable=rce, port=_TRIAL_PORT)
+    assert again.up_to_date and again.native and ran == []  # nothing compiled, nothing re-signed
+    assert (binary.stat().st_ino, binary.stat().st_mtime_ns) == stamp
+    assert cli.main(["app", "--dir", str(target), "--port", str(_TRIAL_PORT)]) == 0
+    assert "RCE.app is up to date" in capsys.readouterr().out and ran == []
+    assert cli.main(["app", "--dir", str(target), "--port", str(_TRIAL_PORT), "--force"]) == 0
+    assert "up to date" not in capsys.readouterr().out and "swiftc" in ran and "codesign" in ran
+    ran.clear()
+    # A changed input (here the port) rebuilds; so does a bundle without a build-id (the V3 launcher).
+    assert not macapp.build_app(target, rce_executable=rce, port=_TRIAL_PORT + 1).up_to_date and "swiftc" in ran
+    launcher = tmp_path / "launcher"
+    macapp.generate_bundle(launcher, rce_executable=rce)
+    assert not macapp.is_up_to_date(launcher / "RCE.app", macapp.build_id(rce, macapp.DEFAULT_PORT))
+
+
+def test_shell_waiting_page_names_the_documents_prompt_and_shows_the_log_only_after_an_exit():
+    """9.12: after a few seconds without an answer the waiting page says
+    the system may ask for the Documents folder; the log tail is shown only
+    once the engine process has EXITED; the child's output is unbuffered."""
+    # As Swift source: the quotes inside the string literal are escaped.
+    assert r'"正在启动引擎… 如果系统询问是否允许 RCE 访问\"文稿\"文件夹，请点\"允许\"。"' in _SHELL
+    assert 'environment["PYTHONUNBUFFERED"] = "1"' in _SHELL
+    poll = _SHELL[_SHELL.index("func pollTick"):_SHELL.index("func showLog")]
+    assert "showLog" not in poll and "documentsHint" in poll
+    exited = _SHELL[_SHELL.index("func engineExited"):_SHELL.index("func schedulePolling")]
+    assert "showLog" in exited

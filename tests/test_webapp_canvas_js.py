@@ -854,6 +854,26 @@ def test_a_move_in_a_pinned_view_also_saves_cards_that_appeared_since():
     assert post["body"] == {"project": PROJECT, "scope": "all", "positions": {RAW: [10, 500], RMD18: run["out"]["placed"]}}
 
 
+def test_a_frozen_project_saves_no_layout_or_viewport():
+    """9.12 (acceptance, 2026-10-05): for a project frozen until it is
+    migrated (GET /api/canvas says `frozen`), panning, zooming, fitting and
+    moving cards POST nothing -- so no 「位置未能保存」 chip either. The same
+    moves in an ordinary view do POST."""
+    script = """
+      enter(input.view);
+      drag(input.id, [1, 2]);
+      C._queueViewport(false);
+      await C._flushSave();
+      S.camera.x += 40;
+      C._queueViewport(false);
+      await C._flushSave();
+    """
+    frozen = _scenario(script, view={**_view("all", [PY16], []), "frozen": True}, id=PY16)
+    assert frozen["posts"] == []
+    live = _scenario(script, view=_view("all", [PY16], []), id=PY16)
+    assert [p["url"] for p in live["posts"]] == ["/api/canvas/layout", "/api/canvas/layout"]
+
+
 def test_writes_go_to_the_view_they_were_made_in():
     """A move queued in one view and unsent when the scope changes is sent
     for THAT view, never for the next one."""
