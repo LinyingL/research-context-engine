@@ -50,6 +50,21 @@
       /api/mappings/delete, 标记为错误提取 (machine) -> /api/edges/reject
       with 「撤销」 -> /api/edges/restore offered on the chip.
 
+  What V5 adds (DESIGN.md 9.3, 9.6 "Where it shows"; task V5 phase 7):
+
+    - a machine link's pinned card judges it -- 「确认这条连线」,
+      「标记为错误提取」, and while a verdict stands 「撤回」 -- each with an
+      optional inline 备注, each undoable for 10 seconds (an `undone`
+      entry), and shows the link's history from the ledger, newest first,
+      with the basis each verdict was made on; a hand-drawn link shows no
+      judgment actions (its authority is mappings.toml);
+    - a link whose old judgment waits for review is drawn as the machine
+      link it is now plus a small ochre ring, and its hover card says what
+      the researcher once decided and why it waits; a candidate says it
+      may correspond to such a judgment;
+    - an arrangement record that cannot be read is said, left untouched,
+      and no position is saved over it.
+
   The page never writes the graph directly from here. Its writes are
   the arrangement record .rce/canvas.json (sections 8.6, 9.2) and the
   canvas write endpoints, which take only paths/ids and resolve every file
@@ -172,6 +187,9 @@ window.RCECanvas = (function () {
     // The cards of the link just confirmed, which the camera keeps on
     // screen through the re-layout that link causes (keepCamera).
     focus: null,
+    // V5: the selected link's ledger history ({id, entries, readable,
+    // error}), and the 备注 typed into its card (kept across re-renders).
+    history: null, cardNote: { id: null, value: "" },
   };
 
   // -- Small helpers ----------------------------------------------------------
@@ -926,9 +944,10 @@ window.RCECanvas = (function () {
     const empty = htmlEl("div", "cv-empty hidden");
     const linkCard = htmlEl("div", "cv-linkcard hidden");
     const ctxMenu = htmlEl("div", "cv-menu cv-ctx hidden");
-    root.append(s.svg, t.bar, zoom, status, tip, empty, linkCard, ctxMenu);
+    const notice = htmlEl("div", "cv-notice hidden");
+    root.append(s.svg, t.bar, zoom, status, tip, empty, linkCard, ctxMenu, notice);
     container.appendChild(root);
-    cv.dom = Object.assign({ root, zoom, status, tip, empty, linkCard, ctxMenu }, s, t);
+    cv.dom = Object.assign({ root, zoom, status, tip, empty, linkCard, ctxMenu, notice }, s, t);
     // A click on the chip dismisses it -- unless it offers an action: a
     // near miss on 「撤销」 must not silently throw the undo away.
     status.addEventListener("click", (e) => {
@@ -1036,6 +1055,10 @@ window.RCECanvas = (function () {
     if (link.human) {
       const m = linkMidpoint(ends);
       g.appendChild(svgEl("circle", { cx: m.x, cy: m.y, r: 3 }, "cv-link-dot"));
+    } else if (link.review || link.conflict) {
+      // 9.6: the old judgment waits -- a small ochre ring, never a human dot.
+      const m = linkMidpoint(ends);
+      g.appendChild(svgEl("circle", { cx: m.x, cy: m.y, r: 4.5 }, "cv-review-mark"));
     }
     return g;
   }
@@ -1045,12 +1068,11 @@ window.RCECanvas = (function () {
     if (!ends) return;
     const d = linkPathD(ends);
     g.querySelectorAll("path").forEach((p) => p.setAttribute("d", d));
-    const dot = g.querySelector(".cv-link-dot");
-    if (dot) {
+    g.querySelectorAll(".cv-link-dot, .cv-review-mark").forEach((dot) => {
       const m = linkMidpoint(ends);
       dot.setAttribute("cx", m.x);
       dot.setAttribute("cy", m.y);
-    }
+    });
   }
 
   function frameTone(verdict) {
@@ -1395,6 +1417,7 @@ window.RCECanvas = (function () {
     const slot = cv.save;
     cv.save = emptySave();
     if (!slot.scope) return;
+    if (layoutBlocked()) return; // nothing is written over a record RCE cannot read (9.2)
     const body = { project: slot.project, scope: slot.scope };
     if (slot.reset) body.reset = true;
     if (Object.keys(slot.positions).length) body.positions = slot.positions;
@@ -1516,10 +1539,14 @@ window.RCECanvas = (function () {
 
   function linkTipText(link) {
     if (cv.cycle.has(link.id)) return "检测到循环 · " + link.evidence_hint;
-    // 9.6: a link whose judgment waits is never shown as an ordinary one.
-    if (link.conflict) return link.evidence_hint + " · 记录冲突，待处理";
-    if (link.review && link.judgement) return link.evidence_hint + " · 待复核 · " + link.judgement.label;
-    if (link.candidate_hint) return link.evidence_hint + " · " + link.candidate_hint;
+    // 9.6: a link whose judgment waits is never shown as an ordinary one:
+    // 「你曾于 2026-10-04 否决 · 依据已变化，待复核」 (app.html's wording).
+    if (link.conflict) return "记录冲突，待处理 · " + link.evidence_hint;
+    if (link.review && link.judgement) {
+      const said = typeof reviewHoverText === "function" ? reviewHoverText(link.judgement) : "待复核 · " + link.judgement.label;
+      return said + " · " + link.evidence_hint;
+    }
+    if (link.candidate_hint) return link.candidate_hint + " · " + link.evidence_hint;
     if (!link.human && link.status === "pending") return link.evidence_hint + " · 待确认";
     return link.evidence_hint;
   }
@@ -1529,6 +1556,7 @@ window.RCECanvas = (function () {
     const tip = cv.dom.tip;
     tip.textContent = linkTipText(link);
     tip.classList.toggle("human", !!link.human);
+    tip.classList.toggle("review", !!(link.review || link.conflict));
     tip.classList.remove("hidden");
     moveTip(clientX, clientY);
   }
@@ -1831,10 +1859,24 @@ window.RCECanvas = (function () {
   // entry leaves mappings.toml). Machine link: 标记为错误提取 (status
   // rejected through the human-only path), undoable from the chip.
 
-  function linkActions(link) {
+  // What may be done to a link. A hand-drawn link: 删除标注 (its truth is
+  // mappings.toml, 8.5). A machine link (9.3): confirm it unless a
+  // confirmation already stands and applies, mark it a wrong extraction,
+  // and withdraw a verdict that stands -- waiting for review or not. The
+  // card's 备注 field (`note`) goes with each; the right-click menu has none.
+  function linkActions(link, note) {
     if (link.optimistic) return [];
     if (link.human) return [{ label: "删除标注", run: () => deleteHumanLink(link) }];
-    return [{ label: "标记为错误提取", run: () => rejectMachineLink(link) }];
+    const j = link.judgement;
+    const waiting = !!(link.review || link.conflict);
+    const stands = waiting ? !!(j && (j.verdict === "confirmed" || j.verdict === "rejected") || link.conflict)
+      : link.status === "confirmed" || link.status === "rejected";
+    const n = () => (note ? note() : "");
+    const out = [];
+    if (waiting || link.status !== "confirmed") out.push({ label: "确认这条连线", run: () => judgeLink(link, "confirmed", n()) });
+    out.push({ label: "标记为错误提取", run: () => rejectMachineLink(link, n()) });
+    if (stands) out.push({ label: "撤回", run: () => judgeLink(link, "withdrawn", n()) });
+    return out;
   }
 
   function linkAssertion(link) {
@@ -1856,11 +1898,28 @@ window.RCECanvas = (function () {
     card.innerHTML = "";
     if (!entry) { card.classList.add("hidden"); return; }
     const link = entry.link;
+    // A re-render (every refresh) must not take the 备注 being typed away.
+    const typing = document.activeElement && document.activeElement.classList &&
+      document.activeElement.classList.contains("cv-linkcard-note") && card.contains(document.activeElement);
+    card.innerHTML = "";
     card.classList.toggle("human", !!link.human);
+    card.classList.toggle("review", !!(link.review || link.conflict));
     card.appendChild(htmlEl("div", "cv-linkcard-assert", linkAssertion(link)));
     card.appendChild(htmlEl("div", "cv-linkcard-hint", linkTipText(link)));
     if (link.optimistic) card.appendChild(htmlEl("div", "cv-linkcard-hint", link.syncing ? "已写入映射文件，等待图谱同步…" : "正在写入…"));
-    const actions = linkActions(link);
+    const machine = !link.human && !link.optimistic;
+    const blocked = machine && typeof humanRecordsBlocked === "function" ? humanRecordsBlocked() : null;
+    let noteInput = null;
+    if (machine && !blocked) {
+      if (cv.cardNote.id !== link.id) cv.cardNote = { id: link.id, value: "" };
+      noteInput = htmlEl("input", "cv-linkcard-note");
+      noteInput.type = "text";
+      noteInput.placeholder = "备注（可选）";
+      noteInput.value = cv.cardNote.value;
+      noteInput.addEventListener("input", () => { cv.cardNote.value = noteInput.value; });
+      card.appendChild(noteInput);
+    }
+    const actions = blocked ? [] : linkActions(link, noteInput ? () => noteInput.value.trim() : null);
     if (actions.length) {
       const row = htmlEl("div", "cv-linkcard-actions");
       actions.forEach((a) => {
@@ -1869,10 +1928,71 @@ window.RCECanvas = (function () {
         b.addEventListener("click", () => a.run());
         row.appendChild(b);
       });
+      if (machine && (link.review || link.conflict) && typeof openReviewPanel === "function") {
+        const b = htmlEl("button", "cv-text-btn", "在待复核列表中查看");
+        b.type = "button";
+        b.addEventListener("click", () => openReviewPanel(link));
+        row.appendChild(b);
+      }
       card.appendChild(row);
     }
+    if (blocked) card.appendChild(htmlEl("div", "cv-linkcard-hint", blocked));
+    if (machine) card.appendChild(renderHistory(link));
     card.classList.remove("hidden");
     positionLinkCard();
+    if (typing && noteInput) {
+      noteInput.focus();
+      noteInput.setSelectionRange(noteInput.value.length, noteInput.value.length);
+    }
+  }
+
+  // The link's history from the ledger (9.3: the file is its own history),
+  // newest first: who did what, when, from where, the note, and the basis
+  // each verdict was made on. An entry an undo cancelled is struck through.
+  function renderHistory(link) {
+    const box = htmlEl("div", "cv-linkcard-history");
+    const h = cv.history && cv.history.id === link.id ? cv.history : null;
+    if (!h) { loadHistory(link); box.appendChild(htmlEl("div", "cv-linkcard-hint", "载入记录中…")); return box; }
+    if (h.error) {
+      const e = htmlEl("div", "cv-linkcard-hint");
+      renderBlockingError(e, "没能读到这条连线的记录", h.error);
+      box.appendChild(e);
+      return box;
+    }
+    if (!h.readable) { box.appendChild(htmlEl("div", "cv-linkcard-hint", "判断记录文件当前无法读取，记录暂时看不到。")); return box; }
+    if (!h.entries.length) {
+      // A pre-V5 project: its judgments still sit in the old index (9.5).
+      const waiting = typeof state === "object" && state && state.summary && state.summary.needs_migration;
+      box.appendChild(htmlEl("div", "cv-linkcard-hint", waiting
+        ? "旧版本里的判断还在旧索引中，迁移后才会出现在这里。" : "还没有你对这条连线的判断。"));
+      return box;
+    }
+    box.appendChild(htmlEl("div", "cv-linkcard-history-title", "记录（新的在上）"));
+    h.entries.slice().reverse().forEach((e) => {
+      const row = htmlEl("div", "cv-hist" + (e.cancelled ? " cancelled" : ""));
+      row.appendChild(htmlEl("div", "cv-hist-what", historyEntryText(e) + (e.cancelled ? "（已撤销）" : "")));
+      if (e.note) row.appendChild(htmlEl("div", "cv-hist-sub", "备注：" + e.note));
+      const basis = historyBasisText(e);
+      if (basis) row.appendChild(htmlEl("div", "cv-hist-sub", basis));
+      box.appendChild(row);
+    });
+    return box;
+  }
+
+  async function loadHistory(link) {
+    if (cv.history && cv.history.id === link.id && cv.history.loading) return;
+    const mine = { id: link.id, loading: true, entries: [], readable: true, error: null };
+    cv.history = mine;
+    const q = ["src", "dst", "type", "extractor"].map((k) => k + "=" + encodeURIComponent(link[k])).join("&");
+    try {
+      const data = await apiGet("/api/history?" + q);
+      mine.entries = data.entries || [];
+      mine.readable = data.readable !== false;
+    } catch (err) {
+      mine.error = err;
+    }
+    mine.loading = false;
+    if (cv.history === mine && cv.selectedLink === link.id) renderLinkCard();
   }
 
   function positionLinkCard() {
@@ -1940,23 +2060,25 @@ window.RCECanvas = (function () {
     await refresh();
   }
 
-  async function rejectMachineLink(link) {
+  async function rejectMachineLink(link, note) {
     if (link.human || link.optimistic) return;
     if (!window.confirm("把这条连线标记为错误提取？\n\n" + linkAssertion(link) + "\n" + link.evidence_hint +
       "\n\n它会从画布上消失，之后可以撤销。")) return;
     const body = { src: link.src, dst: link.dst, type: link.type, extractor: link.extractor };
     try {
-      await apiPost("/api/edges/reject", body);
+      await apiPost("/api/edges/reject", note ? Object.assign({ note: note }, body) : body);
     } catch (err) {
       showStatus("无法标记为错误提取", err, { kind: "write" }); // human_link -> use 「删除标注」
       return;
     }
     selectLink(null);
+    cv.cardNote = { id: null, value: "" };
+    cv.history = null;
     showStatus("已标记为错误提取", null, {
       kind: "undo", notice: true, ms: UNDO_MS,
       action: { label: "撤销", run: () => restoreLink(body) },
     });
-    await refresh();
+    await refreshAll();
   }
 
   async function restoreLink(body) {
@@ -1967,7 +2089,49 @@ window.RCECanvas = (function () {
       showStatus("无法撤销", err, { kind: "write" });
       return;
     }
-    await refresh();
+    await refreshAll();
+  }
+
+  // 「确认这条连线」 / 「撤回」 from the card (9.3): one ledger entry through
+  // POST /api/judgements, then 「撤销」 offered for 10 seconds -- an
+  // `undone` entry naming it, so a mis-click is taken back on the record.
+  async function judgeLink(link, verdict, note) {
+    if (link.human || link.optimistic) return;
+    const body = { src: link.src, dst: link.dst, type: link.type, extractor: link.extractor, verdict: verdict };
+    if (note) body.note = note;
+    try {
+      await apiPost("/api/judgements", body);
+    } catch (err) {
+      showStatus(verdict === "withdrawn" ? "无法撤回" : "无法确认这条连线", err, { kind: "write" });
+      return;
+    }
+    cv.cardNote = { id: null, value: "" };
+    cv.history = null;
+    showStatus(verdict === "withdrawn" ? "已撤回判断，连线按机器的结果显示" : "已确认这条连线", null, {
+      kind: "undo", notice: true, ms: UNDO_MS,
+      action: { label: "撤销", run: () => undoJudgement(body) },
+    });
+    await refreshAll();
+  }
+
+  async function undoJudgement(body) {
+    hideStatus("undo");
+    try {
+      await apiPost("/api/judgements", { src: body.src, dst: body.dst, type: body.type, extractor: body.extractor, verdict: "undone" });
+    } catch (err) {
+      showStatus("无法撤销", err, { kind: "write" });
+      return;
+    }
+    cv.history = null;
+    await refreshAll();
+  }
+
+  // After a judgment, the header's counts and any open 待复核 list follow
+  // too, not only this picture (app.html's refresh; this view's own load
+  // without it).
+  function refreshAll() {
+    if (typeof refreshCurrentView === "function") return refreshCurrentView();
+    return refresh();
   }
 
   // -- Pointer, wheel, gesture and keyboard handling (8.3) ------------------
@@ -2422,6 +2586,7 @@ window.RCECanvas = (function () {
       cv.drag.el = cv.nodeEls.get(cv.drag.id) || cv.drag.el;
       if (cv.drag.moved) cv.drag.el.classList.add("dragging");
     }
+    renderLayoutNotice(payload.layout);
     if (entering) {
       const vp = slot.viewport !== undefined ? slot.viewport : payload.viewport;
       if (vp) {
@@ -2452,7 +2617,52 @@ window.RCECanvas = (function () {
     if (typeof clearProjectState === "function") clearProjectState();
     ensureDom(container);
     container.dataset.loaded = "1";
+    // The selected link's history may have moved with the record.
+    if (cv.history && !cv.history.loading) cv.history = null;
     applyPayload(payload);
+  }
+
+  // 9.2: an arrangement record RCE cannot read is said, left untouched,
+  // and nothing is saved over it until it is repaired or set aside.
+  function layoutBlocked() {
+    const layout = cv.data && cv.data.layout;
+    return !!(layout && layout.state && ["ok", "absent", "legacy"].indexOf(layout.state) < 0);
+  }
+
+  function renderLayoutNotice(layout) {
+    if (!cv.dom) return;
+    const el = cv.dom.notice;
+    el.innerHTML = "";
+    if (!layoutBlocked()) { el.classList.add("hidden"); return; }
+    if (layout.state === "dataless") {
+      el.appendChild(htmlEl("div", "cv-notice-title", "画布位置记录文件正在从云端下载…"));
+      el.appendChild(htmlEl("div", null, "下载完成前先按自动排列显示；这期间不保存位置。"));
+    } else {
+      el.appendChild(htmlEl("div", "cv-notice-title", "画布位置记录文件无法读取"));
+      el.appendChild(htmlEl("div", null,
+        "这次不显示你摆放的位置，" + (layout.file || ".rce/canvas.json") + " 保持原样；修好之前，移动卡片不会被保存。"));
+      const row = htmlEl("div", "cv-linkcard-actions");
+      const b = htmlEl("button", "cv-text-btn", "把它移到备份，重新开始摆放");
+      b.type = "button";
+      b.addEventListener("click", () => setAsideLayout());
+      row.appendChild(b);
+      el.appendChild(row);
+    }
+    const why = htmlEl("div", "cv-hist-sub");
+    if (layout.error) renderBlockingError(why, "", layout.error);
+    el.appendChild(why);
+    el.classList.remove("hidden");
+  }
+
+  async function setAsideLayout() {
+    if (!window.confirm("把无法读取的画布位置记录移到 .rce/backups/？\n\n文件不会被删除；之后移动卡片会开始一份新的记录。")) return;
+    try {
+      await apiPost("/api/records/answer", { file: "canvas", answer: "set_aside" });
+    } catch (err) {
+      showStatus("没能移开画布位置记录", err, { kind: "write" });
+      return;
+    }
+    await refresh();
   }
 
   // 8.7: the selection and a pinned link card belong to the view that was
@@ -2501,7 +2711,9 @@ window.RCECanvas = (function () {
       autoFit: true, resizeTimer: null,
       drag: null, lastClick: null, nodeEls: new Map(), linkEls: new Map(),
       selectedLink: null, optimistic: new Map(), focus: null,
+      history: null, cardNote: { id: null, value: "" },
     });
+    if (cv.dom) cv.dom.notice.classList.add("hidden");
     if (cv.dom) cv.dom.linkCard.classList.add("hidden");
     if (cv.dom) {
       cv.dom.search.value = "";
@@ -2529,6 +2741,8 @@ window.RCECanvas = (function () {
     _assertionText: assertionText,
     _socketAt: socketAt,
     _linkRules: LINK_RULES,
+    _linkActions: linkActions,
+    _layoutBlocked: layoutBlocked,
     _state: cv,
   };
 })();

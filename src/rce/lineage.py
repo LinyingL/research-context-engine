@@ -113,6 +113,9 @@ def _flag_occurrences(occurrences: list[dict[str, Any]], edge: dict[str, Any], f
     if not (marks["review"] or marks["conflict"]):
         return occurrences
     keep = {k: marks[k] for k in ("review", "conflict", "judgement")}
+    # Which link the mark is about, so the app's 「待复核」 tag can open the
+    # review list at that item.
+    keep["link"] = {k: edge[k] for k in ("src", "dst", "type", "extractor")}
     return [{**occ, **keep} if isinstance(occ, dict) else occ for occ in occurrences]
 
 
@@ -153,7 +156,7 @@ def _reader_entry(occ: dict[str, Any]) -> dict[str, Any]:
     entry = {"script": occ.get("file"), "line": occ.get("line"), "callee": occ.get("callee")}
     if occ.get("human"):
         entry["human"] = True  # a human mapping: no line, the researcher's own assertion
-    for mark in ("review", "conflict", "judgement"):
+    for mark in ("review", "conflict", "judgement", "link"):
         if occ.get(mark):
             entry[mark] = occ[mark]
     return entry

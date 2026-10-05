@@ -462,7 +462,7 @@ details.script-node > summary::-webkit-details-marker { display: none; }
 body.canvas-mode #app { height: 100vh; min-height: 0; }
 body.canvas-mode main#main { max-width: none; padding: 0; display: flex; flex-direction: column; min-height: 0; }
 body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 1px solid var(--line); }
-#view-canvas { flex: 1; min-height: 0; position: relative; }
+#view-canvas { flex: 1; min-height: 0; position: relative; overflow-y: auto; }
 .cv-root { position: absolute; inset: 0; overflow: hidden; background: var(--paper); user-select: none; -webkit-user-select: none; }
 .cv-svg { display: block; width: 100%; height: 100%; touch-action: none; }
 .cv-root.space .cv-svg, .cv-root.space .cv-node { cursor: grab; }
@@ -555,7 +555,7 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
   background: var(--paper); border: 1px solid var(--line); padding: 0.1rem 0.45rem;
 }
 .cv-status {
-  position: absolute; left: 72px; bottom: 12px; z-index: 2; max-width: calc(100% - 96px);
+  position: absolute; left: 72px; bottom: 12px; z-index: 4; max-width: calc(100% - 96px);
   font-size: 0.76rem; color: var(--clay); background: var(--clay-soft); border: 1px solid var(--clay); padding: 0.1rem 0.55rem;
 }
 .cv-tip {
@@ -605,6 +605,104 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
 .cv-status-action { margin-left: 0.6rem; }
 .cv-ctx { top: auto; right: auto; z-index: 4; }
 .cv-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 2rem; text-align: center; color: var(--ink-soft); font-size: 0.88rem; pointer-events: none; }
+/* V5 (9.6 "Where it shows"): a link whose old judgment waits is drawn as
+   the machine link it is now, plus a small ochre ring at its midpoint --
+   never clay (clay is the human link's dot) and never invisible. */
+.cv-review-mark { fill: var(--paper); stroke: var(--ochre); stroke-width: 1.75; }
+.cv-tip.review, .cv-linkcard.review { border-color: var(--ochre); }
+.cv-linkcard { max-width: 25rem; user-select: text; -webkit-user-select: text; }
+.cv-linkcard-note {
+  display: block; width: 100%; margin-top: 0.35rem; font: inherit; font-size: 0.74rem; color: var(--ink);
+  background: var(--paper-alt); border: 1px solid var(--line-strong); border-radius: 0; padding: 0.15rem 0.4rem;
+}
+.cv-linkcard-note:focus { outline: 1px solid var(--clay); outline-offset: 1px; }
+.cv-linkcard-actions { flex-wrap: wrap; }
+.cv-linkcard-history { margin-top: 0.45rem; padding-top: 0.3rem; border-top: 1px solid var(--line); max-height: 13rem; overflow-y: auto; }
+.cv-linkcard-history-title { color: var(--ink-soft); font-size: 0.7rem; margin-bottom: 0.1rem; }
+.cv-hist { padding: 0.12rem 0; }
+.cv-hist.cancelled .cv-hist-what { color: var(--ink-soft); text-decoration: line-through; }
+.cv-hist-sub { color: var(--ink-soft); font-size: 0.72rem; word-break: break-all; }
+.cv-notice {
+  position: absolute; bottom: 44px; left: 12px; z-index: 2; max-width: min(30rem, calc(100% - 24px));
+  font-size: 0.78rem; color: var(--ink); background: var(--clay-soft); border: 1px solid var(--clay); padding: 0.4rem 0.65rem;
+}
+.cv-notice .cv-notice-title { color: var(--clay); font-weight: 600; }
+
+/* -- V5: the human record's surfaces (DESIGN.md 9.3-9.6, task V5 phase 7) --
+   Ochre = "waits for you" (待复核, a question), clay = "something is wrong",
+   on the same tokens as everything else. */
+.line-part { white-space: nowrap; }
+.review-count-btn {
+  font: inherit; font-size: inherit; color: var(--ink-soft); background: none; border: none; padding: 0;
+  cursor: pointer; text-decoration: underline; text-underline-offset: 2px;
+}
+.review-count-btn.has { color: var(--ochre); font-weight: 600; }
+.review-count-btn:hover { color: var(--ink); }
+.review-tag {
+  font: inherit; font-family: var(--font-sans); font-size: 0.68rem; line-height: 1.35; flex: none;
+  color: var(--ochre); background: var(--ochre-soft); border: 1px solid var(--ochre); padding: 0 0.35rem; cursor: pointer;
+}
+.review-tag:hover { color: var(--ink); border-color: var(--ink); }
+.lineage-sub li .review-tag { margin-left: 0.5rem; }
+
+.notices { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.25rem; }
+.notices:empty { display: none; }
+body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px solid var(--line); max-height: 45vh; overflow-y: auto; }
+.notice { border: 1px solid var(--line-strong); background: var(--paper-alt); padding: 0.85rem 1.1rem; font-size: 0.86rem; max-width: 780px; }
+.notice.warn { border-color: var(--ochre); background: var(--ochre-soft); }
+.notice.bad { border-color: var(--clay); background: var(--clay-soft); }
+.notice-title { font-weight: 600; margin-bottom: 0.15rem; }
+.notice.bad .notice-title, .state-note .notice-title { color: var(--clay); }
+.notice p { margin: 0.3rem 0 0; color: var(--ink-soft); }
+.notice-close { float: right; margin-left: 0.6rem; background: none; border: none; cursor: pointer; color: var(--ink-soft); font-size: 1.1rem; line-height: 1; padding: 0; }
+.notice-close:hover { color: var(--ink); }
+.notice-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.7rem; align-items: center; }
+.notice-status { font-size: 0.8rem; margin-top: 0.45rem; min-height: 1em; }
+.notice-status.err { color: var(--clay); }
+.notice-status.ok { color: var(--olive); }
+.answer { display: flex; gap: 0.8rem; align-items: baseline; margin-top: 0.6rem; }
+.answer .btn { flex: none; }
+.answer-help { font-size: 0.8rem; color: var(--ink-soft); }
+.fact-line { font-size: 0.8rem; color: var(--ink-soft); margin-top: 0.25rem; word-break: break-all; }
+.mono { font-family: var(--font-mono); font-size: 0.78rem; }
+.entry-list { list-style: none; margin: 0.45rem 0 0; padding: 0; max-height: 16rem; overflow-y: auto; }
+.entry-list li { font-size: 0.8rem; padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
+.entry-list .entry-sub { color: var(--ink-soft); font-size: 0.74rem; word-break: break-all; }
+.locate-row { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
+.locate-row .form-input { flex: 1; min-width: 14rem; font-family: var(--font-mono); font-size: 0.8rem; }
+.btn-small { font-size: 0.76rem; padding: 0.22rem 0.6rem; }
+.btn:disabled { color: var(--ink-soft); cursor: default; border-color: var(--line); }
+
+.review-intro { font-size: 0.8rem; color: var(--ink-soft); margin: 0 0 0.9rem; }
+.review-item { border: 1px solid var(--line-strong); background: var(--paper-alt); padding: 0.75rem 0.9rem; margin-bottom: 0.8rem; }
+.review-item.focus { border-color: var(--ochre); box-shadow: 0 0 0 2px var(--ochre-soft); }
+.review-link { font-family: var(--font-mono); font-size: 0.82rem; word-break: break-all; }
+.review-reason {
+  display: inline-block; font-size: 0.72rem; color: var(--ochre); border: 1px solid var(--ochre);
+  background: var(--ochre-soft); padding: 0 0.35rem; margin: 0.35rem 0 0.15rem;
+}
+.review-was { font-size: 0.82rem; margin: 0.25rem 0; }
+.review-note { font-size: 0.8rem; color: var(--ink-soft); }
+.basis-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin: 0.5rem 0; }
+.basis-col { border: 1px solid var(--line); background: var(--paper); padding: 0.35rem 0.5rem; font-size: 0.78rem; word-break: break-word; }
+.basis-col-title { font-size: 0.7rem; color: var(--ink-soft); margin-bottom: 0.1rem; }
+.review-cands { margin: 0.5rem 0 0.2rem; font-size: 0.8rem; }
+.review-cands-title { font-size: 0.74rem; color: var(--ink-soft); }
+.review-cand { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; padding: 0.25rem 0; border-top: 1px dashed var(--line); }
+.review-cand .review-link { flex: 1; min-width: 12rem; }
+.review-branches { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin: 0.5rem 0; }
+.review-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.55rem; align-items: center; }
+.review-actions .form-input { flex: 1 1 100%; font-size: 0.8rem; }
+.review-quiet-title { font-size: 0.8rem; color: var(--ink-soft); margin: 1.4rem 0 0.4rem; padding-bottom: 0.25rem; border-bottom: 1px solid var(--line); }
+.review-quiet { font-size: 0.8rem; color: var(--ink-soft); padding: 0.35rem 0; border-bottom: 1px solid var(--line); }
+.review-quiet .review-link { color: var(--ink); }
+
+.records-row { border-bottom: 1px solid var(--line); padding: 0.7rem 0; }
+.records-kind { font-weight: 600; font-size: 0.88rem; }
+.records-path { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: baseline; margin-top: 0.2rem; }
+.records-count { font-size: 0.84rem; margin-top: 0.15rem; }
+.records-problem { font-size: 0.8rem; color: var(--clay); margin-top: 0.2rem; }
+.pagefoot { gap: 1.2rem; }
 
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
@@ -633,11 +731,16 @@ body.canvas-mode .pagefoot { max-width: none; padding: 0.2rem 1rem; border-top: 
     <div class="project-line" id="project-line"></div>
   </header>
   <main id="main">
+    <!-- V5: what the record needs from the researcher right now (a
+         migration waiting, a ledger RCE cannot trust, the shrink question,
+         a read-only open, a project moved under the page). -->
+    <div id="notices" class="notices" aria-live="polite"></div>
     <section id="view-tree" class="view"></section>
     <section id="view-lineage" class="view hidden"></section>
     <section id="view-canvas" class="view hidden"></section>
   </main>
   <footer class="pagefoot">
+    <button id="records-btn" class="shutdown-btn" type="button" title="查看这个项目的人工记录放在哪里">记录</button>
     <button id="shutdown-btn" class="shutdown-btn" type="button" title="停止本地服务进程">停止服务</button>
   </footer>
 </div>
@@ -689,6 +792,13 @@ const state = {
   attemptsConfig: null, projectState: null,
   dataEpoch: 0,
   headerError: false, // the header line holds a blocking error (showHeaderError)
+  // V5 (DESIGN.md 9.3-9.6): the last /api/summary (what the record needs
+  // from the researcher: a migration, an untrusted ledger, the shrink
+  // question, a read-only open), the migration preview fetched for it,
+  // a write refused because the folder moved under the page, and notes
+  // an answer left to read (dismissed by the researcher).
+  summary: null, migrationInfo: null, projectMoved: false, sessionNotes: [],
+  noticeBusy: false, noticeSig: null, reviewOffer: null,
 };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
@@ -775,7 +885,14 @@ async function apiPost(path, payload) {
     }
   }
   if (!res.ok) {
-    throw apiError(path, res, body);
+    const err = apiError(path, res, body);
+    // 9.4: a write refused because the folder moved (or was claimed
+    // elsewhere) under this page -- the page says so until it is reopened.
+    if (err.state === "project_moved" && !state.projectMoved) {
+      state.projectMoved = true;
+      renderNotices();
+    }
+    throw err;
   }
   return body;
 }
@@ -785,6 +902,122 @@ function escapeHtml(value) {
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
   ));
 }
+
+// -- Judgment wording (pure; DESIGN.md 9.3, 9.6, 9.12) -----------------------
+// How a ledger entry, a basis and a link under review read in product
+// language. Pure functions of their arguments -- tests/test_v5_phase7.py
+// loads this block into node -- used by the 待复核 list, the shrink
+// question and (at run time) canvas.js's link card and hover text. A
+// migrated entry's time is the migration's, so it is never shown as when
+// the researcher judged (9.12): it reads MIGRATED_AT_LABEL instead.
+const MIGRATED_AT_LABEL = "迁移自旧索引（原判断时间未知）";
+const VERDICT_WORDS = { confirmed: "确认", rejected: "否决", withdrawn: "撤回", undone: "撤销" };
+const VIA_WORDS = { canvas: "在画布上", cli: "在命令行里", mcp: "通过 MCP" };
+const LINK_VERBS = {
+  reads: "读取", writes: "写出", generates: "生成", backed_by: "依据", includes: "引用",
+  cites: "引用文献", produces: "产出", implements: "实现", uses: "使用", supports: "支持",
+  authored_by: "提交者",
+};
+const NODE_KIND_WORDS = { claim: "论断", experiment: "实验", commit: "提交", paper: "论文", reference: "文献", attempt: "尝试" };
+const BASIS_RECORDED_WORDS = {
+  "at-migration": "（迁移时核对过）", "last-known": "（最近一次读到时）", "old-index": "（旧索引里的记录）",
+};
+
+function verdictWord(verdict) {
+  return Object.prototype.hasOwnProperty.call(VERDICT_WORDS, verdict) ? VERDICT_WORDS[verdict] : String(verdict || "");
+}
+
+// When an entry was made, as written by the machine that made it (no
+// time-zone arithmetic: `at` is for a person to read, 9.3).
+function whenText(entry) {
+  if (!entry) return "";
+  if (entry.migrated) return entry.at_label || MIGRATED_AT_LABEL;
+  const at = entry.at == null ? "" : String(entry.at);
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(at) ? at.slice(0, 10) + " " + at.slice(11, 16) : at;
+}
+
+// The facts a judgment rested on (9.6's table), one readable line each.
+function basisLines(basis) {
+  if (basis == null || typeof basis !== "object") return [];
+  const keys = Object.keys(basis);
+  if (!keys.length) return ["只凭这条关联本身"];
+  return keys.map((k) => {
+    const v = basis[k];
+    if (k === "calls") return "调用：" + [].concat(v).join("、");
+    if (k === "artifacts") return "产物：" + [].concat(v).join("、");
+    if (k === "sentence") return "论断：「" + v + "」";
+    if (k === "number") return "数值：" + v;
+    if (k === "old_index") {
+      // 9.5 step 2: the old index held several bases at once; each is kept
+      // as it was stored (canonical JSON), never merged into one.
+      const each = [].concat(v).map((b) => {
+        let parsed = b;
+        try { parsed = typeof b === "string" ? JSON.parse(b) : b; } catch (err) { return String(b); }
+        return parsed && typeof parsed === "object" ? basisLines(parsed).join("，") : String(b);
+      });
+      return "旧索引里记着几种不同的依据：" + each.join(" / ");
+    }
+    if (k === "metrics") {
+      const names = v && typeof v === "object" ? Object.keys(v).map((n) => n + " = " + v[n]) : [];
+      return "指标：" + (names.length ? names.join("、") : "没有对得上的指标");
+    }
+    return k + "：" + (typeof v === "string" ? v : JSON.stringify(v));
+  });
+}
+
+function basisText(basis) {
+  const lines = basisLines(basis);
+  return lines.length ? lines.join("；") : "（没有记录依据）";
+}
+
+// One end of a link, as a person names it: the file's basename, or for a
+// claim / experiment / ... its kind and file.
+function endName(id) {
+  const s = String(id || "");
+  const colon = s.indexOf(":");
+  const kind = colon > 0 ? s.slice(0, colon) : "";
+  const rest = colon > 0 ? s.slice(colon + 1) : s;
+  const file = rest.split("#")[0];
+  const base = file.split("/").filter(Boolean).pop() || file || rest;
+  return Object.prototype.hasOwnProperty.call(NODE_KIND_WORDS, kind) ? NODE_KIND_WORDS[kind] + "（" + base + "）" : base;
+}
+
+// A link {src, dst, type} in product language: 「17.Rmd 读取 panel.csv」.
+function linkText(key) {
+  const verb = Object.prototype.hasOwnProperty.call(LINK_VERBS, key.type) ? LINK_VERBS[key.type] : key.type;
+  return endName(key.src) + " " + verb + " " + endName(key.dst);
+}
+
+// Who did what, when, from where: 「2026-10-04 21:15 · 你在画布上否决」.
+function historyEntryText(entry) {
+  const what = entry.verdict === "undone" ? "撤销了上一步"
+    : entry.verdict === "withdrawn" ? "撤回了判断" : verdictWord(entry.verdict);
+  if (entry.migrated) return whenText(entry) + " · " + what;
+  if (entry.via === "recovered") return whenText(entry) + " · 补回文件里缺少的判断：" + what;
+  const via = Object.prototype.hasOwnProperty.call(VIA_WORDS, entry.via) ? VIA_WORDS[entry.via] : "";
+  return whenText(entry) + " · 你" + via + what;
+}
+
+// The basis a verdict was made on, for its history line ("" for an undo
+// or a withdrawal, which rest on nothing of their own).
+function historyBasisText(entry) {
+  if (entry.verdict !== "confirmed" && entry.verdict !== "rejected") return "";
+  if (entry.basis_recorded === "not-produced") return "依据：当时的扫描没有得出这条关联";
+  if (entry.basis == null) return "依据：没有记录";
+  return "依据 · " + basisText(entry.basis) + (BASIS_RECORDED_WORDS[entry.basis_recorded] || "");
+}
+
+// The hover line of a link whose old judgment waits (9.6): 「你曾于
+// 2026-10-04 否决 · 依据已变化，待复核」. `j` is a link's `judgement`.
+function reviewHoverText(j) {
+  if (!j) return "";
+  if (j.outcome === "conflict") return "记录冲突，待处理";
+  const who = j.migrated
+    ? "你曾" + verdictWord(j.verdict) + "（" + (j.at_label || MIGRATED_AT_LABEL) + "）"
+    : "你曾于 " + String(j.at || "").slice(0, 10) + " " + verdictWord(j.verdict);
+  return who + " · " + (j.label || "依据已变化") + "，待复核";
+}
+// -- end of judgment wording --------------------------------------------------
 
 // -- Errors that blocked an action (DESIGN.md 8.8 "Errors") -----------------
 // One helper for every place an error has just stopped something the
@@ -807,7 +1040,7 @@ const BLOCKING_ERROR_TEXT = {
   human_link: "这是你的标注：请用「删除标注」移除",
   // DESIGN.md 9.4 / 9.7 / 9.10: a write that was refused, nothing written
   project_moved: "项目已移动或已在别处认领，请重新打开",
-  needs_migration: "这个项目来自旧版本：迁移之后才能保存人工记录，现在只能浏览",
+  needs_migration: "迁移后才能记录判断：这个项目来自旧版本，请先在页面上方迁移旧记录",
   read_only: "项目当前是只读打开的，不会写入任何东西",
   project_busy: "另一个 RCE 进程正在写入这个项目，请稍后再试",
   project_blocked: "这个项目需要你先确认，确认之前不会写入任何东西",
@@ -815,6 +1048,13 @@ const BLOCKING_ERROR_TEXT = {
   record_untrusted: "判断记录文件当前无法读取，请先恢复它",
   record_shrunk: "判断记录文件比图谱少了几条判断，需要你先确认以哪一份为准",
   layout_unreadable: "画布位置记录文件无法读取，请先修复它",
+  // DESIGN.md 9.3's question and 9.4 / 9.5's answers, refused: nothing written
+  record_question_changed: "记录文件在提问之后又变了，请重新查看问题再回答",
+  record_would_lose: "记录文件当前为空或无法使用，以文件为准会丢掉仅存的判断副本；请先恢复文件，或选择「把缺少的补回文件」",
+  no_question: "现在已经没有需要回答的问题了，记录文件可能已经恢复",
+  answer_refused: "项目的情况在你选择之前又变了，没有写入任何东西；请看看现在的问题再选",
+  not_this_project: "这个文件夹带着别的项目身份（或没有身份），不是要找的项目；什么都没有关联",
+  migration_refused: "现在不能迁移：没有等待迁移的旧索引，或这个文件夹的状态不允许迁移",
 };
 
 function blockingErrorText(framing, err) {
@@ -885,7 +1125,9 @@ function setProjectState(err) {
   const name = projectStateOf(err);
   if (!name) return false;
   state.projectState = name;
-  projectStateChip.textContent = PROJECT_STATES[name].chip;
+  // 9.4: a registry entry whose folder is gone says exactly that.
+  projectStateChip.textContent = (err.situation && err.situation.situation === "missing")
+    ? SITUATION_TITLES.missing : PROJECT_STATES[name].chip;
   projectStateChip.title = err.message;
   projectStateChip.classList.remove("hidden");
   // Rule 2's one-message rule, applied the moment the state appears rather
@@ -908,6 +1150,11 @@ function clearProjectState() {
 function renderStateNote(container, err) {
   const name = projectStateOf(err);
   container.innerHTML = "";
+  if (name === "project_blocked" && err.situation && typeof err.situation === "object") {
+    // DESIGN.md 9.4: the question itself, with its answers as buttons.
+    container.appendChild(renderSituation(err));
+    return;
+  }
   const box = document.createElement("div");
   box.className = "state-note";
   box.title = err.message; // the engine's own English, folded onto the hover
@@ -1018,19 +1265,43 @@ async function loadProjectSummary(force) {
   try {
     const data = await fetchSummary();
     if (!data) return; // the project was switched meanwhile; its own refresh is under way
+    // V5: what the record needs from the researcher rides on the same
+    // fetch (notices above the views), whatever the header line shows.
+    state.summary = data;
+    renderNotices();
+    if (data.needs_migration) ensureMigrationInfo(data);
     if (state.headerError) return;
     // Registry label when loadProjects() found one, else the directory
     // basename -- never the raw path, which lives on as the hover title.
     const label = state.projectLabel || basename(data.project_root);
-    // 9.6: an old judgment waiting for review is counted here, never in 待确认.
-    const review = data.review ? "   ·   待复核：" + data.review : "";
-    line.textContent = "项目：" + label + "   ·   待确认：" + data.pending + review;
+    line.textContent = "";
     line.title = data.project_root;
+    const part = (text) => {
+      const span = document.createElement("span");
+      span.className = "line-part";
+      span.textContent = text;
+      return span;
+    };
+    line.append(part("项目：" + label), "   ·   ", part("待确认：" + data.pending));
+    if (typeof data.review === "number") {
+      // 9.6: an old judgment waiting for review (or a record conflict) is
+      // counted here, never in 待确认; the count opens the list.
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "review-count-btn line-part" + (data.review > 0 ? " has" : "");
+      btn.id = "review-count";
+      btn.textContent = "待复核：" + data.review;
+      btn.title = "查看证据变了的旧判断";
+      btn.addEventListener("click", (e) => { e.stopPropagation(); openReviewPanel(null); });
+      line.append("   ·   ", btn);
+    }
     // The edit form's column names (attemptsConfig, above) ride along on
     // this same fetch (task V3 phase 3) -- kept fresh so a config edit
     // mid-serve is picked up by the next summary refresh, not only by a
     // full page reload.
   } catch (err) {
+    state.summary = null;
+    renderNotices();
     if (state.headerError) return;
     line.textContent = "";
     line.title = "";
@@ -1083,11 +1354,16 @@ async function loadProjects() {
     // rule 3): 「目录已不存在」 is a dead entry worth removing; 「未初始化」 is a
     // real directory that simply needs `rce init`, and must NOT be offered
     // for removal.
-    const mark = !p.available ? "（目录已不存在）" : (p.initialized ? "" : "（未初始化）");
+    // 9.4: an entry with an id whose folder is gone (or now holds another
+    // project) stays choosable -- opening it asks for 「选择新位置…」.
+    const relocatable = !!(p.missing && p.id);
+    const mark = relocatable ? "（找不到项目文件夹，可能已移动）"
+      : !p.available ? "（目录已不存在）" : (p.initialized ? "" : "（未初始化）");
     opt.textContent = p.label + mark;
     opt.value = p.path;
+    if (p.id) opt.dataset.id = p.id;
     opt.title = p.path;
-    opt.disabled = !p.initialized || !p.available;
+    opt.disabled = relocatable ? false : (!p.initialized || !p.available);
     opt.selected = p.path === current;
     projectSwitcher.appendChild(opt);
   });
@@ -1148,6 +1424,11 @@ async function reloadAllViews() {
   state.dataEpoch += 1;
   state.attemptsById = new Map();
   state.attemptsConfig = null;
+  state.summary = null;
+  state.migrationInfo = null;
+  state.projectMoved = false;
+  state.reviewOffer = null;
+  renderNotices();
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
@@ -1166,14 +1447,16 @@ async function reloadAllViews() {
 
 projectSwitcher.addEventListener("change", async () => {
   projectSwitcher.disabled = true;
+  const chosen = projectSwitcher.options[projectSwitcher.selectedIndex];
   try {
-    await apiPost("/api/projects/switch", { path: projectSwitcher.value });
+    await apiPost("/api/projects/switch", { path: projectSwitcher.value, id: chosen && chosen.dataset.id ? chosen.dataset.id : undefined });
   } catch (err) {
     showHeaderError("切换项目失败", err);
     await loadProjects(); // resync the select with what the server actually serves
     projectSwitcher.disabled = false;
     return;
   }
+  state.sessionNotes = []; // notes about the previous project
   await reloadAllViews();
   projectSwitcher.disabled = false;
 });
@@ -1220,7 +1503,11 @@ function hideRefreshChip() {
 }
 
 function updateChipFromStatus(status) {
-  if (status.last_error && state.projectState) {
+  // One cause, one message (8.10 rule 2): a project state, a move under the
+  // page, or a pre-V5 index waiting for its migration (the new code cannot
+  // rescan the old store; the banner says what to do) is the cause.
+  const explained = state.projectState || state.projectMoved || (state.summary && state.summary.needs_migration);
+  if (status.last_error && explained) {
     hideRefreshChip();
   } else if (status.last_error) {
     refreshChip.classList.remove("hidden");
@@ -1240,7 +1527,11 @@ function updateChipFromStatus(status) {
 // If that fails the panel is left as it stands until the next bump.
 async function revalidatePanel() {
   const subject = state.panelSubject;
-  if (!subject || subject.kind !== "attempt" || panel.classList.contains("hidden")) return;
+  if (!subject || panel.classList.contains("hidden")) return;
+  // V5: the 待复核 list and the 记录 inventory follow the record live.
+  if (subject.kind === "review") { await renderReviewPanel(subject); return; }
+  if (subject.kind === "records") { await renderRecordsPanel(subject); return; }
+  if (subject.kind !== "attempt") return;
   try {
     if (!(await ensureAttemptData())) return;
   } catch (err) {
@@ -1498,6 +1789,8 @@ function fileList(entries, direction) {
       flag.textContent = "（文件不存在）";
       li.appendChild(flag);
     }
+    // 9.6 "Where it shows" (决策树): a link whose old judgment waits.
+    if ((entry.review || entry.conflict) && entry.link) li.appendChild(reviewTag(entry));
     li.addEventListener("click", () => openFilePanel(entry.path));
     ul.appendChild(li);
   });
@@ -1613,6 +1906,31 @@ function scriptRefSpan(scriptPath, line, callee, human) {
   return span;
 }
 
+// 9.6 "Where it shows" (决策树, 血缘): a compact 「待复核」 tag on a line
+// whose link's old judgment waits -- a formerly rejected link back at the
+// machine's status must never pass for an ordinary one. It opens the
+// 待复核 list at that item. `entry` carries `link` and `judgement`.
+function reviewTag(entry) {
+  const tag = document.createElement("button");
+  tag.type = "button";
+  tag.className = "review-tag";
+  tag.textContent = "待复核";
+  tag.title = entry.conflict ? "记录冲突，待处理" : reviewHoverText(entry.judgement);
+  tag.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openReviewPanel(entry.link);
+  });
+  return tag;
+}
+
+function withReviewTag(span, entry) {
+  if (!(entry.review || entry.conflict) || !entry.link) return span;
+  const wrap = document.createElement("span");
+  wrap.append(span, reviewTag(entry));
+  return wrap;
+}
+
 function subList(label, entries, renderEntry) {
   const wrap = document.createElement("div");
   wrap.className = "lineage-sub";
@@ -1634,7 +1952,7 @@ function renderOrphanItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.readers && item.readers.length) {
-    div.appendChild(subList("被这些脚本读取", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
+    div.appendChild(subList("被这些脚本读取", item.readers, (r) => withReviewTag(scriptRefSpan(r.script, r.line, r.callee, r.human), r)));
   }
   return div;
 }
@@ -1644,10 +1962,10 @@ function renderChainItem(item) {
   div.className = "lineage-item";
   div.appendChild(clickablePath(item.path));
   if (item.writers && item.writers.length) {
-    div.appendChild(subList("由这些脚本写出", item.writers, (w) => scriptRefSpan(w.script, w.line, w.callee, w.human)));
+    div.appendChild(subList("由这些脚本写出", item.writers, (w) => withReviewTag(scriptRefSpan(w.script, w.line, w.callee, w.human), w)));
   }
   if (item.readers && item.readers.length) {
-    div.appendChild(subList("被这些脚本读取", item.readers, (r) => scriptRefSpan(r.script, r.line, r.callee, r.human)));
+    div.appendChild(subList("被这些脚本读取", item.readers, (r) => withReviewTag(scriptRefSpan(r.script, r.line, r.callee, r.human), r)));
   }
   return div;
 }
@@ -2330,6 +2648,880 @@ function renderAttemptForm(mode, attemptId) {
 
 document.getElementById("new-attempt-btn").addEventListener("click", () => openAttemptForm("append"));
 
+// -- The human record's surfaces (DESIGN.md 9.3-9.6, task V5 phase 7) --------
+// The 待复核 list (9.6), the 记录 inventory (9.2), the identity questions
+// (9.4), the migration banner (9.5), the ledger's trust and shrink states
+// (9.3). Every write goes through an existing origin-checked endpoint and
+// the server's one human write path; every refusal is shown with the
+// shared helper (a Chinese sentence, the engine's text behind 「详情」).
+
+const JUDGE_UNDO_MS = 10000; // as long as the canvas's 「撤销」 offer
+
+function mk(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function mkButton(label, cls, onClick) {
+  const b = mk("button", cls || "btn btn-small", label);
+  b.type = "button";
+  if (onClick) b.addEventListener("click", onClick);
+  return b;
+}
+
+function keyOf(x) {
+  return { src: x.src, dst: x.dst, type: x.type, extractor: x.extractor };
+}
+
+function keyId(x) {
+  return JSON.stringify([x.src, x.dst, x.type, x.extractor]);
+}
+
+function setStatus(el, cls, text, err) {
+  el.className = "notice-status" + (cls ? " " + cls : "");
+  if (err) renderBlockingError(el, text, err);
+  else { el.textContent = text || ""; el.title = ""; }
+}
+
+// What stops a human record before it is even tried (9.10, 9.4): the page
+// says it in place of the action rather than letting the click fail.
+function humanRecordsBlocked() {
+  const s = state.summary;
+  if (!s) return null;
+  if (s.needs_migration) return "迁移后才能记录判断";
+  if (s.read_only) return "只读打开：不会写入任何东西";
+  return null;
+}
+
+// One human act on one machine link, through POST /api/judgements (the
+// one write path, 9.1). Resolves the response, or throws the refusal.
+function postJudgement(key, verdict, note) {
+  const body = Object.assign(keyOf(key), { verdict: verdict });
+  if (note && note.trim()) body.note = note.trim();
+  return apiPost("/api/judgements", body);
+}
+
+// -- 待复核 (9.6) ---------------------------------------------------------------
+
+const reviewNotes = new Map(); // keyId -> a note being typed, kept across re-renders
+
+async function openReviewPanel(focus) {
+  const subject = { kind: "review", focus: focus ? keyId(focus) : null, scrolled: false };
+  state.panelSubject = subject;
+  panelTitle.textContent = "待复核";
+  panelTitle.title = "";
+  panelSubtitle.textContent = "证据变了的旧判断，等你再看一眼";
+  panelBody.innerHTML = '<p class="empty-note">载入中…</p>';
+  openPanel();
+  await renderReviewPanel(subject);
+}
+
+function reasonNow(item) {
+  if (item.basis_now) return basisLines(item.basis_now);
+  if (item.reason === "not_produced") return ["本次扫描读到了两端，但没有得出这条关联"];
+  if (item.reason === "endpoint_gone") return ["关联的一端不在本次扫描结果里"];
+  return ["本次扫描没有给出依据"];
+}
+
+function basisColumn(title, lines) {
+  const col = mk("div", "basis-col");
+  col.appendChild(mk("div", "basis-col-title", title));
+  (lines.length ? lines : ["（没有记录依据）"]).forEach((l) => col.appendChild(mk("div", null, l)));
+  return col;
+}
+
+function reviewActions(item) {
+  if (item.outcome === "conflict") {
+    return [["定为确认", "confirmed"], ["定为否决", "rejected"], ["撤回", "withdrawn"]];
+  }
+  const opposite = item.verdict === "confirmed" ? ["改为否决", "rejected"] : ["改为确认", "confirmed"];
+  return [["仍然成立", item.verdict], opposite, ["撤回", "withdrawn"]];
+}
+
+async function judgeFromReview(target, verdict, note, statusEl, buttons, done) {
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", "正在记录…");
+  try {
+    const res = await postJudgement(target, verdict, note);
+    // This page re-fetches right below; the poll need not do it again.
+    if (res && typeof res.generation === "number") lastGeneration = res.generation;
+  } catch (err) {
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", "没能记录这条判断", err);
+    return;
+  }
+  reviewNotes.delete(keyId(target));
+  state.reviewOffer = { text: done + "：" + linkText(target), key: keyOf(target), until: Date.now() + JUDGE_UNDO_MS };
+  setTimeout(() => {
+    if (state.reviewOffer && state.reviewOffer.until <= Date.now()) {
+      state.reviewOffer = null;
+      const subject = state.panelSubject;
+      if (subject && subject.kind === "review") renderReviewPanel(subject);
+    }
+  }, JUDGE_UNDO_MS + 50);
+  await refreshCurrentView(); // the count, the marks and this list, now
+}
+
+async function undoFromReview(key, statusEl) {
+  state.reviewOffer = null;
+  setStatus(statusEl, "", "正在撤销…");
+  try {
+    const res = await postJudgement(key, "undone");
+    if (res && typeof res.generation === "number") lastGeneration = res.generation;
+  } catch (err) {
+    setStatus(statusEl, "err", "无法撤销", err);
+    return;
+  }
+  await refreshCurrentView();
+}
+
+function renderReviewItem(item, subject) {
+  const id = keyId(item);
+  const box = mk("div", "review-item" + (subject.focus === id ? " focus" : ""));
+  box.dataset.key = id;
+  const link = mk("div", "review-link", linkText(item));
+  link.title = item.src + " → " + item.dst + "（" + item.type + " · " + item.extractor + "）";
+  box.append(link, mk("span", "review-reason", item.label || "待复核"));
+  if (item.outcome === "conflict") {
+    const d = item.detail || {};
+    box.appendChild(mk("p", "review-note", d.contradicts
+      ? "迁移来的旧判断和记录里已有的判断相反（两台电脑各判断过一次）。RCE 不按迁移日期替你选，请写一条新判断定下它。"
+      : "两份记录各自追加了不同的内容（可能是两台电脑各改了一份，再被同步合并）。RCE 不按时间替你选，请写一条新判断定下它。"));
+    if (d.common && d.common.length) box.appendChild(mk("div", "review-note", "共同的记录：" + d.common.map(historyEntryText).join("；")));
+    const branches = mk("div", "review-branches");
+    (d.branches || []).forEach((branch, i) => {
+      const col = mk("div", "basis-col");
+      col.appendChild(mk("div", "basis-col-title", (d.contradicts ? ["记录里原有的", "迁移来的"][i] : "第 " + (i + 1) + " 份") || ("第 " + (i + 1) + " 份")));
+      branch.forEach((e) => col.appendChild(mk("div", null, historyEntryText(e) + (e.note ? " · " + e.note : ""))));
+      branches.appendChild(col);
+    });
+    box.appendChild(branches);
+  } else {
+    box.appendChild(mk("div", "review-was", "原判断：" + verdictWord(item.verdict) + " · " + whenText(item)));
+    if (item.note) box.appendChild(mk("div", "review-note", "备注：" + item.note));
+    const pair = mk("div", "basis-pair");
+    pair.append(basisColumn("当时的依据", basisLines(item.basis)), basisColumn("现在", reasonNow(item)));
+    box.appendChild(pair);
+  }
+  const noteInput = mk("input", "form-input");
+  noteInput.placeholder = "备注（可选）";
+  noteInput.dataset.noteFor = id;
+  noteInput.value = reviewNotes.get(id) || "";
+  noteInput.addEventListener("input", () => reviewNotes.set(id, noteInput.value));
+  const status = mk("div", "notice-status");
+  const buttons = [];
+  const candidates = item.candidates || [];
+  if (candidates.length && (item.verdict === "confirmed" || item.verdict === "rejected")) {
+    const cands = mk("div", "review-cands");
+    cands.appendChild(mk("div", "review-cands-title",
+      "可能对应的新关联（同一次扫描里新出现）：旧判断不会自己转过去，点了才会在它上面记下一条新判断，旧的这条保持原样。"));
+    candidates.forEach((c) => {
+      const row = mk("div", "review-cand");
+      const t = mk("span", "review-link", linkText(c));
+      t.title = c.src + " → " + c.dst;
+      const b = mkButton("把这条旧判断用到它上面", "btn btn-small", () =>
+        judgeFromReview(c, item.verdict, noteInput.value, status, buttons, "已用到新关联上（" + verdictWord(item.verdict) + "）"));
+      buttons.push(b);
+      row.append(t, b);
+      cands.appendChild(row);
+    });
+    box.appendChild(cands);
+  }
+  const actions = mk("div", "review-actions");
+  const blocked = humanRecordsBlocked();
+  if (blocked) {
+    actions.appendChild(mk("span", "review-note", blocked));
+  } else {
+    actions.appendChild(noteInput);
+    reviewActions(item).forEach(([label, verdict]) => {
+      const done = verdict === "withdrawn" ? "已撤回" : label === "仍然成立" ? "已记录：仍然成立" : "已" + label;
+      const b = mkButton(label, "btn btn-small", () => judgeFromReview(item, verdict, noteInput.value, status, buttons, done));
+      buttons.push(b);
+      actions.appendChild(b);
+    });
+  }
+  box.append(actions, status);
+  return box;
+}
+
+function sourceFiles(item) {
+  const d = item.detail || {};
+  if (Array.isArray(d.sources) && d.sources.length) return d.sources;
+  return [String(item.src).slice(String(item.src).indexOf(":") + 1)];
+}
+
+async function renderReviewPanel(subject) {
+  let data;
+  try {
+    data = await apiGet("/api/review");
+  } catch (err) {
+    if (state.panelSubject !== subject) return;
+    renderViewFailure(panelBody, err);
+    return;
+  }
+  if (state.panelSubject !== subject) return;
+  const top = panelBody.scrollTop;
+  panelBody.innerHTML = "";
+  const ledger = data.ledger || {};
+  if (ledger.state && ledger.state !== "ok") {
+    const warn = mk("div", "notice bad");
+    warn.appendChild(mk("div", "notice-title", ledger.message || "判断记录文件当前无法读取，请先恢复它"));
+    warn.appendChild(mk("p", null, "修好之前，这里的操作都不会被记录。"));
+    panelBody.appendChild(warn);
+  }
+  const offer = state.reviewOffer;
+  const offerStatus = mk("div", "panel-status ok");
+  if (offer && offer.until > Date.now()) {
+    offerStatus.appendChild(mk("span", null, offer.text));
+    const undo = mkButton("撤销", "err-detail-toggle", () => undoFromReview(offer.key, offerStatus));
+    offerStatus.appendChild(undo);
+  }
+  panelBody.appendChild(offerStatus);
+  panelBody.appendChild(mk("p", "review-intro",
+    "这些判断做出时依据的事实，这次扫描看到的不一样了。判断没有被删掉，也没有被套用：连线暂时按机器的结果显示，等你决定。"));
+  if (!data.review.length) panelBody.appendChild(mk("p", "empty-note", "没有待复核的旧判断。"));
+  data.review.forEach((item) => panelBody.appendChild(renderReviewItem(item, subject)));
+  const held = data.source_unreadable || [], absent = data.not_in_index || [];
+  if (held.length || absent.length) {
+    panelBody.appendChild(mk("div", "review-quiet-title", "不计入待复核"));
+    held.forEach((item) => {
+      const row = mk("div", "review-quiet");
+      row.append(mk("span", "review-link", linkText(item)),
+        " · 来源文件暂不可读：" + sourceFiles(item).join("、") + " · 判断照旧（" + verdictWord(item.verdict) + "）");
+      panelBody.appendChild(row);
+    });
+    absent.forEach((item) => {
+      const row = mk("div", "review-quiet");
+      row.append(mk("span", "review-link", linkText(item)),
+        " · 图谱里还没有这条关联 · 你的判断：" + verdictWord(item.verdict) + "（" + whenText(item) + "）");
+      panelBody.appendChild(row);
+    });
+  }
+  if (subject.focus && !subject.scrolled) {
+    subject.scrolled = true;
+    const target = Array.from(panelBody.querySelectorAll(".review-item")).find((n) => n.dataset.key === subject.focus);
+    if (target && target.scrollIntoView) target.scrollIntoView({ block: "center" });
+  } else {
+    panelBody.scrollTop = top;
+  }
+}
+
+// -- 记录 (9.2: what `rce records` prints) -------------------------------------
+
+const RECORD_KIND_WORDS = {
+  judgements: "对机器连线的确认与否决",
+  mappings: "手工连线与备注",
+  attempts: "尝试结论",
+  attempts_config: "尝试年表配置",
+  canvas: "画布位置",
+  variables: "变量定义卡",
+  legacy: "旧版本索引里的判断",
+};
+
+const RECORD_ISSUE_WORDS = {
+  dataless: "正在从云端下载", unreadable: "无法读取", conflict_copy: "旁边有同步冲突副本",
+  invalid: "内容无法解析", refused_entries: "有条目没有被采用（运行 rce mappings 查看）",
+  migration_unfinished: "上次迁移没有完成", needs_migration: "等待迁移",
+};
+
+function recordCountText(row) {
+  const f = row.facts || {};
+  switch (row.code) {
+    case "judgements":
+      if (typeof f.entries === "number") {
+        return f.entries + " 条记录，其中 " + f.standing + " 条判断生效中" + (f.conflicts ? "，" + f.conflicts + " 条记录冲突" : "");
+      }
+      return f.file_state === "absent" ? "还没有" : "无法读取";
+    case "mappings":
+      if (f.state === "present") return f.links + " 条手工连线，其中 " + f.with_note + " 条带备注";
+      return f.state === "absent" ? "还没有" : "无法读取";
+    case "attempts":
+      if (f.state === "present") return f.attempts + " 条尝试，其中 " + f.with_verdict + " 条有结论";
+      return { not_configured: "还没有配置尝试年表", unusable: "年表配置无法使用", table_missing: "找不到年表" }[f.state] || "无法读取";
+    case "attempts_config":
+      return f.exists ? "已配置" : "没有";
+    case "canvas":
+      if (f.state === "ok" || f.state === "legacy") {
+        return f.views + " 个视图，其中 " + f.arranged + " 个摆放过" + (f.state === "legacy" ? "（还在索引旁，尚未移入项目）" : "");
+      }
+      return f.state === "absent" ? "还没有摆放过" : f.state === "dataless" ? "正在从云端下载…" : "无法读取";
+    case "variables":
+      return f.exists ? f.cards + " 张卡片" : "还没有";
+    case "legacy":
+      return f.waiting + " 个旧索引等待迁移";
+    default:
+      return row.count || "";
+  }
+}
+
+function recordIssueText(row) {
+  const f = row.facts || {};
+  const words = (f.issues || []).map((code) => {
+    if (code === "invalid" && f.line) return "第 " + f.line + " 行无法解析";
+    if (Object.prototype.hasOwnProperty.call(RECORD_ISSUE_WORDS, code)) return RECORD_ISSUE_WORDS[code];
+    return f.trust_message || "需要处理";
+  });
+  return Array.from(new Set(words)).join("；");
+}
+
+async function openRecordsPanel() {
+  const subject = { kind: "records" };
+  state.panelSubject = subject;
+  panelTitle.textContent = "人工记录";
+  panelTitle.title = "";
+  panelSubtitle.textContent = "你的劳动成果，保存在项目自己的 .rce/ 里；删掉索引也不会丢";
+  panelBody.innerHTML = '<p class="empty-note">载入中…</p>';
+  openPanel();
+  await renderRecordsPanel(subject);
+}
+
+async function renderRecordsPanel(subject) {
+  let data;
+  try {
+    data = await apiGet("/api/records");
+  } catch (err) {
+    if (state.panelSubject !== subject) return;
+    renderErrorBox(panelBody, err);
+    return;
+  }
+  if (state.panelSubject !== subject) return;
+  panelBody.innerHTML = "";
+  (data.rows || []).forEach((row) => {
+    const div = mk("div", "records-row");
+    div.appendChild(mk("div", "records-kind", RECORD_KIND_WORDS[row.code] || row.kind));
+    const where = mk("div", "records-path");
+    where.appendChild(mk("span", "mono", row.path));
+    const status = mk("div", "panel-status");
+    const inside = row.code !== "legacy" && row.path && row.path !== "-" && row.path.charAt(0) !== "/";
+    if (inside) {
+      // 在 Finder 中显示: the file itself, or the .rce/ folder it will live in.
+      const target = (row.facts && row.facts.exists) ? row.path : ".rce";
+      where.appendChild(mkButton("在 Finder 中显示", "err-detail-toggle", () => runOpenAction(target, true, status)));
+    }
+    div.append(where, mk("div", "records-count", recordCountText(row)));
+    div.appendChild(mk("div", "fact-line", row.snapshot ? "最新快照：" + row.snapshot : "还没有快照"));
+    if (row.problems && row.problems.length) {
+      const problem = mk("div", "records-problem");
+      renderBlockingError(problem, recordIssueText(row) || "需要处理", row.problems.join("\n"));
+      div.appendChild(problem);
+    }
+    div.appendChild(status);
+    panelBody.appendChild(div);
+  });
+}
+
+document.getElementById("records-btn").addEventListener("click", () => openRecordsPanel());
+
+// -- Notices above the views ------------------------------------------------------
+// One place for what the record needs from the researcher, rebuilt from
+// state.summary on every summary refresh -- but only when what it shows
+// changed (a typed answer or a running migration is never wiped), and
+// never while an answer is in flight.
+
+function notice(tone) {
+  return mk("div", "notice" + (tone ? " " + tone : ""));
+}
+
+function noticeHead(box, title, onClose) {
+  if (onClose) {
+    const close = mkButton("×", "notice-close", onClose);
+    close.setAttribute("aria-label", "关闭");
+    close.title = "关闭";
+    box.appendChild(close);
+  }
+  box.appendChild(mk("div", "notice-title", title));
+}
+
+function renderNotices(force) {
+  const host = document.getElementById("notices");
+  if (!host || (state.noticeBusy && !force)) return;
+  const s = state.summary;
+  const sig = JSON.stringify([
+    state.projectMoved, s && s.read_only, s && s.needs_migration, s && s.migration, s && s.records,
+    state.migrationInfo && [state.migrationInfo.loading, !!state.migrationInfo.data, !!state.migrationInfo.error],
+    state.sessionNotes.length,
+  ]);
+  if (!force && sig === state.noticeSig) return;
+  state.noticeSig = sig;
+  host.innerHTML = "";
+  if (state.projectMoved) host.appendChild(movedNotice());
+  if (s && s.read_only) host.appendChild(readOnlyNotice());
+  if (s && s.needs_migration) host.appendChild(migrationNotice(s));
+  // An unfinished migration is said once, by its own banner, not again as
+  // a ledger that refuses writes (one cause, one message).
+  const migrating = s && s.records && s.records.reason === "migrating" && s.needs_migration;
+  if (s && s.records && s.records.state && s.records.state !== "ok" && !migrating) host.appendChild(recordsNotice(s.records));
+  state.sessionNotes.forEach((n, i) => host.appendChild(sessionNotice(n, i)));
+}
+
+async function reopenProject(statusEl, buttons) {
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", "正在重新打开…");
+  try {
+    await apiPost("/api/project/reopen", {});
+  } catch (err) {
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", "没能重新打开", err);
+    return;
+  }
+  state.projectMoved = false;
+  await reloadAllViews();
+}
+
+function movedNotice() {
+  const box = notice("bad");
+  noticeHead(box, "项目已移动或已在别处认领，请重新打开");
+  box.appendChild(mk("p", null,
+    "刚才的操作没有写入任何东西：这个文件夹已经不在原处，或者另一个文件夹已经认领了这个项目。重新打开后，RCE 会重新确认它是谁。"));
+  const status = mk("div", "notice-status");
+  const actions = mk("div", "notice-actions");
+  const b = mkButton("重新打开", "btn", () => reopenProject(status, [b]));
+  actions.appendChild(b);
+  box.append(actions, status);
+  return box;
+}
+
+function readOnlyNotice() {
+  const box = notice("warn");
+  noticeHead(box, "只读打开");
+  box.appendChild(mk("p", null, "原位置暂时无法确认，这次只浏览：不认领、不写入任何东西。原位置能访问后，点「重新检查」回答是移动还是复制。"));
+  const status = mk("div", "notice-status");
+  const actions = mk("div", "notice-actions");
+  const b = mkButton("重新检查", "btn", () => reopenProject(status, [b]));
+  actions.appendChild(b);
+  box.append(actions, status);
+  return box;
+}
+
+// -- 9.5: a pre-V5 project's migration -------------------------------------------
+
+async function ensureMigrationInfo(summary) {
+  const waiting = (summary.migration && summary.migration.waiting) || [];
+  if (!waiting.length || (summary.migration && summary.migration.migrating_from)) return;
+  const key = state.dataEpoch + ":" + waiting.map((w) => w.key).join(",");
+  if (state.migrationInfo && state.migrationInfo.key === key) return;
+  const info = { key: key, loading: true, data: null, error: null };
+  state.migrationInfo = info;
+  renderNotices();
+  try {
+    info.data = await apiGet("/api/migration");
+  } catch (err) {
+    info.error = err;
+  }
+  info.loading = false;
+  if (state.migrationInfo === info) renderNotices();
+}
+
+function previewLines(p) {
+  const lines = [];
+  if (p.error) {
+    lines.push("这个旧索引读不出来（" + p.db_path + "）");
+    return lines;
+  }
+  if (p.recorded_path) {
+    lines.push("旧索引说它来自：" + p.recorded_path +
+      (p.path_exists === false ? "（这个位置现在没有文件夹）" : p.path_exists ? "（这个位置还在）" : ""));
+  } else {
+    lines.push("旧索引没有记下它来自哪里（" + p.db_path + "）");
+  }
+  lines.push("里面有 " + p.confirmed + " 条确认、" + p.rejected + " 条否决，" + p.arranged_views + " 个摆放过的画布视图" +
+    (p.mapping_links ? "；另有 " + p.mapping_links + " 条手工连线，它们本来就在 mappings.toml 里" : ""));
+  if (p.judged) {
+    lines.push(p.judged + " 条里有 " + p.produced + " 条的两端能在这个文件夹里扫到");
+    if (p.produced / p.judged < 0.5) lines.push("匹配很低：这些判断可能属于另一个项目。");
+  }
+  if (p.scan_error) lines.push("扫描这个文件夹时出了错，能扫到的数目可能偏低。");
+  return lines;
+}
+
+function migrationNotice(s) {
+  const box = notice("warn");
+  const waiting = (s.migration && s.migration.waiting) || [];
+  const resuming = s.migration && s.migration.migrating_from;
+  noticeHead(box, resuming ? "上次迁移没有完成" : waiting.length ? "旧版本的判断在等待迁移" : "这个项目来自旧版本");
+  box.appendChild(mk("p", null, "迁移后才能记录判断。" + (resuming || waiting.length
+    ? "迁移会把旧索引里的确认、否决和画布位置写进项目自己的 .rce/，核对数目对上之后才把旧索引移到一旁（不删除）。"
+    : "没有找到等待迁移的旧索引；在终端运行 rce migrate --list 可以查看本机所有旧索引。")));
+  const status = mk("div", "notice-status");
+  const actions = mk("div", "notice-actions");
+  if (resuming) {
+    box.appendChild(mk("div", "fact-line", "旧索引：" + resuming));
+    const b = mkButton("继续迁移", "btn btn-primary", () => runMigration("migrate", status, [b]));
+    actions.appendChild(b);
+  } else if (waiting.length) {
+    const info = state.migrationInfo;
+    if (!info || info.loading) {
+      box.appendChild(mk("p", null, "正在核对旧索引与这个文件夹…"));
+    } else if (info.error) {
+      const e = mk("div", "notice-status err");
+      renderBlockingError(e, "没能读出等待迁移的旧索引", info.error);
+      box.appendChild(e);
+    } else {
+      (info.data.previews || []).forEach((p) => {
+        const list = mk("ul", "entry-list");
+        previewLines(p).forEach((l) => list.appendChild(mk("li", null, l)));
+        box.appendChild(list);
+      });
+      const yes = mkButton("迁移这些记录", "btn btn-primary", () => runMigration("migrate", status, [yes, no]));
+      const no = mkButton("这不是这个项目的", "btn", () => runMigration("not_mine", status, [yes, no]));
+      actions.append(yes, no);
+    }
+  }
+  box.append(actions, status);
+  return box;
+}
+
+function tallyLines(t) {
+  if (!t) return [];
+  const lines = ["旧索引里有 " + t.m + " 条确认或否决：" + t.applied + " 条已生效，" + t.review_other + " 条待复核" +
+    (t.contradicted ? "（其中 " + t.contradicted + " 条记录冲突）" : "") + "，" + t.review_not_produced + " 条机器不再得出、同样待复核"];
+  if (t.skipped_mappings) lines.push("手工连线 " + t.skipped_mappings + " 条本来就在 mappings.toml 里，没有重复迁移");
+  if (t.stale_mirror && t.stale_mirror.length) lines.push("旧索引里有 " + t.stale_mirror.length + " 处和你的文件不一致，以文件为准");
+  if (t.review_other + t.review_not_produced > 0) lines.push("待复核的可以点页面顶部的「待复核」逐条查看。");
+  return lines;
+}
+
+function migrationResultNote(res) {
+  if (res.declined) {
+    return { tone: "", title: "已记下：这些旧记录不属于这个项目", lines: ["旧索引保持原样，没有被删除；这个文件夹以后不再提示它们。"] };
+  }
+  const results = res.results || [];
+  const last = results[results.length - 1] || {};
+  if (res.ok) {
+    const lines = [];
+    results.forEach((r) => {
+      tallyLines(r.tally).forEach((l) => lines.push(l));
+      if (r.retired_to) lines.push("旧索引已移到：" + r.retired_to);
+    });
+    return { tone: "", title: "迁移完成", lines: lines };
+  }
+  if (last.holders && last.holders.length) {
+    return {
+      tone: "bad", title: "记录已经写好，但旧索引还被占用，没有移走",
+      lines: last.holders.map((h) => "占用它的进程" + (h.pid != null ? " " + h.pid : "") + "：" + h.what)
+        .concat(["请先退出 RCE 与 MCP 服务（占用它的那一个），然后点「继续迁移」。"]),
+      detail: last.stopped,
+    };
+  }
+  return {
+    tone: "bad", title: "核对没有对上，迁移停了下来",
+    lines: ["什么都没有移走，旧索引继续使用；再试一次不会重复写入。"].concat(tallyLines(last.tally)),
+    detail: [last.stopped].concat((last.tally && last.tally.unmatched) || []).filter(Boolean).join("\n"),
+  };
+}
+
+async function runMigration(answer, statusEl, buttons) {
+  if (answer === "not_mine" && !window.confirm(
+    "确定这些旧记录不属于这个项目？\n\n旧索引保持原样，不会被删除；这个文件夹以后不再提示它们。")) return;
+  state.noticeBusy = true;
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", answer === "migrate" ? "正在迁移…（会重新扫描整个项目，可能要一会儿）" : "正在记下…");
+  let res;
+  try {
+    res = await apiPost("/api/migration/run", { answer: answer });
+  } catch (err) {
+    state.noticeBusy = false;
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", answer === "migrate" ? "迁移没有完成" : "没能记下", err);
+    return;
+  }
+  state.noticeBusy = false;
+  // The latest outcome replaces an earlier one (a refused retire, then 继续迁移).
+  state.sessionNotes = state.sessionNotes.filter((n) => n.kind !== "migration");
+  state.sessionNotes.push(Object.assign(migrationResultNote(res), { kind: "migration" }));
+  await reloadAllViews();
+}
+
+// -- 9.3: a ledger RCE cannot trust, and the shrink question -----------------------
+
+const RECORD_TROUBLE = {
+  missing: ["判断记录文件不见了", "项目身份文件记着这个项目有判断记录（.rce/judgements.toml），但文件不在。RCE 不会新建一个空文件来代替它；请从备份或同步服务里把它找回来。"],
+  dataless: ["判断记录文件还在云端", "系统正在下载 .rce/judgements.toml，下载完成后会自动恢复。"],
+  unreadable: ["判断记录文件无法读取", ".rce/judgements.toml 读不出来。"],
+  invalid: ["判断记录文件有一处无法解析", ".rce/judgements.toml 里有一处读不懂（常见于手工编辑），请修正它。"],
+  empty_but_expected: ["判断记录文件是空的", "这个项目记录过判断，但 .rce/judgements.toml 现在没有任何条目。"],
+  conflict_copy: ["判断记录文件旁有同步冲突副本", "同步服务在 .rce/ 里留下了冲突副本。RCE 不会自行合并：请留下正确的那一份，把另一份移走。"],
+  no_identity: ["项目身份文件无法读取", "没有可读的项目身份，判断无处记录。"],
+  migrating: ["项目正在迁移", "迁移完成之前不能记录判断。"],
+};
+
+function recordsNotice(rec) {
+  if (rec.state === "shrunk") return shrinkNotice(rec);
+  const box = notice("bad");
+  const trouble = RECORD_TROUBLE[rec.reason] || [rec.message || "判断记录文件当前无法读取，请先恢复它", ""];
+  noticeHead(box, trouble[0]);
+  if (trouble[1]) box.appendChild(mk("p", null, trouble[1]));
+  if (rec.reason === "invalid" && rec.line) box.appendChild(mk("div", "fact-line", "出错的位置：第 " + rec.line + " 行"));
+  if (rec.conflict_copies && rec.conflict_copies.length) box.appendChild(mk("div", "fact-line", "冲突副本：" + rec.conflict_copies.join("、")));
+  box.appendChild(mk("p", null, "修好之前，确认、否决、撤回都不会被记录；图谱保留着它原来知道的判断状态，没有因此改变。"));
+  if (rec.detail) {
+    const d = mk("div", "notice-status");
+    renderBlockingError(d, "", rec.detail);
+    box.appendChild(d);
+  }
+  return box;
+}
+
+function shrinkNotice(rec) {
+  const missing = rec.missing || [];
+  const n = missing.length;
+  const box = notice("warn");
+  noticeHead(box, "记录文件比图谱少了 " + n + " 条判断");
+  box.appendChild(mk("p", null,
+    "图谱记得下面这些判断，但 .rce/judgements.toml 里没有了（可能是从备份恢复、同步服务保留了另一台电脑的文件，或文件被截断）。RCE 什么都没改，等你决定以哪一份为准。"));
+  const list = mk("ul", "entry-list");
+  missing.forEach((m) => {
+    const li = mk("li", null, historyEntryText(m));
+    li.appendChild(mk("div", "entry-sub", linkText(m) + (m.note ? " · 备注：" + m.note : "")));
+    list.appendChild(li);
+  });
+  box.appendChild(list);
+  const ids = missing.map((m) => m.id); // the answer names exactly the entries shown (9.12)
+  const status = mk("div", "notice-status");
+  const answers = [
+    ["file", "以文件为准", "这是有意从备份恢复时要的：图谱忘掉这 " + n + " 条判断，以文件现在的内容为准。"],
+    ["restore", "把缺少的补回文件", "把这 " + n + " 条判断按原样追加回文件末尾（标为补回），文件里已有的内容不动。"],
+  ];
+  const buttons = [];
+  answers.forEach(([answer, label, help]) => {
+    const row = mk("div", "answer");
+    const b = mkButton(label, "btn", () => answerShrink(answer, ids, n, status, buttons));
+    buttons.push(b);
+    row.append(b, mk("span", "answer-help", help));
+    box.appendChild(row);
+  });
+  box.appendChild(status);
+  return box;
+}
+
+async function answerShrink(answer, ids, n, statusEl, buttons) {
+  if (answer === "file" && !window.confirm("以文件为准？\n\n图谱会忘掉这 " + n + " 条判断，以 .rce/judgements.toml 现在的内容为准。")) return;
+  state.noticeBusy = true;
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", "正在处理…");
+  try {
+    await apiPost("/api/records/answer", { file: "judgements", answer: answer, missing: ids });
+  } catch (err) {
+    state.noticeBusy = false;
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", "没能完成这个回答", err);
+    return;
+  }
+  state.noticeBusy = false;
+  state.sessionNotes.push(answer === "file"
+    ? { tone: "", title: "已以文件为准", lines: ["图谱现在只按 .rce/judgements.toml 里的判断显示。"] }
+    : { tone: "", title: "已把缺少的 " + n + " 条判断补回文件", lines: ["它们追加在 .rce/judgements.toml 末尾，标为补回。"] });
+  await refreshCurrentView();
+  renderNotices(true);
+}
+
+function sessionNotice(note, index) {
+  const box = notice(note.tone);
+  noticeHead(box, note.title, () => {
+    state.sessionNotes.splice(state.sessionNotes.indexOf(note), 1);
+    renderNotices(true);
+  });
+  (note.lines || []).forEach((l) => box.appendChild(mk("p", null, l)));
+  if (note.detail) {
+    const d = mk("div", "notice-status");
+    renderBlockingError(d, "", note.detail);
+    box.appendChild(d);
+  }
+  return box;
+}
+
+// -- 9.4: the identity questions, asked where the view would have been ------------
+
+const SITUATION_TITLES = {
+  copy: "这个文件夹是一个项目的副本",
+  cannot_check: "无法确认原来的项目还在不在",
+  lost_id: "项目身份文件不见了",
+  unreadable_id: "项目身份文件无法读取",
+  missing: "找不到项目文件夹（可能已移动）",
+};
+
+const ANSWER_HELP = {
+  fork: "这个文件夹得到新的项目身份，带着现有的全部记录从这里起与原项目分开；原来的文件夹不受影响。",
+  claim: "这里才是原项目：项目的索引改为跟随这个文件夹，并按它重新建立；另一个文件夹下次打开时会被问同样的问题。",
+  other: "这个文件夹只是收到了别处复制来的 .rce/：给它新的身份；复制来的判断、画布位置和变量卡移到 .rce/backups/，不再算作它的记录。",
+  readonly: "先只浏览，不认领、不写入任何东西；原位置能访问后再来回答。",
+  restore: "用 .rce/backups/ 里的快照把项目身份文件放回去，项目恢复原来的身份。",
+  adopt: "给这个文件夹新的项目身份，.rce/ 里现有的判断、画布位置和变量卡全部保留，并据此重新建立索引。",
+};
+
+const ANSWER_CONFIRM = {
+  claim: "这里才是原项目？\n\n项目的索引会按这个文件夹重新建立；另一个文件夹下次打开时会被问同样的问题。",
+  other: "这是另一个项目？\n\n复制来的判断、画布位置和变量卡会被移到 .rce/backups/（不删除），这个文件夹得到新的身份。",
+};
+
+function resolveNote(answer, res) {
+  const lines = [];
+  if (answer === "fork") lines.push("新的项目身份：" + res.project_id + "。从现在起，这里的判断不会出现在原项目里。");
+  if (answer === "claim") lines.push("项目的索引已按这个文件夹重新建立。");
+  if (answer === "adopt") lines.push("新的项目身份：" + res.project_id + "，原有记录都保留了。");
+  if (answer === "restore" && res.restored_from) lines.push("项目身份文件已从备份恢复：" + res.restored_from);
+  if (res.git_tracked_identity) lines.push("注意：.rce/project.toml 由 git 跟踪；提交它，会把新的身份带进它被合并到的分支。");
+  if (res.moved_aside && res.moved_aside.length) lines.push("复制来的记录已移进 .rce/backups/（没有删除）：" + res.moved_aside.join("、"));
+  const titles = {
+    fork: "已作为独立分支继续", claim: "已认领：这里是原项目", other: "已作为另一个项目打开",
+    restore: "项目身份已恢复", adopt: "已沿用这些记录，建立新身份",
+  };
+  if (!titles[answer]) return null;
+  if (res.build_error) lines.push("重新建立索引时出了错，下次打开会再试。");
+  return { tone: res.build_error ? "bad" : "", title: titles[answer], lines: lines, detail: res.build_error || null };
+}
+
+async function answerSituation(answer, statusEl, buttons) {
+  if (ANSWER_CONFIRM[answer] && !window.confirm(ANSWER_CONFIRM[answer])) return;
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", "正在处理…");
+  let res;
+  try {
+    res = await apiPost("/api/project/resolve", { answer: answer });
+  } catch (err) {
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", "没能完成这个选择", err);
+    return;
+  }
+  const note = resolveNote(answer, res);
+  if (note) state.sessionNotes.push(note);
+  await reloadAllViews();
+}
+
+async function locateProject(projectId, path, statusEl, buttons) {
+  if (!path || path.charAt(0) !== "/") {
+    setStatus(statusEl, "err", "请填写文件夹的完整路径（以 / 开头）");
+    return;
+  }
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(statusEl, "", "正在确认这个文件夹是不是这个项目…");
+  try {
+    await apiPost("/api/projects/locate", { id: projectId, path: path });
+  } catch (err) {
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", "没能使用这个位置", err);
+    return;
+  }
+  await reloadAllViews();
+}
+
+function renderSituation(err) {
+  const sit = err.situation;
+  const box = mk("div", "notice bad state-note");
+  noticeHead(box, SITUATION_TITLES[sit.situation] || PROJECT_STATES.project_blocked.title);
+  if (sit.message && sit.message !== SITUATION_TITLES[sit.situation]) box.appendChild(mk("p", null, sit.message));
+  const fact = (label, value) => { if (value) box.appendChild(mk("div", "fact-line", label + value)); };
+  const status = mk("div", "notice-status");
+  const buttons = [];
+  if (sit.situation === "missing") {
+    fact("项目列表里记的位置：", sit.path);
+    if (sit.reason === "path_holds_another_project") {
+      box.appendChild(mk("p", null, "这个位置现在放着另一个项目（或一个没有项目身份的文件夹），不会被当成它。"));
+    }
+    if (!sit.project_id) {
+      box.appendChild(mk("p", null, "这个项目来自旧版本，没有项目身份，无法按身份找回；请在新位置运行 rce serve。"));
+    } else {
+      box.appendChild(mk("p", null, "如果你把它移到了别处，在下面指明新位置：RCE 只认带着这个项目身份的文件夹，不会自己去找。"));
+      box.appendChild(mk("div", "notice-title", "选择新位置…"));
+      const row = mk("div", "locate-row");
+      const input = mk("input", "form-input");
+      input.id = "locate-path";
+      input.placeholder = "新位置的完整路径，例如 /Users/你/Documents/项目文件夹";
+      const use = mkButton("使用这个位置", "btn", () => locateProject(sit.project_id, input.value.trim(), status, buttons));
+      buttons.push(use);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") use.click(); });
+      row.append(input, use);
+      if (shellCan("choose-folder")) {
+        const pick = mkButton("选择文件夹…", "btn", async () => {
+          const chosen = await chooseFolder();
+          if (!chosen) return; // cancelled in the native panel
+          input.value = chosen;
+          locateProject(sit.project_id, chosen, status, buttons);
+        });
+        buttons.push(pick);
+        row.appendChild(pick);
+      }
+      box.appendChild(row);
+    }
+  } else {
+    fact("这个文件夹：", sit.path);
+    if (sit.situation === "copy" || sit.situation === "cannot_check") fact("项目原来的位置：", sit.home);
+    if (sit.situation === "lost_id") {
+      if (Array.isArray(sit.records) && sit.records.length) fact("在 .rce/ 里找到的记录：", sit.records.join("、"));
+      if (sit.snapshot) fact("备份里的项目身份：", sit.snapshot.file + (sit.snapshot.created ? "（创建于 " + sit.snapshot.created + "）" : ""));
+    }
+    if (sit.situation === "unreadable_id") {
+      if (sit.line) fact("出错的位置：", "第 " + sit.line + " 行");
+      if (Array.isArray(sit.conflict_copies) && sit.conflict_copies.length) fact("旁边的同步冲突副本：", sit.conflict_copies.join("、"));
+      box.appendChild(mk("p", null, "修好 .rce/project.toml（或等它从云端取回、移走冲突副本）之后，点「重新检查」。"));
+    }
+    box.appendChild(mk("p", null, ((sit.answers || []).length ? "选择之前" : "修好之前") +
+      "，RCE 不会写入任何东西，包括项目列表。也可以在上方切换到别的项目。"));
+    (sit.answers || []).forEach((answer) => {
+      const label = (sit.answer_labels && sit.answer_labels[answer]) || answer;
+      const row = mk("div", "answer");
+      const b = mkButton(label, "btn", () => answerSituation(answer, status, buttons));
+      buttons.push(b);
+      row.append(b, mk("span", "answer-help", ANSWER_HELP[answer] || ""));
+      box.appendChild(row);
+    });
+    if (!(sit.answers || []).length) {
+      const actions = mk("div", "notice-actions");
+      const again = mkButton("重新检查", "btn", () => reopenProject(status, buttons));
+      buttons.push(again);
+      actions.appendChild(again);
+      box.appendChild(actions);
+    }
+  }
+  box.appendChild(status);
+  const raw = sit.detail || err.message;
+  if (raw) {
+    const d = mk("div", "notice-status");
+    renderBlockingError(d, "", raw);
+    box.appendChild(d);
+  }
+  return box;
+}
+
+// 「选择文件夹…」 through the native shell (8.9's bridge, task V5 phase 9
+// implements the Swift side): page -> native {type: "choose-folder",
+// request}; native -> page window.RCE.folderChosen(request, path | null).
+// Offered only when the shell says it can (window.RCEShellFeatures), so a
+// shell without it -- or a plain browser -- simply has the path field.
+const folderRequests = new Map();
+
+function shellCan(feature) {
+  try {
+    return Array.isArray(window.RCEShellFeatures) && window.RCEShellFeatures.indexOf(feature) >= 0 &&
+      !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.rce);
+  } catch (err) {
+    return false;
+  }
+}
+
+function chooseFolder() {
+  return new Promise((resolve) => {
+    const request = "folder-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    folderRequests.set(request, resolve);
+    try {
+      window.webkit.messageHandlers.rce.postMessage({ type: "choose-folder", request: request });
+    } catch (err) {
+      folderRequests.delete(request);
+      resolve(null);
+    }
+  });
+}
+
+function folderChosen(request, path) {
+  const resolve = folderRequests.get(String(request));
+  if (!resolve) return false;
+  folderRequests.delete(String(request));
+  resolve(typeof path === "string" && path ? path : null);
+  return true;
+}
+
 // -- 停止服务 (task V3 phase 4) ----------------------------------------------
 // The footer button POSTs /api/shutdown behind an explicit Chinese confirm.
 // Success replaces the whole page with a plain stopped state and stops the
@@ -2457,6 +3649,10 @@ const SHELL_COMMANDS = {
 };
 
 window.RCE = Object.freeze({
+  // The native shell's answer to {type: "choose-folder"} (see chooseFolder).
+  folderChosen(request, path) {
+    return folderChosen(request, path);
+  },
   command(name) {
     if (typeof name !== "string" || !Object.prototype.hasOwnProperty.call(SHELL_COMMANDS, name)) return false;
     // After 停止服务 the page is a static note; a menu click must not throw.

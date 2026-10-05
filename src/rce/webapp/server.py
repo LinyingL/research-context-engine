@@ -122,7 +122,8 @@ Endpoints (all GET unless noted):
                             see "Canvas write defense" below).
     POST /api/mappings/delete -- body `{"from", "to", "type"}`: remove that
                             entry from the file and re-ingest.
-    POST /api/edges/reject -- body `{"src", "dst", "type", "extractor"}`:
+    POST /api/edges/reject -- body `{"src", "dst", "type", "extractor",
+                            "note"?}`:
                             标记为错误提取 -- a `rejected` entry in
                             `.rce/judgements.toml`, then applied (V5, 9.3;
                             `rce.records.judgements.judge`, the one human
@@ -140,7 +141,13 @@ Endpoints (all GET unless noted):
                             not be read, or whose link the index lacks, plus
                             the judgment ledger's trust state.
     GET  /api/history   -- `?src&dst&type&extractor`: every ledger entry
-                            for one link, in order (9.9 #12).
+                            for one link, in order (9.9 #12), each with
+                            the basis it was made on.
+    GET  /api/records   -- the 9.2 inventory (`rce records`) for the app's
+                            「记录」 panel (see `records_payload`).
+    POST /api/project/reopen -- no body: the identity check again on the
+                            served folder (「重新打开」; see
+                            `reopen_payload`).
     POST /api/records/answer -- body `{"file": "judgements", "answer":
                             "file"|"restore"}` answers 「记录文件比图谱少了 N
                             条判断」 (9.3); `{"file": "canvas", "answer":
@@ -389,7 +396,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable, Iterator
 
-from rce import db, lineage, migration, paths
+from rce import db, inventory, lineage, migration, paths
 from rce import project as project_identity
 from rce.records import judgements
 from rce.records import ledger as ledger_mod
@@ -1027,7 +1034,7 @@ def _connected_files(conn: Connection, script_id: str, edge_type: str) -> list[d
     for edge in db.query_edges(conn, src=script_id, type=edge_type):
         missing = any(occ.get("missing") for occ in _occurrences(edge["evidence"]))
         marks = flags.for_key(judgements.key_of(edge))
-        entries.append({
+        entry = {
             "path": _target_path(conn, edge["dst"]),
             "role": _lineage_role(conn, edge["dst"]),
             "missing": missing,
@@ -1037,7 +1044,11 @@ def _connected_files(conn: Connection, script_id: str, edge_type: str) -> list[d
             "review": marks["review"],
             "conflict": marks["conflict"],
             "judgement": marks["judgement"],
-        })
+        }
+        if marks["review"] or marks["conflict"]:
+            # Which link, so the 「待复核」 tag opens the review list at it.
+            entry["link"] = {k: edge[k] for k in ("src", "dst", "type", "extractor")}
+        entries.append(entry)
     return sorted(entries, key=lambda e: e["path"])
 
 
@@ -1380,6 +1391,24 @@ def resolve_payload(served: ServedProject, body: dict[str, Any]) -> tuple[Served
         "build_error": result.build_error,
         "restored_from": result.restored_from,
         "blocked": new_served.blocked,
+    }
+
+
+def reopen_payload(served: ServedProject) -> tuple[ServedProject, dict[str, Any]]:
+    """`POST /api/project/reopen` (no body): run the identity check again on
+    the folder this server serves, as if it were opened anew -- 「重新打开」
+    after 「项目已移动或已在别处认领」, after repairing an unreadable identity
+    file, or to leave a read-only open. Takes no path from the page: the
+    folder is the served one, and the id it is expected to carry is the one
+    it was opened with (a folder that is gone, or now holds another project,
+    becomes the 「找不到项目文件夹」 state with 「选择新位置…」). Nothing is
+    written unless the folder opens normally (then, as any open, it may
+    adopt a move and bump the registry)."""
+    root = served.root
+    new = served_for(root, expected_id=served.project_id, label=served.label, register=True)
+    return new, {
+        "current": str(root), "label": served.label or root.name,
+        "project_id": new.project_id, "blocked": new.blocked, "read_only": new.read_only,
     }
 
 
@@ -1786,6 +1815,9 @@ def edge_status_payload(conn: Connection, served: ServedProject, body: dict[str,
     a reject that stands and is applied writes nothing."""
     src, dst, edge_type, extractor = _string_fields(body, ("src", "dst", "type", "extractor"))
     key = (src, dst, edge_type, extractor)
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        raise MissingParamError("request body 'note' must be a string when present")
     if extractor == mappings_ingest.EXTRACTOR:
         raise HumanLinkError(
             "this link is a human mapping from .rce/mappings.toml -- delete the mapping "
@@ -1795,7 +1827,8 @@ def edge_status_payload(conn: Connection, served: ServedProject, body: dict[str,
     if not matches or not canvas.is_canvas_edge(conn, matches[0]):
         raise NotFoundError(f"no canvas link {src} --{edge_type}--> {dst} (extractor {extractor!r})")
     if action == "reject":
-        judged = _judge(served, key, "rejected", unless_standing=True)
+        # The card's optional 备注 goes with the reject (9.3 `note`).
+        judged = _judge(served, key, "rejected", unless_standing=True, note=note)
     else:
         judged = _judge(served, key, "undone", undo_only="rejected")
     return _judged_payload(conn, key, judged)
@@ -1814,6 +1847,30 @@ def judgement_payload(conn: Connection, served: ServedProject, body: dict[str, A
     key = (src, dst, edge_type, extractor)
     judged = _judge(served, key, verdict, note=note)
     return _judged_payload(conn, key, judged)
+
+
+def records_payload(served: ServedProject) -> dict[str, Any]:
+    """`GET /api/records`: the inventory of 9.2 -- what `rce records`
+    prints -- for the app's 「记录」 panel: each kind of human record, where
+    it lives (project-relative when inside the project), how many, the
+    newest snapshot and any problem, each row with its machine-readable
+    `code` and `facts` (the page words them in Chinese; `problems` stays
+    the engine's English for 「详情」). Reads only. The index is consulted
+    for the shrink check when it can be opened; a blocked project, or one
+    whose index is missing or in the cloud, is listed from its files
+    alone."""
+    conn: Connection | None = None
+    if served.blocked is None:
+        try:
+            conn = db.connect(_served_db(served))
+        except ApiError:
+            conn = None
+    try:
+        rows = inventory.inventory(conn, served.root)
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"project_root": str(served.root), "rows": [r.payload() for r in rows]}
 
 
 def history_payload(served: ServedProject, query_args: dict[str, list[str]]) -> dict[str, Any]:
@@ -2177,6 +2234,10 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, migration_payload(self._served()))
             elif path == "/api/history":
                 self._send_json(200, history_payload(self._require_unblocked(), query))
+            elif path == "/api/records":
+                # The 「记录」 panel (9.2): read even for a blocked project --
+                # it lists the folder's own files and writes nothing.
+                self._send_json(200, records_payload(self._served()))
             elif path == "/api/file":
                 values = query.get("path")
                 if not values:
@@ -2243,6 +2304,13 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/project/resolve":
                 # The answer to a blocked project's question (9.4).
                 served, payload = resolve_payload(self._served(), self._read_json_object())
+                self._switch_to(served)
+                self._send_json(200, payload)
+            elif parsed.path == "/api/project/reopen":
+                # 「重新打开」: the identity check again on the served folder
+                # (reopen_payload); no path is taken from the page.
+                self._read_json_object()
+                served, payload = reopen_payload(self._served())
                 self._switch_to(served)
                 self._send_json(200, payload)
             elif parsed.path == "/api/projects/remove":

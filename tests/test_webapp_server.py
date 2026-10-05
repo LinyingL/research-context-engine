@@ -866,6 +866,9 @@ def test_canvas_js_writes_only_through_the_canvas_endpoints():
     assert posted == {
         "/api/canvas/layout", "/api/open", "/api/mappings/add", "/api/mappings/delete",
         "/api/edges/reject", "/api/edges/restore",
+        # V5 phase 7: the link card's judgments (9.3) and setting aside an
+        # arrangement record that cannot be read (9.2).
+        "/api/judgements", "/api/records/answer",
     }
     source = Path(server.__file__).read_text(encoding="utf-8")
     for path in posted:

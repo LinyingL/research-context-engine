@@ -986,11 +986,13 @@ def retire(root: Path, key: str, db_path: Path, *, engine_probe: EngineProbe = e
                 continue
             blocking.append(Holder(pid, f"has {db_path.name} open: {what}"))
     if blocking:
-        raise MigrationRefused(
+        refused = MigrationRefused(
             f"{PLEASE_QUIT}: the old index {db_path} is still held by "
             + "; ".join(h.describe() for h in blocking)
             + " -- quit it, then run 'rce migrate' again (nothing was retired; the migration resumes)"
         )
+        refused.holders = [h.payload() for h in blocking]  # the app names them (8.8)
+        raise refused
     target = retired_dir_for(key, root)
     target.parent.mkdir(parents=True, exist_ok=True)
     if _is_index_directory(key, db_path):
@@ -1024,10 +1026,13 @@ class Migrated:
     previews: list[Preview] = field(default_factory=list)
     resumed: bool = False
     notes: list[str] = field(default_factory=list)
+    #: A refused retirement: who holds the old index, `{pid, what}` each.
+    holders: list[dict[str, Any]] = field(default_factory=list)
 
     def payload(self) -> dict[str, Any]:
         return {
             "ok": self.ok, "key": self.key, "project_id": self.identity.id if self.identity else None,
+            "holders": list(self.holders),
             "tally": self.tally.payload() if self.tally else None,
             "appended": self.exported.appended if self.exported else 0,
             "retired_to": str(self.retired_to) if self.retired_to else None,
@@ -1143,7 +1148,7 @@ def migrate_one(
                                  project_id=ident.id, notes=notes)
             except MigrationRefused as exc:
                 return Migrated(root, key, ok=False, identity=ident, tally=tally, exported=exported, resumed=resumed,
-                                stopped=str(exc), notes=notes)
+                                stopped=str(exc), notes=notes, holders=list(getattr(exc, "holders", []) or []))
             fault("after_retire")
             ident = _finish(root, ident)
     _follow_registry(root, ident)

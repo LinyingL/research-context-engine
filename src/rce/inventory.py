@@ -160,9 +160,21 @@ class Row:
     count: str
     snapshot: str | None = None
     problems: tuple[str, ...] = ()
+    #: For the app, which words a row in its own language (8.8): a stable
+    #: name for the kind (`judgements`, `mappings`, `attempts`,
+    #: `attempts_config`, `canvas`, `variables`, `legacy`), the numbers and
+    #: states behind `count`, and `issues` -- machine-readable names of
+    #: `problems` (`dataless`, `unreadable`, `conflict_copy`, `invalid`,
+    #: `refused_entries`, `migration_unfinished`, `needs_migration`, or a
+    #: ledger trust reason such as `shrunk`). `problems` stays the English.
+    code: str = ""
+    facts: dict[str, Any] = field(default_factory=dict)
 
     def payload(self) -> dict[str, Any]:
-        return {"kind": self.kind, "path": self.path, "count": self.count, "snapshot": self.snapshot, "problems": list(self.problems)}
+        return {
+            "kind": self.kind, "path": self.path, "count": self.count, "snapshot": self.snapshot,
+            "problems": list(self.problems), "code": self.code, "facts": dict(self.facts),
+        }
 
 
 def _shown(path: Path, root: Path) -> str:
@@ -177,16 +189,23 @@ def _snapshot(root: Path, path: Path) -> str | None:
     return newest.name if newest is not None else None
 
 
-def _file_problems(path: Path) -> list[str]:
+def _file_problems(path: Path, issues: list[str] | None = None) -> list[str]:
+    """English problems of one record file; their names go into `issues`."""
     problems = []
     got = record_files.read_record(path)
     if got.state is RecordState.DATALESS:
         problems.append("in the cloud (download requested)")
+        if issues is not None:
+            issues.append("dataless")
     elif got.state is RecordState.UNREADABLE:
         problems.append(f"unreadable ({got.error})")
+        if issues is not None:
+            issues.append("unreadable")
     copies = record_files.conflict_copies(path)
     if copies:
         problems.append(f"sync conflict copies beside it: {', '.join(p.name for p in copies)}")
+        if issues is not None:
+            issues.append("conflict_copy")
     return problems
 
 
@@ -195,6 +214,8 @@ def _judgement_row(conn: Connection | None, root: Path) -> Row:
     ident = read_identity(root)
     identity = ident.identity if ident.state is IdentityState.PRESENT else None
     problems: list[str] = []
+    issues: list[str] = []
+    facts: dict[str, Any] = {"file_state": loaded.state.value, "exists": loaded.path.exists()}
     if loaded.ledger is not None:
         n = len(loaded.ledger.entries)
         stands = sum(
@@ -203,12 +224,16 @@ def _judgement_row(conn: Connection | None, root: Path) -> Row:
         )
         conflicts = sum(1 for key in loaded.ledger.keys() if ledger_mod.judgement_status(loaded.ledger.state(key)) == "conflict")
         count = f"{n} entr(y/ies), {stands} judgment(s) standing" + (f", {conflicts} in conflict" if conflicts else "")
+        facts.update(entries=n, standing=stands, conflicts=conflicts)
     elif loaded.state is RecordState.ABSENT:
         count = "none yet"
     else:
         count = loaded.state.value
     if conn is not None:
         _loaded, decision = judgements.assess(conn, root, identity, for_migration=True)
+        if decision.reason is not None:
+            issues.append(decision.reason)
+            facts.update(trust_message=decision.message, missing=len(decision.missing), line=decision.line)
         if decision.reason == "shrunk":
             problems.append(
                 f"shrunk: the file lacks {len(decision.missing)} entr(y/ies) the index applied "
@@ -217,29 +242,42 @@ def _judgement_row(conn: Connection | None, root: Path) -> Row:
         elif decision.reason is not None:
             problems.append(f"{decision.reason}: {decision.detail or ''}".rstrip(": "))
     else:
-        problems.extend(_file_problems(loaded.path))
+        problems.extend(_file_problems(loaded.path, issues))
     if loaded.state is RecordState.INVALID:
         where = f" (line {loaded.line})" if loaded.line else ""
         problems.append(f"invalid{where}: {loaded.error}")
+        issues.append("invalid")
+        facts["line"] = loaded.line
     if identity is not None and identity.migrating_from is not None:
         problems.append(f"migration from {identity.migrating_from} not finished -- run 'rce migrate'")
-    return Row("Confirm/reject of machine links", _shown(loaded.path, root), count, _snapshot(root, loaded.path), tuple(dict.fromkeys(problems)))
+        issues.append("migration_unfinished")
+    facts["issues"] = list(dict.fromkeys(issues))
+    return Row("Confirm/reject of machine links", _shown(loaded.path, root), count, _snapshot(root, loaded.path),
+               tuple(dict.fromkeys(problems)), code="judgements", facts=facts)
 
 
 def _mapping_row(root: Path) -> Row:
     path = mappings_ingest.mappings_path(root)
-    problems = _file_problems(path)
+    issues: list[str] = []
+    problems = _file_problems(path, issues)
+    facts: dict[str, Any] = {"exists": path.exists(), "issues": issues}
     try:
         loaded = mappings_ingest.load_mappings(root)
     except mappings_ingest.MappingsFileError as exc:
-        return Row("Hand-drawn links", _shown(path, root), "cannot be read", _snapshot(root, path), (*problems, str(exc)))
+        issues.append("unreadable")
+        facts.update(state="unreadable", issues=list(dict.fromkeys(issues)))
+        return Row("Hand-drawn links", _shown(path, root), "cannot be read", _snapshot(root, path), (*problems, str(exc)),
+                   code="mappings", facts=facts)
     if not loaded.file_present:
-        return Row("Hand-drawn links", _shown(path, root), "none yet", None, tuple(problems))
+        facts["state"] = "absent"
+        return Row("Hand-drawn links", _shown(path, root), "none yet", None, tuple(problems), code="mappings", facts=facts)
     notes = sum(1 for m in loaded.mappings if m.note)
     count = f"{len(loaded.mappings)} link(s), {notes} with a note"
+    facts.update(state="present", links=len(loaded.mappings), with_note=notes, refused=len(loaded.problems))
     if loaded.problems:
         problems.append(f"{len(loaded.problems)} entr(y/ies) refused (see 'rce mappings')")
-    return Row("Hand-drawn links", _shown(path, root), count, _snapshot(root, path), tuple(problems))
+        issues.append("refused_entries")
+    return Row("Hand-drawn links", _shown(path, root), count, _snapshot(root, path), tuple(problems), code="mappings", facts=facts)
 
 
 def _attempt_rows(root: Path) -> list[Row]:
@@ -248,28 +286,41 @@ def _attempt_rows(root: Path) -> list[Row]:
         config = attempts_ingest.load_config(root)
     except attempts_ingest.AttemptsConfigError as exc:
         configured = config_path.exists()
+        config_issues: list[str] = []
+        config_problems = tuple(_file_problems(config_path, config_issues))
         return [
             Row("Attempt verdicts", "-", "no attempt table configured" if not configured else "configuration not usable",
-                None, () if not configured else (str(exc),)),
+                None, () if not configured else (str(exc),), code="attempts",
+                facts={"state": "unusable" if configured else "not_configured", "exists": False,
+                       "issues": ["invalid"] if configured else []}),
             Row("Attempt-table configuration", _shown(config_path, root), "present" if configured else "none",
-                _snapshot(root, config_path) if configured else None, tuple(_file_problems(config_path))),
+                _snapshot(root, config_path) if configured else None, config_problems, code="attempts_config",
+                facts={"exists": configured, "issues": config_issues}),
         ]
     table = root / config.file
-    problems = _file_problems(table)
+    issues: list[str] = []
+    problems = _file_problems(table, issues)
+    facts: dict[str, Any] = {"exists": table.exists(), "issues": issues}
     got = record_files.read_record(table)
     if got.state is RecordState.PRESENT:
         try:
             rows = attempts_ingest.parse_attempts_table(got.text or "", config.heading, config.columns)
             judged = sum(1 for r in rows if r.verdict.strip())
             count = f"{len(rows)} attempt(s), {judged} with a verdict"
+            facts.update(state="present", attempts=len(rows), with_verdict=judged)
         except attempts_ingest.AttemptsConfigError as exc:
             count = "table not found"
             problems.append(str(exc))
+            facts["state"] = "table_missing"
     else:
         count = got.state.value
+        facts["state"] = got.state.value
+    config_issues = []
+    config_problems = tuple(_file_problems(config_path, config_issues))
     return [
-        Row("Attempt verdicts", _shown(table, root), count, _snapshot(root, table), tuple(problems)),
-        Row("Attempt-table configuration", _shown(config_path, root), "present", _snapshot(root, config_path), tuple(_file_problems(config_path))),
+        Row("Attempt verdicts", _shown(table, root), count, _snapshot(root, table), tuple(problems), code="attempts", facts=facts),
+        Row("Attempt-table configuration", _shown(config_path, root), "present", _snapshot(root, config_path), config_problems,
+            code="attempts_config", facts={"exists": True, "issues": config_issues}),
     ]
 
 
@@ -278,19 +329,30 @@ def _canvas_row(root: Path) -> Row:
 
     layout = canvas_mod.layout_record(root)
     problems = [] if layout.writable else [f"{layout.state}: {layout.error}"]
-    problems += [p for p in _file_problems(layout.path) if "conflict" in p]
-    return Row("Canvas arrangement", _shown(layout.path, root), layout.describe(), _snapshot(root, layout.path), tuple(problems))
+    issues = [] if layout.writable else ["dataless" if layout.state == "dataless" else "invalid"]
+    file_issues: list[str] = []
+    problems += [p for p in _file_problems(layout.path, file_issues) if "conflict" in p]
+    issues += [i for i in file_issues if i == "conflict_copy"]
+    facts = {
+        "state": layout.state, "exists": layout.path.exists(), "views": len(layout.views),
+        "arranged": sum(1 for v in layout.views.values() if v["positions"]), "issues": issues,
+    }
+    return Row("Canvas arrangement", _shown(layout.path, root), layout.describe(), _snapshot(root, layout.path), tuple(problems),
+               code="canvas", facts=facts)
 
 
 def _variables_row(root: Path) -> Row:
     directory = paths.project_rce_dir(root) / VARIABLES_DIRNAME
     if not directory.is_dir():
-        return Row("Variable definition cards", _shown(directory, root), "none yet")
+        return Row("Variable definition cards", _shown(directory, root), "none yet", code="variables",
+                   facts={"exists": False, "cards": 0, "issues": []})
     try:
         cards = sorted(p.name for p in directory.iterdir() if p.is_dir() and p.name != CODE_DIRNAME)
     except OSError as exc:
-        return Row("Variable definition cards", _shown(directory, root), "cannot be listed", None, (str(exc),))
-    return Row("Variable definition cards", _shown(directory, root), f"{len(cards)} card(s)")
+        return Row("Variable definition cards", _shown(directory, root), "cannot be listed", None, (str(exc),),
+                   code="variables", facts={"exists": True, "issues": ["unreadable"]})
+    return Row("Variable definition cards", _shown(directory, root), f"{len(cards)} card(s)", code="variables",
+               facts={"exists": True, "cards": len(cards), "issues": []})
 
 
 def record_file_paths(root: Path) -> list[Path]:
@@ -354,6 +416,7 @@ def inventory(conn: Connection | None, root: Path) -> list[Row]:
         rows.append(Row(
             "Pre-V5 index holding judgments", ", ".join(str(p) for _k, p in waiting), f"{len(waiting)} waiting",
             None, ("needs migration: 'rce migrate --list', then 'rce migrate --yes'",),
+            code="legacy", facts={"waiting": len(waiting), "exists": False, "issues": ["needs_migration"]},
         ))
     return rows
 

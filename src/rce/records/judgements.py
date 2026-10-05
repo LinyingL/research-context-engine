@@ -957,7 +957,9 @@ def review_count(conn: Connection) -> int:
 
 def history(project_root: str | Path, key: Iterable[str]) -> list[dict[str, Any]] | None:
     """Every entry for one link in file order (the app's history), or None
-    when the ledger cannot be read."""
+    when the ledger cannot be read. Each entry carries the basis it was
+    made on (`basis`, None when none was recorded; `basis_recorded` says
+    how) -- the app shows *what* was judged, not merely that it was."""
     loaded = load_judgements(project_root)
     if loaded.state is RecordState.ABSENT:
         return []
@@ -965,6 +967,11 @@ def history(project_root: str | Path, key: Iterable[str]) -> list[dict[str, Any]
         return None
     ledger = loaded.ledger
     return [
-        {**_summary(e.data), "cancelled": ledger.is_cancelled(e)}
+        {
+            **_summary(e.data),
+            "cancelled": ledger.is_cancelled(e),
+            "basis": _basis_of(e) if e.get("basis") is not None else None,
+            "basis_recorded": e.get("basis_recorded"),
+        }
         for e in ledger.history(tuple(key))
     ]
