@@ -1013,3 +1013,47 @@ def test_a_second_merge_after_a_settlement_asks_again(tmp_path):
     log.write_text(text + "\n[[entry]]" + stray, encoding="utf-8")
     card = _card(root)
     assert card.state == "frozen" and card.reason == "conflict"
+
+
+def _settled_both_ways(tmp_path: Path, first: str) -> tuple[Path, str, str, str]:
+    """Two copies of a merged card (`_merged_two_v2`) each settle the same
+    dispute differently -- one keeps A, the other B -- and a sync merges
+    the second copy's `settled` entry into the first's log. `first` says
+    which settlement the file holds first ("a" or "b")."""
+    root, v1, a, b = _merged_two_v2(tmp_path)
+    copy = tmp_path / "copy2"
+    shutil.copytree(root, copy)
+    project_identity.fork(copy)
+    mine, theirs = (a, b) if first == "a" else (b, a)
+    cards.settle(root, "topicshift", [mine])
+    cards.settle(copy, "topicshift", [theirs])
+    log, other = (V.variables_dir(r) / "topicshift" / "log.toml" for r in (root, copy))
+    tail = other.read_text(encoding="utf-8").split("\n[[entry]]")[-1]
+    log.write_text(log.read_text(encoding="utf-8") + "\n[[entry]]" + tail, encoding="utf-8")
+    return root, v1, a, b
+
+
+@pytest.mark.parametrize("first", ["a", "b"])
+@pytest.mark.parametrize("keep", ["a", "b"])
+def test_two_copies_settling_differently_ask_again_and_the_answer_stands_whatever_the_order(tmp_path, capsys, first, keep):
+    """9.12 (follow-up): two settlements of the same dispute, merged, are a
+    new dispute about the same versions -- not a question with nothing to
+    choose. The confirmations both settlements chose between are offered
+    again, the CLI and the page can answer, and what stands is what the
+    answer names, whichever settlement the file holds first."""
+    root, v1, a, b = _settled_both_ways(tmp_path, first)
+    card = _card(root)
+    assert card.state == "frozen" and card.reason == "conflict"
+    d = cards.dispute_payload(card)
+    assert d["versions"] == [{"version": 2, "candidates": [a, b]}]
+    assert set(d["shown"]) >= {a, b}
+    assert {e["id"] for br in d["branches"] for e in br} >= {a, b}
+    with pytest.raises(cards.CardRefused):
+        cards.settle(root, "topicshift", [])  # nothing is chosen by position
+    kept = a if keep == "a" else b
+    assert cli.main(["variable", "settle", "topicshift", "--keep", kept, str(root)]) == 0
+    card = _card(root)
+    assert card.state == "ok" and card.in_use == 2
+    assert card.versions[2].entry.id == kept
+    assert card.not_in_force >= {a, b} - {kept} and kept not in card.not_in_force
+    assert cards.dispute_payload(card) is None

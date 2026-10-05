@@ -731,30 +731,86 @@ def read_card(project_root: str | Path, directory: str | Path, *, siblings: list
 # -- two histories, and naming what stands (9.12) -----------------------------------------
 
 
+@dataclass(frozen=True)
+class _Settlements:
+    """The `settled` entries of a log, read once. `fresh`: for each, the
+    anomalies it settled first (those no earlier settlement settled).
+    `contested`: pairs (x, y) where y, a later settlement written without
+    knowing x (its seq is not above x's: another copy's), settles an
+    anomaly x settled -- two copies that each settled the same dispute
+    differently. Neither of a contested pair stands; a later settlement
+    decides over the region both of them settled."""
+
+    by_id: dict[str, Any]
+    fresh: dict[str, tuple[Any, ...]]
+    contested: tuple[tuple[LedgerEntry, LedgerEntry], ...]
+
+    @property
+    def void(self) -> set[str]:
+        return {e.id for pair in self.contested for e in pair}
+
+    def widen(self, start: int, end: int) -> int:
+        """`start` moved back over the regions that contested settlements in
+        [start, end) settled, until no more is found."""
+        while True:
+            new = start
+            for x, y in self.contested:
+                if (start <= x.index < end) or (start <= y.index < end):
+                    for a in self.fresh.get(x.id, ()):
+                        new = min(new, a.start)
+            if new == start:
+                return start
+            start = new
+
+
+def _settlements(ledger: Any) -> _Settlements:
+    by_id = {a.entry.id: a for a in ledger.anomalies}
+    handled: set[str] = set()
+    fresh: dict[str, tuple[Any, ...]] = {}
+    deciding: list[LedgerEntry] = []
+    contested: list[tuple[LedgerEntry, LedgerEntry]] = []
+    for e in ledger.entries:
+        if e.get("act") != SETTLED_ACT:
+            continue
+        for x in deciding:
+            if (e.seq is not None and x.seq is not None and e.seq <= x.seq
+                    and set(e.settles) & {a.entry.id for a in fresh[x.id]}):
+                contested.append((x, e))
+        mine = tuple(by_id[i] for i in e.settles if i in by_id and i not in handled)
+        fresh[e.id] = mine
+        handled |= {a.entry.id for a in mine}
+        if mine:
+            deciding.append(e)
+    return _Settlements(by_id=by_id, fresh=fresh, contested=tuple(contested))
+
+
 def settled_out(ledger: Any, *, before: int | None = None) -> set[str]:
     """The ids a `settled` entry left out of force: every entry of the
     region it settled (from where the two histories diverged up to the
     settlement) except those it keeps. Settlements are taken in file order,
-    each over the anomalies no earlier one settled. `before`: only the
-    settlements at an index below it. Positions decide nothing here -- the
-    region is both histories, and only `keeps` says what stands."""
-    by_id = {a.entry.id: a for a in ledger.anomalies}
-    handled: set[str] = set()
+    each over the anomalies no earlier one settled; each decides its whole
+    region, over what an earlier one said about it. Two copies that settled
+    the same dispute differently (contested, see `_Settlements`) decide
+    nothing; the settlement that answers them decides over both their
+    regions. `before`: only the settlements at an index below it. Positions
+    decide nothing here -- the region is both histories, and only `keeps`
+    says what stands."""
+    info = _settlements(ledger)
+    void = info.void
     out: set[str] = set()
     for e in ledger.entries:
         if before is not None and e.index >= before:
             break
-        if e.get("act") != SETTLED_ACT:
+        if e.get("act") != SETTLED_ACT or e.id in void:
             continue
-        fresh = [by_id[i] for i in e.settles if i in by_id and i not in handled]
+        fresh = info.fresh.get(e.id, ())
         if not fresh:
             continue
         keeps = set(e.get("keeps") or ())
-        start = min(a.start for a in fresh)
-        for x in ledger.entries[start:e.index]:
-            if x.get("act") != SETTLED_ACT and x.id not in keeps:
-                out.add(x.id)
-        handled |= {a.entry.id for a in fresh}
+        start = info.widen(min(a.start for a in fresh), e.index)
+        region = [x for x in ledger.entries[start:e.index] if x.get("act") != SETTLED_ACT]
+        out -= {x.id for x in region}
+        out |= {x.id for x in region if x.id not in keeps}
     return out
 
 
@@ -795,16 +851,39 @@ class Dispute:
 
 def dispute_of(card: Card) -> Dispute | None:
     """The question a conflicted card asks, or None when its log holds no
-    unsettled histories. Reads only."""
+    unsettled histories. Reads only. When the histories that diverged hold
+    settlements that contest each other (two copies each settled the same
+    dispute their own way), the question goes back to what those
+    settlements chose between: the region widens over theirs, and the
+    confirmations they disagreed on are offered again."""
     ledger = card.log.ledger if card.log is not None else None
     if ledger is None or not ledger.anomalies:
         return None
     conflict = ledger.conflict(())
     if conflict is None:
         return None
-    earlier_out = settled_out(ledger, before=min(e.index for b in conflict.branches for e in b) if any(conflict.branches) else None)
-    common = tuple(e for e in conflict.common if e.id not in earlier_out and e.get("act") != SETTLED_ACT)
-    branches = tuple(tuple(e for e in b if e.get("act") != SETTLED_ACT) for b in conflict.branches)
+    info = _settlements(ledger)
+    first = min((e.index for b in conflict.branches for e in b), default=None)
+    opened = min(a.start for a in ledger.anomalies if a.entry.id in conflict.anomalies)
+    start = info.widen(opened, len(ledger.entries))
+    if start < opened:
+        open_ids = set(conflict.anomalies)
+        split: list[list[LedgerEntry]] = [[]]
+        previous: int | None = None
+        for e in ledger.entries[start:]:
+            if e.get("act") == SETTLED_ACT or (e.settles and open_ids <= set(e.settles)):
+                continue
+            if e.seq is not None:
+                if previous is not None and e.seq <= previous:
+                    split.append([])
+                previous = e.seq
+            split[-1].append(e)
+        raw_common, raw_branches, before_index = ledger.entries[:start], tuple(tuple(b) for b in split), start
+    else:
+        raw_common, raw_branches, before_index = conflict.common, conflict.branches, first
+    earlier_out = settled_out(ledger, before=before_index)
+    common = tuple(e for e in raw_common if e.id not in earlier_out and e.get("act") != SETTLED_ACT)
+    branches = tuple(tuple(e for e in b if e.get("act") != SETTLED_ACT) for b in raw_branches)
     region = [e for b in branches for e in b]
     candidates: dict[int, tuple[LedgerEntry, ...]] = {}
     for number in sorted({int(e.get("version")) for e in region if e.get("act") in KEEPABLE_ACTS}):

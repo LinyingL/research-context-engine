@@ -464,6 +464,40 @@ def test_pre_v5_project_is_frozen_scans_included_until_migrated(tmp_path, capsys
     assert _db_bytes(old) == before
 
 
+def test_pre_v5_project_review_is_read_by_the_app_without_an_error(tmp_path):
+    """9.12 "Reading works", in the app too: GET /api/review on a project
+    frozen until it is migrated answers (an empty list -- its old index
+    keeps no review), not a 500 from a column the old index does not have,
+    and writes nothing into the old index."""
+    import http.client
+    import json
+    import threading
+
+    from rce.webapp import server as server_mod
+
+    root, old = _migration_fixture(tmp_path)
+    before = _db_bytes(old)
+    httpd = server_mod.build_server(root, 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert httpd.get_served().needs_migration
+        conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1])
+        try:
+            conn.request("GET", "/api/review")
+            resp = conn.getresponse()
+            status, body = resp.status, json.loads(resp.read())
+        finally:
+            conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+    assert status == 200, body
+    assert body["count"] == 0 and body["review"] == [] and body["cards"]["count"] == 0
+    assert _db_bytes(old) == before
+
+
 def test_pre_v5_index_is_writable_again_once_migrated(tmp_path, capsys):
     """The freeze lasts exactly until the migration: afterwards `rce ingest`
     runs against the new index."""
@@ -835,3 +869,25 @@ def test_migrate_preview_says_how_many_scripts_reach_outside_the_folder(tmp_path
     cli.main(["migrate", str(inside)])
     out = capsys.readouterr().out
     assert "match: a scan of" in out and "outside it" not in out
+
+
+# -- follow-up: `rce rebuild` builds an index, so it rewrites .rce/README (9.12)
+
+
+def test_readme_is_rewritten_by_a_rebuild(tmp_path):
+    """`rce rebuild` builds an index too: afterwards `.rce/README` lists the
+    record files the folder holds now -- a card directory created since,
+    not a record file deleted since."""
+    from rce import cli, paths
+
+    root, _pid = _project(tmp_path)
+    readme = root / ".rce" / "README"
+    (root / ".rce" / "mappings.toml").write_text("", encoding="utf-8")
+    paths.write_project_readme(root)
+    assert "mappings.toml" in readme.read_text(encoding="utf-8")
+    assert cli.main(["variable", "new", "topicshift", str(root)]) == 0
+    assert "variables/" not in readme.read_text(encoding="utf-8")
+    (root / ".rce" / "mappings.toml").unlink()
+    assert cli.main(["rebuild", str(root)]) == 0
+    text = readme.read_text(encoding="utf-8")
+    assert "mappings.toml" not in text and "variables/" in text

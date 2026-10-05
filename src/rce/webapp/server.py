@@ -1875,7 +1875,13 @@ def judgement_payload(conn: Connection, served: ServedProject, body: dict[str, A
 def review_payload(conn: Connection) -> dict[str, Any]:
     """`GET /api/review`: 9.6's list of links, plus the variable cards whose
     implementation moved under a confirmed version (9.11 stage (b)) --
-    one list, one count."""
+    one list, one count. A pre-V5 index (a project frozen until it is
+    migrated, 9.12) keeps no review: its judgments move into the record when
+    it is migrated, so it is read as an empty list, as `rce review` reads
+    it -- never a crash on a column the old index does not have."""
+    if not db._has_machine_status(conn):
+        return {"review": [], "count": 0, "source_unreadable": [], "not_in_index": [], "ledger": None,
+                "cards": card_implementation.review_groups(None), "pre_v5": True}
     payload = judgements.review_items(conn)
     card_items = card_implementation.review_groups(conn)
     payload["cards"] = card_items

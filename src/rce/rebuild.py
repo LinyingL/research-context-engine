@@ -431,5 +431,8 @@ def rebuild(
             if not target.exists() and staging.exists():
                 os.replace(staging, target)  # never leave neither
             raise
+        from rce import project as project_mod  # noqa: PLC0415 -- project imports this module
+
+        project_mod._signpost(root)  # 9.12: a rebuilt index -- .rce/README says where things are now
         logger.warning("RCE: rebuilt the index of %s at %s (previous kept at %s)", root, target, previous)
         return Rebuilt(target, swapped=True, previous=previous, blocked=blocked, failures=failures, tally=tally, report=report)

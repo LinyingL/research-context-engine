@@ -385,9 +385,18 @@ class Answered:
 
 
 def _require(c: Classification, allowed: tuple[Situation, ...], answer: str) -> None:
+    """Act on an answer only when the folder's question offers it: the
+    situation must be one the answer is for, and the answer one of those
+    the question offers (`Classification.answers` -- a lost identity known
+    only by its snapshot offers restore / adopt, not 「这是另一个项目」)."""
     if c.situation not in allowed:
         raise AnswerRefused(
             f"'{answer}' answers {' / '.join(s.value for s in allowed)}; {c.root} is {c.situation.value} -- nothing written"
+        )
+    if answer not in c.answers:
+        offered = " / ".join(c.answers) or "none"
+        raise AnswerRefused(
+            f"'{answer}' is not an answer to {c.root}'s question (offered: {offered}) -- nothing written"
         )
 
 

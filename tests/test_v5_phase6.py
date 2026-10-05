@@ -341,6 +341,16 @@ TRAILING_PATH_SHAPES = [
      {"src": "a", "dst": "b", "type": "c", "extractor": "d", "path": "/p"}),
     (["confirm", "--index", "1", "--status", "confirmed", "/p"], {"path": "/p", "src": None}),
     (["status", "/p"], {"path": "/p"}),
+    # a `--` separator before the trailing path (3.11 left it over): dropped,
+    # and what follows it is plain, even a path that starts with "-"
+    (["variable", "abandon", "t", "--note", "x", "--", "/p"], {"path": "/p"}),
+    (["variable", "settle", "t", "--keep", "e1", "--", "/p"], {"path": "/p"}),
+    (["variable", "answer", "rv", "file", "--missing", "a", "--", "/p"], {"path": "/p"}),
+    (["confirm", "a", "b", "c", "d", "--status", "confirmed", "--", "/p"],
+     {"src": "a", "dst": "b", "type": "c", "extractor": "d", "path": "/p"}),
+    (["confirm", "a", "b", "--status", "confirmed", "--", "c", "d", "/p"],
+     {"src": "a", "dst": "b", "type": "c", "extractor": "d", "path": "/p"}),
+    (["variable", "abandon", "t", "--note", "x", "--", "-p"], {"path": "-p"}),
 ]
 
 
@@ -360,6 +370,7 @@ def test_the_trailing_path_is_read_the_same_on_every_python(argv, expected):
     ["confirm", "a", "b", "c", "d", "--status", "confirmed", "/p", "/q"],
     ["status", "/p", "--bogus"],                                         # an unknown option
     ["variable", "abandon", "t", "--note", "x", "--bogus", "/p"],
+    ["variable", "abandon", "t", "--note", "x", "--", "/p", "/q"],     # still one path too many
 ], ids=" ".join)
 def test_what_the_parser_refused_it_still_refuses(argv, capsys):
     with pytest.raises(SystemExit) as exc:
@@ -398,6 +409,14 @@ def test_the_leftover_rule_itself_with_the_older_argparse_shape():
         assert (ns.path, extras) == (None, ["/p", "/q"])
         ns, extras = parser.parse_known_args(["t", "--note", "x", "/p", "-z"])
         assert (ns.path, extras) == (None, ["/p", "-z"])
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "--", "/p"])
+        assert (ns.path, extras) == ("/p", [])
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "--", "-p"])
+        assert (ns.path, extras) == ("-p", [])
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "--", "/p", "/q"])
+        assert (ns.path, extras) == (None, ["--", "/p", "/q"])
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "--"])
+        assert (ns.path, extras) == (None, ["--"])
     finally:
         _argparse.ArgumentParser.parse_known_args = original
 
@@ -566,6 +585,21 @@ def test_lost_identity_is_recognised_by_its_snapshot_alone(tmp_path, capsys, ans
     now = identity.read_identity(root).identity
     assert (now.id == pid) is (answer == "restore")
     assert situation.classify(root).situation is Situation.NORMAL
+
+
+def test_an_answer_the_snapshot_only_question_does_not_offer_is_refused(tmp_path, capsys):
+    """Only the answers offered are acted on: a snapshot-only lost identity
+    offers restore and adopt, so `rce project other` (and fork, claim) is
+    refused, nothing minted."""
+    root, _pid = _project(tmp_path)
+    (root / ".rce" / "project.toml").unlink()
+    assert situation.classify(root).answers == ("restore", "adopt")
+    for answer in ("other", "fork", "claim"):
+        assert cli.main(["project", answer, str(root)]) == 1, answer
+        assert "nothing written" in capsys.readouterr().err
+    with pytest.raises(project_identity.AnswerRefused, match="restore / adopt"):
+        project_identity.other(root)
+    assert not (root / ".rce" / "project.toml").exists()
 
 
 def test_a_never_initialised_folder_is_still_not_a_project(tmp_path):

@@ -165,13 +165,18 @@ class PathParser(argparse.ArgumentParser):
     placed the later way on every version: when everything left over is
     plain tokens (no option among them), and there are no more of them
     than optional positionals still unfilled (None, their default; no
-    `type`/`choices`), they fill those, in declaration order. Anything else
-    is refused exactly as before. Nothing is accepted that the later
-    argparse refuses, and nothing it accepts is refused."""
+    `type`/`choices`), they fill those, in declaration order. A leftover
+    that starts with the `--` separator (older argparse leaves it there,
+    later versions consume it) is read as later argparse reads it: the
+    separator is dropped and every token after it is plain, even one that
+    starts with "-". Anything else is refused exactly as before. Nothing is
+    accepted that the later argparse refuses, and nothing it accepts is
+    refused."""
 
     def parse_known_args(self, args=None, namespace=None):  # type: ignore[override]
         namespace, extras = super().parse_known_args(args, namespace)
-        if not extras or any(token.startswith("-") for token in extras):
+        tokens = extras[1:] if extras and extras[0] == "--" else extras
+        if not tokens or (tokens is extras and any(token.startswith("-") for token in tokens)):
             return namespace, extras
         open_slots = [
             action.dest for action in self._actions
@@ -179,9 +184,9 @@ class PathParser(argparse.ArgumentParser):
             and action.default is None and action.type is None and action.choices is None
             and getattr(namespace, action.dest, None) is None
         ]
-        if len(extras) > len(open_slots):
+        if len(tokens) > len(open_slots):
             return namespace, extras
-        for dest, token in zip(open_slots, extras):
+        for dest, token in zip(open_slots, tokens):
             setattr(namespace, dest, token)
         return namespace, []
 
