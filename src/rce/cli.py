@@ -151,6 +151,41 @@ def add_project_path(parser: argparse.ArgumentParser, *, default: str | None = "
     parser.set_defaults(path_default=default)
 
 
+class PathParser(argparse.ArgumentParser):
+    """The parser of every `rce` command, so that the trailing project path
+    is read the same way on every supported Python (9.12: "RCE runs on
+    Python 3.11 ... as it says it does").
+
+    An optional positional (`path`, `confirm`'s link args) followed by an
+    option and then a token: older argparse (3.11, early 3.12) matches the
+    optional positionals at the first positional run, with nothing if the
+    run is short (`variable abandon ID --note X PATH` gives `path` nothing
+    while reading ID), so PATH is left over as "unrecognized"; later
+    versions keep them open and PATH fills `path`. Here the leftover is
+    placed the later way on every version: when everything left over is
+    plain tokens (no option among them), and there are no more of them
+    than optional positionals still unfilled (None, their default; no
+    `type`/`choices`), they fill those, in declaration order. Anything else
+    is refused exactly as before. Nothing is accepted that the later
+    argparse refuses, and nothing it accepts is refused."""
+
+    def parse_known_args(self, args=None, namespace=None):  # type: ignore[override]
+        namespace, extras = super().parse_known_args(args, namespace)
+        if not extras or any(token.startswith("-") for token in extras):
+            return namespace, extras
+        open_slots = [
+            action.dest for action in self._actions
+            if not action.option_strings and action.nargs == argparse.OPTIONAL
+            and action.default is None and action.type is None and action.choices is None
+            and getattr(namespace, action.dest, None) is None
+        ]
+        if len(extras) > len(open_slots):
+            return namespace, extras
+        for dest, token in zip(open_slots, extras):
+            setattr(namespace, dest, token)
+        return namespace, []
+
+
 def settle_project_path(positional: str | None, flag: str | None, default: str | None) -> str | None:
     """The one project path a command line gave (`add_project_path`)."""
     if positional is not None and flag is not None:
@@ -1869,7 +1904,7 @@ def _positive_hops(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rce", description="Research Context Engine CLI.")
+    parser = PathParser(prog="rce", description="Research Context Engine CLI.")
     # Global, precedes the subcommand (e.g. `rce -v attempts --check`): every
     # extractor logs its skip/orphan/fallback reasons at INFO via the
     # standard `logging` module, but main() never called `basicConfig`, so

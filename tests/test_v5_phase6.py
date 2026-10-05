@@ -215,12 +215,13 @@ def test_where_open_files_cannot_be_told_it_is_said_and_the_engine_check_stands(
 
 
 def test_a_process_holding_the_old_index_is_named_with_its_command(tmp_path, capsys):
+    """The holder is found (/proc on Linux, lsof on macOS) and named by its
+    whole command line up to the cap -- not cut at 80 columns, as `ps`
+    writing to a pipe does on Linux (CI run 37268751080)."""
     root = _folder(tmp_path)
     old = build_pre_v5_index(root)
-    holder = subprocess.Popen(
-        [sys.executable, "-c", "import sys,time; f=open(sys.argv[1],'rb'); print('ok', flush=True); time.sleep(60)", str(old)],
-        stdout=subprocess.PIPE,
-    )
+    argv = [sys.executable, "-c", "import sys,time; f=open(sys.argv[1],'rb'); print('ok', flush=True); time.sleep(60)", str(old)]
+    holder = subprocess.Popen(argv, stdout=subprocess.PIPE)
     try:
         assert holder.stdout.readline().strip() == b"ok"
         assert cli.main(["migrate", "--yes", str(root)]) == 1
@@ -228,7 +229,74 @@ def test_a_process_holding_the_old_index_is_named_with_its_command(tmp_path, cap
     finally:
         holder.kill()
         holder.wait()
-    assert f"process {holder.pid} (has graph.db open: " in out and "time.sleep" in out
+    shown = " ".join(argv)
+    shown = shown if len(shown) <= migration.COMMAND_LIMIT else shown[: migration.COMMAND_LIMIT - 3] + "..."
+    assert f"process {holder.pid} (has graph.db open: {shown})" in out
+
+
+def _fake_proc(tmp_path: Path, processes: dict[int, tuple[bytes | None, list[Path | str]]]) -> Path:
+    """A /proc tree: `<pid>/cmdline` (None: none) and `<pid>/fd/<n>` links."""
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)  # not a pid: passed over
+    (proc / "meminfo").write_text("")
+    for pid, (cmdline, fds) in processes.items():
+        entry = proc / str(pid)
+        (entry / "fd").mkdir(parents=True)
+        (entry / "comm").write_text(f"comm{pid}\n")
+        if cmdline is not None:
+            (entry / "cmdline").write_bytes(cmdline)
+        for n, target in enumerate(fds):
+            os.symlink(str(target), entry / "fd" / str(n))
+    return proc
+
+
+def test_the_proc_reader_names_the_processes_holding_the_index(tmp_path):
+    """9.12: where there is no lsof the holder is found by its /proc/<pid>/fd
+    links and named by /proc/<pid>/cmdline -- covered here on any platform
+    with a fake /proc."""
+    data = tmp_path / "data"
+    data.mkdir()
+    db_file = data / "graph.db"
+    db_file.write_bytes(b"x")
+    wal = data / "graph.db-wal"
+    wal.write_bytes(b"x")
+    (tmp_path / "alias").symlink_to(data)
+    long_arg = "y" * 300
+    proc = _fake_proc(tmp_path, {
+        101: (b"/usr/bin/python3\0-c\0import time; time.sleep(60)\0", ["socket:[123]", "/dev/null", db_file]),
+        102: (b"sqlite3\0" + str(tmp_path / "alias" / "graph.db").encode() + b"\0", [tmp_path / "alias" / "graph.db"]),
+        103: (b"", [wal]),                                   # empty cmdline: its comm
+        104: (b"vim\0notes.md\0", [tmp_path / "other.txt"]),  # holds something else
+        105: (b"me\0", [db_file]),                           # this process
+        106: (b"long\0" + long_arg.encode() + b"\0", [db_file]),
+    })
+    os.mkdir(proc / "107")  # vanished / unreadable: no fd directory
+    found = migration.proc_holders([db_file, wal, data / "graph.db-shm"], proc, me=105)
+    assert set(found) == {101, 102, 103, 106}
+    assert found[101] == "/usr/bin/python3 -c import time; time.sleep(60)"
+    assert found[102].startswith("sqlite3 ")
+    assert found[103] == "comm103"
+    assert len(found[106]) == migration.COMMAND_LIMIT and found[106].endswith("...")
+    assert migration._proc_command(104, proc) == "vim notes.md"
+    assert migration._proc_command(999, proc) is None
+    # nothing to scan: not a /proc (macOS) -- None, so lsof or the note takes over
+    assert migration.proc_holders([db_file], tmp_path / "no-proc") is None
+    empty = tmp_path / "empty-proc"
+    empty.mkdir()
+    assert migration.proc_holders([db_file], empty) is None
+
+
+def test_on_linux_the_holders_come_from_proc_without_lsof(tmp_path, monkeypatch):
+    """With a /proc to read, lsof is never needed (CI's Linux, a container
+    with no lsof); with neither, it cannot be told (None)."""
+    db_file = tmp_path / "graph.db"
+    db_file.write_bytes(b"x")
+    proc = _fake_proc(tmp_path, {4242: (b"python3\0hold.py\0", [db_file])})
+    monkeypatch.setattr(migration, "PROC_ROOT", proc)
+    monkeypatch.setattr(migration, "_lsof", lambda: None)
+    assert migration.holders([db_file]) == {4242: "python3 hold.py"}
+    monkeypatch.setattr(migration, "PROC_ROOT", tmp_path / "none")
+    assert migration.holders([db_file]) is None
 
 
 # -- (b) one path convention ---------------------------------------------------------------
@@ -258,6 +326,80 @@ def test_every_subcommand_takes_the_project_positionally_or_as_path(argv, capsys
         cli.main(argv[:2 if argv[0] == "project" or argv[0] == "projects" else 1] + ["--help"])
     help_text = " ".join(capsys.readouterr().out.split())
     assert "--path PATH" in help_text and "or give it as --path" in help_text
+
+
+TRAILING_PATH_SHAPES = [
+    # the exact shapes that failed on CPython 3.11 (CI run 37268751080): an
+    # optional positional, an option, then the project path
+    (["variable", "abandon", "topicshift", "--note", "no stable relation", "/p"], {"path": "/p"}),
+    (["variable", "answer", "rv", "file", "--missing", "a,b", "/p"], {"path": "/p"}),
+    (["variable", "confirm", "topicshift", "--attest", "unknown", "/p"], {"path": "/p"}),
+    (["confirm", "a", "b", "c", "d", "--status", "confirmed", "/p"],
+     {"src": "a", "dst": "b", "type": "c", "extractor": "d", "path": "/p"}),
+    # the link args split around an option: the later ones fill what is still open, in order
+    (["confirm", "a", "b", "--status", "confirmed", "c", "d", "/p"],
+     {"src": "a", "dst": "b", "type": "c", "extractor": "d", "path": "/p"}),
+    (["confirm", "--index", "1", "--status", "confirmed", "/p"], {"path": "/p", "src": None}),
+    (["status", "/p"], {"path": "/p"}),
+]
+
+
+@pytest.mark.parametrize("argv,expected", TRAILING_PATH_SHAPES, ids=lambda a: " ".join(a) if isinstance(a, list) else "")
+def test_the_trailing_path_is_read_the_same_on_every_python(argv, expected):
+    """9.12: "RCE runs on Python 3.11 ... as it says it does" -- the path
+    convention does not depend on a later argparse (`cli.PathParser`)."""
+    args = cli.build_parser().parse_args(argv)
+    cli._settle_path(args)
+    for name, value in expected.items():
+        assert getattr(args, name) == value, (argv, name)
+
+
+@pytest.mark.parametrize("argv", [
+    ["status", "/a", "/b"],                                              # one path too many
+    ["variable", "abandon", "t", "--note", "x", "/p", "/q"],
+    ["confirm", "a", "b", "c", "d", "--status", "confirmed", "/p", "/q"],
+    ["status", "/p", "--bogus"],                                         # an unknown option
+    ["variable", "abandon", "t", "--note", "x", "--bogus", "/p"],
+], ids=" ".join)
+def test_what_the_parser_refused_it_still_refuses(argv, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(argv)
+    assert exc.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_the_leftover_rule_itself_with_the_older_argparse_shape():
+    """`PathParser` given what argparse 3.11 hands back (the optional
+    positional consumed empty, the path left over) -- driven directly, so
+    the rule is covered whichever Python runs the suite."""
+    parser = cli.PathParser(prog="t")
+    parser.add_argument("id")
+    parser.add_argument("path", nargs="?", default=None)
+    parser.add_argument("--note")
+    import argparse as _argparse
+
+    def older(self, args=None, namespace=None):
+        ns = _argparse.Namespace(id=args[0], path=None, note=None)
+        rest, i = [], 1
+        while i < len(args):
+            if args[i] == "--note":
+                ns.note = args[i + 1]
+                i += 2
+            else:
+                rest.append(args[i])
+                i += 1
+        return ns, rest
+
+    original = _argparse.ArgumentParser.parse_known_args
+    _argparse.ArgumentParser.parse_known_args = older
+    try:
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "/p"])
+        assert (ns.path, extras) == ("/p", [])
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "/p", "/q"])
+        assert (ns.path, extras) == (None, ["/p", "/q"])
+        ns, extras = parser.parse_known_args(["t", "--note", "x", "/p", "-z"])
+        assert (ns.path, extras) == (None, ["/p", "-z"])
+    finally:
+        _argparse.ArgumentParser.parse_known_args = original
 
 
 def test_existing_forms_still_work_and_the_new_ones_too(tmp_path, capsys):

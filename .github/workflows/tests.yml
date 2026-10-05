@@ -54,7 +54,7 @@ jobs:
             echo "$extra_packages"
             exit 1
           fi
-      - name: rce init / ingest / status / query / trace on a fixture repo
+      - name: rce init / ingest / status / query / trace / records / review / variable list on a fixture repo
         run: |
           set -euo pipefail
           workdir=$(mktemp -d)
@@ -66,12 +66,22 @@ jobs:
           echo "hello" > README.md
           git add README.md
           git commit -q -m "init"
-          project_id="project:$(basename "$workdir")"
-          rce init .
+          # Since V5 the project node is project:<id>, the id 'rce init'
+          # prints (and writes to .rce/project.toml) -- not the folder name.
+          init_output=$(rce init .)
+          echo "$init_output"
+          project_id="project:$(echo "$init_output" | sed -n 's/^Project id: \(p-[0-9a-f]*\).*/\1/p')"
+          if [ "$project_id" = "project:" ]; then
+            echo "'rce init' did not print a 'Project id: p-...' line"
+            exit 1
+          fi
           rce ingest .
           rce status
           rce query "$project_id"
           rce trace "$project_id"
+          rce records .
+          rce review .
+          rce variable list .
       - name: rce attempts (the only command that reads a TOML config) on a minimal fixture table
         run: |
           set -euo pipefail

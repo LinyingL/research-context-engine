@@ -67,8 +67,9 @@ stops and asks -- instead of a migration that resumes. So, in order:
    the engine on the app's port blocks only when it serves THIS project or
    this old index (asked through `GET /api/engine` and compared
    canonically; one that does not answer in the V5 shape blocks), and any
-   other process with its `graph.db` open blocks (lsof, or /proc; where
-   neither exists that is said, and the engine comparison stands alone).
+   other process with its `graph.db` open blocks (/proc where it exists,
+   else lsof; where neither does that is said, and the engine comparison
+   stands alone).
    The refusal names each process, pid and what it is (「请先退出 RCE
    与 MCP 服务」). Retiring is renaming it into `~/.rce/graphs/.retired/<hash>-
    <date>/` (a `~/.rce/graphs/<hash>/` directory whole; from anywhere
@@ -809,27 +810,58 @@ def _same_path(a: str | Path | None, b: str | Path | None) -> bool:
         return False
 
 
-def _command_of(pid: int) -> str | None:
-    """A short description of process `pid` (its command line), or None."""
-    ps = shutil.which("ps") or ("/bin/ps" if os.path.exists("/bin/ps") else None)
-    if ps:
-        try:
-            done = subprocess.run([ps, "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5, check=False)
-        except (OSError, subprocess.SubprocessError):
-            done = None
-        if done is not None and done.returncode == 0 and done.stdout.strip():
-            text = done.stdout.strip().splitlines()[0]
-            return text if len(text) <= 160 else text[:157] + "..."
-    comm = Path("/proc") / str(pid) / "comm"
+PROC_ROOT = Path("/proc")
+COMMAND_LIMIT = 160
+
+
+def _shorten(text: str) -> str:
+    return text if len(text) <= COMMAND_LIMIT else text[: COMMAND_LIMIT - 3] + "..."
+
+
+def _proc_command(pid: int, proc: Path | None = None) -> str | None:
+    """Process `pid`'s command line from `<proc>/<pid>/cmdline` (its argv,
+    NUL-separated, joined with spaces as `ps` prints it), or its `comm`
+    when the command line is empty (a kernel thread, a zombie); None where
+    there is no such /proc entry (macOS) or it cannot be read."""
+    entry = (PROC_ROOT if proc is None else proc) / str(pid)
     try:
-        return comm.read_text().strip() or None
+        raw = (entry / "cmdline").read_bytes()
+    except OSError:
+        raw = b""
+    words = [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
+    if words:
+        return _shorten(" ".join(words))
+    try:
+        return (entry / "comm").read_text(errors="replace").strip() or None
     except OSError:
         return None
 
 
+def _command_of(pid: int) -> str | None:
+    """A short description of process `pid` (its command line), or None.
+    From /proc where it exists (Linux); else from `ps` (macOS). `-ww`: a
+    `ps` writing to a pipe otherwise cuts the line at 80 columns (procps)."""
+    from_proc = _proc_command(pid)
+    if from_proc:
+        return from_proc
+    ps = shutil.which("ps") or ("/bin/ps" if os.path.exists("/bin/ps") else None)
+    if ps:
+        try:
+            done = subprocess.run([ps, "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is not None and done.returncode == 0 and done.stdout.strip():
+            return _shorten(done.stdout.strip().splitlines()[0])
+    return None
+
+
+def _lsof() -> str | None:
+    return shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+
+
 def _listener_pid(port: int) -> int | None:
     """The pid listening on 127.0.0.1:`port`, when lsof can tell."""
-    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+    lsof = _lsof()
     if not lsof:
         return None
     try:
@@ -874,14 +906,54 @@ def engine_holding(root: Path, project_id: str | None, db_path: Path) -> Holder 
     return None
 
 
+def proc_holders(files: Iterable[Path | str], proc: Path | None = None, *, me: int | None = None) -> dict[int, str] | None:
+    """9.12, where there is no lsof: the processes under `proc` (Linux's
+    /proc) with any of `files` open -- each `<proc>/<pid>/fd/<n>` link is
+    read and compared with the files' real paths -- named by their command
+    line (`_proc_command`). None when `proc` has no process entries to scan
+    (macOS, or /proc not mounted). Entries that vanish or cannot be read
+    (another user's process) are passed over."""
+    proc = PROC_ROOT if proc is None else proc
+    me = os.getpid() if me is None else me
+    try:
+        entries = [e for e in proc.iterdir() if e.name.isdigit()]
+    except OSError:
+        return None
+    if not entries:
+        return None
+    wanted = {os.path.realpath(f) for f in files}
+    found: dict[int, str] = {}
+    for entry in entries:
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        try:
+            links = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in links:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if target in wanted or os.path.realpath(target) in wanted:
+                found[pid] = _proc_command(pid, proc) or "unknown"
+                break
+    return found
+
+
 def holders(files: Iterable[Path]) -> dict[int, str] | None:
     """OTHER processes holding any of `files` open, {pid: what it is};
-    None when that cannot be told on this platform."""
+    None when that cannot be told on this platform. /proc first where it
+    exists (Linux: no lsof needed); else lsof (macOS)."""
     existing = [str(f) for f in files if f.exists()]
     if not existing:
         return {}
     me = os.getpid()
-    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+    from_proc = proc_holders(existing, me=me)
+    if from_proc is not None:
+        return from_proc
+    lsof = _lsof()
     if lsof:
         try:
             done = subprocess.run([lsof, "-F", "pc", "--", *existing], capture_output=True, text=True, timeout=20, check=False)
@@ -899,23 +971,6 @@ def holders(files: Iterable[Path]) -> dict[int, str] | None:
                 elif line.startswith("c") and pid is not None:
                     found[pid] = line[1:]
             return {p: (_command_of(p) or c or "unknown") for p, c in found.items() if p != me}
-    proc = Path("/proc")
-    if proc.is_dir():
-        wanted = {os.path.realpath(f) for f in existing}
-        found = {}
-        for entry in proc.iterdir():
-            if not entry.name.isdigit() or int(entry.name) == me:
-                continue
-            try:
-                for fd in (entry / "fd").iterdir():
-                    try:
-                        if os.path.realpath(fd) in wanted:
-                            found[int(entry.name)] = _command_of(int(entry.name)) or "unknown"
-                    except OSError:
-                        continue
-            except OSError:
-                continue
-        return found
     return None
 
 
