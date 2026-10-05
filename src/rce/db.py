@@ -436,6 +436,16 @@ def _has_scan_stamps(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _has_machine_status(conn: sqlite3.Connection) -> bool:
+    """Whether this index has migration 0005 (`edges.machine_status`, the
+    judgment tables) -- False only for a partially migrated test index."""
+    try:
+        conn.execute("SELECT machine_status FROM edges LIMIT 0")
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
 def _scan_columns(
     existing: sqlite3.Row | None,
     scan_id: int,
@@ -640,6 +650,14 @@ def upsert_edge(
                     "DELETE FROM removed_edges WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
                     (src, dst, type, extractor),
                 )
+            if extractor not in HUMAN_EXTRACTORS and _has_machine_status(conn):
+                # Migration 0005: what the machine says, kept apart from
+                # the status a human verdict may have set -- the applier
+                # falls back to it when a judgment is not applied.
+                conn.execute(
+                    "UPDATE edges SET machine_status = ? WHERE src = ? AND dst = ? AND type = ? AND extractor = ?",
+                    (status, src, dst, type, extractor),
+                )
             if scan_id is not None:
                 assert scan_source is not None and basis is not None
                 stamps = _scan_columns(existing, scan_id, scan_source, basis, prior_scan)
@@ -675,6 +693,12 @@ def set_edge_status(
     status: str,
 ) -> None:
     """Human-only write path for an edge's status (confirm/reject/correct).
+
+    Since V5 (DESIGN.md 9.1) no surface calls this for a verdict on a
+    machine link: a judgment is appended to `.rce/judgements.toml` and the
+    index's status is DERIVED from it by `rce.records.judgements` (through
+    `write_judgement_state`). What remains is the mapping ingest, whose
+    hand-drawn links have their one authority in `.rce/mappings.toml`.
 
     Symmetric with set_human_fields on the node side: this is the sole path
     allowed to move a status to or from 'confirmed'/'rejected'. Unlike
@@ -772,7 +796,9 @@ def _edge_status_txn(
 def reject_edge_remembering(
     conn: sqlite3.Connection, src: str, dst: str, type: str, extractor: str
 ) -> str | None:
-    """Human-only: mark an edge `rejected`, recording the status it had
+    """Pre-V5 (kept for indexes and tests of that era; since V5 no surface
+    calls it -- a reject is a ledger entry, its undo an `undone` entry).
+    Human-only: mark an edge `rejected`, recording the status it had
     (`STATUS_BEFORE_REJECT_KEY`) so `restore_rejected_edge` can undo the
     reject exactly -- the canvas's 「标记为错误提取」 and its 「撤销」.
 
@@ -798,7 +824,8 @@ def reject_edge_remembering(
 def restore_rejected_edge(
     conn: sqlite3.Connection, src: str, dst: str, type: str, extractor: str
 ) -> str | None:
-    """Human-only undo of `reject_edge_remembering`: put a rejected edge
+    """Pre-V5, like `reject_edge_remembering`. Human-only undo of
+    `reject_edge_remembering`: put a rejected edge
     back at the status recorded when it was rejected (`confirmed` stays
     confirmed), or `DEFAULT_RESTORED_STATUS` when none was recorded, and
     drop the memory. Returns the restored status; None when the edge does
@@ -1036,8 +1063,154 @@ def query_edges(
 
 
 def pending_edges(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """The confirmation queue: edges awaiting human review (status='pending')."""
-    return query_edges(conn, status="pending")
+    """The confirmation queue: edges awaiting human review (status='pending').
+
+    A link whose old judgment is under review or in conflict (DESIGN.md
+    9.6, migration 0005's `judgement_state`) is shown at the machine's
+    status -- often 'pending' -- but it is counted in 待复核, never in
+    待确认: it is not a new candidate, it is an old judgment waiting."""
+    edges = query_edges(conn, status="pending")
+    waiting = waiting_judgement_keys(conn)
+    if not waiting:
+        return edges
+    return [e for e in edges if (e["src"], e["dst"], e["type"], e["extractor"]) not in waiting]
+
+
+# -- the judgment ledger's derived state (DESIGN.md 9.3/9.6, migration 0005) ------
+#
+# The SQL half of `rce.records.judgements`: that module decides, from the
+# ledger and the scan stamps, what the index's human state is; these
+# functions only store and fetch it.
+
+JUDGEMENT_OUTCOMES = frozenset({"applied", "review", "conflict", "held", "not_in_index"})
+#: Outcomes counted in 待复核 (the researcher has to act).
+WAITING_OUTCOMES = frozenset({"review", "conflict"})
+_JUDGEMENT_STATE_JSON = ("basis", "basis_now", "candidates", "detail")
+
+
+def waiting_judgement_keys(conn: sqlite3.Connection) -> set[tuple[str, str, str, str]]:
+    """Keys of links under review or in conflict ({} on an index before 0005)."""
+    if not _has_machine_status(conn):
+        return set()
+    rows = conn.execute(
+        "SELECT src, dst, type, extractor FROM judgement_state WHERE outcome IN ('review', 'conflict')"
+    ).fetchall()
+    return {(r["src"], r["dst"], r["type"], r["extractor"]) for r in rows}
+
+
+def judgement_states(conn: sqlite3.Connection) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    """Every row of `judgement_state`, keyed by link, JSON columns decoded."""
+    if not _has_machine_status(conn):
+        return {}
+    found = {}
+    for row in conn.execute("SELECT * FROM judgement_state ORDER BY src, dst, type, extractor").fetchall():
+        item = dict(row)
+        for column in _JUDGEMENT_STATE_JSON:
+            item[column] = json.loads(item[column]) if item[column] is not None else None
+        found[(item["src"], item["dst"], item["type"], item["extractor"])] = item
+    return found
+
+
+def edge_statuses(conn: sqlite3.Connection) -> dict[tuple[str, str, str, str], tuple[str, str | None]]:
+    """{key: (status, machine_status)} for every non-mapping edge."""
+    placeholders = ", ".join("?" for _ in HUMAN_EXTRACTORS)
+    rows = conn.execute(
+        f"SELECT src, dst, type, extractor, status, machine_status FROM edges WHERE extractor NOT IN ({placeholders})",
+        sorted(HUMAN_EXTRACTORS),
+    ).fetchall()
+    return {(r["src"], r["dst"], r["type"], r["extractor"]): (r["status"], r["machine_status"]) for r in rows}
+
+
+def applied_judgement_rows(conn: sqlite3.Connection) -> dict[str, str]:
+    """{entry id: the entry's JSON as the index applied it}."""
+    if not _has_machine_status(conn):
+        return {}
+    return {r["id"]: r["data"] for r in conn.execute("SELECT id, data FROM applied_judgements").fetchall()}
+
+
+def write_judgement_state(
+    conn: sqlite3.Connection,
+    *,
+    statuses: dict[tuple[str, str, str, str], str],
+    states: dict[tuple[str, str, str, str], dict[str, Any]],
+    applied: dict[str, tuple[int | None, str]] | None,
+) -> None:
+    """The applier's one write, in one transaction: each edge's derived
+    `status` (only rows whose status differs are touched, so a rescan with
+    nothing new writes nothing), the whole `judgement_state` table, and --
+    when `applied` is given -- the whole applied copy ({id: (seq, json)})."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        now = _now()
+        for (src, dst, type_, extractor), status in statuses.items():
+            if status not in EDGE_STATUSES:
+                raise ValueError(f"unknown edge status: {status!r}")
+            conn.execute(
+                "UPDATE edges SET status = ?, updated_at = ? "
+                "WHERE src = ? AND dst = ? AND type = ? AND extractor = ? AND status != ?",
+                (status, now, src, dst, type_, extractor, status),
+            )
+        conn.execute("DELETE FROM judgement_state")
+        for (src, dst, type_, extractor), item in states.items():
+            if item["outcome"] not in JUDGEMENT_OUTCOMES:
+                raise ValueError(f"unknown judgement outcome: {item['outcome']!r}")
+            conn.execute(
+                """
+                INSERT INTO judgement_state (src, dst, type, extractor, outcome, reason, verdict,
+                    entry_id, at, note, basis, basis_now, candidates, source_status, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    src, dst, type_, extractor, item["outcome"], item.get("reason"), item.get("verdict"),
+                    item.get("entry_id"), item.get("at"), item.get("note"),
+                    None if item.get("basis") is None else json.dumps(item["basis"], ensure_ascii=False, sort_keys=True),
+                    None if item.get("basis_now") is None else json.dumps(item["basis_now"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(item.get("candidates") or [], ensure_ascii=False, sort_keys=True),
+                    item.get("source_status"),
+                    json.dumps(item.get("detail") or {}, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+        if applied is not None:
+            conn.execute("DELETE FROM applied_judgements")
+            conn.executemany(
+                "INSERT INTO applied_judgements (id, seq, data) VALUES (?, ?, ?)",
+                [(entry_id, seq, data) for entry_id, (seq, data) in applied.items()],
+            )
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def forget_applied_judgements(conn: sqlite3.Connection, ids: list[str]) -> None:
+    """Drop entries from the applied copy (9.3's 「以文件为准」, and the old
+    ids of entries 「把缺少的补回文件」 re-appended under new ids)."""
+    conn.executemany("DELETE FROM applied_judgements WHERE id = ?", [(i,) for i in ids])
+    conn.commit()
+
+
+def get_record_status(conn: sqlite3.Connection, name: str) -> dict[str, Any] | None:
+    if not _has_machine_status(conn):
+        return None
+    row = conn.execute("SELECT state FROM record_status WHERE name = ?", (name,)).fetchone()
+    return None if row is None else json.loads(row["state"])
+
+
+def set_record_status(conn: sqlite3.Connection, name: str, state: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO record_status (name, state) VALUES (?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET state = excluded.state",
+        (name, json.dumps(state, ensure_ascii=False, sort_keys=True)),
+    )
+    conn.commit()
+
+
+def has_finished_scan(conn: sqlite3.Connection) -> bool:
+    """Whether any scan of this index ran to the end."""
+    try:
+        return conn.execute("SELECT 1 FROM scans WHERE outcome = 'finished' LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
 
 
 # -- scans (DESIGN.md 9.6, migration 0004) ---------------------------------------

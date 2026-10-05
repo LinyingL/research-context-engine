@@ -811,6 +811,10 @@ const BLOCKING_ERROR_TEXT = {
   read_only: "项目当前是只读打开的，不会写入任何东西",
   project_busy: "另一个 RCE 进程正在写入这个项目，请稍后再试",
   project_blocked: "这个项目需要你先确认，确认之前不会写入任何东西",
+  // DESIGN.md 9.3 / 9.2: a record RCE cannot trust right now, nothing written
+  record_untrusted: "判断记录文件当前无法读取，请先恢复它",
+  record_shrunk: "判断记录文件比图谱少了几条判断，需要你先确认以哪一份为准",
+  layout_unreadable: "画布位置记录文件无法读取，请先修复它",
 };
 
 function blockingErrorText(framing, err) {
@@ -1018,7 +1022,9 @@ async function loadProjectSummary(force) {
     // Registry label when loadProjects() found one, else the directory
     // basename -- never the raw path, which lives on as the hover title.
     const label = state.projectLabel || basename(data.project_root);
-    line.textContent = "项目：" + label + "   ·   待确认：" + data.pending;
+    // 9.6: an old judgment waiting for review is counted here, never in 待确认.
+    const review = data.review ? "   ·   待复核：" + data.review : "";
+    line.textContent = "项目：" + label + "   ·   待确认：" + data.pending + review;
     line.title = data.project_root;
     // The edit form's column names (attemptsConfig, above) ride along on
     // this same fetch (task V3 phase 3) -- kept fresh so a config edit

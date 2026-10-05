@@ -11,8 +11,14 @@ functions below (which take `conn` directly -- that's what the test suite
 calls, no stdio/client involved), format as text, close the connection.
 Every tool states explicitly when its result is empty/unknown, per the
 constitution's "无边如实返回空结构，禁止编造" -- never invented. rce_confirm_edge
-is the sole write path (via db.set_edge_status); its description tells the
-calling assistant to invoke it only on an explicit human confirm/reject ask.
+is the sole write tool; since V5 (DESIGN.md 9.1, 9.8) it records the act in
+the project's `.rce/judgements.toml` through `rce.records.judgements.judge`
+-- the one human write path every surface uses -- and the index follows.
+Its verdicts are the ledger's (confirmed / rejected / withdrawn / undone),
+and like the canvas it refuses a hand-drawn link. Its description tells
+the calling assistant to invoke it only on an explicit human ask. A link
+whose judgment is under review or in conflict is marked in every tool's
+output (9.6 "Where it shows").
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from mcp.server.fastmcp import FastMCP
 
 from rce import db, paths, query
 from rce import project as project_identity
+from rce.records import judgements
 from rce.records import lock as records_lock
 from rce.records import situation as records_situation
 
@@ -97,7 +104,7 @@ def format_trace_text(node_id: str, result: dict[str, Any]) -> str:
         lines.append(
             f"  [{hop['depth']}] {hop['src']} --{hop['type']}--> {hop['dst']} "
             f"(extractor={hop['extractor']}, confidence={hop['confidence']:.2f}, "
-            f"status={hop['status']}{location_note}) evidence={evidence}"
+            f"status={hop['status']}{location_note}){judgements.review_marker(hop)} evidence={evidence}"
         )
     return "\n".join(lines)
 
@@ -133,7 +140,10 @@ def status_summary(conn: Connection) -> dict[str, Any]:
     edge_counts = {t: 0 for t in sorted(db.EDGE_TYPES)}
     for edge in db.query_edges(conn):
         edge_counts[edge["type"]] += 1
-    return {"nodes": node_counts, "edges": edge_counts, "pending": len(db.pending_edges(conn))}
+    return {
+        "nodes": node_counts, "edges": edge_counts, "pending": len(db.pending_edges(conn)),
+        "review": judgements.review_count(conn),
+    }
 
 
 def format_status_text(summary: dict[str, Any]) -> str:
@@ -143,41 +153,60 @@ def format_status_text(summary: dict[str, Any]) -> str:
             "  Nodes: " + " ".join(f"{k}={v}" for k, v in summary["nodes"].items()),
             "  Edges: " + " ".join(f"{k}={v}" for k, v in summary["edges"].items()),
             f"  Pending confirmation queue: {summary['pending']}",
+            f"  Judgments under review (see `rce review`): {summary.get('review', 0)}",
         ]
     )
 
 
-def confirm_edge(conn: Connection, src: str, dst: str, type: str, extractor: str, new_status: str) -> str:
-    """The human confirm/reject channel -- mirrors db.set_edge_status's
-    human-only contract. Explicit "no such edge" message (no-op) when the
-    (src, dst, type, extractor) row doesn't exist."""
+CONFIRM_VERDICTS = ("confirmed", "rejected", "withdrawn", "undone")
+
+
+def confirm_edge(
+    root: str | Path,
+    project_id: str | None,
+    src: str,
+    dst: str,
+    type: str,  # noqa: A002 -- the tool's own parameter name
+    extractor: str,
+    new_status: str,
+    note: str | None = None,
+) -> str:
+    """The human act on one machine link, through the one write path
+    (`rce.records.judgements.judge`, `via = "mcp"`): written to the ledger
+    first, then applied. ValueError for an unknown edge type or verdict; a
+    refusal (a hand-drawn link, no such edge, a ledger that cannot be
+    trusted, a moved or pre-V5 project) is the tool's answer, not an
+    exception -- nothing was written."""
     if type not in db.EDGE_TYPES:
         raise ValueError(f"unknown edge type: {type!r}")
-    if new_status not in db.EDGE_STATUSES:
-        raise ValueError(f"unknown edge status: {new_status!r}")
-    existing = [e for e in db.query_edges(conn, src=src, dst=dst, type=type) if e["extractor"] == extractor]
-    if not existing:
-        return f"No such edge: {src} --{type}--> {dst} (extractor={extractor}); nothing changed."
-    db.set_edge_status(conn, src, dst, type, extractor, new_status)
-    return f"Edge {src} --{type}--> {dst} (extractor={extractor}) status set to {new_status!r}."
-
-
-# -- FastMCP server assembly --------------------------------------------------
-
-
-def _guarded_confirm(root: Path, project_id: str | None, *args: str) -> str:
-    """`confirm_edge` as a human write (DESIGN.md 9.4, 9.7, 9.10): under the
-    project lock, with the identity re-checked against the one this server
-    opened, and refused on a pre-V5 project until it is migrated. A
-    refusal is the tool's answer, not an exception: nothing was written."""
+    if new_status not in CONFIRM_VERDICTS:
+        raise ValueError(f"unknown verdict: {new_status!r} (one of {', '.join(CONFIRM_VERDICTS)})")
+    label = f"{src} --{type}--> {dst} (extractor={extractor})"
     try:
-        with records_situation.write_guard(root, project_id, human=True):
-            with _connect(root) as conn:
-                return confirm_edge(conn, *args)
+        judged = judgements.judge(
+            Path(root), (src, dst, type, extractor), new_status, via="mcp", note=note, expected_id=project_id,
+        )
+    except judgements.JudgementRefused as exc:
+        if exc.code == "no_such_link":
+            return f"No such edge: {label}; nothing changed."
+        why = f" ({exc.message_zh})" if exc.message_zh else ""
+        return f"Not written: {exc}{why}"
     except records_situation.WriteRefused as exc:
         return f"Not written: {exc}"
     except records_lock.ProjectLockError as exc:
         return f"Not written: could not take the project lock ({exc})"
+    state = judged.state
+    tail = ""
+    if state is not None and state["outcome"] != "applied":
+        reason = state.get("reason") or state["outcome"]
+        tail = f" Not applied: {reason} ({judgements.REASON_LABELS.get(reason, '')}) -- see `rce review`."
+    return (
+        f"Edge {label}: recorded {new_status!r} in .rce/judgements.toml ({judged.entry.id}); "
+        f"status set to {judged.status!r}.{tail}"
+    )
+
+
+# -- FastMCP server assembly --------------------------------------------------
 
 
 def build_server(project_root: str | Path, project_id: str | None = None) -> FastMCP:
@@ -226,14 +255,20 @@ def build_server(project_root: str | Path, project_id: str | None = None) -> Fas
         return format_status_text(summary)
 
     @mcp.tool()
-    def rce_confirm_edge(src: str, dst: str, type: str, extractor: str, new_status: str) -> str:
-        """Human confirmation/rejection channel for exactly one edge. Call
-        this ONLY when the user has explicitly asked to confirm, reject, or
-        correct the status of a specific edge (e.g. "confirm that figure 4
-        is backed by run xyz") -- never speculatively or during routine
-        tracing. new_status must be one of: confirmed/rejected/pending/auto.
-        States explicitly when no matching edge exists."""
-        return _guarded_confirm(root, project_id, src, dst, type, extractor, new_status)
+    def rce_confirm_edge(
+        src: str, dst: str, type: str, extractor: str, new_status: str, note: str | None = None,
+    ) -> str:
+        """Human judgment channel for exactly one machine-extracted edge,
+        recorded in the project's .rce/judgements.toml. Call this ONLY when
+        the user has explicitly asked to confirm, reject, withdraw or undo
+        a judgment on a specific edge (e.g. "confirm that figure 4 is
+        backed by run xyz") -- never speculatively or during routine
+        tracing. new_status must be one of: confirmed / rejected /
+        withdrawn (back to the machine's status) / undone (takes back the
+        last act). `note` is optional. Hand-drawn links (extractor
+        "mapping") are refused: they live in .rce/mappings.toml. States
+        explicitly when no matching edge exists or nothing was written."""
+        return confirm_edge(root, project_id, src, dst, type, extractor, new_status, note)
 
     return mcp
 

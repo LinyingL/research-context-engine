@@ -74,6 +74,9 @@ from rce.ingest import attempts as attempts_ingest
 from rce.ingest import git as git_ingest  # noqa: F401
 from rce.ingest import mappings as mappings_ingest
 from rce.ingest import pipeline as ingest_pipeline
+from rce.records import files as record_files
+from rce.records import judgements
+from rce.records import ledger as ledger_mod
 from rce.records import lock as records_lock
 from rce.records import situation as records_situation
 # S2: `rce judge`, the optional semantic layer. Unlike rce.mcp_server
@@ -95,6 +98,7 @@ from rce.semantic import judge as semantic_judge
 # launcher bundle (`rce app`). Generation is pure stdlib file writing,
 # platform-independent -- only cmd_app's *default* install location is
 # macOS-gated -- so this too is a plain eager import.
+from rce.webapp import canvas as canvas_mod
 from rce.webapp import macapp
 from rce.webapp import registry as project_registry
 from rce.webapp import server as webapp_server
@@ -180,6 +184,10 @@ def _print_graph_counts(conn: Connection) -> None:
     print(f"  Nodes: {_format_counts(node_counts)}")
     print(f"  Edges: {_format_counts(edge_counts)}")
     print(f"  Pending confirmation queue: {len(db.pending_edges(conn))}")
+    waiting = judgements.review_count(conn)
+    if waiting:
+        # 9.6: old judgments waiting for the researcher, never in the queue above.
+        print(f"  Judgments under review: {waiting} (see 'rce review')")
 
 
 def _ordered_edges(edges: list[dict]) -> list[dict]:
@@ -290,7 +298,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     # and files the researcher owns, so whether it goes into git is theirs.
     print(
         f"Note: '{RCE_DIRNAME}/' in your project now holds only your own files "
-        f"(project.toml, attempts.toml, mappings.toml, backups/) -- commit or .gitignore it as you "
+        f"(project.toml, judgements.toml, canvas.json, attempts.toml, mappings.toml, backups/) -- "
+        f"commit or .gitignore it as you "
         f"prefer. The derived graph is outside the project; see {result.readme}."
     )
     return 0
@@ -473,8 +482,10 @@ def cmd_attempts(args: argparse.Namespace) -> int:
 
             if args.check:
                 results = consistency.run_checks(conn, project_root, config)
+                judgements.apply_after_scan(conn, project_root, print)  # 9.1: the end of a scan
                 _print_consistency_report(results)
                 return 1 if any(r.findings for r in results) else 0
+            judgements.apply_after_scan(conn, project_root, print)
             _print_attempts_listing(conn, config)
         finally:
             conn.close()
@@ -503,6 +514,7 @@ def cmd_mappings(args: argparse.Namespace) -> int:
             except mappings_ingest.MappingsFileError as exc:
                 print(f"Error: {exc} -- graph left untouched", file=sys.stderr)
                 return 1
+            judgements.apply_after_scan(conn, project_root, print)  # 9.1: the end of a scan
         finally:
             conn.close()
     if not report.file_present:
@@ -518,51 +530,229 @@ def cmd_mappings(args: argparse.Namespace) -> int:
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
-    """Thin wrapper over db.set_edge_status, mirroring
-    rce.mcp_server.confirm_edge's contract. Identifies the edge by its 4
-    identity columns, or by `--index` into a freshly re-queried queue.
-    A human write: under the project lock with identity re-checked, and
-    refused on a pre-V5 project until it is migrated (9.10)."""
+    """A human act on one machine link, written to the judgment ledger
+    first and only then reflected in the index (DESIGN.md 9.1, 9.8):
+    `rce.records.judgements.judge`, the one write path every surface uses.
+    Verdicts: confirmed, rejected, withdrawn (the machine's status again),
+    undone (takes back the last act). Identifies the link by its 4
+    identity columns, or by `--index` into a freshly re-queried queue. A
+    hand-drawn link is refused (its truth is .rce/mappings.toml), and so
+    is a pre-V5 project until it is migrated (9.10)."""
     opened = _open(args.path)
     db_path = _require_db(opened.root)
-    with _write_guard(opened, human=True):
-        return _confirm(args, db.connect(db_path))
-
-
-def _confirm(args: argparse.Namespace, conn: Connection) -> int:
+    conn = db.connect(db_path)
     try:
-        positional = (args.src, args.dst, args.type, args.extractor)
-        if args.index is not None:
-            if any(v is not None for v in positional):
-                raise CliError("--index cannot be combined with the src/dst/type/extractor positional args")
-            queue = _ordered_edges(db.query_edges(conn, status=args.from_status))
-            if not 1 <= args.index <= len(queue):
-                raise CliError(
-                    f"--index {args.index} out of range: the {args.from_status!r} queue has "
-                    f"{len(queue)} edge(s) right now -- indices are 1-based and re-sorted on "
-                    f"every run, so re-check with 'rce status --pending' immediately before use"
-                )
-            edge = queue[args.index - 1]
-            src, dst, edge_type, extractor = edge["src"], edge["dst"], edge["type"], edge["extractor"]
-        else:
-            if any(v is None for v in positional):
-                raise CliError(
-                    "confirm requires either all four positional args (src dst type extractor) "
-                    "or --index (with --from-status)"
-                )
-            src, dst, edge_type, extractor = positional
-
+        src, dst, edge_type, extractor = _confirm_target(args, conn)
         matches = [
             e for e in db.query_edges(conn, src=src, dst=dst, type=edge_type) if e["extractor"] == extractor
         ]
-        if not matches:
-            raise CliError(f"no such edge: {src} --{edge_type}--> {dst} (extractor={extractor})")
-        old_status = matches[0]["status"]
-        db.set_edge_status(conn, src, dst, edge_type, extractor, args.status)
-        print(f"Edge {src} --{edge_type}--> {dst} (extractor={extractor}): {old_status} -> {args.status}")
+        old_status = matches[0]["status"] if matches else None
     finally:
         conn.close()
+    try:
+        judged = judgements.judge(
+            opened.root, (src, dst, edge_type, extractor), args.status,
+            via="cli", note=args.note, expected_id=opened.project_id,
+        )
+    except judgements.JudgementRefused as exc:
+        raise CliError(f"not written: {exc}") from exc
+    except records_situation.WriteRefused as exc:
+        raise CliError(str(exc)) from exc
+    except records_lock.ProjectLockError as exc:
+        raise CliError(f"could not take the project lock: {exc}") from exc
+    entry = judged.entry
+    print(
+        f"Edge {src} --{edge_type}--> {dst} (extractor={extractor}): {old_status} -> {judged.status} "
+        f"[recorded {entry.get('verdict')} as {entry.id}, seq {entry.seq}, in .rce/judgements.toml]"
+    )
+    state = judged.state
+    if state is not None and state["outcome"] != "applied":
+        reason = state.get("reason") or state["outcome"]
+        print(f"  not applied: {reason} ({judgements.REASON_LABELS.get(reason, '')}) -- see 'rce review'")
     return 0
+
+
+def _confirm_target(args: argparse.Namespace, conn: Connection) -> tuple[str, str, str, str]:
+    positional = (args.src, args.dst, args.type, args.extractor)
+    if args.index is not None:
+        if any(v is not None for v in positional):
+            raise CliError("--index cannot be combined with the src/dst/type/extractor positional args")
+        # The same queue `status --pending` prints: a link whose old
+        # judgment is under review is not in 待确认 (9.6).
+        candidates = db.pending_edges(conn) if args.from_status == "pending" else db.query_edges(conn, status=args.from_status)
+        queue = _ordered_edges(candidates)
+        if not 1 <= args.index <= len(queue):
+            raise CliError(
+                f"--index {args.index} out of range: the {args.from_status!r} queue has "
+                f"{len(queue)} edge(s) right now -- indices are 1-based and re-sorted on "
+                f"every run, so re-check with 'rce status --pending' immediately before use"
+            )
+        edge = queue[args.index - 1]
+        return edge["src"], edge["dst"], edge["type"], edge["extractor"]
+    if any(v is None for v in positional):
+        raise CliError(
+            "confirm requires either all four positional args (src dst type extractor) "
+            "or --index (with --from-status)"
+        )
+    if args.extractor == "mapping":
+        raise CliError(
+            "this is a hand-drawn link: its one authority is .rce/mappings.toml -- edit or delete "
+            "the mapping there (or in the app) instead"
+        )
+    return positional  # type: ignore[return-value]
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """`rce review` (DESIGN.md 9.6, 9.8): the judgments not applied --
+    under review (with the reason, the old verdict, its date and note, the
+    basis then and now, and candidate links), in conflict, held because
+    their source could not be read, or whose link the index does not hold.
+    Settle one with `rce confirm ...`: the same verdict again (仍然成立,
+    recorded on the basis as it is now), the opposite one, or withdrawn."""
+    opened = _open(args.path)
+    db_path = _require_db(opened.root)
+    # The ledger may have changed since anything last applied it (a hand
+    # edit, a sync, no engine running): apply it first -- an index write,
+    # so under the project lock like a scan.
+    with _write_guard(opened, human=False):
+        conn = db.connect(db_path)
+        try:
+            judgements.apply_ledger(conn, opened.root)
+            items = judgements.review_items(conn)
+        finally:
+            conn.close()
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    ledger_state = items["ledger"]
+    if ledger_state and ledger_state.get("state") != "ok":
+        print(
+            f"Judgment ledger: {ledger_state['state']} -- {ledger_state.get('reason')} "
+            f"({ledger_state.get('detail') or ''}); the index keeps what it had and nothing is written to the ledger"
+        )
+        if ledger_state.get("state") == "shrunk":
+            print("  answer with: rce records --answer file|restore")
+    print(f"Under review: {items['count']}")
+    for item in items["review"]:
+        _print_review_item(item)
+    if items["source_unreadable"]:
+        print(f"Source not readable (judgment kept as it was): {len(items['source_unreadable'])}")
+        for item in items["source_unreadable"]:
+            print(f"  {_item_label(item)} [{item['source_status']}]")
+    if items["not_in_index"]:
+        print(f"Judged links the index does not hold: {len(items['not_in_index'])}")
+        for item in items["not_in_index"]:
+            print(f"  {_item_label(item)} ({item['verdict']} at {item['at']})")
+    return 0
+
+
+def _item_label(item: dict[str, Any]) -> str:
+    return f"{item['src']} --{item['type']}--> {item['dst']} (extractor={item['extractor']})"
+
+
+def _print_review_item(item: dict[str, Any]) -> None:
+    print(f"  {_item_label(item)}")
+    print(f"    reason: {item['reason']} ({item['label']})")
+    if item["outcome"] == "conflict":
+        for n, branch in enumerate(item["detail"].get("branches", []), start=1):
+            acts = ", ".join(f"{e.get('verdict')} seq {e.get('seq')} at {e.get('at')}" for e in branch) or "-"
+            print(f"    history {n}: {acts}")
+        print("    settle it with a new judgment: rce confirm ... --status confirmed|rejected|withdrawn")
+        return
+    note = f", note: {item['note']}" if item.get("note") else ""
+    print(f"    was: {item['verdict']} at {item['at']}{note}")
+    print(f"    basis then: {json.dumps(item['basis'], ensure_ascii=False, sort_keys=True)}")
+    print(f"    basis now:  {json.dumps(item['basis_now'], ensure_ascii=False, sort_keys=True)}")
+    for cand in item["candidates"]:
+        print(f"    candidate ({judgements.CANDIDATE_HINT}): {_item_label(cand)}")
+    print(
+        f"    settle: rce confirm {item['src']} {item['dst']} {item['type']} {item['extractor']} "
+        f"--status {item['verdict']}|{'confirmed' if item['verdict'] == 'rejected' else 'rejected'}|withdrawn"
+    )
+
+
+def cmd_records(args: argparse.Namespace) -> int:
+    """`rce records` (DESIGN.md 9.2, 9.8): where each kind of human labor
+    lives for this project, how many, the newest snapshot; `--verify`
+    checks, per link, that the index's human state is what the record
+    implies (exit 1 if not); `--answer file|restore` answers 9.3's
+    question when the judgment ledger has fewer entries than the index
+    applied."""
+    opened = _open(args.path)
+    root = opened.root
+    if args.answer:
+        try:
+            answered = judgements.answer_shrunk(root, args.answer, expected_id=opened.project_id)
+        except judgements.JudgementRefused as exc:
+            raise CliError(f"not answered: {exc}") from exc
+        except records_situation.WriteRefused as exc:
+            raise CliError(str(exc)) from exc
+        if args.answer == judgements.ANSWER_FILE:
+            print(f"Took the file as it is: {len(answered.missing)} entr(y/ies) dropped from the index's copy")
+        else:
+            print(f"Appended {len(answered.appended)} missing entr(y/ies) to .rce/judgements.toml (via = recovered)")
+    conn = db.connect(_require_db(root))
+    try:
+        for line in records_inventory_lines(conn, root):
+            print(line)
+        if not args.verify:
+            return 0
+        problems = judgements.verify(conn, root)
+    finally:
+        conn.close()
+    if problems:
+        print(f"Verify: {len(problems)} mismatch(es)")
+        for problem in problems:
+            print(f"  {problem}")
+        return 1
+    print("Verify: the index's human state is what the record implies")
+    return 0
+
+
+def records_inventory_lines(conn: Connection, root: Path) -> list[str]:
+    """The 9.2 inventory, one line per kind of human labor."""
+    lines = [f"Records of {root}:"]
+    identity = records_situation.read_identity(root).identity
+    loaded, decision = judgements.assess(conn, root, identity)  # as it is now, not as last applied
+    state = judgements.status_payload(decision, loaded)
+    if loaded.ledger is not None:
+        n = len(loaded.ledger.entries)
+        stands = sum(
+            1 for key in loaded.ledger.keys()
+            if ledger_mod.judgement_status(loaded.ledger.state(key)) in ("confirmed", "rejected")
+        )
+        detail = f"{n} entr(y/ies), {stands} judgment(s) standing"
+    else:
+        detail = f"{loaded.state.value}" + (f" ({loaded.error})" if loaded.error else "")
+    trust = f"; {state['state']}: {state['reason']} ({state['detail'] or ''})" if state["state"] != "ok" else ""
+    if state["state"] == "shrunk":
+        trust = f"; shrunk: the file lacks {len(state['missing'])} entr(y/ies) the index applied"
+    if state["state"] == "shrunk":
+        trust += " -- answer with 'rce records --answer file|restore'"
+    lines.append(_inventory_line("Confirm/reject of machine links", loaded.path, root, detail + trust))
+    mappings_file = mappings_ingest.mappings_path(root)
+    mapping_count = sum(1 for e in db.query_edges(conn) if e["extractor"] == mappings_ingest.EXTRACTOR)
+    lines.append(_inventory_line("Hand-drawn links", mappings_file, root, f"{mapping_count} in the index"))
+    try:
+        config = attempts_ingest.load_config(root)
+    except attempts_ingest.AttemptsConfigError:
+        lines.append("  Attempt verdicts: no .rce/attempts.toml")
+    else:
+        attempts = db.get_nodes_by_type(conn, "attempt")
+        lines.append(_inventory_line("Attempt verdicts", root / config.file, root, f"{len(attempts)} attempt(s) in the index"))
+    layout = canvas_mod.layout_record(root)
+    lines.append(_inventory_line("Canvas arrangement", layout.path, root, layout.describe()))
+    return lines
+
+
+def _inventory_line(kind: str, path: Path, root: Path, detail: str) -> str:
+    try:
+        shown = path.relative_to(root).as_posix()
+    except ValueError:
+        shown = str(path)
+    newest = record_files.newest_snapshot(root, path) if path.exists() else None
+    snap = f"; newest snapshot {newest.name}" if newest is not None else ""
+    return f"  {kind}: {shown} -- {detail}{snap}"
 
 
 def cmd_judge(args: argparse.Namespace) -> int:
@@ -621,6 +811,7 @@ def _judge(args: argparse.Namespace, conn: Connection) -> int:
 
 def _print_edge(edge: dict, other_side: str, direction: str, conn=None) -> None:
     evidence = json.dumps(edge["evidence"], sort_keys=True)
+    marker = judgements.review_marker(judgements.link_flags(conn).for_key(judgements.key_of(edge))) if conn is not None else ""
     # A claim's line lives on the claim node, not in the edge evidence, so resolve
     # it here the same way `status --pending` and `trace` do -- otherwise this is
     # the one consumer that cannot tell the reader where in the paper to look.
@@ -633,7 +824,7 @@ def _print_edge(edge: dict, other_side: str, direction: str, conn=None) -> None:
             location = f" source_location={loc.get('file')}:{loc['line']}"
     print(
         f"  {direction} {edge[other_side]} [{edge['type']}] extractor={edge['extractor']} "
-        f"confidence={edge['confidence']:.2f} status={edge['status']} evidence={evidence}{location}"
+        f"confidence={edge['confidence']:.2f} status={edge['status']}{marker} evidence={evidence}{location}"
     )
 
 
@@ -732,7 +923,7 @@ def _format_trace_human(node_id: str, max_hops: int, result: dict[str, Any]) -> 
         lines.append(f"{indent}[depth {hop['depth']}] {hop['src']} --{hop['type']}--> {hop['dst']}")
         lines.append(
             f"{indent}    extractor={hop['extractor']} confidence={hop['confidence']:.2f} "
-            f"status={hop['status']}"
+            f"status={hop['status']}{judgements.review_marker(hop)}"
         )
         display_line = _display_line(hop.get("source_location"))
         lines.append(f"{indent}    evidence: {_format_evidence_summary(hop['evidence'], display_line)}")
@@ -765,7 +956,7 @@ def _format_lineage_entry(entry: dict[str, Any]) -> str:
         # A human mapping (rce.lineage): no call site to cite, and the
         # assertion's source is the mappings file the researcher wrote.
         return f"{entry['script']} (human mapping, .rce/mappings.toml)"
-    return f"{entry['script']}:{entry['line']} ({entry['callee']})"
+    return f"{entry['script']}:{entry['line']} ({entry['callee']}){judgements.review_marker(entry)}"
 
 
 def _format_lineage_human(report: dict[str, Any], orphans_only: bool) -> str:
@@ -1342,15 +1533,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "confirm",
-        help="Human confirm/reject one edge (writes via db.set_edge_status) -- no mcp extra required",
+        help="Record a human verdict on one machine link in .rce/judgements.toml, then apply it",
     )
     p.add_argument("src", nargs="?", default=None, help="edge src node id, e.g. claim:paper.tex#abc123")
     p.add_argument("dst", nargs="?", default=None, help="edge dst node id, e.g. experiment:run_a")
     p.add_argument("type", nargs="?", default=None, help="edge type, e.g. backed_by")
     p.add_argument("extractor", nargs="?", default=None, help="edge extractor, e.g. claims")
     p.add_argument(
-        "--status", required=True, choices=["confirmed", "rejected"], help="new human verdict",
+        "--status", required=True, choices=["confirmed", "rejected", "withdrawn", "undone"],
+        help="the act: confirmed / rejected; withdrawn (the machine's status again); undone (takes back the last act)",
     )
+    p.add_argument("--note", default=None, help="optional note stored with the judgment")
     p.add_argument(
         "--index", type=int, default=None, metavar="N",
         help=(
@@ -1365,6 +1558,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--path", default=".", help="project root (default: '.')")
     p.set_defaults(func=cmd_confirm)
+
+    p = sub.add_parser(
+        "review",
+        help="List judgments not applied: under review (with reason, old verdict, basis then/now, candidates), "
+             "in conflict, or held because their source could not be read",
+    )
+    p.add_argument("--json", action="store_true", help="print the list as JSON")
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser(
+        "records",
+        help="Inventory of this project's human records (.rce/); --verify checks the index against them",
+    )
+    p.add_argument("--verify", action="store_true", help="check per link that the index's human state is what the record implies; exit 1 if not")
+    p.add_argument(
+        "--answer", choices=list(judgements.ANSWERS), default=None,
+        help="when the judgment ledger has fewer entries than the index applied: 'file' takes the file as "
+             "truth (以文件为准), 'restore' appends the missing entries back (把缺少的补回文件)",
+    )
+    p.add_argument("path", nargs="?", default=".", help="project root (default: '.')")
+    p.set_defaults(func=cmd_records)
 
     p = sub.add_parser(
         "judge",

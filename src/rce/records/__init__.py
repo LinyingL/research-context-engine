@@ -19,4 +19,8 @@ wired to it by later phases, through these modules only:
 - `situation` -- which project a folder is (the 9.4 situation table),
                 `home.json`, and the write-time identity re-check every
                 record and index write makes under the project lock
+- `judgements` -- the one write path for a human verdict on a machine
+                link, the applier that derives the index's human state
+                from the ledger (9.6's review states), the SHRUNK answers,
+                and what readers need to mark a link under review
 """

@@ -19,8 +19,11 @@ So the derived half of `.rce/` moves out of the project entirely, to
 `~/.rce/graphs/<id>/`, and `.rce/` inside the project keeps only what the
 researcher owns and may want under git: `attempts.toml`, `mappings.toml`
 (section 8.5), `backups/`, and the one-line `README` (`write_project_readme`)
-that says where the graph went. `canvas.json` (section 8.6) is derived
-too, so `canvas_state_path` puts it beside the graph, never in the project.
+that says where the graph went. Since V5 (section 9.2) the human records
+live there too: `project.toml`, `judgements.toml` and the canvas
+arrangement `canvas.json` (`rce.webapp.canvas.canvas_record_path`);
+`canvas_state_path` names only the pre-V5 place beside the graph, read as
+a fallback until a project's arrangement is first written to its record.
 
 Where the index lives: keyed by the project's identity (V5)
 ------------------------------------------------------------
@@ -300,16 +303,18 @@ def graph_db_path(project_root: str | Path) -> Path:
 
 
 def canvas_state_path(project_root: str | Path) -> Path:
-    """`canvas.json` (DESIGN.md section 8.6: node positions and last
-    viewport) -- beside the graph for now; section 9.2 moves it into the
-    project's own `.rce/` in a later phase of V5."""
+    """The PRE-V5 place of `canvas.json` (DESIGN.md section 8.6), beside
+    the graph. Since V5 phase 4 the arrangement is a record in the
+    project's own `.rce/canvas.json` (9.2, `rce.webapp.canvas`); this path
+    is only read, as a fallback while that record does not exist yet, and
+    phase 5's migration copies it."""
     return graph_dir(project_root) / CANVAS_FILENAME
 
 
 def project_rce_dir(project_root: str | Path) -> Path:
     """`<project>/.rce` -- the researcher-owned half: `project.toml`,
-    `attempts.toml`, `mappings.toml`, `backups/`, `README`. No database
-    lives here."""
+    `judgements.toml`, `canvas.json`, `attempts.toml`, `mappings.toml`,
+    `backups/`, `README`. No database lives here."""
     return Path(project_root) / RCE_DIRNAME
 
 

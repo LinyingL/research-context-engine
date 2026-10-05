@@ -585,6 +585,11 @@ def _reingest_attempts(project_root: Path) -> None:
         config = attempts_ingest.load_config(project_root)
         counts = attempts_ingest.ingest_attempts_repo(conn, project_root, config)
         logger.info("mapedit re-ingested attempts for %s: %s", project_root, counts)
+        # DESIGN.md 9.1: the end of a scan applies the judgment ledger
+        # (an attempt row removed may take a judged link with it).
+        from rce.records import judgements  # noqa: PLC0415 -- records.ledger imports this module
+
+        judgements.apply_after_scan(conn, project_root)
     finally:
         conn.close()
 

@@ -528,10 +528,10 @@ def test_unreadable_identity_stops_everything(tmp_path: Path, fake_home: Path, c
     assert pid
 
 
-def test_no_index_builds_an_empty_one_for_the_id(tmp_path: Path) -> None:
+def test_no_index_builds_one_for_the_id(tmp_path: Path) -> None:
     """Restored, cloned, synced from another Mac, or the index deleted: a
-    new index for the id, home here (later phases fill it from the
-    record)."""
+    new index for the id, home here, built from the sources and the record
+    (9.9 #5 is in tests/test_records_judgements.py)."""
     root = tmp_path / "p"
     pid = _make(root)
     shutil.rmtree(paths.index_dir(pid))

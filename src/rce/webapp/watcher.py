@@ -55,6 +55,18 @@ attempts failure; refused individual entries are not failures -- they are
 logged by the ingest and left for the canvas to show, not raised into the
 refresh chip.
 
+Since V5 (DESIGN.md 9.1, 9.2) the record files join the watch set too:
+`.rce/judgements.toml` and `.rce/canvas.json`. A change to the judgment
+ledger -- a hand edit, a `git pull`, another engine's or the CLI's write --
+re-applies the ledger to the index (`rce.records.judgements.apply_ledger`)
+and nothing else; a change to the arrangement only bumps the generation, so
+open pages re-read it. Every re-ingest ends by applying the ledger too (the
+end of a scan), and the first poll that sees a root applies it once, beside
+the mappings sync, so a judgment made while the app was closed reaches the
+index without the file having to be touched again. A ledger RCE cannot
+trust (refused, unreadable, shrunk) is never applied; its state is reported
+under `records` in the status payload, and polling goes on.
+
 A vanished graph is not a transient failure (DESIGN.md section 8.10
 rule 2). Observed in real use: the graph disappeared mid-serve and this
 watcher raised the same "graph database disappeared" error -- with a full
@@ -128,6 +140,8 @@ from rce.ingest import files as files_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import mappings as mappings_ingest
 from rce.ingest import scan as scan_mod
+from rce.records import judgements
+from rce.records import ledger as ledger_mod
 
 logger = logging.getLogger(__name__)
 
@@ -173,9 +187,10 @@ def take_snapshot(project_root: Path) -> WatchSnapshot:
     files: dict[str, tuple[int, int]] = {}
     steps: set[str] = set()
 
-    mappings_entry = _stat_entry(mappings_ingest.mappings_path(project_root))
-    if mappings_entry is not None:
-        files[str(mappings_ingest.mappings_path(project_root))] = mappings_entry
+    for record in record_paths(project_root):
+        record_entry = _stat_entry(record)
+        if record_entry is not None:
+            files[str(record)] = record_entry
 
     config_path = project_root / attempts_ingest.CONFIG_RELATIVE_PATH
     entry = _stat_entry(config_path)
@@ -208,6 +223,20 @@ def take_snapshot(project_root: Path) -> WatchSnapshot:
                 files[str(child)] = child_entry
                 steps.add(str(child))
     return WatchSnapshot(files=files, steps_paths=frozenset(steps))
+
+
+def record_paths(project_root: Path) -> tuple[Path, Path, Path]:
+    """The record files watched whatever the attempts config says:
+    mappings (8.5), the judgment ledger and the arrangement (9.2)."""
+    return (
+        mappings_ingest.mappings_path(project_root),
+        ledger_mod.judgements_path(project_root),
+        canvas_record_path(project_root),
+    )
+
+
+def canvas_record_path(project_root: Path) -> Path:
+    return project_root / paths.RCE_DIRNAME / "canvas.json"
 
 
 def _steps_changed(old: WatchSnapshot, new: WatchSnapshot) -> bool:
@@ -376,6 +405,9 @@ class ProjectWatcher:
         # and cleared by the attempt that finally lands).
         self._mappings_synced_root: Path | None = None
         self._mappings_sync_failed = False
+        # The judgment ledger's trust state as the last application found
+        # it (9.3), reported by `status_payload` under `records`.
+        self._records: dict[str, object] | None = None
         self._epoch = 0  # bumped by retarget(); lets a mid-ingest poll notice a switch
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -452,13 +484,40 @@ class ProjectWatcher:
 
     def status_payload(self) -> dict[str, object]:
         """`GET /api/generation`'s body, verbatim: `{generation,
-        refreshing, last_error}` -- one locked read, JSON-ready."""
+        refreshing, last_error}` plus `records` while the judgment ledger
+        cannot be trusted -- one locked read, JSON-ready."""
         with self._state_lock:
-            return {
+            payload: dict[str, object] = {
                 "generation": self._generation,
                 "refreshing": self._refreshing,
                 "last_error": self._last_error,
             }
+            # 9.3: a judgment ledger RCE cannot trust right now (refused,
+            # unreadable, shrunk, a conflict copy) is reported -- present
+            # only then, so a healthy project's payload keeps its V3 shape.
+            if self._records is not None and self._records.get("state") != "ok":
+                payload["records"] = self._records
+            return payload
+
+    def record_write(self, absorb: Collection[str], *, bump: bool = True) -> int:
+        """A request just wrote these record files AND applied them itself
+        (a judgment, an answer, an arrangement): re-baseline exactly those
+        paths so the next poll does not act on them a second time, refresh
+        the ledger's reported state, and (unless `bump=False`, for a drag
+        that changed nothing any other view shows) bump the generation.
+        Unlike `record_external_change`, `last_error` is left alone: the
+        write re-ran no ingest, so it cannot have cleared one."""
+        root = self._get_project_root()
+        snapshot = take_snapshot(root)
+        records = _read_records_state(root)
+        with self._state_lock:
+            if self._baseline is not None and self._baseline_root == root:
+                self._baseline = _absorb_only(self._baseline, snapshot, frozenset(absorb))
+            if records is not None:
+                self._records = records
+            if bump:
+                self._generation += 1
+            return self._generation
 
     def retarget(self) -> None:
         """A project switch happened: drop the old root's baseline (the next
@@ -479,6 +538,7 @@ class ProjectWatcher:
             self._graph_missing_root = None
             # The new root's mappings file has not been synced by us yet.
             self._mappings_synced_root = None
+            self._records = None
             self._mappings_sync_failed = False
             self._generation += 1
 
@@ -521,15 +581,17 @@ class ProjectWatcher:
 
         steps_changed = _steps_changed(baseline, snapshot)
         changed = _changed_paths(baseline, snapshot)
-        mappings_file = str(mappings_ingest.mappings_path(root))
+        mappings_file, ledger_file, canvas_file = (str(p) for p in record_paths(root))
         mappings_changed = mappings_file in changed
-        attempts_changed = bool(changed - {mappings_file})
+        ledger_changed = ledger_file in changed
+        attempts_changed = bool(changed - {mappings_file, ledger_file, canvas_file})
         error: str | None = None
         try:
-            with self._guarded_ingest_lock:
-                self._reingest(
-                    root, steps_changed, attempts=attempts_changed, mappings=mappings_changed,
-                )
+            if attempts_changed or mappings_changed or ledger_changed:
+                with self._guarded_ingest_lock:
+                    self._reingest(
+                        root, steps_changed, attempts=attempts_changed, mappings=mappings_changed,
+                    )
         except Exception as exc:  # noqa: BLE001 -- containment is the whole point
             # A half-saved table or a mid-edit script must never kill the
             # watcher (module docstring): remember the failure for the
@@ -550,6 +612,17 @@ class ProjectWatcher:
             self._last_error = error
             self._generation += 1
         return True
+
+    def _apply_ledger(self, conn, root: Path) -> None:
+        """Apply the judgment ledger (the last step of every ingest here)
+        and remember its trust state for `status_payload`. An untrusted
+        ledger is reported there, never raised: the watcher keeps going."""
+        result = judgements.apply_ledger(conn, root)
+        state = db.get_record_status(conn, judgements.RECORD_STATUS_NAME)
+        with self._state_lock:
+            self._records = state
+        if result.decision is not None and not result.applied:
+            logger.warning("watcher: judgment ledger of %s not applied (%s)", root, result.decision.reason)
 
     def _sync_mappings_on_first_sight(self, root: Path) -> bool:
         """Ingest `.rce/mappings.toml` once per root this watcher serves
@@ -576,6 +649,11 @@ class ProjectWatcher:
                 conn = db.connect(paths.graph_db_path(root))
                 try:
                     report = mappings_ingest.ingest_mappings(conn, root)
+                    # 9.1: the record files are applied on first sight of a
+                    # project, as mappings.toml is -- the judgment ledger too.
+                    before = _human_state(conn)
+                    self._apply_ledger(conn, root)
+                    ledger_changed = _human_state(conn) != before
                 finally:
                     conn.close()
         except Exception as exc:  # noqa: BLE001 -- containment, same as poll_once's
@@ -590,7 +668,7 @@ class ProjectWatcher:
                     self._last_error = str(exc)
             return False
         counts = report.counts
-        changed = any(
+        changed = ledger_changed or any(
             counts.get(key, 0) for key in ("nodes_created", "edges_confirmed", "edges_removed", "nodes_removed")
         )
         if changed:
@@ -694,6 +772,12 @@ class ProjectWatcher:
                         )
                 except Exception as exc:  # noqa: BLE001 -- re-raised below
                     errors.append(exc)
+            # The end of every scan, and the reaction to the ledger itself
+            # changing (9.1, 9.6): recompute the human state.
+            try:
+                self._apply_ledger(conn, root)
+            except Exception as exc:  # noqa: BLE001 -- re-raised below
+                errors.append(exc)
         finally:
             conn.close()
         if len(errors) == 1:
@@ -758,3 +842,26 @@ class ProjectWatcher:
                 # snapshot/compare machinery itself (e.g. an OSError shape no
                 # one anticipated) -- log and keep the thread alive.
                 logger.exception("watcher poll cycle failed -- watcher keeps polling")
+
+
+def _human_state(conn) -> tuple[object, object]:
+    """A cheap fingerprint of the index's human state, to tell whether an
+    application changed anything an open page shows."""
+    states = {k: (v["outcome"], v["reason"], v["entry_id"]) for k, v in db.judgement_states(conn).items()}
+    return db.edge_statuses(conn), states
+
+
+def _read_records_state(root: Path) -> dict[str, object] | None:
+    """The judgment ledger's last trust state as the index stored it, or
+    None when the index cannot be opened right now."""
+    try:
+        db_path = paths.graph_db_path(root)
+        if not db_path.exists():
+            return None
+        conn = db.connect(db_path)
+    except Exception:  # noqa: BLE001 -- a status read never fails a write
+        return None
+    try:
+        return db.get_record_status(conn, judgements.RECORD_STATUS_NAME)
+    finally:
+        conn.close()

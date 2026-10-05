@@ -105,8 +105,10 @@ Endpoints (all GET unless noted):
                             "positions"?: {id: [x, y] | null},
                             "viewport"?: {x, y, zoom} | null,
                             "reset"?: bool}`: merge into THAT view's entry
-                            of the UI-state file beside the graph (8.4,
-                            8.6; see `canvas_layout_payload`).
+                            of the arrangement record `.rce/canvas.json`
+                            (8.4, 9.2; see `canvas_layout_payload`); 409
+                            `layout_unreadable` while that file cannot be
+                            read -- it is never written over.
     POST /api/mappings/add -- body `{"from", "to", "type", "note"?}`: append
                             one human mapping to `.rce/mappings.toml` and
                             re-ingest it; returns the resulting link (8.5;
@@ -114,13 +116,29 @@ Endpoints (all GET unless noted):
     POST /api/mappings/delete -- body `{"from", "to", "type"}`: remove that
                             entry from the file and re-ingest.
     POST /api/edges/reject -- body `{"src", "dst", "type", "extractor"}`:
-                            标记为错误提取 -- a machine link's status to
-                            `rejected` through `db.set_edge_status`, the
-                            human-only path (8.3). A human mapping is
-                            refused: deleting the entry is how it goes.
-    POST /api/edges/restore -- same body: undo the above, `rejected` ->
-                            the status recorded at reject time (see
+                            标记为错误提取 -- a `rejected` entry in
+                            `.rce/judgements.toml`, then applied (V5, 9.3;
+                            `rce.records.judgements.judge`, the one human
+                            write path). A human mapping is refused:
+                            deleting the entry is how it goes.
+    POST /api/edges/restore -- same body: undo the above -- an `undone`
+                            entry naming the reject (see
                             `edge_status_payload`).
+    POST /api/judgements -- body `{"src", "dst", "type", "extractor",
+                            "verdict": confirmed|rejected|withdrawn|undone,
+                            "note"?}`: any human act on a machine link from
+                            the app, through the same write path.
+    GET  /api/review    -- 9.6's list: judgments under review or in
+                            conflict (待复核), held because their source could
+                            not be read, or whose link the index lacks, plus
+                            the judgment ledger's trust state.
+    GET  /api/history   -- `?src&dst&type&extractor`: every ledger entry
+                            for one link, in order (9.9 #12).
+    POST /api/records/answer -- body `{"file": "judgements", "answer":
+                            "file"|"restore"}` answers 「记录文件比图谱少了 N
+                            条判断」 (9.3); `{"file": "canvas", "answer":
+                            "set_aside"}` moves an arrangement record RCE
+                            cannot read into `.rce/backups/`.
     POST /api/shutdown  -- respond `{"ok": true}`, then stop this server's
                             `serve_forever` loop from a separate thread
                             (task V3 phase 4) -- the app's 停止服务 button;
@@ -229,12 +247,13 @@ mappings file alone, after which the watcher re-baselines ONLY that file
 ingested yet is never swallowed. `_require_db` runs before the write, so a
 project whose graph is missing or still in iCloud refuses cleanly instead
 of writing a file it then cannot ingest (or blocking on a dataless open).
-`canvas.json` is written to a path computed from the served root alone,
-outside the project. The edge-status endpoints write the graph directly --
-by design: a status is the human's verdict on a MACHINE edge, and
-`db.set_edge_status` is the one path Section 4 allows for it -- and only
-for links the canvas actually draws (`canvas.is_canvas_edge`), never for a
-mapping edge (whose truth is the file).
+`.rce/canvas.json` is written to a path computed from the served root
+alone (`rce.webapp.canvas.canvas_record_path`), never one a request names.
+Since V5 the edge-status endpoints and `POST /api/judgements` write NO
+status into the graph: they append to `.rce/judgements.toml` through
+`rce.records.judgements.judge` -- record first, index second (9.1) -- and
+only for links the canvas actually draws (`canvas.is_canvas_edge`) or the
+review list names, never for a mapping edge (whose truth is its file).
 
 Shutdown defense (`POST /api/shutdown`, task V3 phase 4): the one endpoint
 whose side effect is the server itself, so `_check_local_origin` runs first
@@ -351,6 +370,8 @@ from typing import Any, Callable, Iterator
 
 from rce import db, lineage, paths
 from rce import project as project_identity
+from rce.records import judgements
+from rce.records import ledger as ledger_mod
 from rce.records import lock as records_lock
 from rce.records import situation as records_situation
 from rce.ingest import attempts as attempts_ingest
@@ -599,6 +620,39 @@ class AnswerRefusedError(ApiError):
     state = "answer_refused"
 
 
+class RecordRefusedError(ApiError):
+    """A human record write refused because the record cannot be trusted
+    right now (DESIGN.md 9.3): missing though expected, in the cloud,
+    unreadable, a sync conflict copy beside it, or SHRUNK (state
+    `record_shrunk`, with the missing entries). Nothing was written; the
+    record's state is under `records`, its Chinese sentence under
+    `message`."""
+
+    status = 409
+    state = "record_untrusted"
+
+    def __init__(self, message: str, *, state: str | None = None, extra: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        if state is not None:
+            self.state = state
+        self.extra = extra or {}
+
+
+class LayoutUnreadableError(ApiError):
+    """`.rce/canvas.json` cannot be read: no arrangement is written over it
+    until it is repaired or set aside (9.2). 409."""
+
+    status = 409
+    state = "layout_unreadable"
+
+
+class NoQuestionError(ApiError):
+    """`POST /api/records/answer` when there is no question to answer."""
+
+    status = 409
+    state = "no_question"
+
+
 @dataclass(frozen=True)
 class ServedProject:
     """What this server serves (module docstring, "Project identity")."""
@@ -808,6 +862,11 @@ def summary_payload(conn: Connection, project_root: Path, served: ServedProject 
         "nodes": node_counts,
         "edges": edge_counts,
         "pending": len(db.pending_edges(conn)),
+        # 9.6: links whose old judgment waits for the researcher (待复核);
+        # never counted in `pending` (待确认).
+        "review": judgements.review_count(conn),
+        # 9.3: whether the judgment ledger can be trusted right now.
+        "records": db.get_record_status(conn, judgements.RECORD_STATUS_NAME),
         "attempts_config": _attempts_config_echo(project_root),
         # 9.4 / 9.10: who this is, and whether human records can be saved.
         "project_id": served.project_id if served else None,
@@ -895,12 +954,20 @@ def _lineage_role(conn: Connection, target_id: str) -> str:
 
 def _connected_files(conn: Connection, script_id: str, edge_type: str) -> list[dict[str, Any]]:
     entries = []
+    flags = judgements.link_flags(conn)
     for edge in db.query_edges(conn, src=script_id, type=edge_type):
         missing = any(occ.get("missing") for occ in _occurrences(edge["evidence"]))
+        marks = flags.for_key(judgements.key_of(edge))
         entries.append({
             "path": _target_path(conn, edge["dst"]),
             "role": _lineage_role(conn, edge["dst"]),
             "missing": missing,
+            # 9.6 "Where it shows" (决策树): the link's status and whether
+            # its judgment waits for review -- never shown as applied.
+            "status": edge["status"],
+            "review": marks["review"],
+            "conflict": marks["conflict"],
+            "judgement": marks["judgement"],
         })
     return sorted(entries, key=lambda e: e["path"])
 
@@ -1379,6 +1446,10 @@ def canvas_layout_payload(conn: Connection, project_root: Path, body: dict[str, 
         raise NotFoundError(str(exc)) from exc
     except canvas.LayoutShapeError as exc:
         raise MissingParamError(str(exc)) from exc
+    except canvas.LayoutRecordError as exc:
+        error = LayoutUnreadableError(str(exc))
+        error.extra = {"layout": exc.record.payload(), "message": exc.record.message}
+        raise error from exc
     return {"ok": True, "scope": body["scope"], "positions": len(view["positions"]), "viewport": view["viewport"]}
 
 
@@ -1412,6 +1483,7 @@ def _reingest_mappings(project_root: Path) -> None:
     try:
         report = mappings_ingest.ingest_mappings(conn, project_root)
         logger.info("canvas write re-ingested mappings for %s: %s", project_root, report.counts)
+        judgements.apply_after_scan(conn, project_root)  # 9.1: the end of a scan
     finally:
         conn.close()
 
@@ -1536,22 +1608,83 @@ def mappings_delete_payload(
     }
 
 
-def edge_status_payload(conn: Connection, body: dict[str, Any], action: str) -> dict[str, Any]:
+def _judgement_error(exc: judgements.JudgementRefused) -> ApiError:
+    """A refused human record write as the page's error (nothing written)."""
+    if exc.code == "untrusted":
+        decision = exc.decision
+        records = None
+        if decision is not None:
+            records = {
+                "state": decision.verdict.value, "reason": decision.reason, "message": decision.message,
+                "detail": decision.detail, "line": decision.line,
+                "missing": [judgements._summary(m) for m in decision.missing],
+            }
+        shrunk = decision is not None and decision.verdict.value == "shrunk"
+        return RecordRefusedError(
+            str(exc), state="record_shrunk" if shrunk else None,
+            extra={"records": records, "message": exc.message_zh},
+        )
+    if exc.code == "mapping":
+        return HumanLinkError(str(exc))
+    if exc.code == "no_such_link":
+        return NotFoundError(str(exc))
+    if exc.code in ("not_rejected", "nothing_to_undo"):
+        return EdgeStatusError(str(exc))
+    if exc.code == "no_index":
+        return ProjectNotInitializedError(str(exc))
+    if exc.code == "no_question":
+        return NoQuestionError(str(exc))
+    return MissingParamError(str(exc))
+
+
+def _judge(served: ServedProject, key: tuple[str, str, str, str], verdict: str, **kwargs: Any) -> judgements.Judged:
+    try:
+        return judgements.judge(
+            served.root, key, verdict, via="canvas", expected_id=served.project_id,
+            timeout=WRITE_LOCK_TIMEOUT_S, **kwargs,
+        )
+    except judgements.JudgementRefused as exc:
+        raise _judgement_error(exc) from exc
+
+
+def _link_after(conn: Connection, key: tuple[str, str, str, str]) -> dict[str, Any] | None:
+    src, dst, edge_type, extractor = key
+    for edge in db.query_edges(conn, src=src, dst=dst, type=edge_type):
+        if edge["extractor"] == extractor:
+            return judgements.link_flags(conn).annotate(canvas.link_entry(edge))
+    return None
+
+
+def _judged_payload(conn: Connection, key: tuple[str, str, str, str], judged: judgements.Judged) -> dict[str, Any]:
+    state = judged.state
+    return {
+        "ok": True,
+        "link": _link_after(conn, key),
+        "entry": judgements._summary(judged.entry.data),
+        "status": judged.status,
+        "judgement": None if state is None else {
+            "outcome": state["outcome"], "reason": state.get("reason"),
+            "label": judgements.REASON_LABELS.get(state.get("reason") or ""),
+        },
+    }
+
+
+def edge_status_payload(conn: Connection, served: ServedProject, body: dict[str, Any], action: str) -> dict[str, Any]:
     """`action` "reject" (标记为错误提取) or "restore" (its undo) on one
-    canvas link, through `db.set_edge_status` -- Section 4's human-only
-    status path, reused rather than a second mechanism (8.3).
+    canvas link -- since V5 a ledger entry, `rejected` or an `undone`
+    naming the reject, through the one human write path
+    (`rce.records.judgements.judge`); the index follows from the record.
 
     Order of refusals: a `mapping` extractor first (whether or not such an
     edge exists, the answer is the same -- delete the entry), then a link
     that does not exist or is not one the canvas draws (404: the app can
-    only change statuses it shows), then for restore a link that is not
-    rejected (409). Reject records the link's current status beside its
-    evidence (`db.reject_edge_remembering`) and restore puts exactly that
-    status back (`db.restore_rejected_edge`), so the mis-click is undone
-    exactly -- including for a link the researcher had *confirmed*, which
-    the previous fixed "auto" silently demoted to a machine status. Reject
-    is idempotent."""
+    only change statuses it shows), then for restore a link whose last act
+    is not a reject (409). The undo of a reject puts back whatever stood
+    before it (8.12, kept by the ledger's undo): a link the researcher had
+    *confirmed* is confirmed again. Reject is idempotent: a second click on
+    a reject that stands and is applied writes nothing."""
     src, dst, edge_type, extractor = _string_fields(body, ("src", "dst", "type", "extractor"))
+    key = (src, dst, edge_type, extractor)
     if extractor == mappings_ingest.EXTRACTOR:
         raise HumanLinkError(
             "this link is a human mapping from .rce/mappings.toml -- delete the mapping "
@@ -1560,19 +1693,56 @@ def edge_status_payload(conn: Connection, body: dict[str, Any], action: str) -> 
     matches = [e for e in db.query_edges(conn, src=src, dst=dst, type=edge_type) if e["extractor"] == extractor]
     if not matches or not canvas.is_canvas_edge(conn, matches[0]):
         raise NotFoundError(f"no canvas link {src} --{edge_type}--> {dst} (extractor {extractor!r})")
-    edge = matches[0]
     if action == "reject":
-        new_status = db.reject_edge_remembering(conn, src, dst, edge_type, extractor)
+        judged = _judge(served, key, "rejected", unless_standing=True)
     else:
-        new_status = db.restore_rejected_edge(conn, src, dst, edge_type, extractor)
-        if new_status is None:
-            raise EdgeStatusError(
-                f"link {src} --{edge_type}--> {dst} is {edge['status']!r}, not rejected -- nothing to restore"
+        judged = _judge(served, key, "undone", undo_only="rejected")
+    return _judged_payload(conn, key, judged)
+
+
+def judgement_payload(conn: Connection, served: ServedProject, body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/judgements`: confirm / reject / withdraw / undo one machine
+    link from the app (9.3, 9.6's three review actions included), through
+    the one write path. A link the index does not hold is accepted only
+    when the ledger already has a history for it (settling a review of a
+    link no scan produces any more)."""
+    src, dst, edge_type, extractor, verdict = _string_fields(body, ("src", "dst", "type", "extractor", "verdict"))
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        raise MissingParamError("request body 'note' must be a string when present")
+    key = (src, dst, edge_type, extractor)
+    judged = _judge(served, key, verdict, note=note)
+    return _judged_payload(conn, key, judged)
+
+
+def history_payload(served: ServedProject, query_args: dict[str, list[str]]) -> dict[str, Any]:
+    values = [(query_args.get(k) or [None])[0] for k in ("src", "dst", "type", "extractor")]
+    if not all(isinstance(v, str) and v for v in values):
+        raise MissingParamError("history needs query parameters src, dst, type and extractor")
+    entries = judgements.history(served.root, values)
+    return {"entries": entries, "readable": entries is not None}
+
+
+def records_answer_payload(served: ServedProject, body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/records/answer` (module docstring)."""
+    record, answer = _string_fields(body, ("file", "answer"))
+    if record == "judgements":
+        try:
+            answered = judgements.answer_shrunk(
+                served.root, answer, expected_id=served.project_id, timeout=WRITE_LOCK_TIMEOUT_S,
             )
-    if new_status is None:  # the edge vanished between the query and the write
-        raise NotFoundError(f"no canvas link {src} --{edge_type}--> {dst} (extractor {extractor!r})")
-    edge["status"] = new_status
-    return {"ok": True, "link": canvas.link_entry(edge)}
+        except judgements.JudgementRefused as exc:
+            raise _judgement_error(exc) from exc
+        return {
+            "ok": True, "file": "judgements", "answer": answer,
+            "missing": len(answered.missing), "appended": len(answered.appended),
+        }
+    if record == "canvas" and answer == "set_aside":
+        moved = canvas.set_aside_layout(served.root)
+        if moved is None:
+            raise NoQuestionError("the arrangement record is readable or absent; nothing to set aside")
+        return {"ok": True, "file": "canvas", "answer": answer, "moved_to": moved.relative_to(served.root).as_posix()}
+    raise MissingParamError("'file' must be 'judgements' (answer 'file' or 'restore') or 'canvas' (answer 'set_aside')")
 
 
 # -- The single-page app (task V2) -------------------------------------------
@@ -1838,6 +2008,10 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/canvas":
                 scope = (query.get("scope") or [None])[0]
                 self._json_from_conn(lambda conn: canvas_payload(conn, self._project_root(), scope))
+            elif path == "/api/review":
+                self._json_from_conn(judgements.review_items)
+            elif path == "/api/history":
+                self._send_json(200, history_payload(self._require_unblocked(), query))
             elif path == "/api/file":
                 values = query.get("path")
                 if not values:
@@ -1938,25 +2112,50 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 with self.server.write_guard(human=True):
                     payload = fn(self._project_root(), body, self.server.watcher)
                 self._send_json(200, payload)
-            elif parsed.path in ("/api/edges/reject", "/api/edges/restore"):
+            elif parsed.path in ("/api/edges/reject", "/api/edges/restore", "/api/judgements"):
+                # A human act on a machine link (9.1, 9.3): the ledger first,
+                # through `rce.records.judgements.judge`, then the index.
                 body = self._read_json_object()
-                action = "reject" if parsed.path.endswith("/reject") else "restore"
+                served = self._served()
                 with self.server.write_guard(human=True):
                     conn = self._open_conn()
                     try:
-                        payload = edge_status_payload(conn, body, action)
+                        if parsed.path == "/api/judgements":
+                            payload = judgement_payload(conn, served, body)
+                        else:
+                            action = "reject" if parsed.path.endswith("/reject") else "restore"
+                            payload = edge_status_payload(conn, served, body, action)
                     finally:
                         conn.close()
-                # A graph change with no file change: pages re-fetch, the
-                # watcher's baseline and error stay exactly as they were.
-                payload["generation"] = self.server.watcher.bump_generation()
+                # The ledger was written and applied here: absorb it so the
+                # watcher does not apply it a second time; pages re-fetch.
+                payload["generation"] = self.server.watcher.record_write(
+                    {str(ledger_mod.judgements_path(served.root))},
+                )
+                self._send_json(200, payload)
+            elif parsed.path == "/api/records/answer":
+                body = self._read_json_object()
+                served = self._served()
+                with self.server.write_guard(human=True):
+                    payload = records_answer_payload(served, body)
+                payload["generation"] = self.server.watcher.record_write(
+                    {str(ledger_mod.judgements_path(served.root)), str(canvas.canvas_record_path(served.root))},
+                )
                 self._send_json(200, payload)
             elif parsed.path == "/api/canvas/layout":
                 # UI state beside the graph (8.6) -- origin-checked like
                 # every POST: a drive-by page must not scramble the canvas.
                 body = self._read_json_object()
                 with self.server.write_guard(human=True):
-                    self._json_from_conn(lambda conn: canvas_layout_payload(conn, self._project_root(), body))
+                    conn = self._open_conn()
+                    try:
+                        payload = canvas_layout_payload(conn, self._project_root(), body)
+                    finally:
+                        conn.close()
+                # A record now (9.2, `.rce/canvas.json`): absorbed so the
+                # watcher does not take this page's own drag for a change.
+                self.server.watcher.record_write({str(canvas.canvas_record_path(self._project_root()))}, bump=False)
+                self._send_json(200, payload)
             elif parsed.path == "/api/shutdown":
                 # Stops this whole server (task V3 phase 4). Respond first,
                 # then stop the serve loop from a separate thread -- see

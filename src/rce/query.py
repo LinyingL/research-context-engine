@@ -35,6 +35,7 @@ from __future__ import annotations
 from typing import Any
 
 from rce import db
+from rce.records import judgements
 
 # Edge types that make up a provenance chain (DESIGN.md section 4).
 UPSTREAM_EDGE_TYPES = frozenset({"implements", "produces", "generates"})
@@ -131,4 +132,9 @@ def trace(conn, node_id: str, max_hops: int = 4) -> dict[str, Any]:
                     next_frontier.add(neighbor)
         frontier = next_frontier
 
+    # 9.6 "Where it shows": a link whose judgment is under review or in
+    # conflict is marked in every reader, never passed off as ordinary.
+    flags = judgements.link_flags(conn)
+    for hop in hops:
+        flags.annotate(hop)
     return {"node_id": node_id, "found": True, "hops": hops}

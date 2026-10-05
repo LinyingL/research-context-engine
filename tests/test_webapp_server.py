@@ -275,7 +275,10 @@ def test_tree_payload_tags_has_generator_when_a_writer_exists_anywhere(conn, tmp
     _mk_edge(conn, "steps/0-prep.py", "data/in.csv", "dataset", "writes")
 
     reads = server.tree_payload(conn, tmp_path)["attempts"][0]["scripts"][0]["reads"]
-    assert reads == [{"path": "data/in.csv", "role": "has_generator", "missing": False}]
+    assert reads == [{
+        "path": "data/in.csv", "role": "has_generator", "missing": False,
+        "status": "auto", "review": False, "conflict": False, "judgement": None,
+    }]
 
 
 def test_tree_payload_tags_orphan_input_when_no_writer_anywhere(conn, tmp_path):
@@ -284,7 +287,10 @@ def test_tree_payload_tags_orphan_input_when_no_writer_anywhere(conn, tmp_path):
     _mk_edge(conn, "steps/1-run.py", "data/in.csv", "dataset", "reads", missing=True)
 
     reads = server.tree_payload(conn, tmp_path)["attempts"][0]["scripts"][0]["reads"]
-    assert reads == [{"path": "data/in.csv", "role": "orphan_input", "missing": True}]
+    assert reads == [{
+        "path": "data/in.csv", "role": "orphan_input", "missing": True,
+        "status": "auto", "review": False, "conflict": False, "judgement": None,
+    }]
 
 
 def test_tree_payload_scripts_empty_when_steps_dir_not_configured(conn, tmp_path):

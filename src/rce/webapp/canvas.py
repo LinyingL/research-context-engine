@@ -58,30 +58,50 @@ The default scope is the current attempt: the one row whose verdict
 carries ✅ when exactly one does, else the most recent row by natural `#`
 order (`attempt_sort_key`); `all` only when the graph has no attempts.
 
-Layout state (section 8.6)
---------------------------
+Layout state (sections 8.6, 9.2)
+--------------------------------
 
-`canvas.json` lives at `rce.paths.canvas_state_path` -- beside the graph,
-outside the project, path never influenced by a request. It holds one
-arrangement and one viewport PER VIEW (8.4 as amended: "each view keeps
-its own"), `{"views": {<scope id>: {"positions", "viewport"}}}`, the scope
-id being `all` or an attempt node id. It is derived UI state: a missing,
-corrupt or older-format file (or a corrupt entry inside it) degrades to
-"nothing saved", never to an error; writes are atomic but never backed up.
-A write names its view, which must exist in the graph, and sets
-positions only for cards that view shows (others are skipped), so the
-file's keys are bounded by the graph rather than by what a page sends. A merge changes only the
-ids a request names, and `null` deletes one; `reset` forgets the view's
-whole arrangement (「重新排列」).
+Since V5 the arrangement is human labor and a record (9.2): its source of
+truth is `.rce/canvas.json` INSIDE the project, beside the other records,
+written under the project lock with the write-time identity re-check
+(`rce.records.situation.write_guard`), durably (`rce.records.files`), with
+a snapshot the first time it changes each day and one before 「重新排列」
+discards a view's arrangement. It holds one arrangement and one viewport
+PER VIEW (8.4 as amended: "each view keeps its own"), `{"views": {<scope
+id>: {"positions", "viewport"}}}`, the scope id being `all` or an attempt
+node id.
+
+A record RCE cannot read is never overwritten (9.3's rule, applied to
+this file): a file that is not JSON, not an object, or whose `views` is
+not an object shows nothing as saved, is left exactly as it is, and every
+layout write is refused (`LayoutRecordError`) until it is repaired or the
+researcher sets it aside (`set_aside_layout`: the file is renamed into
+`.rce/backups/`, never deleted). A file in the cloud says so and refuses
+writes the same way. One malformed position inside a good file is still
+skipped on read (8.6); a write merges into the file's own JSON, so
+everything it does not touch -- other views, unknown keys -- is kept as
+written.
+
+The old place, `rce.paths.canvas_state_path` beside the index, is read
+only while `.rce/canvas.json` does not exist (a project arranged before
+V5; phase 5's migration copies it); the first write then carries those
+views into the record. A write names its view, which must exist in the
+graph, and sets positions only for cards that view shows (others are
+skipped), so the keys a write adds are bounded by the graph rather than
+by what a page sends. A merge changes only the ids a request names, and
+`null` deletes one; `reset` forgets the view's whole arrangement.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
 import posixpath
 import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
@@ -90,8 +110,9 @@ from rce import db, lineage, paths
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import mappings as mappings_ingest
+from rce.records import files as record_files
+from rce.records import judgements
 from rce.records import situation as records_situation
-from rce.webapp import mapedit
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +135,18 @@ class UnknownScopeError(LookupError):
 
 class LayoutShapeError(ValueError):
     """A `POST /api/canvas/layout` body that is not the 8.6 shape."""
+
+
+class LayoutRecordError(RuntimeError):
+    """`.rce/canvas.json` cannot be read (corrupt, in the cloud,
+    unreadable): nothing is written over it. `record` says what was found."""
+
+    def __init__(self, record: "LayoutRecord") -> None:
+        super().__init__(
+            f"{record.path} cannot be read ({record.state}: {record.error}); it is left untouched "
+            "and no arrangement is written until it is repaired or set aside"
+        )
+        self.record = record
 
 
 # -- small helpers ---------------------------------------------------------------
@@ -390,11 +423,18 @@ def build_canvas(conn: Connection, project_root: Path, scope: str | None = None)
                 "title": summary["title"], "verdict": summary["verdict"], "node_ids": members,
             })
 
-    saved = load_layout(project_root, scope)
+    record = layout_record(project_root)
+    saved = record.views.get(scope) or _empty_view()
     default_id = default["id"] if default is not None else None
+    # 9.6 "Where it shows": a link whose judgment is under review or in
+    # conflict carries the mark; a candidate for an old judgment the hint.
+    flags = judgements.link_flags(conn)
     return {
         "nodes": node_entries,
-        "links": sorted((link_entry(e) for e in links), key=lambda link: link["id"]),
+        "links": sorted((flags.annotate(link_entry(e)) for e in links), key=lambda link: link["id"]),
+        # 9.2: the arrangement record's own state -- a file RCE cannot read
+        # is reported, never shown as saved and never written over.
+        "layout": record.payload(),
         "frames": [] if scope == SCOPE_ALL else groups,
         "step_groups": [{"attempt_id": g["attempt_id"], "node_ids": g["node_ids"]} for g in groups],
         "positions": {k: v for k, v in saved["positions"].items() if k in visible},
@@ -443,29 +483,112 @@ def _clean_view(raw: Any) -> dict[str, Any] | None:
     return {"positions": positions, "viewport": viewport}
 
 
-def load_views(project_root: Path) -> dict[str, dict[str, Any]]:
-    """Every view's `{"positions": {id: [x, y]}, "viewport": {x, y, zoom} |
-    None}` from canvas.json, keyed by scope id. Missing, unreadable,
-    non-JSON, older-format (the flat `{"positions", "viewport"}` of the
-    first canvas, whose positions were global) or wrongly shaped content
-    degrades to nothing saved (section 8.6)."""
-    path = paths.canvas_state_path(project_root)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        logger.info("ignoring unreadable canvas state %s (%s) -- nothing saved", path, exc)
-        return {}
+CANVAS_RECORD_FILENAME = "canvas.json"
+
+#: Product language (8.8) for a canvas record RCE cannot use.
+LAYOUT_MESSAGES = {
+    "invalid": "画布位置记录文件无法读取，请先修复它",
+    "unreadable": "画布位置记录文件无法读取，请先修复它",
+    "dataless": "记录文件正在从云端下载…",
+}
+
+
+def canvas_record_path(project_root: Path) -> Path:
+    """`.rce/canvas.json` -- the arrangement's source of truth (9.2)."""
+    return Path(project_root) / paths.RCE_DIRNAME / CANVAS_RECORD_FILENAME
+
+
+@dataclass(frozen=True)
+class LayoutRecord:
+    """What reading the arrangement found. `state`: `ok` (the record),
+    `absent` (nothing saved), `legacy` (no record yet; read from the old
+    place beside the index), or `invalid` / `unreadable` / `dataless` (the
+    record exists and cannot be used -- nothing is shown as saved, and
+    nothing may be written over it)."""
+
+    state: str
+    path: Path
+    views: dict[str, dict[str, Any]] = field(default_factory=dict)
+    raw: dict[str, Any] | None = None
+    error: str | None = None
+    legacy_path: Path | None = None
+
+    @property
+    def writable(self) -> bool:
+        return self.state in ("ok", "absent", "legacy")
+
+    @property
+    def message(self) -> str | None:
+        return LAYOUT_MESSAGES.get(self.state)
+
+    def payload(self) -> dict[str, Any]:
+        return {"state": self.state, "message": self.message, "error": self.error, "file": f"{paths.RCE_DIRNAME}/{CANVAS_RECORD_FILENAME}"}
+
+    def describe(self) -> str:
+        if self.state == "absent":
+            return "nothing arranged yet"
+        if self.state in ("ok", "legacy"):
+            arranged = sum(1 for v in self.views.values() if v["positions"])
+            where = " (still beside the index, not yet in the record)" if self.state == "legacy" else ""
+            return f"{len(self.views)} view(s), {arranged} arranged{where}"
+        return f"{self.state}: {self.error}"
+
+
+def _views_of(data: Any) -> dict[str, dict[str, Any]] | None:
+    """The cleaned views of a parsed canvas file, or None when its shape is
+    not `{"views": {...}}` at all."""
     raw_views = data.get("views") if isinstance(data, dict) else None
     if not isinstance(raw_views, dict):
-        return {}
+        return None
     views = {}
     for scope, raw in raw_views.items():
         view = _clean_view(raw) if isinstance(scope, str) and scope else None
         if view is not None:
             views[scope] = view
     return views
+
+
+def _legacy_layout(project_root: Path, path: Path) -> LayoutRecord:
+    try:
+        legacy = paths.canvas_state_path(project_root)
+    except paths.GraphMigrationError:
+        return LayoutRecord("absent", path)
+    try:
+        data = json.loads(legacy.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return LayoutRecord("absent", path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.info("ignoring unreadable pre-V5 canvas state %s (%s)", legacy, exc)
+        return LayoutRecord("absent", path)
+    views = _views_of(data)
+    if views is None:
+        return LayoutRecord("absent", path)
+    return LayoutRecord("legacy", path, views=views, raw={"views": copy.deepcopy(data["views"])}, legacy_path=legacy)
+
+
+def layout_record(project_root: Path) -> LayoutRecord:
+    """Read the arrangement (module docstring, "Layout state")."""
+    path = canvas_record_path(project_root)
+    got = record_files.read_record(path)
+    if got.state is record_files.RecordState.ABSENT:
+        return _legacy_layout(Path(project_root), path)
+    if got.state is not record_files.RecordState.PRESENT:
+        return LayoutRecord(got.state.value, path, error=got.error)
+    try:
+        data = json.loads(got.text or "")
+    except json.JSONDecodeError as exc:
+        return LayoutRecord("invalid", path, error=f"not JSON ({exc})")
+    views = _views_of(data)
+    if views is None:
+        return LayoutRecord("invalid", path, error='not an object with a "views" object')
+    return LayoutRecord("ok", path, views=views, raw=data)
+
+
+def load_views(project_root: Path) -> dict[str, dict[str, Any]]:
+    """Every view's `{"positions": {id: [x, y]}, "viewport": {x, y, zoom} |
+    None}`, keyed by scope id; nothing saved when the record is absent or
+    cannot be used (`layout_record` says which)."""
+    return layout_record(project_root).views
 
 
 def load_layout(project_root: Path, scope: str) -> dict[str, Any]:
@@ -535,25 +658,61 @@ def save_layout(conn: Connection, project_root: Path, body: dict[str, Any]) -> d
     if stray:
         logger.info("layout for %s: skipped %d card(s) the view does not show, e.g. %r", scope, len(stray), stray[0])
     positions = {k: v for k, v in positions.items() if v is None or k in visible}
-    # V5 (DESIGN.md 9.4, 9.7): the project lock and identity re-check
-    # around the read-merge-write, so two processes' position changes all
-    # land (9.9 scenario 10) and a moved project gets nothing written.
+    # V5 (DESIGN.md 9.2, 9.4, 9.7): a record write -- the project lock and
+    # identity re-check around the read-merge-write, so two processes'
+    # position changes all land (9.9 #10) and a moved project gets nothing.
     with records_situation.write_guard(project_root, human=True), _LAYOUT_LOCK:
-        views = load_views(project_root)
-        view = views.setdefault(scope, _empty_view())
+        record = layout_record(project_root)
+        if not record.writable:
+            raise LayoutRecordError(record)
+        data = copy.deepcopy(record.raw) if isinstance(record.raw, dict) else {}
+        raw_views = data.setdefault("views", {})
+        raw_view = raw_views.get(scope)
+        if raw_view is None:
+            raw_view = {}
+        if not isinstance(raw_view, dict) or not isinstance(raw_view.get("positions", {}), dict):
+            raise LayoutRecordError(LayoutRecord("invalid", record.path, error=f"view {scope!r} is not an object"))
+        raw_view = dict(raw_view)
+        raw_positions = dict(raw_view.get("positions") or {})
+        path = record.path
         if reset:
-            view["positions"] = {}
+            if path.exists():
+                record_files.snapshot_now(project_root, path)  # 「重新排列」 discards an arrangement
+            raw_positions = {}
         for key, value in positions.items():
             if value is None:
-                view["positions"].pop(key, None)
+                raw_positions.pop(key, None)
             else:
-                view["positions"][key] = [float(value[0]), float(value[1])]
+                raw_positions[key] = [float(value[0]), float(value[1])]
+        raw_view["positions"] = raw_positions
         if viewport is not ...:
-            view["viewport"] = (
+            raw_view["viewport"] = (
                 None if viewport is None else {k: float(viewport[k]) for k in ("x", "y", "zoom")}
             )
-        path = paths.canvas_state_path(project_root)
-        path.parent.mkdir(parents=True, exist_ok=True)  # under rce_home(), never the project
-        data = json.dumps({"views": views}, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        mapedit.atomic_replace_bytes(path, data)
+        raw_views[scope] = raw_view
+        encoded = (json.dumps(data, ensure_ascii=False, sort_keys=True, indent=1) + "\n").encode("utf-8")
+        record_files.ensure_dir_within(project_root, path.parent)
+        if path.exists():
+            record_files.snapshot_if_first_change_today(project_root, path)
+        record_files.durable_write(path, encoded)
+        view = _clean_view(raw_view) or _empty_view()
     return view
+
+
+def set_aside_layout(project_root: Path) -> Path | None:
+    """The researcher's answer to an arrangement record RCE cannot read:
+    rename it into `.rce/backups/` (never delete it) so a new arrangement
+    can begin. Returns where it went (None when there was nothing to set
+    aside: the record is readable or absent). Under the project lock with
+    the identity re-check, like every record write."""
+    with records_situation.write_guard(project_root, human=True), _LAYOUT_LOCK:
+        record = layout_record(project_root)
+        if record.state not in ("invalid", "unreadable"):
+            return None
+        backups = record_files.ensure_dir_within(
+            project_root, Path(project_root) / paths.RCE_DIRNAME / record_files.BACKUPS_DIRNAME,
+        )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        target = backups / f"{CANVAS_RECORD_FILENAME}.unreadable-{stamp}"
+        record.path.rename(target)
+        return target

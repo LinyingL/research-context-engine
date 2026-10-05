@@ -12,8 +12,8 @@ legacy move:
 |                | adopted like a move: only the spelling changes)             |
 | MOVED          | adopt: `home.json`, the registry entry's path and label,    |
 |                | the project node's path; one WARNING log line               |
-| NO_INDEX       | build an empty index for the id (later phases fill human    |
-|                | state from the record)                                      |
+| NO_INDEX       | build the index for the id from the sources and the record |
+|                | (a scan, then the judgment ledger applied, 9.4 / 9.9 #5)   |
 | LEGACY         | open; human records are refused until it is migrated        |
 | NOT_A_PROJECT  | open (the callers' own "run rce init" refusal follows)      |
 | COPY, CANNOT_CHECK, LOST_ID, UNREADABLE_ID | `ProjectBlocked`, nothing written |
@@ -213,7 +213,9 @@ def _build_missing_index(root: Path, c: Classification, probes: Probes | None) -
     with project_lock(root, c.project_id):
         c = _reclassify_same(root, c, probes)
         create_index(root, c.identity)
-    logger.warning("RCE: built a new, empty index for project %s at %s", c.project_id, paths.index_dir(c.project_id))
+        error = _build_from_sources(root, c.identity, lambda _line: None)
+    logger.warning("RCE: built a new index for project %s at %s from its sources and record%s",
+                   c.project_id, paths.index_dir(c.project_id), f" (scan failed: {error})" if error else "")
     return classify(root, probes=probes), True
 
 
@@ -343,17 +345,22 @@ def _require(c: Classification, allowed: tuple[Situation, ...], answer: str) -> 
 
 
 def _build_from_sources(root: Path, ident: ProjectIdentity, echo: Echo) -> str | None:
-    """Scan this folder into its (fresh) index; returns the failure, if
-    any, as text -- the identity answer itself has already landed."""
+    """Scan this folder into its (fresh) index and apply the record --
+    the record files and the judgment ledger even when the source scan
+    failed, so a judgment is never missing from an index for want of a
+    scan; returns the scan's failure, if any, as text -- the identity
+    answer itself has already landed."""
     conn = db.connect(index_db_path(ident.id))
+    error: str | None = None
     try:
-        pipeline.ingest_sources(conn, root, echo=echo)
+        try:
+            pipeline.ingest_sources(conn, root, echo=echo)
+        except pipeline.IngestFailed as exc:
+            error = str(exc)
         pipeline.ingest_records(conn, root, echo=echo)
-    except pipeline.IngestFailed as exc:
-        return str(exc)
     finally:
         conn.close()
-    return None
+    return error
 
 
 def fork(project_root: str | Path, *, probes: Probes | None = None, build: bool = True, echo: Echo = lambda _l: None, today: date | None = None) -> Answered:

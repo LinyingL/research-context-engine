@@ -57,6 +57,7 @@ from sqlite3 import Connection
 from typing import Any
 
 from rce import db
+from rce.records import judgements
 
 # Directories never worth walking for a duplicate-basename scan: version
 # control internals, this tool's own state, and common tooling caches --
@@ -102,7 +103,20 @@ def _target_path_and_type(conn: Connection, target_id: str) -> tuple[str, str | 
     return path or target_id, None
 
 
-def _edge_occurrences(conn: Connection, edge: dict[str, Any]) -> list[dict[str, Any]]:
+def _flag_occurrences(occurrences: list[dict[str, Any]], edge: dict[str, Any], flags: Any) -> list[dict[str, Any]]:
+    """DESIGN.md 9.6 "Where it shows": every occurrence of a link whose
+    judgment is under review or in conflict carries the mark (copies; the
+    evidence itself is never touched)."""
+    if flags is None:
+        return occurrences
+    marks = flags.for_key((edge["src"], edge["dst"], edge["type"], edge["extractor"]))
+    if not (marks["review"] or marks["conflict"]):
+        return occurrences
+    keep = {k: marks[k] for k in ("review", "conflict", "judgement")}
+    return [{**occ, **keep} if isinstance(occ, dict) else occ for occ in occurrences]
+
+
+def _edge_occurrences(conn: Connection, edge: dict[str, Any], flags: Any = None) -> list[dict[str, Any]]:
     """One edge's occurrences as this report lists them. A human mapping's
     evidence is `{file: .rce/mappings.toml, source: human}` -- naming the
     mappings file, not a script -- so its single occurrence is rebuilt from
@@ -111,7 +125,7 @@ def _edge_occurrences(conn: Connection, edge: dict[str, Any]) -> list[dict[str, 
     if edge["extractor"] in db.HUMAN_EXTRACTORS:
         script_path, _ = _target_path_and_type(conn, edge["src"])
         return [{"file": script_path, "line": None, "callee": None, "human": True}]
-    return _occurrences(edge["evidence"])
+    return _flag_occurrences(_occurrences(edge["evidence"]), edge, flags)
 
 
 def _live_edges(conn: Connection, edge_type: str) -> list[dict[str, Any]]:
@@ -119,7 +133,7 @@ def _live_edges(conn: Connection, edge_type: str) -> list[dict[str, Any]]:
     return [e for e in db.query_edges(conn, type=edge_type) if e["status"] != "rejected"]
 
 
-def _collect_by_target(conn: Connection, edges: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _collect_by_target(conn: Connection, edges: list[dict[str, Any]], flags: Any = None) -> dict[str, list[dict[str, Any]]]:
     """Every `(file, line, callee, ...)` occurrence across a list of edges,
     grouped by the edge's `dst` (the target node id) -- one edge per distinct
     script, so a target read/written by several scripts spans several edges
@@ -127,7 +141,7 @@ def _collect_by_target(conn: Connection, edges: list[dict[str, Any]]) -> dict[st
     sites in that one script)."""
     by_target: dict[str, list[dict[str, Any]]] = {}
     for edge in edges:
-        by_target.setdefault(edge["dst"], []).extend(_edge_occurrences(conn, edge))
+        by_target.setdefault(edge["dst"], []).extend(_edge_occurrences(conn, edge, flags))
     return by_target
 
 
@@ -139,6 +153,9 @@ def _reader_entry(occ: dict[str, Any]) -> dict[str, Any]:
     entry = {"script": occ.get("file"), "line": occ.get("line"), "callee": occ.get("callee")}
     if occ.get("human"):
         entry["human"] = True  # a human mapping: no line, the researcher's own assertion
+    for mark in ("review", "conflict", "judgement"):
+        if occ.get(mark):
+            entry[mark] = occ[mark]
     return entry
 
 
@@ -201,8 +218,9 @@ def build_lineage_report(conn: Connection, project_root: str | Path) -> dict[str
     project_root = Path(project_root)
     reads_edges = _live_edges(conn, "reads")
     writes_edges = _live_edges(conn, "writes")
-    readers_by_target = _collect_by_target(conn, reads_edges)
-    writers_by_target = _collect_by_target(conn, writes_edges)
+    flags = judgements.link_flags(conn)
+    readers_by_target = _collect_by_target(conn, reads_edges, flags)
+    writers_by_target = _collect_by_target(conn, writes_edges, flags)
     all_targets = sorted(set(readers_by_target) | set(writers_by_target))
 
     orphans: list[dict[str, Any]] = []

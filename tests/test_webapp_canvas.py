@@ -23,7 +23,9 @@ from typing import Any
 
 import pytest
 
-from rce import db, paths
+from rce import db
+from rce import paths
+from rce.records import ledger as ledger_mod
 from rce import project as project_identity
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
@@ -398,7 +400,9 @@ def test_layout_legacy_flat_file_is_nothing_saved(project):
     payload = _canvas(project, A17)
     assert payload["positions"] == {} and payload["viewport"] is None
     _save(project, {"scope": A17, "positions": {RMD17: [5, 6]}})
-    assert json.loads(path.read_text()) == {"views": {A17: {"positions": {RMD17: [5.0, 6.0]}, "viewport": None}}}
+    record = canvas.canvas_record_path(project)
+    assert json.loads(record.read_text()) == {"views": {A17: {"positions": {RMD17: [5.0, 6.0]}}}}
+    assert json.loads(path.read_text())["positions"] == {PY16: [1, 2]}  # the old place is only ever read
 
 
 def test_layout_corrupt_entries_drop_individually(tmp_path):
@@ -481,17 +485,69 @@ def test_a_write_keeps_views_of_attempts_the_graph_lacks_right_now(project):
     assert canvas.load_layout(project, "attempt:map.md#99")["positions"] == {"x": [1.0, 2.0]}
 
 
-def test_layout_save_recovers_a_corrupt_file(project):
+def _write_record(root: Path, data: Any) -> Path:
+    path = canvas.canvas_record_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_a_corrupt_pre_v5_file_is_nothing_saved_and_the_write_lands_in_the_record(project):
     path = _write_state(project, "garbage")
     _save(project, {"scope": "all", "positions": {RAW: [1, 2]}})
-    assert json.loads(path.read_text()) == {"views": {"all": {"positions": {RAW: [1.0, 2.0]}, "viewport": None}}}
+    assert path.read_text() == "garbage"
+    assert json.loads(canvas.canvas_record_path(project).read_text()) == {"views": {"all": {"positions": {RAW: [1.0, 2.0]}}}}
 
 
-def test_layout_is_never_backed_up_and_never_in_the_project(project):
+@pytest.mark.parametrize("content", ["garbage", "[1, 2]", '{"views": [1]}', b"\xff\xfe"])
+def test_a_corrupt_record_is_never_overwritten_and_refuses_writes_until_set_aside(project, content):
+    """9.2 + 9.3's rule for a record RCE cannot read: nothing is shown as
+    saved, the file is left untouched and reported, the next drag writes
+    nothing; set aside (renamed into .rce/backups/), writing works again."""
+    path = canvas.canvas_record_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    path.write_bytes(raw)
+    record = canvas.layout_record(project)
+    assert record.state in ("invalid", "unreadable") and not record.writable
+    assert record.message == "画布位置记录文件无法读取，请先修复它"
+    assert canvas.load_views(project) == {}
+    with pytest.raises(canvas.LayoutRecordError):
+        _save(project, {"scope": "all", "positions": {RAW: [1, 2]}})
+    assert path.read_bytes() == raw
+    moved = canvas.set_aside_layout(project)
+    assert moved is not None and moved.read_bytes() == raw and moved.parent.name == "backups"
+    _save(project, {"scope": "all", "positions": {RAW: [1, 2]}})
+    assert canvas.load_layout(project, "all")["positions"] == {RAW: [1.0, 2.0]}
+
+
+def test_a_write_keeps_unknown_keys_and_malformed_entries_of_other_views(project):
+    """A write merges into the file's own JSON: what it does not touch is
+    kept exactly as written."""
+    _write_record(project, {"note": "mine", "views": {"attempt:x#1": [1], "all": {"positions": {"q": "x"}, "extra": 1}}})
+    _save(project, {"scope": A17, "positions": {RMD17: [1, 2]}})
+    data = json.loads(canvas.canvas_record_path(project).read_text())
+    assert data["note"] == "mine" and data["views"]["attempt:x#1"] == [1]
+    assert data["views"]["all"] == {"positions": {"q": "x"}, "extra": 1}
+
+
+def test_layout_lives_in_the_project_with_a_daily_snapshot_and_one_before_reset(project):
+    """9.2: the arrangement is a record -- `.rce/canvas.json` -- snapshotted
+    the first time it changes each day and before 「重新排列」."""
     _save(project, {"scope": "all", "positions": {PY16: [1, 2]}})
-    assert not (project / ".rce" / "backups").exists()
-    assert not (project / ".rce" / "canvas.json").exists()
-    assert paths.canvas_state_path(project).exists()
+    assert canvas.canvas_record_path(project).exists()
+    assert not paths.canvas_state_path(project).exists()
+    backups = project / ".rce" / "backups"
+    assert not backups.exists()  # the first write had nothing to keep
+    _save(project, {"scope": "all", "positions": {PY16: [3, 4]}})
+    first = sorted(backups.iterdir())
+    assert len(first) == 1  # the first change today
+    _save(project, {"scope": "all", "positions": {PY16: [5, 6]}})
+    assert sorted(backups.iterdir()) == first  # once a day, not per write
+    _save(project, {"scope": "all", "reset": True})
+    snapshots = sorted(backups.iterdir())
+    assert len(snapshots) == 2
+    assert json.loads(snapshots[-1].read_text())["views"]["all"]["positions"] == {PY16: [5.0, 6.0]}
 
 
 @pytest.mark.parametrize("body", [
@@ -720,18 +776,15 @@ def test_http_reject_then_restore_round_trip(live):
 
 def test_http_restore_puts_back_a_human_confirmation(live):
     """Adversarial review of the V4 work: undoing 标记为错误提取 on a link
-    the researcher had confirmed (`rce confirm`) must restore `confirmed`,
-    not demote the human's judgement to the machine status `auto`. The
-    recorded prior status survives a re-ingest in between."""
+    the researcher had confirmed must restore `confirmed`, not demote the
+    human's judgement to the machine status `auto`. Since V5 the ledger's
+    undo does it (8.12's rule, kept), and survives a re-ingest between."""
     base, root, httpd = live
     body = _edge_body(RMD18, MONTHLY, "reads")
-    conn = db.connect(paths.graph_db_path(root))
-    try:
-        db.set_edge_status(conn, RMD18, MONTHLY, "reads", "dataflow", "confirmed")
-    finally:
-        conn.close()
+    status, payload = _call(base, "POST", "/api/judgements", {**body, "verdict": "confirmed"})
+    assert status == 200 and payload["link"]["status"] == "confirmed"
     assert _call(base, "POST", "/api/edges/reject", body)[1]["link"]["status"] == "rejected"
-    assert _call(base, "POST", "/api/edges/reject", body)[0] == 200  # second click keeps the memory
+    assert _call(base, "POST", "/api/edges/reject", body)[0] == 200  # a second click writes nothing
     httpd.watcher._reingest(root, steps_changed=True)  # a machine re-ingest in between
 
     status, payload = _call(base, "POST", "/api/edges/restore", body)
@@ -743,6 +796,9 @@ def test_http_restore_puts_back_a_human_confirmation(live):
         assert db.STATUS_BEFORE_REJECT_KEY not in edge["evidence"]
     finally:
         conn.close()
+    ledger = ledger_mod.load_judgements(root).ledger
+    assert [e.get("verdict") for e in ledger.entries] == ["confirmed", "rejected", "undone"]
+    assert all(e.get("via") == "canvas" for e in ledger.entries)
 
 
 def test_http_restore_of_a_live_link_is_409(live):

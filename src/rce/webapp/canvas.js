@@ -51,11 +51,12 @@
       with 「撤销」 -> /api/edges/restore offered on the chip.
 
   The page never writes the graph directly from here. Its writes are
-  canvas.json (UI state, section 8.6) and the three canvas write
-  endpoints, which take only paths/ids and resolve every file location
-  server-side (mappings.toml from the served root alone, confined like
-  every other path); a status change goes through the human-only
-  db.set_edge_status path. Every drop is re-validated by the server --
+  the arrangement record .rce/canvas.json (sections 8.6, 9.2) and the
+  canvas write endpoints, which take only paths/ids and resolve every file
+  location server-side (mappings.toml from the served root alone, confined
+  like every other path); a status change is a judgment, appended to
+  .rce/judgements.toml by the server's one human write path and only then
+  reflected in the graph (9.1). Every drop is re-validated by the server --
   the JS grammar only spares a round trip.
 */
 "use strict";
@@ -1515,6 +1516,10 @@ window.RCECanvas = (function () {
 
   function linkTipText(link) {
     if (cv.cycle.has(link.id)) return "检测到循环 · " + link.evidence_hint;
+    // 9.6: a link whose judgment waits is never shown as an ordinary one.
+    if (link.conflict) return link.evidence_hint + " · 记录冲突，待处理";
+    if (link.review && link.judgement) return link.evidence_hint + " · 待复核 · " + link.judgement.label;
+    if (link.candidate_hint) return link.evidence_hint + " · " + link.candidate_hint;
     if (!link.human && link.status === "pending") return link.evidence_hint + " · 待确认";
     return link.evidence_hint;
   }

@@ -38,6 +38,7 @@ from rce.ingest import mlflow as mlflow_ingest
 from rce.ingest import pyfig as pyfig_ingest
 from rce.ingest import scan as scan_mod
 from rce.ingest import wandb as wandb_ingest
+from rce.records import judgements
 
 Echo = Callable[[str], None]
 
@@ -101,7 +102,24 @@ def ingest_sources(
     One scan (`rce.ingest.scan`, DESIGN.md 9.6) covers the whole run: every
     extractor reports into it, and the inventory is recorded so a file it
     no longer lists is reported ABSENT. If the run fails, the scan is
-    recorded as failed and speaks for nothing it read."""
+    recorded as failed and speaks for nothing it read.
+
+    Then the judgment ledger is applied (DESIGN.md 9.1, 9.6): the human
+    state of the index is recomputed against what this scan saw, AFTER the
+    scan finished (its source and node stamps are written at finish)."""
+    warnings = _scan_sources(conn, project_root, mlruns=mlruns, wandb=wandb, echo=echo)
+    judgements.apply_after_scan(conn, project_root, echo)
+    return warnings
+
+
+def _scan_sources(
+    conn: Connection,
+    project_root: Path,
+    *,
+    mlruns: str | None,
+    wandb: str | None,
+    echo: Echo,
+) -> int:
     with count_ingest_warnings() as warnings, scan_mod.scan(conn, "ingest") as sc:
         try:
             commits = git_ingest.ingest_git_repo(conn, project_root, scan=sc)
@@ -195,7 +213,15 @@ def ingest_records(conn: Connection, project_root: Path, *, echo: Echo = lambda 
     (as `rce mappings`) and, when `.rce/attempts.toml` loads, the attempt
     table (as `rce attempts`). A file that cannot be read is reported and
     skipped, never treated as a deletion (Section 4). Each is its own
-    partial scan, as when the watcher or the CLI runs it alone."""
+    partial scan, as when the watcher or the CLI runs it alone. The
+    judgment ledger is applied last, whatever was read."""
+    try:
+        _ingest_record_files(conn, project_root, echo)
+    finally:
+        judgements.apply_after_scan(conn, project_root, echo)
+
+
+def _ingest_record_files(conn: Connection, project_root: Path, echo: Echo) -> None:
     try:
         report = mappings_ingest.ingest_mappings(conn, project_root)
         if report.file_present:

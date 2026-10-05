@@ -107,34 +107,73 @@ def test_status_summary_counts_and_pending_queue(conn):
     assert "Pending confirmation queue: 1" in mcp_server.format_status_text(summary)
 
 
-def test_confirm_edge_moves_pending_to_confirmed(conn):
-    db.upsert_node(conn, "claim:paper.tex#abc", "claim")
-    db.upsert_node(conn, "experiment:run1", "experiment")
-    _mk(conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", extractor="7b-judge", status="pending")
+def _v5_project(tmp_path):
+    """A V5 project with one pending claim link (no scan: the link was
+    never stamped, so its judgment is compared with no basis)."""
+    from rce import project as project_identity
 
+    root = tmp_path / "proj"
+    root.mkdir()
+    ident = project_identity.init_project(root).identity
+    conn = db.connect(paths.graph_db_path(root))
+    try:
+        db.upsert_node(conn, "claim:paper.tex#abc", "claim")
+        db.upsert_node(conn, "experiment:run1", "experiment")
+        _mk(conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", extractor="7b-judge", status="pending")
+    finally:
+        conn.close()
+    return root, ident.id
+
+
+def _status(root):
+    conn = db.connect(paths.graph_db_path(root))
+    try:
+        return db.query_edges(conn, src="claim:paper.tex#abc", dst="experiment:run1", type="backed_by")[0]["status"]
+    finally:
+        conn.close()
+
+
+def test_confirm_edge_records_the_judgment_then_applies_it(tmp_path):
+    """9.1/9.8: the MCP channel writes the ledger (via = "mcp") through the
+    one write path; the index follows."""
+    from rce.records import ledger as ledger_mod
+
+    root, pid = _v5_project(tmp_path)
     message = mcp_server.confirm_edge(
-        conn, "claim:paper.tex#abc", "experiment:run1", "backed_by", "7b-judge", "confirmed",
+        root, pid, "claim:paper.tex#abc", "experiment:run1", "backed_by", "7b-judge", "confirmed", "checked",
     )
     assert "status set to 'confirmed'" in message
-    edges = db.query_edges(conn, src="claim:paper.tex#abc", dst="experiment:run1", type="backed_by")
-    assert edges[0]["status"] == "confirmed"
-
-
-def test_confirm_edge_no_such_edge_says_so(conn):
+    assert _status(root) == "confirmed"
+    (entry,) = ledger_mod.load_judgements(root).ledger.entries
+    assert entry.get("via") == "mcp" and entry.get("note") == "checked"
     message = mcp_server.confirm_edge(
-        conn, "claim:missing", "experiment:missing", "backed_by", "7b-judge", "confirmed",
+        root, pid, "claim:paper.tex#abc", "experiment:run1", "backed_by", "7b-judge", "withdrawn",
+    )
+    assert _status(root) == "pending"
+
+
+def test_confirm_edge_no_such_edge_says_so(tmp_path):
+    root, pid = _v5_project(tmp_path)
+    message = mcp_server.confirm_edge(
+        root, pid, "claim:missing", "experiment:missing", "backed_by", "7b-judge", "confirmed",
     )
     assert "No such edge" in message
-    assert db.query_edges(conn) == []
+    assert not (root / ".rce" / "judgements.toml").exists()
 
 
-def test_confirm_edge_rejects_unknown_type_and_status(conn):
-    db.upsert_node(conn, "claim:x", "claim")
-    db.upsert_node(conn, "experiment:y", "experiment")
+def test_confirm_edge_refuses_a_hand_drawn_link(tmp_path):
+    root, pid = _v5_project(tmp_path)
+    message = mcp_server.confirm_edge(root, pid, "script:a.py", "dataset:b.csv", "reads", "mapping", "rejected")
+    assert message.startswith("Not written") and "mappings.toml" in message
+    assert not (root / ".rce" / "judgements.toml").exists()
+
+
+def test_confirm_edge_rejects_unknown_type_and_status(tmp_path):
     with pytest.raises(ValueError):
-        mcp_server.confirm_edge(conn, "claim:x", "experiment:y", "haunts", "test", "confirmed")
-    with pytest.raises(ValueError):
-        mcp_server.confirm_edge(conn, "claim:x", "experiment:y", "backed_by", "test", "in_review")
+        mcp_server.confirm_edge(tmp_path, None, "claim:x", "experiment:y", "haunts", "test", "confirmed")
+    for status in ("in_review", "pending", "auto"):
+        with pytest.raises(ValueError):
+            mcp_server.confirm_edge(tmp_path, None, "claim:x", "experiment:y", "backed_by", "test", status)
 
 
 def test_build_server_registers_tools_with_legal_schemas(tmp_path):
