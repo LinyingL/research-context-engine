@@ -583,10 +583,12 @@ def test_http_root_returns_spa_shell_with_key_mount_points(live_server):
     assert html.lstrip().lower().startswith("<!doctype html>")
     for mount_point in (
         'id="app"', 'id="view-tree"', 'id="view-lineage"', 'id="panel"',
-        'id="panel-backdrop"', 'id="panel-body"', 'id="project-switcher"',
-        # Section 8.10's two additions: the degraded-project header state
-        # and the dead-registry-entry cleanup button.
-        'id="project-state"', 'id="remove-missing-btn"',
+        'id="panel-backdrop"', 'id="panel-body"',
+        # Section 8.10's degraded-project header state; DESIGN.md 10.1's
+        # project menu (it replaced the <select> and 「移除失效项目」), the
+        # scan's progress chip and the no-project welcome.
+        'id="project-state"', 'id="project-menu-btn"', 'id="project-menu"', 'id="scan-chip"',
+        'id="welcome"', 'id="welcome-add-btn"',
         'data-view="tree"', 'data-view="lineage"',
         # Task V4 phase 2a: the canvas tab and its view.
         'data-view="canvas"', 'id="view-canvas"',
@@ -608,8 +610,8 @@ def test_served_app_carries_the_degraded_state_copy_in_product_language(live_ser
     for copy in (
         "项目不可用 — 图谱文件已不存在",   # rule 2's header state
         "图谱文件正在从云端下载…",           # rule 1's dataless state
-        "移除失效项目",                      # rule 3's cleanup button
-        "（目录已不存在）",                  # rule 3's dead entry marker
+        "从列表中移除…",                    # rule 3's cleanup, in the 10.1 menu
+        "找不到文件夹",                      # rule 3's dead entry marker (10.1)
     ):
         assert copy in html, f"missing product-language copy in app.html: {copy}"
     assert "graph_missing" in html and "graph_downloading" in html
@@ -814,7 +816,7 @@ def test_served_ui_has_no_hover_only_errors_and_one_detail_helper(live_server):
     assert ".err-detail {" in html and "var(--ink-soft)" in html[html.index(".err-detail {"):][:300]
     for call in (
         'showHeaderError("切换项目失败", err)',                        # switch project
-        'showHeaderError("移除失效项目失败", err)',                    # remove project
+        'renderBlockingError(statusEl, "没能从列表中移除", err)',      # remove project (10.4)
         'showHeaderError("停止服务失败", err)',                        # stop service
         'renderBlockingError(statusEl, reveal ? "无法在 Finder 中显示" : "无法打开", err)',
         "renderBlockingError(statusEl, cnText, err)",                 # attempt form
@@ -2107,7 +2109,7 @@ def test_served_page_exposes_the_shell_dispatcher_and_title_message(live_server)
     assert "window.RCE = Object.freeze({" in html and "command(name)" in html
     assert 'window.webkit.messageHandlers.rce' in html
     assert 'postMessage({ type: "title", text:' in html
-    load_projects = html[html.index("async function loadProjects()"):html.index("function updateSwitcherVisibility()")]
+    load_projects = html[html.index("async function loadProjects()"):html.index("function projectMenuOpen()")]
     assert load_projects.count("postShellTitle();") == 2  # success and failure paths alike
 
 
@@ -2122,7 +2124,7 @@ def test_page_dispatcher_and_shell_whitelist_name_the_same_commands():
     swift_names = set(re.findall(r'"([a-z-]+)"', whitelist_src))
     expected = {
         "tree", "lineage", "canvas", "variables", "new-attempt", "reload", "zoom-in", "zoom-out",
-        "zoom-reset", "fit", "reveal-project", "open-map",
+        "zoom-reset", "fit", "reveal-project", "open-map", "add-project",
     }
     assert _page_shell_commands(html) == expected
     assert swift_names == expected

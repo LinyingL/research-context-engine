@@ -52,9 +52,13 @@
 //   directory, whose answer goes back through the fixed callback
 //   `RCE.folderChosen(request, path)` -- called with callAsyncJavaScript,
 //   the request id and the path passed as ARGUMENTS (serialized by WebKit),
-//   never spliced into script text. The page learns it may ask from
+//   never spliced into script text. Since V6 (DESIGN.md 10.7) it may carry
+//   a third key, `purpose`, exactly "add" or "locate", which changes only
+//   the panel's message (folderPanelMessage); the two-key shape is the
+//   locate panel, as before, so a page from before V6 still works. The page
+//   learns it may ask (and may name a purpose) from
 //   `window.RCEShellFeatures`, injected at document start. Every other
-//   message shape is ignored.
+//   message shape -- any other purpose included -- is ignored.
 // - Navigation: only http://127.0.0.1:<port> (and the placeholder's
 //   about:blank) load in the window. Any other http(s)/mailto link opens
 //   in the default browser; every other scheme is refused. Developer
@@ -71,6 +75,7 @@ import AppKit
 let shellCommands: Set<String> = [
     "tree", "lineage", "canvas", "variables", "new-attempt", "reload",
     "zoom-in", "zoom-out", "zoom-reset", "fit", "reveal-project", "open-map",
+    "add-project",
 ]
 
 let defaultPort = 7357
@@ -83,9 +88,19 @@ let startupBudget: TimeInterval = 4.0
 let documentsHint = "正在启动引擎… 如果系统询问是否允许 RCE 访问\"文稿\"文件夹，请点\"允许\"。"
 let titleLimit = 60
 // What the page may ask the shell for (app.html, shellCan).
-let shellFeaturesScript = "window.RCEShellFeatures = [\"choose-folder\"];"
+let shellFeaturesScript = "window.RCEShellFeatures = [\"choose-folder\", \"choose-folder-purpose\"];"
 // The page's own request ids ("folder-<time>-<random>"): anything else is ignored.
 let folderRequestLimit = 80
+
+// The folder panel's message per purpose (DESIGN.md 10.2, 10.7); nil for
+// anything else, and such a message is ignored.
+func folderPanelMessage(_ purpose: String) -> String? {
+    switch purpose {
+    case "add": return "选择要加入 RCE 的项目文件夹"
+    case "locate": return "选择项目文件夹的新位置"
+    default: return nil
+    }
+}
 
 func isFolderRequest(_ request: String) -> Bool {
     !request.isEmpty && request.count <= folderRequestLimit
@@ -463,6 +478,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
             item("退出", #selector(NSApplication.terminate(_:)), "q"),
         ]))
         main.addItem(submenu("文件", [
+            cmd("添加项目…", "add-project", "o"),
+            .separator(),
             cmd("新增尝试", "new-attempt", "n"),
             cmd("在 Finder 中显示项目", "reveal-project", "r", [.command, .shift]),
             .separator(),
@@ -606,20 +623,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
         guard message.name == "rce", message.frameInfo.isMainFrame else { return }
         let origin = message.frameInfo.securityOrigin
         guard origin.protocol == "http", origin.host == "127.0.0.1", origin.port == port else { return }
-        guard let body = message.body as? [String: Any], body.count == 2 else { return }
-        if body["type"] as? String == "title", let text = body["text"] as? String {
+        guard let body = message.body as? [String: Any] else { return }
+        if body.count == 2, body["type"] as? String == "title", let text = body["text"] as? String {
             let label = sanitizedLabel(text)
             window.title = label.isEmpty ? "RCE" : "RCE — " + label
-        } else if body["type"] as? String == "choose-folder", let request = body["request"] as? String,
-                  isFolderRequest(request) {
-            chooseFolder(request)
+        } else if body.count == 2, body["type"] as? String == "choose-folder",
+                  let request = body["request"] as? String, isFolderRequest(request) {
+            chooseFolder(request, purpose: "locate")
+        } else if body.count == 3, body["type"] as? String == "choose-folder",
+                  let request = body["request"] as? String, isFolderRequest(request),
+                  let purpose = body["purpose"] as? String, folderPanelMessage(purpose) != nil {
+            chooseFolder(request, purpose: purpose)
         }
     }
 
-    // 「选择新位置…」: one directory, chosen in a sheet; the answer (or null
-    // when cancelled) goes back through the page's fixed callback.
-    func chooseFolder(_ request: String) {
-        guard !choosingFolder, appLoaded else {
+    // 「选择新位置…」 / 「添加项目…」: one directory, chosen in a sheet; the
+    // answer (or null when cancelled) goes back through the page's fixed
+    // callback. The purpose picks the panel's message, nothing else.
+    func chooseFolder(_ request: String, purpose: String) {
+        guard !choosingFolder, appLoaded, let panelMessage = folderPanelMessage(purpose) else {
             answerFolder(request, nil)
             return
         }
@@ -630,7 +652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation,
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
         panel.prompt = "选择"
-        panel.message = "选择项目文件夹的新位置"
+        panel.message = panelMessage
         panel.beginSheetModal(for: window) { [weak self] response in
             guard let self = self else { return }
             self.choosingFolder = false

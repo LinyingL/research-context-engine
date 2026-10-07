@@ -7,7 +7,8 @@
   and read entirely client-side against this same process's JSON API
   (/api/summary, /api/attempts, /api/tree, /api/lineage, /api/file,
   /api/open, /api/projects, /api/projects/switch, /api/projects/remove,
-  /api/generation,
+  /api/projects/inspect, /api/projects/add, /api/projects/rescan,
+  /api/projects/rename, /api/generation,
   /api/attempts/preview, /api/attempts/write, /api/shutdown -- see
   rce/webapp/server.py's module docstring for the contract each endpoint
   promises).
@@ -22,13 +23,26 @@
   rescan is in flight or when the last one failed (the raw error lives on
   the chip's hover title, technical detail folded away).
 
-  Multi-project switching (task V3 phase 1): the header shows the current
-  project's registry label (hover for the full path), and -- only when the
-  registry has more than one entry -- a <select> to switch. Switching
-  POSTs /api/projects/switch (the server accepts only exact registry
-  members; this page only ever offers values it got from /api/projects),
-  then re-fetches every view from scratch, since everything on screen
-  belongs to the previous project.
+  Multi-project switching (task V3 phase 1, reshaped by DESIGN.md 10.1 in
+  task V6): the project line starts with one button, 「项目：<名称> ▾」,
+  shown always (hover for the full path). Its menu lists the registered
+  projects (the open one marked, one whose folder cannot be found greyed
+  「找不到文件夹」 with 「选择新位置…」), then 「添加项目…」, 「重新扫描这个项目」,
+  「重命名显示名称…」 and 「从列表中移除…」. Switching POSTs
+  /api/projects/switch (the server accepts only exact registry members;
+  this page only ever offers values it got from /api/projects), then
+  re-fetches every view from scratch, since everything on screen belongs
+  to the previous project.
+
+  Adding a project (DESIGN.md Section 10, task V6): 「添加项目…」 (also the
+  native 文件 → 添加项目… ⌘O, and the no-project page's button) opens the add
+  dialog in the side panel: choose a folder (the shell's folder panel, or a
+  path field), let the engine look at it (POST /api/projects/inspect --
+  writes nothing), then write (POST /api/projects/add with the
+  inspection's token). A new folder's first full scan, and a rescan from
+  the menu, show their progress in the header from GET /api/generation's
+  `scanning`. With an empty registry the engine serves no project, and
+  every tab shows only the welcome (10.1).
 
   Writing from the UI (task V3 phase 3): the "＋ 新增尝试" header button and
   the attempt panel's "编辑" button open a form in the same slide-out
@@ -52,13 +66,11 @@
   state in product language instead of an English error box: 「项目不可用 —
   图谱文件已不存在」 for a graph that vanished mid-serve, 「图谱文件正在从云端
   下载…」 for one macOS has evicted to iCloud. The raw engine message stays
-  on the hover title. Crucially the project switcher stays usable in both
-  (and is shown even for a single registered project while degraded), since
-  switching away is the one action that can actually fix it. A registry
-  entry whose directory is gone is marked 「目录已不存在」 and disabled, and a
-  「移除失效项目」 button appears beside the switcher to drop those entries
-  from ~/.rce/projects.json (POST /api/projects/remove) -- a bookmark
-  removal, nothing on disk.
+  on the hover title. Crucially the project menu stays usable in both,
+  since switching away is the one action that can actually fix it. A
+  registry entry whose folder is gone is marked 「找不到文件夹」, and
+  「从列表中移除…」 drops any entry from ~/.rce/projects.json (POST
+  /api/projects/remove) -- a bookmark removal, nothing on disk.
 
   Stopping the server (task V3 phase 4): a quiet 停止服务 text button in
   the page footer, behind an explicit Chinese window.confirm. Confirming
@@ -158,20 +170,44 @@ body {
 .brand-mark { font-family: var(--font-serif); font-size: 1.4rem; letter-spacing: 0.04em; }
 .brand-sub { font-size: 0.78rem; color: var(--ink-soft); }
 
-.project-switcher {
-  font: inherit;
-  font-size: 0.82rem;
-  color: var(--ink);
-  background: var(--paper-alt);
-  border: 1px solid var(--line-strong);
-  border-radius: 0;
-  padding: 0.3rem 0.55rem;
-  max-width: 18rem;
-  align-self: center;
-  cursor: pointer;
+/* 「项目：<名称> ▾」 (DESIGN.md 10.1): the project line's one button and its
+   small menu -- the registered projects, then 添加 / 重新扫描 / 重命名 /
+   移除. Quiet like the line it sits in; the menu is paper on a strong rule. */
+.project-menu-wrap { position: relative; display: inline-block; font-family: var(--font-sans); }
+.project-menu-btn {
+  font: inherit; font-size: 0.8rem; color: var(--ink); background: none;
+  border: 1px solid transparent; padding: 0.05rem 0.35rem; margin-left: -0.35rem; cursor: pointer;
+  max-width: 28rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: baseline;
 }
-.project-switcher:hover { border-color: var(--ink); }
-.project-switcher:focus { outline: 1px solid var(--clay); outline-offset: 1px; }
+.project-menu-btn:hover, .project-menu-btn[aria-expanded="true"] { border-color: var(--line-strong); background: var(--paper-alt); }
+.project-menu-btn:focus-visible { outline: 1px solid var(--clay); outline-offset: 1px; }
+.project-menu {
+  position: absolute; top: calc(100% + 0.25rem); left: -0.35rem; z-index: 45; min-width: 17rem; max-width: min(26rem, 92vw);
+  background: var(--paper); border: 1px solid var(--line-strong); box-shadow: 0 6px 18px rgba(38, 34, 27, 0.12);
+  padding: 0.3rem 0; font-size: 0.84rem; color: var(--ink);
+}
+.pm-item {
+  display: flex; align-items: baseline; gap: 0.5rem; width: 100%; text-align: left; font: inherit; color: inherit;
+  background: none; border: none; padding: 0.32rem 0.9rem 0.32rem 0.7rem; cursor: pointer;
+}
+.pm-item:hover:not(:disabled), .pm-item:focus-visible { background: var(--paper-alt); outline: none; }
+.pm-item:disabled { color: var(--ink-soft); cursor: default; }
+.pm-mark { flex: none; width: 1em; color: var(--clay); }
+.pm-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pm-flag { flex: none; font-size: 0.74rem; color: var(--ink-soft); }
+.pm-row { display: flex; align-items: baseline; }
+.pm-row .pm-item { flex: 1; min-width: 0; }
+.pm-row .pm-sub { flex: none; width: auto; font-size: 0.76rem; color: var(--clay); padding: 0.32rem 0.9rem 0.32rem 0.4rem; }
+.pm-missing .pm-label { color: var(--ink-soft); }
+.pm-rule { border: none; border-top: 1px solid var(--line); margin: 0.3rem 0; }
+.pm-empty { padding: 0.32rem 0.9rem 0.32rem 1.7rem; color: var(--ink-soft); font-size: 0.8rem; }
+.pm-form { padding: 0.45rem 0.9rem 0.55rem; display: flex; flex-direction: column; gap: 0.45rem; }
+.pm-form-title { font-weight: 600; font-size: 0.82rem; }
+.pm-form p { margin: 0; font-size: 0.78rem; color: var(--ink-soft); }
+.pm-form .form-input { font-size: 0.82rem; }
+.pm-form-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.pm-status { font-size: 0.78rem; color: var(--clay); min-height: 0; }
+.pm-status:empty { display: none; }
 
 .refresh-chip {
   font-size: 0.76rem;
@@ -186,7 +222,7 @@ body {
 
 /* A degraded project (DESIGN.md section 8.10 rules 1-2). Clay, because in
    this app clay means "a human did this" or "something is wrong" -- and
-   this is the second kind. Sits next to the switcher, which stays usable:
+   this is the second kind. Sits by the project menu, which stays usable:
    the state is about the project, not about the page. */
 .project-state {
   font-size: 0.76rem;
@@ -199,21 +235,21 @@ body {
   cursor: help;
 }
 
-/* 「移除失效项目」 -- quiet until needed, like the footer's 停止服务, since a
-   dead registry entry is a chore rather than an action worth advertising. */
-.remove-missing-btn {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font: inherit;
-  font-size: 0.76rem;
-  color: var(--clay);
-  align-self: center;
-  padding: 0.2rem 0;
-  white-space: nowrap;
+/* The full scan's progress (DESIGN.md 10.2 step 3, 10.3): 「正在扫描：<步骤>
+   （n/m）」 while it runs, then a quiet 「扫描完成」 for a few seconds. */
+.scan-chip {
+  font-size: 0.76rem; color: var(--ink); background: var(--paper-alt); border: 1px solid var(--line-strong);
+  padding: 0.18rem 0.6rem; align-self: center; white-space: nowrap;
 }
-.remove-missing-btn:hover { text-decoration: underline; }
-.remove-missing-btn:disabled { color: var(--ink-soft); cursor: default; text-decoration: none; }
+.scan-chip.done { color: var(--olive); border-color: var(--olive); background: var(--olive-soft); }
+.scan-chip.warn { color: var(--ink); border-color: var(--ochre); background: var(--ochre-soft); }
+.scan-chip.err { color: var(--ink); border-color: var(--clay); background: var(--clay-soft); white-space: normal; max-width: 28rem; }
+.scan-chip-link {
+  font: inherit; color: inherit; background: none; border: none; padding: 0; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.scan-chip-close { font: inherit; color: var(--ink-soft); background: none; border: none; padding: 0 0 0 0.5rem; cursor: pointer; }
+.scan-chip-close:hover { color: var(--ink); }
 
 /* The in-view companion to the header state: product language where the
    error box would have been, with the engine's English on hover. */
@@ -242,6 +278,37 @@ body {
   color: var(--ink-soft);
   margin-top: 0.25rem;
 }
+
+.project-line-msg { margin-left: 0.6rem; }
+.project-line-msg:empty { display: none; }
+
+/* No project yet (DESIGN.md 10.1): every tab shows only the welcome. */
+.welcome { display: none; max-width: 560px; margin: 3.5rem auto 0; }
+body.no-project .welcome { display: block; }
+body.no-project .view, body.no-project .notices, body.no-project #new-attempt-btn,
+body.no-project #records-btn { display: none !important; }
+.welcome p { margin: 0 0 0.6rem; font-size: 0.95rem; }
+.welcome .welcome-what { color: var(--ink-soft); font-size: 0.84rem; margin-top: 1.1rem; }
+.welcome .btn { margin-top: 0.6rem; font-size: 0.88rem; padding: 0.45rem 1rem; }
+
+/* The add dialog (DESIGN.md 10.2), in the side panel. */
+.add-choose { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+.add-choose .locate-row { margin-top: 0; }
+.add-busy { font-size: 0.84rem; color: var(--ink-soft); }
+.add-result { display: flex; flex-direction: column; gap: 0.7rem; }
+.add-root { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-soft); word-break: break-all; }
+.add-lead { font-size: 0.92rem; font-weight: 600; }
+.add-lead.bad { color: var(--clay); }
+.add-counts { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+.add-counts li { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.84rem; padding: 0.28rem 0; border-bottom: 1px solid var(--line); }
+.add-counts .n { font-family: var(--font-mono); font-size: 0.8rem; }
+.add-note { font-size: 0.82rem; color: var(--ink-soft); margin: 0; }
+.add-note.warn { color: var(--ink); border-left: 2px solid var(--ochre); padding-left: 0.6rem; }
+.add-writes { font-size: 0.8rem; color: var(--ink-soft); border-left: 2px solid var(--line-strong); padding-left: 0.6rem; margin: 0; }
+.add-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+.add-confirm { border: 1px solid var(--ochre); background: var(--ochre-soft); padding: 0.7rem 0.9rem; font-size: 0.84rem; }
+.add-confirm .add-actions { margin-top: 0.55rem; }
+.add-result .notice { max-width: none; }
 
 main#main { flex: 1; padding: 1.75rem 2rem 4rem; max-width: 1080px; width: 100%; margin: 0 auto; }
 
@@ -772,10 +839,9 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
       <span class="brand-mark">RCE</span>
       <span class="brand-sub">研究脉络</span>
     </div>
-    <select id="project-switcher" class="project-switcher hidden" title="切换项目" aria-label="切换项目"></select>
     <span id="project-state" class="project-state hidden" role="status"></span>
-    <button id="remove-missing-btn" class="remove-missing-btn hidden" type="button">移除失效项目</button>
     <span id="refresh-chip" class="refresh-chip hidden" role="status"></span>
+    <span id="scan-chip" class="scan-chip hidden" role="status" aria-live="polite"></span>
     <button id="new-attempt-btn" class="btn new-attempt-btn" type="button">＋ 新增尝试</button>
     <nav class="tabs" role="tablist">
       <button class="tab active" data-view="tree" role="tab" aria-selected="true">决策树</button>
@@ -783,13 +849,25 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
       <button class="tab" data-view="canvas" role="tab" aria-selected="false">画布</button>
       <button class="tab" data-view="variables" role="tab" aria-selected="false">变量</button>
     </nav>
-    <div class="project-line" id="project-line"></div>
+    <div class="project-line" id="project-line">
+      <span class="project-menu-wrap" id="project-menu-wrap">
+        <button id="project-menu-btn" class="project-menu-btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="project-menu">项目：… ▾</button>
+        <div id="project-menu" class="project-menu hidden" role="menu" aria-label="项目"></div>
+      </span><span id="project-line-msg" class="project-line-msg"></span>
+    </div>
   </header>
   <main id="main">
     <!-- V5: what the record needs from the researcher right now (a
          migration waiting, a ledger RCE cannot trust, the shrink question,
          a read-only open, a project moved under the page). -->
     <div id="notices" class="notices" aria-live="polite"></div>
+    <!-- DESIGN.md 10.1: no project yet -- every tab shows only this. -->
+    <section id="welcome" class="welcome" aria-label="还没有项目">
+      <p>RCE 读取一个研究文件夹里的脚本、数据和文稿，理清它们之间是怎么一步步连起来的。</p>
+      <p>你对这些关联做出的判断，RCE 会替你记下来，和这项研究的文件放在一起。</p>
+      <button id="welcome-add-btn" class="btn" type="button">添加项目…</button>
+      <p class="welcome-what">项目就是存放一项研究的那个文件夹。</p>
+    </section>
     <section id="view-tree" class="view"></section>
     <section id="view-lineage" class="view hidden"></section>
     <section id="view-canvas" class="view hidden"></section>
@@ -840,7 +918,7 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
 // never from hardcoded column labels; null means no usable config.
 // projectState is the degraded-project condition currently on screen
 // ("graph_missing" / "graph_downloading", null when healthy) -- it decides
-// whether the header chip shows and whether the switcher is forced visible.
+// whether the header chip shows.
 // dataEpoch counts project switches so a fetch that started for the
 // previous project never lands in this one -- see "Attempt records" below.
 const state = {
@@ -855,6 +933,12 @@ const state = {
   // an answer left to read (dismissed by the researcher).
   summary: null, migrationInfo: null, projectMoved: false, sessionNotes: [],
   noticeBusy: false, noticeSig: null, reviewOffer: null,
+  // DESIGN.md Section 10 (task V6): /api/projects as last read (the menu is
+  // built from it when opened), whether the engine serves no project at
+  // all (10.1), and the last scan end this page has accounted for
+  // (undefined: take the next status as the baseline; null: none yet).
+  projects: [], currentPath: "", currentId: null, currentEntry: null, noProject: false,
+  scanSeen: undefined,
 };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
@@ -894,6 +978,12 @@ function apiError(path, res, body) {
   // A refusal that names its own product sentence (a variable card's,
   // `message_zh`): shown in place of the caller's framing.
   if (body && typeof body.message_zh === "string" && body.message_zh) err.messageZh = body.message_zh;
+  // DESIGN.md Section 10's refusals carry their Chinese sentence as
+  // `message` and the engine's own text as `detail` (shown behind 「详情」);
+  // an add refusal carries the fresh look at the folder (`inspection`).
+  if (body && typeof body.message === "string" && body.message) err.engineMessage = body.message;
+  if (body && typeof body.detail === "string" && body.detail) err.detail = body.detail;
+  if (body && body.inspection && typeof body.inspection === "object") err.inspection = body.inspection;
   return err;
 }
 
@@ -1129,10 +1219,24 @@ const BLOCKING_ERROR_TEXT = {
   migration_refused: "现在不能迁移：没有等待迁移的旧索引，或这个文件夹的状态不允许迁移",
 };
 
+// DESIGN.md Section 10: the add-project endpoints' codes. Their sentence
+// comes from the engine (`message`), because some name a project (「这个
+// 文件夹在项目「X」里面」) or a rule (a display name's three limits).
+const ENGINE_SENTENCE_CODES = new Set([
+  "inspected_changed", "waiting_permission", "missing", "not_a_folder", "unreadable", "top_level",
+  "system_folder", "rce_home", "inside_project", "contains_project", "bad_path", "bad_label", "bad_request",
+  "unknown_project", "not_registered", "scan_running", "frozen", "blocked", "not_a_project", "no_index",
+  "lock_failed", "no_project",
+]);
+
 function blockingErrorText(framing, err) {
   const code = err && typeof err === "object" ? err.state : null;
   if (typeof code === "string" && Object.prototype.hasOwnProperty.call(BLOCKING_ERROR_TEXT, code)) return BLOCKING_ERROR_TEXT[code];
-  return (err && typeof err === "object" && typeof err.messageZh === "string" && err.messageZh) ? err.messageZh : framing;
+  if (err && typeof err === "object" && typeof err.messageZh === "string" && err.messageZh) return err.messageZh;
+  if (typeof code === "string" && ENGINE_SENTENCE_CODES.has(code) && typeof err.engineMessage === "string" && err.engineMessage) {
+    return err.engineMessage;
+  }
+  return framing;
 }
 
 // Replaces `el`'s content with the sentence, the 「详情」 toggle and the
@@ -1145,7 +1249,8 @@ function renderBlockingError(el, framing, err) {
   text.className = "err-text";
   text.textContent = blockingErrorText(framing, err);
   el.appendChild(text);
-  const raw = err instanceof Error ? err.message : (err == null ? "" : String(err));
+  const raw = (err && typeof err === "object" && typeof err.detail === "string" && err.detail) ? err.detail
+    : err instanceof Error ? err.message : (err == null ? "" : String(err));
   if (!raw) return;
   const toggle = document.createElement("button");
   toggle.type = "button";
@@ -1186,10 +1291,9 @@ function renderErrorBox(container, err) {
 // -- Degraded project state (DESIGN.md section 8.10 rules 1-2) ---------------
 // A read that fails with a known state does NOT get the generic error box:
 // it gets one clay chip in the header (raw engine message on hover) and one
-// product-language note where the view would have been. The switcher is
-// left alone -- more than that, it is forced visible while degraded even
-// for a single registered project, because switching away is the one action
-// that can fix this from here.
+// product-language note where the view would have been. The project menu
+// (「项目：<名称> ▾」, shown always since DESIGN.md 10.1) stays usable,
+// because switching away is the one action that can fix this from here.
 
 const projectStateChip = document.getElementById("project-state");
 
@@ -1206,7 +1310,6 @@ function setProjectState(err) {
   // than on the next poll tick (refreshChip is declared further down; this
   // only ever runs after the whole script has loaded).
   if (refreshChip.classList.contains("err")) hideRefreshChip();
-  updateSwitcherVisibility();
   return true;
 }
 
@@ -1216,7 +1319,6 @@ function clearProjectState() {
   projectStateChip.classList.add("hidden");
   projectStateChip.textContent = "";
   projectStateChip.title = "";
-  updateSwitcherVisibility();
 }
 
 function renderStateNote(container, err) {
@@ -1291,7 +1393,8 @@ function activateView(name) {
   Object.entries(views).forEach(([key, node]) => node.classList.toggle("hidden", key !== name));
   // The canvas wants the whole window below the header, not the reading
   // column the two text views use.
-  document.body.classList.toggle("canvas-mode", name === "canvas");
+  document.body.classList.toggle("canvas-mode", name === "canvas" && !state.noProject);
+  if (state.noProject) return null; // 10.1: every tab shows only the welcome
   if (name === "tree" && !views.tree.dataset.loaded) loadTreeView();
   if (name === "lineage" && !views.lineage.dataset.loaded) loadLineageView();
   if (name === "variables" && !views.variables.dataset.loaded) loadVariablesView();
@@ -1322,20 +1425,30 @@ function basename(path) {
 // action of theirs rewrites it: the summary refresh every generation bump
 // makes (an editor autosave, a knit) must not wipe it unread (verifier
 // finding), so loadProjectSummary leaves the line alone meanwhile.
+// Since DESIGN.md 10.1 the line is two parts: the project menu's button
+// (always there) and the message part beside it, which holds either the
+// counts or such an error.
 function showHeaderError(framing, err) {
-  renderBlockingError(document.getElementById("project-line"), framing, err);
+  renderBlockingError(document.getElementById("project-line-msg"), framing, err);
   state.headerError = true;
 }
 
-document.getElementById("project-line").addEventListener("click", (e) => {
+document.getElementById("project-line-msg").addEventListener("click", (e) => {
   if (!state.headerError || e.target.closest(".err-detail")) return; // reading the detail is not dismissing
   loadProjectSummary(true);
 });
 
 // `force`: a researcher's action rewrites the line, a header error included.
 async function loadProjectSummary(force) {
-  const line = document.getElementById("project-line");
+  const line = document.getElementById("project-line-msg");
   if (force) state.headerError = false;
+  if (state.noProject) {
+    // 10.1: no project, no summary to ask for (it would only be refused).
+    state.summary = null;
+    renderNotices();
+    if (!state.headerError) { line.textContent = ""; line.title = ""; }
+    return;
+  }
   try {
     const data = await fetchSummary();
     if (!data) return; // the project was switched meanwhile; its own refresh is under way
@@ -1345,18 +1458,19 @@ async function loadProjectSummary(force) {
     renderNotices();
     if (data.needs_migration) ensureMigrationInfo(data);
     if (state.headerError) return;
-    // Registry label when loadProjects() found one, else the directory
-    // basename -- never the raw path, which lives on as the hover title.
-    const label = state.projectLabel || basename(data.project_root);
+    // The project's name is the menu button's (registry label, else the
+    // folder's name -- never the raw path, which lives on as its hover
+    // title); this part carries the counts.
+    if (!state.projectLabel) setProjectMenuLabel(basename(data.project_root), data.project_root);
     line.textContent = "";
-    line.title = data.project_root;
+    line.title = "";
     const part = (text) => {
       const span = document.createElement("span");
       span.className = "line-part";
       span.textContent = text;
       return span;
     };
-    line.append(part("项目：" + label), "   ·   ", part("待确认：" + data.pending));
+    line.append("·   ", part("待确认：" + data.pending));
     if (typeof data.review === "number") {
       // 9.6: an old judgment waiting for review (or a record conflict) is
       // counted here, never in 待确认; the count opens the list.
@@ -1382,114 +1496,383 @@ async function loadProjectSummary(force) {
   }
 }
 
-// -- Project switcher (task V3 phase 1) ------------------------------------
-// The <select> only ever offers paths /api/projects returned -- the server
-// additionally enforces registry membership on switch, so this page can
-// never introduce a new filesystem path, only choose among registered ones.
+// -- The project menu (DESIGN.md 10.1, 10.4; task V6) --------------------------
+// 「项目：<名称> ▾」 is the project line's one button, shown always -- with
+// one project, with none, while degraded (switching away is the one repair
+// a degraded project offers from here). It replaces the V3 <select> and the
+// separate 「移除失效项目」 button. Its menu offers only entries
+// /api/projects returned -- the server additionally enforces registry
+// membership on switch, rename and remove, so the menu can never introduce
+// a path; a new folder comes in only through the add dialog, which has the
+// engine look at it first. Keyboard: Enter / Space / ↓ on the button opens
+// it on its first item, ↑ ↓ Home End move, Esc closes (or leaves the rename
+// / remove step), Tab and a click outside close it.
 
-const projectSwitcher = document.getElementById("project-switcher");
-const removeMissingBtn = document.getElementById("remove-missing-btn");
+const projectMenuBtn = document.getElementById("project-menu-btn");
+const projectMenu = document.getElementById("project-menu");
+const projectMenuWrap = document.getElementById("project-menu-wrap");
+const NO_PROJECT_NAME = "还没有项目";
+let projectMenuMode = "list"; // "list" | "rename" | "remove"
+
+function setProjectMenuLabel(label, path) {
+  projectMenuBtn.textContent = "项目：" + (label || NO_PROJECT_NAME) + " ▾";
+  projectMenuBtn.title = path || "";
+}
+
+// 10.1: no project yet. Every tab shows only the welcome; nothing asks
+// the engine for a project's data (it would only be refused).
+function setNoProject(flag) {
+  state.noProject = !!flag;
+  document.body.classList.toggle("no-project", state.noProject);
+  document.body.classList.toggle("canvas-mode", !state.noProject && currentView === "canvas");
+  if (state.noProject) clearProjectState();
+}
 
 async function loadProjects() {
   let data;
   try {
     data = await apiGet("/api/projects");
   } catch (err) {
-    // The switcher is a convenience; a registry hiccup must not take the
-    // header down. Each view surfaces its own real errors already.
-    projectSwitcher.classList.add("hidden");
-    removeMissingBtn.classList.add("hidden");
-    state.projectLabel = "";
-    state.projectCount = 0;
-    state.deadProjects = [];
+    // A registry hiccup must not take the header down: the button stays,
+    // with what it last knew. Each view surfaces its own real errors.
     postShellTitle();
     return;
   }
-  const projects = data.projects || [];
-  const current = data.current || "";
-  const currentEntry = projects.find((p) => p.path === current);
-  state.projectLabel = currentEntry ? currentEntry.label : basename(current);
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+  const noProject = !!data.no_project || data.current == null;
+  const current = noProject ? "" : String(data.current);
+  const currentId = noProject ? null : (data.current_id || null);
+  state.projects = projects;
+  state.currentPath = current;
+  state.currentId = currentId;
+  state.currentEntry = noProject ? null : (projects.find((p) => (currentId && p.id ? p.id === currentId : p.path === current)) || null);
+  // Registry label, else the folder's name -- never the raw path, which
+  // lives on as the button's hover title.
+  state.projectLabel = noProject ? "" : (state.currentEntry ? state.currentEntry.label : basename(current));
   state.projectCount = projects.length;
-
-  projectSwitcher.innerHTML = "";
-  if (!currentEntry && current) {
-    // Currently serving a project that is not (or no longer) a registry
-    // member -- still show it as the selected entry so the select never
-    // silently claims some other project is active.
-    const opt = document.createElement("option");
-    opt.value = current;
-    opt.textContent = basename(current);
-    opt.selected = true;
-    projectSwitcher.appendChild(opt);
+  setProjectMenuLabel(state.projectLabel, current);
+  setNoProject(noProject);
+  if (projectMenuOpen() && projectMenuMode === "list") {
+    // Re-rendered with what is true now, keeping the keyboard where it was.
+    const focused = menuItems().indexOf(document.activeElement);
+    renderProjectMenu();
+    if (focused >= 0) focusMenuItem(focused);
   }
-  projects.forEach((p) => {
-    const opt = document.createElement("option");
-    // Two different failures, two different words (DESIGN.md section 8.10
-    // rule 3): 「目录已不存在」 is a dead entry worth removing; 「未初始化」 is a
-    // real directory that simply needs `rce init`, and must NOT be offered
-    // for removal.
-    // 9.4: an entry with an id whose folder is gone (or now holds another
-    // project) stays choosable -- opening it asks for 「选择新位置…」.
-    const relocatable = !!(p.missing && p.id);
-    const mark = relocatable ? "（找不到项目文件夹，可能已移动）"
-      : !p.available ? "（目录已不存在）" : (p.initialized ? "" : "（未初始化）");
-    opt.textContent = p.label + mark;
-    opt.value = p.path;
-    if (p.id) opt.dataset.id = p.id;
-    opt.title = p.path;
-    opt.disabled = relocatable ? false : (!p.initialized || !p.available);
-    opt.selected = p.path === current;
-    projectSwitcher.appendChild(opt);
-  });
-  state.deadProjects = projects.filter((p) => !p.available);
-  removeMissingBtn.classList.toggle("hidden", state.deadProjects.length === 0);
-  removeMissingBtn.disabled = false;
-  updateSwitcherVisibility();
   postShellTitle(); // on load and after every switch (reloadAllViews)
 }
 
-// Normally the switcher only earns its place when there is something to
-// switch between. While the current project is degraded it is shown
-// regardless: switching away is the one repair available from this page,
-// and hiding the control that performs it is how a degraded state becomes
-// a dead end (DESIGN.md section 8.10 rule 2, "leaves the project switcher
-// usable").
-function updateSwitcherVisibility() {
-  const worthShowing = (state.projectCount || 0) > 1 || state.projectState !== null;
-  projectSwitcher.classList.toggle("hidden", !worthShowing);
+function projectMenuOpen() {
+  return !projectMenu.classList.contains("hidden");
 }
 
-// 「移除失效项目」 (DESIGN.md section 8.10 rule 3). One button rather than a
-// control per row: a <select> cannot hold buttons, and the confirm names
-// every entry it is about to drop, so nothing is removed unseen. The
-// removal is a bookmark removal -- the confirm says so, because "移除项目"
-// otherwise reads like "delete my project".
-removeMissingBtn.addEventListener("click", async () => {
-  const dead = state.deadProjects || [];
-  if (dead.length === 0) return;
-  const names = dead.map((p) => p.label + "  " + p.path).join("\n");
-  if (!window.confirm(
-    "从项目列表里移除这些已经找不到的项目？\n\n" + names +
-    "\n\n只是把它们从列表里去掉，不会删除任何文件。"
-  )) return;
-  removeMissingBtn.disabled = true;
-  let failed = false;
-  try {
-    for (const p of dead) await apiPost("/api/projects/remove", { path: p.path });
-  } catch (err) {
-    // 8.8 "Errors": the Chinese framing, the engine's text behind 「详情」.
-    showHeaderError("移除失效项目失败", err);
-    failed = true;
+function isCurrentEntry(p) {
+  if (state.noProject) return false;
+  if (state.currentId && p.id) return p.id === state.currentId;
+  return p.path === state.currentPath;
+}
+
+function menuItems() {
+  return Array.from(projectMenu.querySelectorAll('[role="menuitem"], [role="menuitemradio"]')).filter((el) => !el.disabled);
+}
+
+function focusMenuItem(index) {
+  const items = menuItems();
+  if (items.length) items[(index + items.length) % items.length].focus();
+}
+
+function openProjectMenu(focusFirst) {
+  projectMenuMode = "list";
+  renderProjectMenu();
+  projectMenu.classList.remove("hidden");
+  projectMenuBtn.setAttribute("aria-expanded", "true");
+  if (focusFirst) focusMenuItem(0);
+  loadProjects(); // a folder can come back or go away between two opens
+}
+
+function closeProjectMenu(returnFocus) {
+  if (!projectMenuOpen()) return;
+  projectMenu.classList.add("hidden");
+  projectMenu.innerHTML = "";
+  projectMenuMode = "list";
+  projectMenuBtn.setAttribute("aria-expanded", "false");
+  if (returnFocus) projectMenuBtn.focus();
+}
+
+function pmItem(text, onClick, opts) {
+  const o = opts || {};
+  const b = mk("button", "pm-item" + (o.cls ? " " + o.cls : ""));
+  b.type = "button";
+  b.tabIndex = -1;
+  b.setAttribute("role", o.role || "menuitem");
+  if (!o.noMark) b.appendChild(mk("span", "pm-mark", o.mark || ""));
+  b.appendChild(mk("span", "pm-label", text));
+  if (o.flag) b.appendChild(mk("span", "pm-flag", o.flag));
+  if (o.title) b.title = o.title;
+  b.disabled = !!o.disabled;
+  b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (!b.disabled) onClick();
+  });
+  return b;
+}
+
+function renderProjectMenu() {
+  projectMenu.innerHTML = "";
+  if (projectMenuMode === "rename" && state.currentEntry) { renderRenameStep(); return; }
+  if (projectMenuMode === "remove" && (state.projects || []).length) { renderRemoveStep(); return; }
+  projectMenuMode = "list";
+  const projects = state.projects || [];
+  if (!projects.length && (state.noProject || state.currentEntry)) {
+    projectMenu.appendChild(mk("div", "pm-empty", "列表里还没有项目"));
   }
-  // Re-read the registry either way: a partial failure must leave the list
-  // showing what the server actually holds now, not what we hoped it would.
+  if (!state.noProject && !state.currentEntry && state.currentPath) {
+    // Served, but not in the list (a folder opened read-only from the add
+    // dialog, say): said, so the menu never claims another one is open.
+    const it = pmItem(basename(state.currentPath), () => closeProjectMenu(true), {
+      role: "menuitemradio", mark: "✓", flag: "不在列表里", title: state.currentPath,
+    });
+    it.setAttribute("aria-checked", "true");
+    projectMenu.appendChild(it);
+  }
+  projects.forEach((p) => {
+    const current = isCurrentEntry(p);
+    const gone = !!(p.missing || !p.available);
+    // A pre-V5 entry with no index cannot be opened from here (`rce init`
+    // first); an entry with an id and no index is rebuilt on open (9.4).
+    const uninitialized = !gone && !p.initialized && !p.id;
+    const row = mk("div", "pm-row" + (gone ? " pm-missing" : ""));
+    const main = pmItem(p.label, () => chooseProject(p), {
+      role: "menuitemradio", mark: current ? "✓" : "", title: p.path,
+      flag: gone ? "找不到文件夹" : (uninitialized ? "未初始化" : ""),
+      disabled: !current && (gone || uninitialized),
+    });
+    main.setAttribute("aria-checked", current ? "true" : "false");
+    row.appendChild(main);
+    if (gone && p.id) row.appendChild(pmItem("选择新位置…", () => relocateFromMenu(p), { cls: "pm-sub", noMark: true }));
+    projectMenu.appendChild(row);
+  });
+  const rule = mk("hr", "pm-rule");
+  rule.setAttribute("role", "separator");
+  projectMenu.appendChild(rule);
+  projectMenu.appendChild(pmItem("添加项目…", () => { closeProjectMenu(false); openAddDialog(); }));
+  const status = mk("div", "pm-status");
+  const rescan = pmItem("重新扫描这个项目", () => rescanFromMenu(status, rescan), { disabled: state.noProject });
+  projectMenu.appendChild(rescan);
+  projectMenu.appendChild(pmItem("重命名显示名称…", () => {
+    projectMenuMode = "rename";
+    renderProjectMenu();
+  }, { disabled: !state.currentEntry }));
+  projectMenu.appendChild(pmItem("从列表中移除…", () => {
+    projectMenuMode = "remove";
+    renderProjectMenu();
+  }, { disabled: !projects.length }));
+  projectMenu.appendChild(status);
+}
+
+function backToMenuList() {
+  projectMenuMode = "list";
+  renderProjectMenu();
+  focusMenuItem(0);
+}
+
+async function chooseProject(p) {
+  closeProjectMenu(true);
+  if (isCurrentEntry(p)) return;
+  await switchToProject(p);
+}
+
+async function switchToProject(p) {
+  try {
+    await apiPost("/api/projects/switch", { path: p.path, id: p.id || undefined });
+  } catch (err) {
+    showHeaderError("切换项目失败", err);
+    await loadProjects(); // resync with what the server actually serves
+    return false;
+  }
+  state.sessionNotes = []; // notes about the previous project
+  await reloadAllViews();
+  return true;
+}
+
+// 「选择新位置…」 (9.4) from the menu: the native folder panel when the
+// shell has one, then the existing locate call; in a plain browser, the
+// entry is opened instead, and its view shows the same question with a
+// path field (renderSituation).
+async function relocateFromMenu(p) {
+  closeProjectMenu(true);
+  if (!shellCan("choose-folder")) {
+    await switchToProject(p);
+    return;
+  }
+  const chosen = await chooseFolder("locate");
+  if (!chosen) return; // cancelled in the native panel
+  try {
+    await apiPost("/api/projects/locate", { id: p.id, path: chosen });
+  } catch (err) {
+    showHeaderError("没能使用这个位置", err);
+    return;
+  }
+  state.sessionNotes = [];
+  await reloadAllViews();
+}
+
+// 10.3: the full scan, in the background; its progress shows in the header.
+async function rescanFromMenu(statusEl, button) {
+  button.disabled = true;
+  try {
+    await apiPost("/api/projects/rescan", {});
+  } catch (err) {
+    button.disabled = false;
+    renderBlockingError(statusEl, "没能开始扫描", err);
+    return;
+  }
+  closeProjectMenu(true);
+  refreshScanStatus();
+}
+
+// 10.4: 「重命名显示名称…」 changes the registry label only, never the folder.
+function renderRenameStep() {
+  const entry = state.currentEntry;
+  const form = mk("div", "pm-form");
+  form.appendChild(mk("div", "pm-form-title", "重命名显示名称"));
+  form.appendChild(mk("p", null, "只改项目列表里显示的名字，文件夹本身不会改名。"));
+  const input = mk("input", "form-input");
+  input.type = "text";
+  input.value = entry.label;
+  input.setAttribute("aria-label", "显示名称");
+  const status = mk("div", "pm-status");
+  const actions = mk("div", "pm-form-actions");
+  const save = mkButton("保存", "btn btn-small", () => saveRename(entry, input.value, status, [save, cancel, input]));
+  const cancel = mkButton("取消", "btn btn-small", backToMenuList);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); save.click(); }
+  });
+  actions.append(save, cancel);
+  form.append(input, actions, status);
+  projectMenu.appendChild(form);
+  input.focus();
+  input.select();
+}
+
+async function saveRename(entry, label, statusEl, controls) {
+  controls.forEach((c) => { c.disabled = true; });
+  try {
+    await apiPost("/api/projects/rename", entry.id ? { id: entry.id, label: label } : { path: entry.path, label: label });
+  } catch (err) {
+    controls.forEach((c) => { c.disabled = false; });
+    renderBlockingError(statusEl, "没能改名", err);
+    return;
+  }
+  closeProjectMenu(true);
   await loadProjects();
-  // The header line quotes the registry label too -- but after a failure it
-  // is holding the error, which the summary refresh would wipe unread.
-  if (!failed) loadProjectSummary(true);
+  loadProjectSummary(true);
+}
+
+// 10.4: 「从列表中移除…」 removes the registry entry only -- the open project
+// by default, any other one by choosing it here; the sentence says what
+// stays. Removing the open project: the engine already serves the next one
+// (or nothing), and the page follows.
+function removeConfirmText(label) {
+  return "把「" + label + "」从项目列表里移除？只是去掉列表里的这一行：文件夹本身、里面的 .rce/ 记录和 ~/.rce 下的索引都原样保留；以后再添加这个文件夹，一切都会回来。";
+}
+
+function renderRemoveStep() {
+  const projects = state.projects || [];
+  const form = mk("div", "pm-form");
+  form.appendChild(mk("div", "pm-form-title", "从列表中移除"));
+  const select = mk("select", "form-input");
+  select.setAttribute("aria-label", "要移除的项目");
+  let chosen = Math.max(0, projects.findIndex((p) => isCurrentEntry(p)));
+  projects.forEach((p, i) => {
+    const opt = mk("option", null, p.label + ((p.missing || !p.available) ? "（找不到文件夹）" : ""));
+    opt.value = String(i);
+    opt.title = p.path;
+    opt.selected = i === chosen;
+    select.appendChild(opt);
+  });
+  const sentence = mk("p", null, removeConfirmText(projects[chosen].label));
+  select.addEventListener("change", () => {
+    chosen = Number(select.value);
+    sentence.textContent = removeConfirmText(projects[chosen].label);
+  });
+  const status = mk("div", "pm-status");
+  const actions = mk("div", "pm-form-actions");
+  const remove = mkButton("从列表中移除", "btn btn-small", () => removeFromMenu(projects[chosen], status, [remove, cancel, select]));
+  const cancel = mkButton("取消", "btn btn-small", backToMenuList);
+  actions.append(remove, cancel);
+  form.append(select, sentence, actions, status);
+  projectMenu.appendChild(form);
+  select.focus();
+}
+
+async function removeFromMenu(p, statusEl, controls) {
+  controls.forEach((c) => { c.disabled = true; });
+  let res;
+  try {
+    res = await apiPost("/api/projects/remove", { path: p.path });
+  } catch (err) {
+    controls.forEach((c) => { c.disabled = false; });
+    // 8.8 "Errors": the Chinese framing, the engine's text behind 「详情」.
+    renderBlockingError(statusEl, "没能从列表中移除", err);
+    return;
+  }
+  closeProjectMenu(true);
+  if (res && Object.prototype.hasOwnProperty.call(res, "no_project")) {
+    state.sessionNotes = []; // the open project was removed; the engine serves the next, or none
+    await reloadAllViews();
+  } else {
+    await loadProjects();
+  }
+}
+
+projectMenuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (projectMenuOpen()) closeProjectMenu(false);
+  else openProjectMenu(e.detail === 0); // a keyboard click lands on the first item
 });
 
-async function reloadAllViews() {
+projectMenuBtn.addEventListener("keydown", (e) => {
+  if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !projectMenuOpen()) {
+    e.preventDefault();
+    openProjectMenu(true);
+  } else if (e.key === "ArrowDown" && projectMenuOpen()) {
+    e.preventDefault();
+    focusMenuItem(0);
+  } else if (e.key === "Escape" && projectMenuOpen()) {
+    e.preventDefault();
+    e.stopPropagation();
+    closeProjectMenu(true);
+  }
+});
+
+projectMenu.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    if (projectMenuMode !== "list") backToMenuList();
+    else closeProjectMenu(true);
+    return;
+  }
+  const role = e.target && e.target.getAttribute ? e.target.getAttribute("role") : null;
+  if (role !== "menuitem" && role !== "menuitemradio") return; // a field of the rename / remove step
+  const items = menuItems();
+  const i = items.indexOf(e.target);
+  if (e.key === "ArrowDown") { e.preventDefault(); focusMenuItem(i + 1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); focusMenuItem(i - 1); }
+  else if (e.key === "Home") { e.preventDefault(); focusMenuItem(0); }
+  else if (e.key === "End") { e.preventDefault(); focusMenuItem(items.length - 1); }
+  else if (e.key === "Tab") closeProjectMenu(false);
+});
+
+document.addEventListener("mousedown", (e) => {
+  if (projectMenuOpen() && !projectMenuWrap.contains(e.target)) closeProjectMenu(false);
+});
+
+document.getElementById("welcome-add-btn").addEventListener("click", () => openAddDialog());
+
+// `opts.scanStarted`: a scan of the project being opened has just begun, so
+// its end is news even if it lands before the first status poll.
+async function reloadAllViews(opts) {
   // Everything on screen belongs to the previous project: drop the cached
   // attempt records, mark both views stale, and re-fetch the one currently
   // visible (the other reloads lazily on its next activation). The attempt
@@ -1512,33 +1895,20 @@ async function reloadAllViews() {
   varState.asking = null;
   RCECanvas.reset();
   closePanel();
+  clearProjectState();
+  resetScanChip(opts && opts.scanStarted);
   // The switch itself bumped the server's generation (watcher.retarget);
   // resync the poller's notion of "current" so the next tick doesn't
   // immediately re-fetch everything this function just fetched.
-  await syncGeneration();
   await loadProjects();
+  await syncGeneration();
   loadProjectSummary(true); // the switch succeeded: the line is the new project's
+  if (state.noProject) return; // 10.1: the welcome is all there is to show
   if (currentView === "tree") loadTreeView();
   else if (currentView === "lineage") loadLineageView();
   else if (currentView === "canvas") RCECanvas.load(views.canvas);
   else if (currentView === "variables") loadVariablesView();
 }
-
-projectSwitcher.addEventListener("change", async () => {
-  projectSwitcher.disabled = true;
-  const chosen = projectSwitcher.options[projectSwitcher.selectedIndex];
-  try {
-    await apiPost("/api/projects/switch", { path: projectSwitcher.value, id: chosen && chosen.dataset.id ? chosen.dataset.id : undefined });
-  } catch (err) {
-    showHeaderError("切换项目失败", err);
-    await loadProjects(); // resync the select with what the server actually serves
-    projectSwitcher.disabled = false;
-    return;
-  }
-  state.sessionNotes = []; // notes about the previous project
-  await reloadAllViews();
-  projectSwitcher.disabled = false;
-});
 
 // -- Auto-refresh (task V3 phase 2) -----------------------------------------
 // GET /api/generation every 2s (matching the server watcher's own poll
@@ -1626,6 +1996,7 @@ async function revalidatePanel() {
 }
 
 async function refreshCurrentView() {
+  if (state.noProject) return; // 10.1: nothing to refresh
   // Both views' data may have moved on disk; only the visible one
   // re-fetches now, the other is marked stale for its next activation.
   delete views.tree.dataset.loaded;
@@ -1652,6 +2023,7 @@ async function syncGeneration() {
     const status = await apiGet("/api/generation");
     lastGeneration = status.generation;
     updateChipFromStatus(status);
+    updateScanChip(status);
   } catch (err) {
     // Leave lastGeneration as-is; the regular poll self-corrects.
   }
@@ -1665,6 +2037,7 @@ async function pollGeneration() {
   } catch (err) {
     return; // transient; retry on the next tick
   }
+  updateScanChip(status);
   if (lastGeneration === null) {
     lastGeneration = status.generation;
     updateChipFromStatus(status);
@@ -1678,10 +2051,98 @@ async function pollGeneration() {
   refreshInFlight = true;
   showRefreshingChip();
   try {
-    await refreshCurrentView();
+    // The served project may have changed under this page (added, removed
+    // or switched from another window): the menu's label and the
+    // no-project page follow it.
+    const wasNoProject = state.noProject;
+    await loadProjects();
+    if (wasNoProject !== state.noProject) await reloadAllViews();
+    else await refreshCurrentView();
   } finally {
     refreshInFlight = false;
     updateChipFromStatus(status);
+  }
+}
+
+// -- The full scan's progress (DESIGN.md 10.2 step 3, 10.3; task V6) ----------
+// From the generation poll's `scanning` / `last_scan`: 「正在扫描：<步骤>
+// （n/m）」 while a scan runs; when one ends, a quiet 「扫描完成」 for a few
+// seconds -- or 「扫描完成，有 N 个文件暂时读不了」, a link to 记录 (9.2:
+// a failed read is not a failed addition) -- or, when it did not finish,
+// its sentence with the engine's text behind 「详情」, until dismissed.
+// The views themselves reload on the generation bump the scan's end makes.
+
+const scanChip = document.getElementById("scan-chip");
+const SCAN_DONE_MS = 6000;
+let scanChipTimer = null;
+
+function hideScanChip() {
+  if (scanChipTimer !== null) { clearTimeout(scanChipTimer); scanChipTimer = null; }
+  scanChip.classList.add("hidden");
+  scanChip.classList.remove("done", "warn", "err");
+  scanChip.textContent = "";
+}
+
+function resetScanChip(scanStarted) {
+  hideScanChip();
+  state.scanSeen = scanStarted ? null : undefined;
+}
+
+function updateScanChip(status) {
+  if (!status || typeof status !== "object") return;
+  const running = status.scanning && typeof status.scanning === "object" ? status.scanning : null;
+  const last = status.last_scan && typeof status.last_scan === "object" ? status.last_scan : null;
+  const finished = last && last.finished ? last.finished : null;
+  if (state.scanSeen === undefined) state.scanSeen = running ? null : finished; // the baseline
+  if (running) {
+    if (scanChipTimer !== null) { clearTimeout(scanChipTimer); scanChipTimer = null; }
+    scanChip.classList.remove("hidden", "done", "warn", "err");
+    scanChip.textContent = scanProgressText(running);
+    return;
+  }
+  if (finished && finished !== state.scanSeen) {
+    state.scanSeen = finished;
+    showScanDone(last);
+    return;
+  }
+  // A running chip whose scan ended without a result this page can show.
+  if (!scanChip.classList.contains("hidden") && !scanChip.classList.contains("done") &&
+      !scanChip.classList.contains("warn") && !scanChip.classList.contains("err")) hideScanChip();
+}
+
+function showScanDone(last) {
+  hideScanChip();
+  scanChip.classList.remove("hidden");
+  const unreadable = Array.isArray(last.unreadable_sources) ? last.unreadable_sources.length : 0;
+  if (last.ok && !unreadable) {
+    scanChip.classList.add("done");
+    scanChip.textContent = scanDoneText(last);
+    scanChipTimer = setTimeout(hideScanChip, SCAN_DONE_MS);
+    return;
+  }
+  if (last.ok) {
+    scanChip.classList.add("warn");
+    const link = mkButton(scanDoneText(last), "scan-chip-link", () => { hideScanChip(); openRecordsPanel(); });
+    link.title = "查看这个项目的记录";
+    scanChip.appendChild(link);
+    scanChipTimer = setTimeout(hideScanChip, SCAN_DONE_MS * 2);
+    return;
+  }
+  scanChip.classList.add("err");
+  const text = mk("span");
+  const err = new Error(String(last.error || ""));
+  renderBlockingError(text, scanDoneText(last), last.error ? err : null);
+  const close = mkButton("×", "scan-chip-close", hideScanChip);
+  close.setAttribute("aria-label", "关闭");
+  close.title = "关闭";
+  scanChip.append(text, close);
+}
+
+async function refreshScanStatus() {
+  try {
+    updateScanChip(await apiGet("/api/generation"));
+  } catch (err) {
+    /* the regular poll catches up */
   }
 }
 
@@ -2475,6 +2936,7 @@ function setFormStatus(statusEl, cls, cnText, err) {
 // Chinese with the engine's text behind 「详情」, never an empty form with
 // wrong defaults.
 async function openAttemptForm(mode, attemptId) {
+  if (state.noProject) return; // 10.1: no project, no attempt table (⌘N from the shell)
   const subject = { kind: "attempt-form" };
   state.panelSubject = subject;
   panelTitle.textContent = mode === "append" ? "新增尝试" : "编辑尝试";
@@ -4327,7 +4789,12 @@ async function locateProject(projectId, path, statusEl, buttons) {
   await reloadAllViews();
 }
 
-function renderSituation(err) {
+// `opts` (DESIGN.md 10.2, the add dialog): the same question for a folder
+// being added -- `answer(answer, statusEl, buttons)` and `recheck()` in place
+// of the served project's resolve / reopen, and no talk of switching away.
+function renderSituation(err, opts) {
+  const o = opts || {};
+  const answerWith = o.answer || answerSituation;
   const sit = err.situation;
   const box = mk("div", "notice bad state-note");
   noticeHead(box, SITUATION_TITLES[sit.situation] || PROJECT_STATES.project_blocked.title);
@@ -4355,7 +4822,7 @@ function renderSituation(err) {
       row.append(input, use);
       if (shellCan("choose-folder")) {
         const pick = mkButton("选择文件夹…", "btn", async () => {
-          const chosen = await chooseFolder();
+          const chosen = await chooseFolder("locate");
           if (!chosen) return; // cancelled in the native panel
           input.value = chosen;
           locateProject(sit.project_id, chosen, status, buttons);
@@ -4378,18 +4845,18 @@ function renderSituation(err) {
       box.appendChild(mk("p", null, "修好 .rce/project.toml（或等它从云端取回、移走冲突副本）之后，点「重新检查」。"));
     }
     box.appendChild(mk("p", null, ((sit.answers || []).length ? "选择之前" : "修好之前") +
-      "，RCE 不会写入任何东西，包括项目列表。也可以在上方切换到别的项目。"));
+      "，RCE 不会写入任何东西，包括项目列表。" + (o.inDialog ? "" : "也可以在上方切换到别的项目。")));
     (sit.answers || []).forEach((answer) => {
       const label = (sit.answer_labels && sit.answer_labels[answer]) || answer;
       const row = mk("div", "answer");
-      const b = mkButton(label, "btn", () => answerSituation(answer, status, buttons));
+      const b = mkButton(label, "btn", () => answerWith(answer, status, buttons));
       buttons.push(b);
       row.append(b, mk("span", "answer-help", ANSWER_HELP[answer] || ""));
       box.appendChild(row);
     });
     if (!(sit.answers || []).length) {
       const actions = mk("div", "notice-actions");
-      const again = mkButton("重新检查", "btn", () => reopenProject(status, buttons));
+      const again = mkButton("重新检查", "btn", () => (o.recheck ? o.recheck() : reopenProject(status, buttons)));
       buttons.push(again);
       actions.appendChild(again);
       box.appendChild(actions);
@@ -4397,7 +4864,7 @@ function renderSituation(err) {
   }
   box.appendChild(status);
   const raw = sit.detail || err.message;
-  if (raw) {
+  if (raw && !o.inDialog) {
     const d = mk("div", "notice-status");
     renderBlockingError(d, "", raw);
     box.appendChild(d);
@@ -4407,9 +4874,13 @@ function renderSituation(err) {
 
 // 「选择文件夹…」 through the native shell (8.9's bridge, task V5 phase 9
 // implements the Swift side): page -> native {type: "choose-folder",
-// request}; native -> page window.RCE.folderChosen(request, path | null).
-// Offered only when the shell says it can (window.RCEShellFeatures), so a
-// shell without it -- or a plain browser -- simply has the path field.
+// request, purpose}; native -> page window.RCE.folderChosen(request, path |
+// null). Offered only when the shell says it can (window.RCEShellFeatures),
+// so a shell without it -- or a plain browser -- simply has the path field.
+// `purpose` (DESIGN.md 10.7: "add" | "locate") changes only the panel's
+// message; it is sent only to a shell that says it takes it
+// ("choose-folder-purpose"), since a shell built before V6 ignores any
+// message with a third key -- and its panel then reads as 「选择新位置」.
 const folderRequests = new Map();
 
 function shellCan(feature) {
@@ -4421,12 +4892,16 @@ function shellCan(feature) {
   }
 }
 
-function chooseFolder() {
+const FOLDER_PURPOSES = ["add", "locate"];
+
+function chooseFolder(purpose) {
   return new Promise((resolve) => {
     const request = "folder-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     folderRequests.set(request, resolve);
+    const message = { type: "choose-folder", request: request };
+    if (FOLDER_PURPOSES.indexOf(purpose) >= 0 && shellCan("choose-folder-purpose")) message.purpose = purpose;
     try {
-      window.webkit.messageHandlers.rce.postMessage({ type: "choose-folder", request: request });
+      window.webkit.messageHandlers.rce.postMessage(message);
     } catch (err) {
       folderRequests.delete(request);
       resolve(null);
@@ -4440,6 +4915,460 @@ function folderChosen(request, path) {
   folderRequests.delete(String(request));
   resolve(typeof path === "string" && path ? path : null);
   return true;
+}
+
+// -- Add-project wording (pure; DESIGN.md 10.2, 10.3) ---------------------------
+// What the add dialog and the scan chip say, as functions of the engine's
+// payloads only -- tests/test_v6_page.py loads this block into node. The
+// preview's numbers are the engine's (the scan's own inventory); this only
+// words them.
+const ADD_GROUP_WORDS = [
+  ["scripts", "脚本（.py、.R、.Rmd）"],
+  ["data", "数据文件"],
+  ["drafts", "文稿（.md、.tex、.bib）"],
+  ["images", "图片"],
+];
+const ADD_LARGE_THRESHOLD = 5000; // rce.addproject.LARGE_THRESHOLD
+const ADD_ENTRY_CAP = 100000; // rce.addproject.ENTRY_CAP
+
+function groupedNumber(n) {
+  return String(Math.max(0, Math.floor(Number(n) || 0))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+// {head, items: [[words, n]], notes: [{text, tone}]} for a preview.
+function addPreviewText(p) {
+  const out = { head: "", items: [], notes: [] };
+  if (!p || typeof p !== "object") return out;
+  const counts = p.counts || {};
+  const git = p.source === "git" && p.git ? p.git : null;
+  if (git && git.tracked == null) {
+    out.head = "这是一个 git 仓库，但 RCE 没能向 git 问出它跟踪哪些文件；照现在这样，扫描会在这一步停下。";
+  } else if (git) {
+    out.head = "这是一个 git 仓库：RCE 只读取 git 跟踪的文件，共 " + groupedNumber(git.tracked) + " 个。其中要扫描的有：";
+  } else {
+    out.head = "RCE 会读取这个文件夹里的这些文件：";
+  }
+  ADD_GROUP_WORDS.forEach(([key, words]) => out.items.push([words, groupedNumber(counts[key])]));
+  out.items.push(["共计要扫描", groupedNumber(p.to_scan)]);
+  if (counts.other > 0) {
+    out.notes.push({ text: "另有 " + groupedNumber(counts.other) + " 个文件不属于这几类，RCE 不读它们。", tone: "" });
+  }
+  if (git && git.tracked != null) {
+    if (git.untracked > 0) {
+      out.notes.push({
+        text: "另有 " + (git.untracked_truncated ? "至少 " : "") + groupedNumber(git.untracked) + " 个未被 git 跟踪的文件不会被扫描。",
+        tone: "warn",
+      });
+    } else if (git.error) {
+      out.notes.push({ text: "没能数出有多少文件未被 git 跟踪；未被跟踪的文件不会被扫描。", tone: "warn" });
+    }
+  }
+  if (p.dataless > 0) {
+    out.notes.push({ text: "其中 " + groupedNumber(p.dataless) + " 个文件还在 iCloud 云端，下载到这台电脑之后才会被读取。", tone: "" });
+  }
+  if (p.truncated) {
+    out.notes.push({ text: "文件太多：数到 " + groupedNumber(ADD_ENTRY_CAP) + " 个就停下了，实际还有更多。", tone: "warn" });
+  }
+  if (p.large) {
+    out.notes.push({
+      text: "要扫描的文件超过 " + groupedNumber(ADD_LARGE_THRESHOLD) + " 个，第一次扫描会花一些时间；加入之前会再问你一次。",
+      tone: "warn",
+    });
+  }
+  return out;
+}
+
+// 10.2: what adding writes, per kind (and, for an RCE project that opens,
+// per what opening it does: 9.4's moved / no index on this machine).
+function addWritesText(insp) {
+  if (!insp) return "";
+  if (insp.kind === "new_folder") {
+    return "加入会写入：这个文件夹里的 .rce/（项目身份文件 project.toml 和一份简短的 README），以及 ~/.rce 下的索引。文件夹里别的东西都不会被创建或改动。";
+  }
+  if (insp.kind === "pre_v5") {
+    return "加入只会把它写进项目列表。迁移旧记录要等你在页面上方确认之后才会进行。";
+  }
+  if (insp.kind === "rce_project" && insp.can_add) {
+    const sit = insp.situation && insp.situation.situation;
+    if (sit === "moved") return "加入会把它写进项目列表，并记下项目的新位置（更新 ~/.rce 下的索引和 .rce/README）。";
+    if (sit === "no_index") return "这台电脑上还没有它的索引：加入后会按文件夹里的文件和 .rce/ 里的记录在 ~/.rce 下重新建立。";
+    return "加入只会把它写进项目列表。";
+  }
+  return "";
+}
+
+function scanProgressText(s) {
+  const label = s && s.label ? s.label : "准备中";
+  const n = s && Number.isFinite(s.n) ? s.n : 0;
+  const m = s && Number.isFinite(s.m) ? s.m : 0;
+  return "正在扫描：" + label + "（" + n + "/" + m + "）";
+}
+
+function scanDoneText(last) {
+  if (!last) return "";
+  if (!last.ok) return last.message || "扫描没有完成";
+  const n = Array.isArray(last.unreadable_sources) ? last.unreadable_sources.length : 0;
+  return n ? "扫描完成，有 " + n + " 个文件暂时读不了" : "扫描完成";
+}
+// -- end of add-project wording
+
+// -- The add dialog (DESIGN.md 10.2: choose, look, then write; task V6) ---------
+// In the side panel. Choose: the native folder panel when the shell has one
+// (purpose "add"), and always a path field with 「检查这个文件夹」, so the
+// page works the same in a plain browser. Look: POST /api/projects/inspect,
+// which writes nothing; each kind of answer is rendered in plain Chinese --
+// the preview's counts, what adding writes, the editable display name, the
+// 9.4 question for an RCE project that must be answered first, the waiting
+// sentence (asked again every 2 s), a refusal with 「重新选择」. Write: POST
+// /api/projects/add with the inspection's token; a folder that changed
+// since is looked at again and the page says why. Nothing is written --
+// the registry included -- before the researcher presses the button that
+// says what will be written.
+
+const ADD_REASK_MS = 2000;
+let addDialog = null; // {subject, path, inspection, labelEdited, label, confirmLarge, busy, timer}
+
+function openAddDialog() {
+  closeProjectMenu(false);
+  if (addDialog && addDialog.timer !== null) clearTimeout(addDialog.timer);
+  const subject = { kind: "add-project" };
+  state.panelSubject = subject;
+  addDialog = {
+    subject: subject, path: "", inspection: null, labelEdited: false, label: "", confirmLarge: false, busy: false,
+    timer: null, why: "", whyErr: null, // why the folder is being looked at again (a refused add), and its error
+  };
+  panelTitle.textContent = "添加项目";
+  panelTitle.title = "";
+  panelSubtitle.textContent = "先看一看这个文件夹；你确认之前，什么都不会写入";
+  panelBody.innerHTML = "";
+  const choose = mk("div", "add-choose");
+  const row = mk("div", "locate-row");
+  const input = mk("input", "form-input");
+  input.id = "add-path";
+  input.type = "text";
+  input.placeholder = "文件夹的完整路径，例如 ~/Documents/我的研究";
+  input.setAttribute("aria-label", "项目文件夹的路径");
+  const check = mkButton("检查这个文件夹", "btn", () => inspectForAdd(subject, input.value.trim()));
+  check.id = "add-check";
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); check.click(); } });
+  row.append(input, check);
+  if (shellCan("choose-folder")) {
+    const pick = mkButton("选择文件夹…", "btn", () => pickFolderForAdd(subject));
+    pick.id = "add-pick";
+    choose.appendChild(pick);
+  }
+  choose.appendChild(row);
+  const status = mk("div", "notice-status");
+  status.id = "add-status";
+  const result = mk("div", "add-result");
+  result.id = "add-result";
+  panelBody.append(choose, status, result);
+  openPanel();
+  if (shellCan("choose-folder")) pickFolderForAdd(subject);
+  else input.focus();
+}
+
+function addDialogLive(subject) {
+  return !!addDialog && addDialog.subject === subject && state.panelSubject === subject && !panel.classList.contains("hidden");
+}
+
+async function pickFolderForAdd(subject) {
+  const chosen = await chooseFolder("add");
+  if (!chosen || !addDialogLive(subject)) return; // cancelled in the native panel
+  const input = document.getElementById("add-path");
+  if (input) input.value = chosen;
+  inspectForAdd(subject, chosen);
+}
+
+function addStatus(cls, text, err) {
+  const el = document.getElementById("add-status");
+  if (el) setStatus(el, cls, text, err);
+}
+
+async function inspectForAdd(subject, path, why, whyErr) {
+  if (!addDialogLive(subject)) return;
+  if (addDialog.timer !== null) { clearTimeout(addDialog.timer); addDialog.timer = null; }
+  if (!path) {
+    addStatus("err", "请先填写文件夹的路径（以 / 或 ~ 开头），或选择一个文件夹");
+    return;
+  }
+  if (path !== addDialog.path) { addDialog.labelEdited = false; addDialog.confirmLarge = false; }
+  addDialog.path = path;
+  addDialog.why = why || "";
+  addDialog.whyErr = whyErr || null;
+  const check = document.getElementById("add-check");
+  if (check) check.disabled = true;
+  if (!addDialog.inspection || addDialog.inspection.kind !== "waiting_permission") {
+    const result = document.getElementById("add-result");
+    if (result) { result.innerHTML = ""; result.appendChild(mk("div", "add-busy", "正在查看这个文件夹……")); }
+  }
+  addStatus("", "");
+  let insp;
+  try {
+    insp = await apiPost("/api/projects/inspect", { path: path });
+  } catch (err) {
+    if (!addDialogLive(subject) || addDialog.path !== path) return;
+    if (check) check.disabled = false;
+    const result = document.getElementById("add-result");
+    if (result) result.innerHTML = "";
+    addStatus("err", "没能查看这个文件夹", err);
+    return;
+  }
+  if (!addDialogLive(subject) || addDialog.path !== path) return; // closed, or another folder chosen meanwhile
+  if (check) check.disabled = false;
+  showInspection(subject, insp);
+}
+
+function showInspection(subject, insp) {
+  const previous = addDialog.inspection;
+  if (previous && previous.root !== insp.root) addDialog.labelEdited = false;
+  addDialog.inspection = insp;
+  if (!addDialog.labelEdited) addDialog.label = insp.label || insp.name || "";
+  if (addDialog.why) addStatus("err", addDialog.why, addDialog.whyErr);
+  renderInspection(subject);
+  if (insp.kind === "waiting_permission") {
+    // 10.2 "Waiting for the system": asked again until the listing returns.
+    addDialog.timer = setTimeout(() => {
+      addDialog.timer = null;
+      inspectForAdd(subject, addDialog.path, addDialog.why, addDialog.whyErr);
+    }, ADD_REASK_MS);
+  }
+}
+
+function addLabelField() {
+  const field = mk("div", "form-field");
+  const label = mk("label", null, "显示名称");
+  label.setAttribute("for", "add-label");
+  const input = mk("input", "form-input");
+  input.id = "add-label";
+  input.type = "text";
+  input.value = addDialog.label;
+  input.addEventListener("input", () => { addDialog.label = input.value; addDialog.labelEdited = true; });
+  const help = mk("div", "add-note", "只在 RCE 的项目列表里显示；文件夹本身不会改名。");
+  field.append(label, input, help);
+  return field;
+}
+
+function addPreviewBlock(insp) {
+  const box = mk("div");
+  const t = addPreviewText(insp.preview);
+  box.appendChild(mk("p", "add-note", t.head));
+  const list = mk("ul", "add-counts");
+  t.items.forEach(([words, n]) => {
+    const li = mk("li");
+    li.append(mk("span", null, words), mk("span", "n", n + " 个"));
+    list.appendChild(li);
+  });
+  box.appendChild(list);
+  t.notes.forEach((note) => box.appendChild(mk("p", "add-note" + (note.tone ? " " + note.tone : ""), note.text)));
+  const gitError = insp.preview && insp.preview.git && insp.preview.git.error;
+  if (gitError) {
+    const d = mk("div", "notice-status");
+    renderBlockingError(d, "git 的回答", gitError);
+    box.appendChild(d);
+  }
+  return box;
+}
+
+function renderInspection(subject) {
+  const result = document.getElementById("add-result");
+  if (!result) return;
+  const insp = addDialog.inspection;
+  result.innerHTML = "";
+  if (insp.root) result.appendChild(mk("div", "add-root", insp.root));
+  const asks = insp.kind === "rce_project" && !insp.can_add && !!insp.situation;
+  // A 9.4 question says its own sentence, under its own title (below).
+  if (!asks) result.appendChild(mk("div", "add-lead" + (insp.kind === "refused" ? " bad" : ""), insp.message || ""));
+  const actions = mk("div", "add-actions");
+  const again = () => mkButton("重新选择", "btn", () => chooseAgain(subject));
+  const cancel = () => mkButton("取消", "btn", closePanel);
+
+  if (insp.kind === "waiting_permission") {
+    result.appendChild(mk("p", "add-note", "RCE 每隔两秒会再问一次，页面不会卡住；也可以换一个文件夹。"));
+    actions.append(again(), cancel());
+    result.appendChild(actions);
+    return;
+  }
+  if (insp.kind === "refused") {
+    if (insp.refusal && insp.refusal.detail) {
+      const d = mk("div", "notice-status");
+      renderBlockingError(d, "", insp.refusal.detail);
+      d.firstChild.remove(); // only the 「详情」 toggle: the sentence is the lead above
+      result.appendChild(d);
+    }
+    actions.append(again());
+    result.appendChild(actions);
+    return;
+  }
+  if (insp.kind === "already_registered") {
+    const entry = insp.entry || {};
+    if (entry.label) result.appendChild(mk("p", "add-note", "在列表里的名字：" + entry.label));
+    const isOpen = !state.noProject && ((state.currentId && entry.id) ? entry.id === state.currentId : entry.path === state.currentPath);
+    if (isOpen) {
+      result.appendChild(mk("p", "add-note", "它就是现在打开的项目。"));
+      actions.append(mkButton("好", "btn", closePanel));
+    } else {
+      const go = mkButton("切换过去", "btn", async () => {
+        go.disabled = true;
+        closePanel();
+        await switchToProject({ path: entry.path, id: entry.id });
+      });
+      actions.append(go, cancel());
+    }
+    result.appendChild(actions);
+    return;
+  }
+  if (asks) {
+    // 9.4's question, here: nothing -- the registry included -- is written
+    // until one answer is chosen (the answer adds, then resolves).
+    result.appendChild(addLabelField());
+    result.appendChild(renderSituation({ situation: insp.situation, message: "" }, {
+      inDialog: true,
+      answer: (answer, statusEl, buttons) => answerForAdd(subject, answer, statusEl, buttons),
+      recheck: () => inspectForAdd(subject, addDialog.path),
+    }));
+    actions.append(again(), cancel());
+    result.appendChild(actions);
+    return;
+  }
+  if (insp.kind === "new_folder") result.appendChild(addPreviewBlock(insp));
+  result.appendChild(addLabelField());
+  const writes = addWritesText(insp);
+  if (writes) result.appendChild(mk("p", "add-writes", writes));
+  const verb = insp.kind === "new_folder" ? "加入并扫描" : "加入列表并打开";
+  const go = mkButton(verb, "btn", () => {
+    if (insp.kind === "new_folder" && insp.preview && insp.preview.large && !addDialog.confirmLarge) {
+      showLargeConfirm(subject, result, actions);
+      return;
+    }
+    writeAdd(subject, [go]);
+  });
+  go.id = "add-go";
+  go.disabled = !insp.can_add;
+  actions.append(go, cancel());
+  result.appendChild(actions);
+}
+
+// 10.2: above 5,000 files to scan, the preview asks a second time.
+function showLargeConfirm(subject, result, actions) {
+  const insp = addDialog.inspection;
+  const box = mk("div", "add-confirm");
+  box.appendChild(mk("p", "add-note", "要扫描的文件有 " + groupedNumber(insp.preview.to_scan) + " 个，超过 " +
+    groupedNumber(ADD_LARGE_THRESHOLD) + " 个。第一次扫描会花一些时间，扫描期间页面照常可用。确定要加入并扫描吗？"));
+  const row = mk("div", "add-actions");
+  const yes = mkButton("确定，加入并扫描", "btn", () => { addDialog.confirmLarge = true; writeAdd(subject, [yes, no]); });
+  const no = mkButton("先不加入", "btn", () => { box.remove(); actions.classList.remove("hidden"); });
+  row.append(yes, no);
+  box.appendChild(row);
+  actions.classList.add("hidden");
+  result.appendChild(box);
+  yes.focus();
+}
+
+function chooseAgain(subject) {
+  if (addDialog.timer !== null) { clearTimeout(addDialog.timer); addDialog.timer = null; }
+  addDialog.inspection = null;
+  addDialog.path = "";
+  addDialog.why = "";
+  addDialog.whyErr = null;
+  const result = document.getElementById("add-result");
+  if (result) result.innerHTML = "";
+  addStatus("", "");
+  const input = document.getElementById("add-path");
+  if (shellCan("choose-folder")) pickFolderForAdd(subject);
+  else if (input) { input.focus(); input.select(); }
+}
+
+function addBody() {
+  return { path: addDialog.path, label: addDialog.label, inspected: addDialog.inspection.inspected };
+}
+
+// A refused add: a changed folder (or one now waiting, or now refused) is
+// shown as it is now, with the reason above it; anything else (a display
+// name the registry will not take) is said in the dialog's status line.
+function addRefused(subject, err, buttons) {
+  buttons.forEach((b) => { b.disabled = false; });
+  if (err.inspection && addDialogLive(subject)) {
+    addDialog.why = blockingErrorText("没能加入这个文件夹", err);
+    addDialog.whyErr = err;
+    addDialog.confirmLarge = false;
+    showInspection(subject, err.inspection);
+    return;
+  }
+  addStatus("err", "没能加入这个文件夹", err);
+}
+
+async function writeAdd(subject, buttons) {
+  if (!addDialogLive(subject) || addDialog.busy) return;
+  buttons.forEach((b) => { b.disabled = true; });
+  addDialog.busy = true;
+  addStatus("", "正在加入…");
+  let res;
+  try {
+    res = await apiPost("/api/projects/add", addBody());
+  } catch (err) {
+    addDialog.busy = false;
+    addRefused(subject, err, buttons);
+    return;
+  }
+  addDialog.busy = false;
+  await addDone(res);
+}
+
+async function addDone(res) {
+  if (res.kind === "already_registered") {
+    // Nothing was written and nothing switched: offer the switch.
+    if (addDialog && res.inspection) { addDialog.why = ""; addDialog.whyErr = null; showInspection(addDialog.subject, res.inspection); }
+    return;
+  }
+  closePanel();
+  state.sessionNotes = [];
+  await reloadAllViews({ scanStarted: !!res.scanning });
+  if (res.scan_error) {
+    const err = new Error(res.scan_error.error || "");
+    err.state = res.scan_error.state;
+    showHeaderError("已加入项目，但没能开始扫描；可以在项目菜单里「重新扫描这个项目」", err);
+  }
+  refreshScanStatus();
+}
+
+// An answer to the 9.4 question from inside the dialog: the add (which
+// serves the folder with its question open, writing nothing), then the
+// answer itself -- which, for a folder added from here, registers it under
+// the display name chosen above.
+async function answerForAdd(subject, answer, statusEl, buttons) {
+  if (ANSWER_CONFIRM[answer] && !window.confirm(ANSWER_CONFIRM[answer])) return;
+  if (!addDialogLive(subject) || addDialog.busy) return;
+  buttons.forEach((b) => { b.disabled = true; });
+  addDialog.busy = true;
+  setStatus(statusEl, "", "正在处理…");
+  let added;
+  try {
+    added = await apiPost("/api/projects/add", addBody());
+  } catch (err) {
+    addDialog.busy = false;
+    addRefused(subject, err, buttons);
+    return;
+  }
+  if (!added.blocked) { // the question no longer stood: added and opened as it is
+    addDialog.busy = false;
+    await addDone(added);
+    return;
+  }
+  let res;
+  try {
+    res = await apiPost("/api/project/resolve", { answer: answer });
+  } catch (err) {
+    addDialog.busy = false;
+    buttons.forEach((b) => { b.disabled = false; });
+    setStatus(statusEl, "err", "没能完成这个选择", err);
+    return;
+  }
+  addDialog.busy = false;
+  closePanel();
+  const note = resolveNote(answer, res);
+  state.sessionNotes = note ? [note] : [];
+  await reloadAllViews();
 }
 
 // -- 停止服务 (task V3 phase 4) ----------------------------------------------
@@ -4552,6 +5481,8 @@ const SHELL_COMMANDS = {
   "canvas": () => activateView("canvas"),
   "variables": () => activateView("variables"),
   "new-attempt": () => openAttemptForm("append"),
+  // 文件 → 「添加项目… ⌘O」 (DESIGN.md 10.1, 10.7).
+  "add-project": () => openAddDialog(),
   "reload": () => window.location.reload(),
   "zoom-in": () => shellZoom(1),
   "zoom-out": () => shellZoom(-1),

@@ -375,11 +375,78 @@ def test_shell_choose_folder_answers_through_a_fixed_callback_with_arguments():
     assert 'callAsyncJavaScript("window.RCE && RCE.folderChosen(request, path)", arguments: arguments' in answer
     assert '["request": request, "path": path ?? NSNull()]' in answer
     assert "\\(" not in answer  # no string interpolation anywhere in the callback
-    assert 'let shellFeaturesScript = "window.RCEShellFeatures = [\\"choose-folder\\"];"' in _SHELL
+    assert 'let shellFeaturesScript = "window.RCEShellFeatures = [\\"choose-folder\\", \\"choose-folder-purpose\\"];"' in _SHELL
     assert "injectionTime: .atDocumentStart, forMainFrameOnly: true" in _SHELL
     validator = _SHELL[_SHELL.index("func isFolderRequest"):]
     validator = validator[: validator.index("\n}\n")]
     assert "folderRequestLimit" in validator and '$0 == "-"' in validator and "isASCII" in validator
+
+
+def test_shell_file_menu_adds_a_project_on_cmd_o():
+    """DESIGN.md 10.8 #1 (first launch) and 10.7: 文件 → 「添加项目… ⌘O」 is
+    the whitelisted command `add-project`, and the page's dispatcher opens
+    the add dialog for it."""
+    assert 'cmd("添加项目…", "add-project", "o")' in _SHELL
+    files = _SHELL[_SHELL.index('submenu("文件"'):]
+    files = files[: files.index("]))")]
+    assert files.index('"add-project"') < files.index('"new-attempt"')
+    whitelist = _SHELL[_SHELL.index("let shellCommands"):]
+    whitelist = whitelist[: whitelist.index("]")]
+    assert '"add-project"' in whitelist
+    page = (Path(macapp.__file__).parent / "app.html").read_text(encoding="utf-8")
+    assert '"add-project": () => openAddDialog(),' in page
+
+
+def test_shell_folder_panel_takes_exactly_add_or_locate_as_its_purpose():
+    """DESIGN.md 10.7 (and 10.8 #1): the bridge takes `{type, request,
+    purpose}` with purpose exactly "add" or "locate" -- the panel's message
+    is 「选择要加入 RCE 的项目文件夹」 or 「选择项目文件夹的新位置」 and nothing
+    else changes; the two-key shape stays the locate panel (a page from
+    before V6); a third key that is anything else is ignored."""
+    helper = _SHELL[_SHELL.index("func folderPanelMessage"):]
+    helper = helper[: helper.index("\n}\n")]
+    assert 'case "add": return "选择要加入 RCE 的项目文件夹"' in helper
+    assert 'case "locate": return "选择项目文件夹的新位置"' in helper
+    assert "default: return nil" in helper
+    handler = _SHELL[_SHELL.index("didReceive message: WKScriptMessage"):]
+    handler = handler[: handler.index("\n    }\n")]
+    assert 'body.count == 2, body["type"] as? String == "choose-folder"' in handler
+    assert 'chooseFolder(request, purpose: "locate")' in handler
+    assert 'body.count == 3, body["type"] as? String == "choose-folder"' in handler
+    assert 'let purpose = body["purpose"] as? String, folderPanelMessage(purpose) != nil' in handler
+    assert 'body.count == 2, body["type"] as? String == "title"' in handler
+    choose = _SHELL[_SHELL.index("func chooseFolder"):]
+    choose = choose[: choose.index("\n    }\n")]
+    assert "let panelMessage = folderPanelMessage(purpose)" in choose
+    assert "panel.message = panelMessage" in choose and "panel.canCreateDirectories = false" in choose
+    # the page sends the purpose only to a shell that says it takes it
+    page = (Path(macapp.__file__).parent / "app.html").read_text(encoding="utf-8")
+    assert 'shellCan("choose-folder-purpose")) message.purpose = purpose;' in page
+    assert 'const FOLDER_PURPOSES = ["add", "locate"];' in page
+
+
+def test_the_v6_shell_changes_the_build_id(tmp_path):
+    """10.7: this rebuilds the shell -- the build-id hashes the Swift source,
+    so the bundle built before V6 is not "up to date" and `rce app` rebuilds
+    it once."""
+    rce = tmp_path / "rce"
+    current = macapp.build_id(rce, 7357)
+    old_source = subprocess.run(
+        ["git", "show", "c98cf5a:src/rce/webapp/shell/RCEShell.swift"],
+        cwd=Path(__file__).parents[1], capture_output=True,
+    )
+    if old_source.returncode != 0:
+        pytest.skip("the pre-V6 shell source is not in this checkout's history")
+    assert old_source.stdout != macapp.SHELL_SOURCE.read_bytes()
+    original = macapp.SHELL_SOURCE
+    staged = tmp_path / "RCEShell.swift"
+    staged.write_bytes(old_source.stdout)
+    try:
+        macapp.SHELL_SOURCE = staged
+        before = macapp.build_id(rce, 7357)
+    finally:
+        macapp.SHELL_SOURCE = original
+    assert before != current
 
 
 def test_shell_window_geometry_and_quit_on_close():

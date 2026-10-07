@@ -575,7 +575,7 @@ def test_engine_errors_are_one_click_away_not_visible_english_or_hover_only():
     box = box[: box.index("\n}\n")]
     assert "box.title = " not in box and "出了点问题" in box
     assert 'renderBlockingError(msg, "引擎返回了错误，这一页没能显示。", err)' in box
-    assert 'showHeaderError("移除失效项目失败", err)' in _APP_SRC
+    assert 'renderBlockingError(statusEl, "没能从列表中移除", err)' in _APP_SRC
     status = _CANVAS_SRC[_CANVAS_SRC.index("function showStatus("):]
     status = status[: status.index("\n  }\n")]
     assert "if (err) renderBlockingError(el, text, err);" in status
@@ -1077,8 +1077,8 @@ def test_a_header_error_outlives_the_summary_refresh():
     summary = _APP_SRC[_APP_SRC.index("async function loadProjectSummary"):]
     summary = summary[: summary.index("\n}\n")]
     assert "if (state.headerError) return;" in summary
-    assert 'renderBlockingError(line' not in _APP_SRC and "renderBlockingError(document.getElementById(\"project-line\")" in _APP_SRC
-    for framing in ("切换项目失败", "移除失效项目失败", "停止服务失败"):
+    assert 'renderBlockingError(line' not in _APP_SRC and "renderBlockingError(document.getElementById(\"project-line-msg\")" in _APP_SRC
+    for framing in ("切换项目失败", "停止服务失败"):
         assert f'showHeaderError("{framing}", err)' in _APP_SRC
     shell = _APP_SRC[_APP_SRC.index("function shellReport"):]
     assert "showHeaderError(message, err)" in shell[: shell.index("\n}\n")]
