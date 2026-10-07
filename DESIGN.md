@@ -2430,8 +2430,9 @@ Documents folder (9.12).
 1. **First launch.** With an empty registry the app opens on the no-project
    page; 「添加项目…」 adds a folder; it scans with progress; the views fill.
 2. **A new folder, not a git repository.** The preview's counts equal what
-   the first scan reads. Afterwards the folder holds `.rce/project.toml` and
-   `.rce/README` and is otherwise unchanged — every other file's bytes and
+   the first scan reads. Afterwards the folder holds `.rce/project.toml`,
+   `.rce/README` and the identity's snapshot under `.rce/backups/` and is
+   otherwise unchanged — every other file's bytes and
    modification time compared before and after; the registry has the
    chosen display name; nothing is under review.
 3. **A git repository with untracked files.** The preview names the tracked
@@ -2457,3 +2458,26 @@ Documents folder (9.12).
 12. **Waiting for the system.** An inspection whose listing blocks (made to
     block in the test) answers with the waiting state within the deadline
     and completes when the listing returns.
+
+### 10.9 Rulings made while building V6
+
+- **What adding writes.** Besides `.rce/project.toml` and `.rce/README`,
+  adding writes the identity's snapshot under `.rce/backups/` (9.12 needs
+  it to recognise a lost identity). Acceptance 2 reads accordingly, and the
+  add dialog lists all three.
+- **What inspecting reads.** No file's contents except RCE's own identity
+  files — the folder's `.rce/project.toml`, its snapshots, and for a moved
+  project the old home's `project.toml` — and none of those while they are
+  in the cloud: a cloud identity file is reported as such and its download
+  is not requested.
+- **A folder from before 8.10.** Opening a folder that still holds
+  `.rce/graph.db` moves that database out of it (8.10, rule 1: copied,
+  checked, then removed). Adding from the app does the same; the dialog
+  says so before anything is written.
+- **Git in a folder that is not yet trusted.** Every git command RCE runs
+  disables the repository's own `core.fsmonitor` and takes no optional
+  locks, so looking at a folder cannot run a program the folder names.
+  Still to do: `git blame` without textconv and `git log` without signature
+  checking, for the same reason, in the scans that follow consent.
+- **A project's display name survives a move.** Re-attaching a moved
+  project keeps the name the researcher gave it.
