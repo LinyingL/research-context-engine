@@ -79,7 +79,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import consistency, db, inventory, lineage, migration, paths, query
+from rce import addproject, consistency, db, inventory, lineage, migration, paths, query
 from rce import project as project_identity
 from rce import rebuild as rebuild_mod
 from rce.ingest import attempts as attempts_ingest
@@ -1408,8 +1408,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     served instead -- NOT the current directory: an implicit "." would be
     exactly the kind of guess DESIGN.md section 0 rules out, since a bare
     `rce serve` is most naturally "reopen what I had open", not "serve
-    wherever my shell happens to be". An empty registry fails with an
-    actionable error rather than guessing either meaning.
+    wherever my shell happens to be". An empty registry starts the engine
+    in the no-project state (DESIGN.md 10.1, 10.5), where the app offers
+    「添加项目…」 -- on a new machine RCE.app opens onto that, not an error.
     """
     if args.path is not None:
         project_root = Path(args.path).resolve()
@@ -1422,12 +1423,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
     else:
         entries = project_registry.load()
         if not entries:
-            raise CliError(
-                "no project path given and the project registry "
-                f"(~/{project_registry.RCE_DIRNAME}/{project_registry.REGISTRY_FILENAME}) is empty -- "
-                "run 'rce serve <path>' once with an explicit project path to register it; "
-                "after that, a bare 'rce serve' reopens the most recently served project"
+            print(
+                "No project yet: the project registry "
+                f"(~/{project_registry.RCE_DIRNAME}/{project_registry.REGISTRY_FILENAME}) is empty. "
+                "Starting with no project -- add one in the app, or with 'rce projects add <path>' "
+                "(or 'rce serve <path>').",
+                file=sys.stderr,
             )
+            try:
+                webapp_server.serve(None, args.port, open_browser=not args.no_browser,
+                                    served=webapp_server.no_project_served())
+            except webapp_server.ApiError as exc:
+                raise CliError(str(exc)) from exc
+            return 0
         entry = entries[0]
         # A bare `rce serve` (how RCE.app starts the engine) whose most
         # recent entry is gone or no longer this project STARTS ANYWAY and
@@ -1481,6 +1489,122 @@ def cmd_projects_list(args: argparse.Namespace) -> int:
     for entry in entries:
         project_id = f"  [{entry['id']}]" if entry.get("id") else "  [pre-V5]"
         print(f"  {entry['label']}  {entry['path']}{project_id}{_project_state_note(entry)}")
+    return 0
+
+
+def _print_add_preview(insp: addproject.Inspection) -> None:
+    """`rce projects add` without --yes: what the folder is and what adding
+    it would do (DESIGN.md 10.2), in English."""
+    print(f"Folder: {insp.root}")
+    if insp.kind == addproject.NEW_FOLDER and insp.preview is not None:
+        pv = insp.preview
+        counts = pv.counts
+        if pv.source == "git":
+            print(f"A git repository: RCE reads the files git tracks ({pv.tracked} tracked).")
+            if pv.untracked:
+                more = "+" if pv.untracked_truncated else ""
+                print(f"  {pv.untracked}{more} more file(s) in the folder are not tracked by git and will not be scanned.")
+            if pv.git_error:
+                print(f"  git could not list the folder: {pv.git_error}")
+        else:
+            print("Not a git repository: RCE reads the folder's files (hidden folders and caches skipped).")
+        print(
+            f"  To scan: {pv.to_scan} file(s) -- scripts (.py/.R/.Rmd) {counts['scripts']}, data {counts['data']}, "
+            f"drafts (.md/.tex/.bib) {counts['drafts']}, images {counts['images']}; other files (not read) {counts['other']}"
+        )
+        if pv.dataless:
+            print(f"  {pv.dataless} of them are still in the cloud and are read once downloaded.")
+        if pv.truncated:
+            print(f"  Counting stopped at {addproject.ENTRY_CAP:,} entries; the folder holds more.")
+        if pv.large:
+            print(f"  This is a large folder (more than {addproject.LARGE_THRESHOLD:,} files to scan).")
+        print(
+            f"Adding writes .rce/ inside the folder (project.toml, a short README) and an index under "
+            f"{paths.rce_home() / paths.GRAPHS_DIRNAME}; nothing else in the folder is created or changed. "
+            f"Then the first full scan runs."
+        )
+    elif insp.kind == addproject.PRE_V5:
+        print("An RCE project from before V5: adding registers and opens it; record judgments after 'rce migrate'.")
+    elif insp.kind == addproject.RCE_PROJECT and insp.classification is not None:
+        c = insp.classification
+        if insp.can_add:
+            print(f"An RCE project (id {c.project_id}, {c.situation.value}): adding registers and opens it.")
+        else:
+            print(project_identity.describe_blocked(c))
+
+
+def cmd_projects_add(args: argparse.Namespace) -> int:
+    """`rce projects add <path> [--label L] [--yes]` (DESIGN.md 10.5): the
+    app's 「添加项目…」 on the command line. Without --yes it prints what the
+    folder is and what adding would do, and writes nothing; with --yes it
+    adds the folder and, for a folder RCE has not seen, runs the first full
+    scan in the foreground."""
+    if args.path is None:
+        raise CliError("name the folder to add: rce projects add <path>")
+    try:
+        insp = addproject.inspect(args.path, deadline=None)
+    except OSError as exc:
+        raise CliError(f"could not look at {args.path}: {exc}") from exc
+    if insp.kind == addproject.REFUSED:
+        assert insp.refusal is not None
+        raise CliError(f"{insp.refusal.detail} -- not added (refused: {insp.refusal.code}); nothing written")
+    if insp.kind == addproject.ALREADY_REGISTERED:
+        print(f"{insp.root} is already in the project list as {(insp.entry or {}).get('label')!r}; nothing written.")
+        return 0
+    _print_add_preview(insp)
+    if insp.kind == addproject.RCE_PROJECT and not insp.can_add:
+        print("Nothing written; answer the question above first.", file=sys.stderr)
+        return 1
+    if not args.yes:
+        print("Nothing written. Run again with --yes to add it.")
+        return 0
+    try:
+        added = addproject.add(args.path, label=args.label, inspected=insp.token, deadline=None)
+    except addproject.AddRefused as exc:
+        raise CliError(f"not added: {exc.detail} ({exc.code}); nothing written") from exc
+    except project_registry.LabelError as exc:
+        raise CliError(f"not added: {exc}; nothing written") from exc
+    print(f"Added {added.root} as {added.label!r}" + (f" (project {added.project_id})." if added.project_id else "."))
+    if not added.needs_scan:
+        return 0
+    print("First full scan:")
+    try:
+        report = addproject.rescan(
+            added.root, expected_id=added.project_id,
+            progress=lambda step, n, m: print(f"[{n}/{m}] {addproject.STEP_NAMES.get(step, step)}"),
+            echo=print,
+        )
+    except addproject.ScanRefused as exc:
+        raise CliError(f"the project was added, but its scan did not run: {exc.detail}; run 'rce ingest {added.root}'") from exc
+    if report.unreadable_sources:
+        print(f"Could not be read ({len(report.unreadable_sources)}): " + ", ".join(report.unreadable_sources))
+    if not report.ok:
+        print(f"Warning: the scan did not finish ({report.error}); run 'rce ingest {added.root}'.", file=sys.stderr)
+        return 1
+    print("Scan finished.")
+    return 0
+
+
+def cmd_projects_rename(args: argparse.Namespace) -> int:
+    """`rce projects rename <path|id> <label>` (DESIGN.md 10.4, 10.5): the
+    registry label only -- never the folder. An id names its entry; a path
+    is matched as stored first and resolved second, as `remove` does."""
+    key = args.path
+    if key is None:
+        raise CliError("name the registered project (its path or id) to rename")
+    try:
+        entry = project_registry.rename(key, args.label)
+        if entry is None and not records_lock.PROJECT_ID_RE.match(key):
+            resolved = str(Path(key).expanduser().resolve())
+            if resolved != key:
+                entry = project_registry.rename(resolved, args.label)
+    except project_registry.LabelError as exc:
+        raise CliError(f"{exc}; nothing renamed") from exc
+    if entry is None:
+        raise CliError(
+            f"{key!r} is not in the project registry ({project_registry.registry_path()}); 'rce projects list' shows what is"
+        )
+    print(f"Renamed {entry['path']} to {entry['label']!r} (the folder itself is unchanged).")
     return 0
 
 
@@ -2126,8 +2250,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "projects",
         help=(
-            "Inspect and prune the project registry the app's switcher reads "
-            "(~/.rce/projects.json): 'rce projects list' / 'rce projects remove <path>'"
+            "The project list the app's project menu reads (~/.rce/projects.json): "
+            "'rce projects list | add <path> | rename <path|id> <label> | remove <path>'"
         ),
     )
     projects_sub = p.add_subparsers(dest="projects_command", required=True)
@@ -2142,6 +2266,20 @@ def build_parser() -> argparse.ArgumentParser:
         "the registered project path to drop (as 'rce projects list' prints it); or give it as --path"
     ))
     q.set_defaults(func=cmd_projects_remove)
+    q = projects_sub.add_parser(
+        "add",
+        help="Add a folder as a project: without --yes, show what RCE would read and write (writes nothing)",
+    )
+    add_project_path(q, default=None, help="the folder to add; or give it as --path")
+    q.add_argument("--label", default=None, help="display name (default: the folder's name)")
+    q.add_argument("--yes", action="store_true", help="add it, then run the first full scan")
+    q.set_defaults(func=cmd_projects_add)
+    q = projects_sub.add_parser(
+        "rename", help="Change a registered project's display name (the folder is never renamed)",
+    )
+    add_project_path(q, default=None, help="the registered project's path (as 'rce projects list' prints it) or id; or give it as --path")
+    q.add_argument("label", help="the new display name")
+    q.set_defaults(func=cmd_projects_rename)
 
     p = sub.add_parser(
         "project",

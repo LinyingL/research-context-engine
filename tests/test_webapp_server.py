@@ -553,12 +553,20 @@ def test_cli_serve_without_path_serves_most_recent_registry_entry(fake_home, tmp
     assert calls[0][0].name == "newer"
 
 
-def test_cli_serve_without_path_and_empty_registry_gives_actionable_error(fake_home, monkeypatch, capsys):
-    calls = _capture_serve(monkeypatch)
-    assert cli.main(["serve"]) == 1
+def test_cli_serve_without_path_and_empty_registry_starts_with_no_project(fake_home, monkeypatch, capsys):
+    """DESIGN.md 10.5 (10.8 scenario 1, first launch): a bare `rce serve`
+    with an empty registry starts in the no-project state instead of
+    exiting -- and still says, on stderr, how a project gets added."""
+    calls: list = []
+    monkeypatch.setattr(
+        server, "serve",
+        lambda root, port, open_browser=True, served=None: calls.append((root, served)),
+    )
+    assert cli.main(["serve", "--no-browser"]) == 0
     err = capsys.readouterr().err
-    assert "Error" in err and "rce serve" in err  # tells the user the fix, not just the state
-    assert calls == []
+    assert "rce projects add" in err
+    assert len(calls) == 1 and calls[0][0] is None and calls[0][1].no_project
+    assert registry.load() == []
 
 
 # -- HTTP-level routing / status codes -------------------------------------------
@@ -1268,7 +1276,7 @@ def test_http_generation_reports_watcher_status(live_server):
     at all (build_server creates the watcher; only serve() starts it)."""
     status, payload = _get(live_server[0], "/api/generation")
     assert status == 200
-    assert payload == {"generation": 1, "refreshing": False, "last_error": None}
+    assert payload == {"generation": 1, "refreshing": False, "last_error": None, "scanning": None, "last_scan": None}
 
 
 def test_http_generation_rejects_mismatched_host_header(live_server):
@@ -1295,7 +1303,7 @@ def test_http_switch_bumps_generation(live_server, fake_home, tmp_path):
 
     status, payload = _get(base_url, "/api/generation")
     assert status == 200
-    assert payload == {"generation": 2, "refreshing": False, "last_error": None}
+    assert payload == {"generation": 2, "refreshing": False, "last_error": None, "scanning": None, "last_scan": None}
 
 
 def test_http_failed_switch_does_not_bump_generation(live_server, fake_home):
@@ -1333,7 +1341,7 @@ def test_http_tree_reflects_map_edit_after_watcher_poll(tmp_path):
 
         status, payload = _get(base_url, "/api/generation")
         assert status == 200
-        assert payload == {"generation": 2, "refreshing": False, "last_error": None}
+        assert payload == {"generation": 2, "refreshing": False, "last_error": None, "scanning": None, "last_scan": None}
         status, payload = _get(base_url, "/api/tree")
         assert status == 200
         assert [a["number"] for a in payload["attempts"]] == ["1", "2"]

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Iterator
 
 from rce.ingest.git import DATA_EXTENSIONS, IMAGE_EXTENSIONS
 
@@ -66,20 +67,17 @@ def _category_for(suffix: str) -> str | None:
     return None
 
 
-def list_source_files(root: str | Path) -> dict[str, list[str]]:
-    """Inventory .tex/.bib/image/.py/.md/.r/.rmd/data files under `root` by
-    walking the filesystem, grouped by category -- same shape as
-    `rce.ingest.git.list_source_files`, for a project root that has no git
-    repository to ask instead. Creates no graph nodes.
-
-    Returned paths are root-relative and forward-slash-normalized
-    (`Path.as_posix()`), matching git's own path convention so downstream
-    extractors (latex/pyfig/claims) can treat either inventory identically.
-    """
+def iter_files(root: str | Path) -> Iterator[tuple[str, str | None]]:
+    """Every file the walk lists under `root`, as `(root-relative posix
+    path, category or None)`, in the walk's deterministic order -- noise
+    and dot-prefixed directories pruned, hidden files and symlinks skipped
+    (module docstring). `list_source_files` keeps the categorized ones;
+    the add-project preview (DESIGN.md 10.2, `rce.addproject`) counts the
+    same stream, uncategorized files included, so the numbers it shows are
+    the numbers this walk gives the scan. Reads directory listings and
+    `lstat` only; never opens a file. A consumer may stop early (closing
+    the generator stops the walk)."""
     root = Path(root)
-    inventory: dict[str, list[str]] = {
-        "tex": [], "bib": [], "image": [], "py": [], "md": [], "r": [], "rmd": [], "data": [],
-    }
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         # Prune in place (os.walk respects in-place mutation of dirnames)
         # so a noise/hidden directory is never even descended into, not
@@ -91,8 +89,23 @@ def list_source_files(root: str | Path) -> dict[str, list[str]]:
             full_path = Path(dirpath) / filename
             if full_path.is_symlink():
                 continue
-            category = _category_for(full_path.suffix.lower())
-            if category is None:
-                continue
-            inventory[category].append(full_path.relative_to(root).as_posix())
+            yield full_path.relative_to(root).as_posix(), _category_for(full_path.suffix.lower())
+
+
+def list_source_files(root: str | Path) -> dict[str, list[str]]:
+    """Inventory .tex/.bib/image/.py/.md/.r/.rmd/data files under `root` by
+    walking the filesystem, grouped by category -- same shape as
+    `rce.ingest.git.list_source_files`, for a project root that has no git
+    repository to ask instead. Creates no graph nodes.
+
+    Returned paths are root-relative and forward-slash-normalized
+    (`Path.as_posix()`), matching git's own path convention so downstream
+    extractors (latex/pyfig/claims) can treat either inventory identically.
+    """
+    inventory: dict[str, list[str]] = {
+        "tex": [], "bib": [], "image": [], "py": [], "md": [], "r": [], "rmd": [], "data": [],
+    }
+    for rel, category in iter_files(root):
+        if category is not None:
+            inventory[category].append(rel)
     return inventory

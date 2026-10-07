@@ -562,6 +562,21 @@ class ProjectWatcher:
                 self._generation += 1
             return self._generation
 
+    def scan_finished(self, root: Path, snapshot: WatchSnapshot) -> int:
+        """A full scan of `root` (DESIGN.md 10.3) just ingested everything:
+        when `root` is still the served project, the folder as it was when
+        the scan BEGAN becomes the baseline -- the scan read all of that,
+        and an edit made while it ran is still a difference for the next
+        poll -- and the error it may have cleared is forgotten. The
+        generation moves either way, so every open page re-fetches."""
+        current = self._get_project_root()
+        with self._state_lock:
+            if current == root and self._baseline_root in (None, root):
+                self._baseline, self._baseline_root = snapshot, root
+                self._last_error = None
+            self._generation += 1
+            return self._generation
+
     def retarget(self) -> None:
         """A project switch happened: drop the old root's baseline (the next
         poll re-baselines against the new root without ingesting -- a switch

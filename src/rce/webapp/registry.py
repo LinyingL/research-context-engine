@@ -65,6 +65,11 @@ Contract:
     Returns whether anything was removed; the atomicity and
     unreadable-registry rules are `register()`'s, unchanged.
 
+  - `register(path, id, label=...)` and `rename(id_or_path, label)` set a
+    display name chosen in the app (DESIGN.md 10.2, 10.4) -- the label
+    only, never the folder; `clean_label` says what a label may be.
+    `remove_entry(path)` is `remove` returning the entry it dropped.
+
 Security note (why `load()` membership matters): `rce.webapp.server`'s
 `POST /api/projects/switch` accepts a path only if it is string-equal to a
 `load()` entry's `"path"`. This file is therefore the allow-list that
@@ -240,7 +245,7 @@ def _update(change) -> bool:
         return True
 
 
-def register(path: Path, project_id: str | None = None) -> None:
+def register(path: Path, project_id: str | None = None, *, label: str | None = None) -> None:
     """Record `path` (resolved to absolute) as the most recently served
     project. Keyed by `project_id` when the project has one (an entry with
     that id is moved to the front and follows the folder: a new path gets
@@ -266,10 +271,70 @@ def register(path: Path, project_id: str | None = None) -> None:
             entry = existing
         else:
             entry = {"id": project_id, "path": resolved, "label": Path(resolved).name}
+        if label is not None:
+            entry["label"] = label
         entries.insert(0, entry)
         return True
 
     _update(change)
+
+
+LABEL_MAX_LENGTH = 100
+
+
+class LabelError(ValueError):
+    """A display name that cannot be stored. `code` names why (`empty`,
+    `multiline`, `too_long`); `message_zh` is the app's sentence."""
+
+    _MESSAGES = {
+        "empty": "显示名称不能为空",
+        "multiline": "显示名称只能有一行",
+        "too_long": f"显示名称不能超过 {LABEL_MAX_LENGTH} 个字符",
+    }
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message_zh = self._MESSAGES[code]
+
+
+def clean_label(label: object) -> str:
+    """A display name as stored (DESIGN.md 10.4): a string, trimmed, one
+    line (no line break or other control character), not empty, at most
+    `LABEL_MAX_LENGTH` characters. Refused, never silently cut."""
+    if not isinstance(label, str):
+        raise LabelError("empty", "the label must be a string")
+    cleaned = label.strip()
+    if not cleaned:
+        raise LabelError("empty", "the label is empty")
+    if any(ord(ch) < 32 or ch in "\x7f\u2028\u2029\x85" for ch in cleaned):
+        raise LabelError("multiline", "the label must be a single line without control characters")
+    if len(cleaned) > LABEL_MAX_LENGTH:
+        raise LabelError("too_long", f"the label is longer than {LABEL_MAX_LENGTH} characters")
+    return cleaned
+
+
+def rename(id_or_path: str, label: str) -> dict[str, str | None] | None:
+    """「重命名显示名称…」 (DESIGN.md 10.4): change one entry's label -- never
+    its folder, its path or its recency. The entry is named by its project
+    id, or (a pre-V5 entry, which has none) by its stored path, matched by
+    string equality exactly as `remove` matches. Returns the renamed entry,
+    or None when nothing matched (or the registry could not be read).
+    `label` is cleaned first (`clean_label`, which raises `LabelError`)."""
+    cleaned = clean_label(label)
+    by_id = bool(PROJECT_ID_RE.match(id_or_path))
+    found: list[dict] = []
+
+    def change(entries: list[dict]) -> bool:
+        for entry in entries:
+            if (entry.get("id") == id_or_path) if by_id else (entry["path"] == id_or_path):
+                entry["label"] = cleaned
+                found.append(dict(entry))
+                return True
+        return False
+
+    _update(change)
+    return found[0] if found else None
 
 
 def relocate(project_id: str, path: Path) -> bool:
@@ -299,7 +364,12 @@ def find(project_id: str) -> dict[str, str | None] | None:
 
 
 def remove(path: str | Path) -> bool:
-    """Drop `path` from the registry; return whether anything matched.
+    """`remove_entry`, as whether anything matched."""
+    return remove_entry(path) is not None
+
+
+def remove_entry(path: str | Path) -> dict[str, str | None] | None:
+    """Drop `path` from the registry; return the entry removed, or None.
 
     Matched by STRING EQUALITY against the stored `"path"` value -- never
     resolved, joined, or normalized -- the same rule
@@ -315,12 +385,15 @@ def remove(path: str | Path) -> bool:
     this a logged no-op rather than a rewrite -- the entries still in that
     file outrank this one removal."""
     requested = str(path)
+    removed: list[dict] = []
 
     def change(entries: list[dict]) -> bool:
         kept = [entry for entry in entries if entry["path"] != requested]
         if len(kept) == len(entries):
             return False
+        removed.extend(dict(e) for e in entries if e["path"] == requested)
         entries[:] = kept
         return True
 
-    return _update(change)
+    _update(change)
+    return removed[0] if removed else None

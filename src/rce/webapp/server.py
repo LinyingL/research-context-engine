@@ -73,6 +73,31 @@ Endpoints (all GET unless noted):
                             an entry whose folder moved; adopts the chosen
                             folder only if it carries that id (V5, see
                             `locate_payload`).
+    POST /api/projects/inspect -- body `{"path"}` (absolute, `~` expanded):
+                            what the folder is and what adding it would do
+                            -- `rce.addproject.Inspection.payload()`: `kind`
+                            already_registered | rce_project | pre_v5 |
+                            new_folder | refused | waiting_permission, the
+                            9.4 `situation`, the `preview` counts, the
+                            `refusal`, the `inspected` token. Writes
+                            nothing (DESIGN.md 10.2).
+    POST /api/projects/add -- body `{"path", "label", "inspected"}`: adds the
+                            folder if it is still what was inspected (409
+                            `inspected_changed` with a fresh `inspection`
+                            otherwise), opens it as /switch does, and for a
+                            new folder starts its first full scan in the
+                            background; a folder whose 9.4 question is open
+                            is served blocked and registered only when
+                            /api/project/resolve answers it (see
+                            `add_payload`).
+    POST /api/projects/rescan -- no body: the full scan of the served
+                            project in the background (10.3); 409
+                            `scan_running` / `frozen`. Progress and the
+                            result: `GET /api/generation`'s `scanning` and
+                            `last_scan`.
+    POST /api/projects/rename -- body `{"id", "label"}` (a pre-V5 entry:
+                            `{"path", "label"}`): the registry label only
+                            (10.4).
     POST /api/project/resolve -- body `{"answer": "fork"|"claim"|"other"|
                             "readonly"|"restore"|"adopt"}`: the answer to a
                             blocked project's question -- only one its
@@ -99,7 +124,11 @@ Endpoints (all GET unless noted):
     GET  /api/generation -- the auto-refresh watcher's status
                             (`rce.webapp.watcher`, task V3 phase 2):
                             `{"generation": int, "refreshing": bool,
-                            "last_error": str|null}`. The frontend polls
+                            "last_error": str|null, "scanning": {step,
+                            label, n, m, started}|null, "last_scan":
+                            {finished, ok, unreadable_sources, error,
+                            message, findings}|null}` (the last two: the
+                            served project's full scan, 10.2/10.3). The frontend polls
                             this and re-fetches its views whenever the
                             generation moved -- see "Auto-refresh" below.
     GET  /api/canvas    -- `?scope=all|<attempt id>` (default: the current
@@ -381,6 +410,25 @@ installed (`_served_db`); a project opened read-only refuses
 every write (`read_only`); a lock held by another process for too long is
 `project_busy` (503), never a write without it.
 
+No project (DESIGN.md 10.1, 10.5): with an empty registry `rce serve` starts
+anyway, serving `no_project_served()` -- and so does a server whose open
+project was removed from the list with none left. Every project endpoint
+then answers 409 `state: "no_project"` before routing; what still answers
+is the page, `/api/projects` (an empty list, `current` null), `/api/engine`,
+`/api/generation`, and what changes the served project (switch, locate,
+remove, inspect, add, rename, shutdown).
+
+Adding a project (DESIGN.md Section 10): `/api/projects/inspect`, `/add`,
+`/rescan` and `/rename` are the first endpoints that let the page name an
+arbitrary folder to write into. `_check_local_origin` runs first, as for
+every endpoint; the named path is resolved by `rce.addproject` (symlinks
+followed) and the RESOLVED folder is the one checked against the refusals
+(top-level and system folders, RCE's home, a folder inside or containing a
+registered project) and the one written into; adding writes only `.rce/`
+inside a folder that exists, and the index and registry under the RCE home;
+the add is refused unless the folder is still what the `inspected` token
+says was seen.
+
 Every handler-facing failure is one of the small `ApiError` subclasses below,
 each carrying its own HTTP status; `RceRequestHandler` catches `ApiError`
 once per request and renders `{"error": str(exc)}` -- plus `"state"` when the
@@ -398,15 +446,17 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable, Iterator
 
-from rce import db, inventory, lineage, migration, paths
+from rce import addproject, db, inventory, lineage, migration, paths
 from rce import project as project_identity
 from rce.records import judgements
 from rce.records import ledger as ledger_mod
@@ -608,6 +658,12 @@ class ProjectBlockedError(ApiError):
     state = "project_blocked"
 
     def __init__(self, blocked: dict[str, Any]) -> None:
+        if blocked.get("situation") == NO_PROJECT_SITUATION:
+            # 10.1: no project at all -- not a question to answer.
+            super().__init__(NO_PROJECT_MESSAGE)
+            self.state = NO_PROJECT_SITUATION
+            self.extra = {"message": NO_PROJECT_MESSAGE, "situation": blocked}
+            return
         message = blocked.get("detail") or blocked.get("message") or blocked.get("situation", "blocked")
         super().__init__(f"this project cannot be opened until a question is answered: {message}")
         self.extra = {"situation": blocked}
@@ -712,9 +768,38 @@ class CardRefusedApiError(ApiError):
         self.extra = exc.extra
 
 
+class AddProjectError(ApiError):
+    """A refusal of the add-project endpoints (DESIGN.md Section 10):
+    inspecting, adding, rescanning, renaming. Nothing was written. `state`
+    is the machine-readable code; `error` and `message` the app's Chinese
+    sentence; `detail` the engine's own text (8.8: 「详情」)."""
+
+    status = 409
+
+    def __init__(
+        self, code: str, message_zh: str, detail: str = "", *, status: int = 409, extra: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message_zh)
+        self.state = code
+        self.status = status
+        self.extra = {"message": message_zh, "detail": detail or message_zh, **(extra or {})}
+
+
+# 10.1: the engine serves no project at all (an empty registry, or the last
+# entry removed). Every project endpoint answers 409 `no_project`.
+NO_PROJECT_SITUATION = "no_project"
+NO_PROJECT_MESSAGE = "还没有项目：请先添加一个项目文件夹"
+
+
 @dataclass(frozen=True)
 class ServedProject:
-    """What this server serves (module docstring, "Project identity")."""
+    """What this server serves (module docstring, "Project identity").
+
+    `no_project` (10.1): there is no project; `root` is then a placeholder
+    that names no folder, and every project endpoint refuses before it is
+    used. `adding` (10.2): a folder chosen in the add dialog whose 9.4
+    question is open -- served blocked, not registered; the answer
+    (`resolve_payload`) registers it under `label`, the name chosen."""
 
     root: Path
     project_id: str | None = None
@@ -722,6 +807,23 @@ class ServedProject:
     read_only: bool = False
     blocked: dict[str, Any] | None = None
     label: str | None = None
+    no_project: bool = False
+    adding: bool = False
+
+
+NO_PROJECT_ROOT = Path("/nonexistent/rce-no-project")
+
+
+def no_project_served() -> ServedProject:
+    """The no-project state (10.1, 10.5)."""
+    blocked = {
+        "situation": NO_PROJECT_SITUATION,
+        "path": None,
+        "message": NO_PROJECT_MESSAGE,
+        "answers": [],
+        "blocked": True,
+    }
+    return ServedProject(NO_PROJECT_ROOT, blocked=blocked, no_project=True)
 
 
 def _missing(root: Path, project_id: str | None, label: str | None, reason: str) -> dict[str, Any]:
@@ -799,7 +901,7 @@ def engine_payload(served: ServedProject) -> dict[str, Any]:
         "engine": "rce",
         "version": 5,
         "pid": os.getpid(),
-        "project_root": str(served.root),
+        "project_root": None if served.no_project else str(served.root),
         "project_id": served.project_id,
         "graph_path": str(graph) if graph is not None else None,
         "rce_home": str(paths.rce_home()),
@@ -1258,8 +1360,9 @@ def projects_payload(current: Path | ServedProject) -> dict[str, Any]:
     ]
     return {
         "projects": projects,
-        "current": str(served.root),
+        "current": None if served.no_project else str(served.root),
         "current_id": served.project_id,
+        "no_project": served.no_project,
         "blocked": served.blocked,
         "read_only": served.read_only,
         "needs_migration": served.needs_migration,
@@ -1404,6 +1507,10 @@ def resolve_payload(served: ServedProject, body: dict[str, Any]) -> tuple[Served
     except records_situation.WriteRefused as exc:
         raise AnswerRefusedError(str(exc)) from exc
     new_served = served_for(served.root, register=True, label=served.label)
+    if served.adding and served.label and new_served.blocked is None and new_served.project_id is not None:
+        # 10.2: a folder added from the app, whose question this answered,
+        # is registered under the display name chosen in the add dialog.
+        project_registry.register(Path(paths._canonical_path(served.root)), new_served.project_id, label=served.label)
     return new_served, {
         "ok": True,
         "answer": answer,
@@ -1455,16 +1562,143 @@ def remove_project_payload(requested: str) -> dict[str, Any]:
     nothing on disk -- no graph, no project, no file -- so the blast
     radius of being wrong is one re-registration by `rce serve <path>`.
 
-    Removing the currently-served project is allowed too: this server keeps
-    serving what it serves, and `projects_payload` already reports a
-    current root that is not a registry member."""
-    if not project_registry.remove(requested):
+    Removing the currently-served project is allowed too (DESIGN.md
+    10.4): the handler then opens the next registered project, or the
+    no-project state (`next_served_after_removal`)."""
+    remove_project_entry(requested)
+    return {"removed": requested}
+
+
+def remove_project_entry(requested: str) -> dict[str, Any]:
+    """`registry.remove_entry` (string equality, see above): the entry
+    removed, or `UnknownProjectError` (403) when none matched."""
+    entry = project_registry.remove_entry(requested)
+    if entry is None:
         raise UnknownProjectError(
             f"{requested!r} is not a registered project -- only paths already in the "
             f"registry (~/{project_registry.RCE_DIRNAME}/{project_registry.REGISTRY_FILENAME}) "
             f"can be removed from it"
         )
-    return {"removed": requested}
+    return entry
+
+
+def is_served_entry(served: ServedProject, entry: dict[str, Any]) -> bool:
+    """Whether the registry `entry` is the project this server serves: the
+    same id, or (an id-less entry) the same stored path."""
+    if served.no_project:
+        return False
+    if entry.get("id") is not None:
+        return entry["id"] == served.project_id
+    return entry["path"] == str(served.root)
+
+
+def next_served_after_removal() -> ServedProject:
+    """10.4: removing the open project opens the next one -- the most
+    recently served entry left, through the same identity check a bare
+    `rce serve` makes -- or the no-project state."""
+    entries = project_registry.load()
+    if not entries:
+        return no_project_served()
+    entry = entries[0]
+    return served_for(Path(entry["path"]), expected_id=entry.get("id"), label=entry["label"], register=True)
+
+
+# -- adding a project from the app (DESIGN.md Section 10, task V6) -------------
+
+BAD_PATH_MESSAGE = "请输入完整的文件夹路径（以 / 或 ~ 开头）"
+
+
+def _chosen_path(body: dict[str, Any]) -> str:
+    """The folder the page named: a string, `~` expanded, absolute. It is
+    resolved (symlinks followed) by the inspection itself, and the resolved
+    folder is the one checked and written into (10.6)."""
+    raw = body.get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise AddProjectError("bad_path", BAD_PATH_MESSAGE, "request body must carry a string 'path'", status=400)
+    expanded = os.path.expanduser(raw.strip())
+    if not os.path.isabs(expanded):
+        raise AddProjectError("bad_path", BAD_PATH_MESSAGE, f"{raw!r} is not an absolute path", status=400)
+    return expanded
+
+
+def inspect_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/projects/inspect {path}` (10.2 step 2): what the folder is,
+    and what adding it would do. Writes nothing; past the deadline the
+    answer is `waiting_permission` and the page asks again."""
+    return addproject.inspect(_chosen_path(body), deadline=addproject.DEFAULT_DEADLINE_S).payload()
+
+
+def add_payload(body: dict[str, Any]) -> tuple[ServedProject | None, dict[str, Any], bool]:
+    """`POST /api/projects/add {path, label, inspected}` (10.2 step 3).
+    Returns `(served, payload, scan)`: what the server now serves (None:
+    unchanged), the reply, and whether the first full scan starts. A
+    project that was registered is opened exactly as `/api/projects/switch`
+    opens it; one whose question is open is served blocked, unregistered
+    (the answer, through `/api/project/resolve`, registers it under the
+    chosen name); one already in the list changes nothing."""
+    path = _chosen_path(body)
+    label = body.get("label")
+    if label is not None and not isinstance(label, str):
+        raise AddProjectError("bad_label", project_registry.LabelError._MESSAGES["empty"], "'label' must be a string", status=400)
+    inspected = body.get("inspected")
+    if not isinstance(inspected, str):
+        raise AddProjectError("bad_request", "请求不完整，请重新查看这个文件夹", "request body must carry the string 'inspected'", status=400)
+    try:
+        added = addproject.add(path, label=label, inspected=inspected, deadline=addproject.DEFAULT_DEADLINE_S)
+    except addproject.AddRefused as exc:
+        extra = {"inspection": exc.inspection.payload()} if exc.inspection is not None else {}
+        raise AddProjectError(exc.code, exc.message, exc.detail, extra=extra) from exc
+    except project_registry.LabelError as exc:
+        raise AddProjectError("bad_label", exc.message_zh, str(exc), status=400) from exc
+    payload: dict[str, Any] = {
+        "ok": True,
+        "kind": added.kind,
+        "root": str(added.root),
+        "label": added.label,
+        "project_id": added.project_id,
+        "entry": added.entry,
+        "registered": added.registered,
+        "blocked": None,
+        "current": None,
+        "scanning": False,
+        "inspection": added.inspection.payload(),
+    }
+    if added.kind == addproject.ALREADY_REGISTERED:
+        return None, payload, False
+    if added.classification is not None and added.entry is None:
+        c = added.classification
+        served = ServedProject(
+            added.root, c.project_id, needs_migration=c.needs_migration, blocked=c.payload(),
+            label=added.label, adding=True,
+        )
+        payload.update(blocked=served.blocked, current=str(added.root))
+        return served, payload, False
+    entry = added.entry
+    if entry is None:  # pragma: no cover -- a registry that could not be written
+        raise AddProjectError("not_registered", "无法写入项目列表", f"{added.root} could not be registered")
+    served, switched = switch_project_payload(entry["path"], entry.get("id"))
+    payload.update(current=switched["current"], blocked=switched["blocked"], project_id=switched["project_id"])
+    scan = added.needs_scan and served.blocked is None
+    payload["scanning"] = scan
+    return served, payload, scan
+
+
+def rename_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/projects/rename {id, label}` (10.4): the registry label
+    only, never the folder. A pre-V5 entry (no id) is named by `path`,
+    string-equal to its stored path, as `/remove` names it."""
+    key = body.get("id") if isinstance(body.get("id"), str) else body.get("path")
+    if not isinstance(key, str) or not key:
+        raise AddProjectError("bad_request", "请求不完整", "request body must carry a string 'id' (or 'path')", status=400)
+    try:
+        entry = project_registry.rename(key, body.get("label"))
+    except project_registry.LabelError as exc:
+        raise AddProjectError("bad_label", exc.message_zh, str(exc), status=400) from exc
+    if entry is None:
+        raise AddProjectError(
+            "unknown_project", "这个项目不在列表里", f"{key!r} is not a registered project", status=403,
+        )
+    return {"ok": True, "entry": entry}
 
 
 # -- POST /api/attempts/preview + /api/attempts/write (task V3 phase 3) -------
@@ -2098,7 +2332,7 @@ class RceHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         handler_cls: type,
-        project_root: Path,
+        project_root: Path | None,
         watch_interval: float = project_watcher.DEFAULT_INTERVAL_SECONDS,
         served: ServedProject | None = None,
     ) -> None:
@@ -2110,8 +2344,17 @@ class RceHTTPServer(ThreadingHTTPServer):
         # accidentally bypass the lock. Since V5 it is the whole
         # `ServedProject` (root, id, blocked state), computed by the
         # identity check when the caller did not pass one.
-        self.__served = served if served is not None else served_for(Path(project_root))
+        if served is None:
+            served = no_project_served() if project_root is None else served_for(Path(project_root))
+        self.__served = served
         self.__served_lock = threading.Lock()
+        # 10.2/10.3: the full scan running in the background, at most one
+        # per project (`rce.addproject.start_scan` holds the slot), and how
+        # the last one ended -- per project root, reported by
+        # `GET /api/generation` for the project being served.
+        self.__scan_lock = threading.Lock()
+        self.__scans: dict[str, dict[str, Any]] = {}
+        self.__last_scans: dict[str, dict[str, Any]] = {}
         # Task V3 phase 2: the auto-refresh watcher. Created here (so
         # /api/generation always has status to report, and a switch always
         # has something to retarget) but its polling thread is only started
@@ -2147,7 +2390,86 @@ class RceHTTPServer(ThreadingHTTPServer):
         still-migrating project is read from its old index, and no scan
         may land in it -- no re-ingest, and so no error chip either."""
         served = self.get_served()
-        return served.blocked is None and not served.read_only and not served.needs_migration
+        return (
+            not served.no_project and served.blocked is None and not served.read_only and not served.needs_migration
+        )
+
+    # -- the full scan (DESIGN.md 10.2, 10.3) ----------------------------------
+
+    def scan_status(self) -> dict[str, Any]:
+        """`{scanning, last_scan}` for the served project, merged into
+        `GET /api/generation` so the page shows 「正在扫描：<步骤>（n/m）」
+        from the poll it already makes."""
+        served = self.get_served()
+        key = None if served.no_project else str(served.root)
+        with self.__scan_lock:
+            running = self.__scans.get(key) if key else None
+            last = self.__last_scans.get(key) if key else None
+            return {
+                "scanning": dict(running) if running else None,
+                "last_scan": dict(last) if last else None,
+            }
+
+    def start_scan(self, served: ServedProject) -> None:
+        """Start the full scan of `served` in a background thread, or raise
+        `AddProjectError` (a scan of it already running, a frozen pre-V5
+        project, a folder that is no longer the project). Progress and the
+        result land in `scan_status`; when it ends the watcher takes the
+        folder as it was when the scan began as its baseline (an edit made
+        during the scan is still seen) and the generation moves, so the
+        views fill."""
+        if served.no_project:
+            raise ProjectBlockedError(served.blocked or {})
+        if served.blocked is not None:
+            raise ProjectBlockedError(served.blocked)
+        if served.read_only:
+            raise ReadOnlyError("this project was opened read-only; nothing is scanned")
+        if served.needs_migration:
+            raise AddProjectError(
+                "frozen", addproject.SCAN_MESSAGES["frozen"],
+                f"{served.root} is frozen until it is migrated (rce migrate); nothing scanned",
+            )
+        try:
+            ticket = addproject.start_scan(served.root, expected_id=served.project_id)
+        except addproject.ScanRefused as exc:
+            raise AddProjectError(exc.code, exc.message, exc.detail) from exc
+        key = str(served.root)
+        snapshot = project_watcher.take_snapshot(served.root)
+        with self.__scan_lock:
+            self.__scans[key] = {
+                "step": None, "label": None, "n": 0, "m": len(addproject.SCAN_STEPS),
+                "started": _now_iso(),
+            }
+
+        def progress(step: str, n: int, m: int) -> None:
+            with self.__scan_lock:
+                state = self.__scans.get(key)
+                if state is not None:
+                    state.update(step=step, label=addproject.STEP_LABELS.get(step, step), n=n, m=m)
+
+        def run() -> None:
+            result: dict[str, Any]
+            try:
+                report = ticket.run(progress=progress)
+                result = {
+                    "ok": report.ok, "unreadable_sources": report.unreadable_sources,
+                    "error": report.error, "message": None if report.ok else "扫描没有完成",
+                    "findings": report.findings,
+                }
+            except addproject.ScanRefused as exc:
+                result = {"ok": False, "unreadable_sources": [], "error": exc.code, "message": exc.message, "findings": None}
+            except Exception as exc:  # noqa: BLE001 -- reported, never kills the engine
+                logger.exception("the scan of %s failed", served.root)
+                result = {"ok": False, "unreadable_sources": [], "error": str(exc), "message": "扫描没有完成", "findings": None}
+            finally:
+                ticket.release()
+            result["finished"] = _now_iso()
+            with self.__scan_lock:
+                self.__scans.pop(key, None)
+                self.__last_scans[key] = result
+            self.watcher.scan_finished(served.root, snapshot)
+
+        threading.Thread(target=run, name="rce-scan", daemon=True).start()
 
     @contextlib.contextmanager
     def write_guard(self, *, human: bool, timeout: float | None = WRITE_LOCK_TIMEOUT_S) -> Iterator[None]:
@@ -2284,12 +2606,23 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 f"request Origin {origin!r} does not match this server; refusing"
             )
 
+    def _refuse_without_project(self, path: str, allowed: frozenset[str]) -> None:
+        """10.1: with no project served, every project endpoint answers 409
+        `no_project` -- before routing, so no handler ever sees the
+        placeholder root."""
+        if path in allowed:
+            return
+        served = self._served()
+        if served.no_project:
+            raise ProjectBlockedError(served.blocked or {"situation": NO_PROJECT_SITUATION})
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib's own method name)
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
             self._check_local_origin()
+            self._refuse_without_project(path, _NO_PROJECT_GET)
             if path == "/":
                 self._send_html(200, _app_html())
             elif path == "/canvas.js":
@@ -2321,7 +2654,8 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # answering even when the current project's own graph.db
                 # has gone missing mid-serve (that failure surfaces as the
                 # watcher's last_error, not as this endpoint erroring).
-                self._send_json(200, self.server.watcher.status_payload())
+                # 10.2/10.3: plus the full scan's progress and last result.
+                self._send_json(200, {**self.server.watcher.status_payload(), **self.server.scan_status()})
             elif path == "/api/canvas":
                 scope = (query.get("scope") or [None])[0]
                 served = self._served()
@@ -2392,6 +2726,7 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             # out; switch repoints the whole server), so this line is what
             # stands between them and a drive-by page's cross-origin fetch.
             self._check_local_origin()
+            self._refuse_without_project(parsed.path, _NO_PROJECT_POST)
             if parsed.path == "/api/open":
                 body = self._read_json_body_with_path()
                 payload = open_payload(self._project_root(), body["path"], bool(body.get("reveal", False)))
@@ -2426,7 +2761,45 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # which is the allow-list /api/projects/switch validates
                 # against, so a drive-by page must never be able to edit it.
                 body = self._read_json_body_with_path()
-                self._send_json(200, remove_project_payload(body["path"]))
+                served = self._served()
+                entry = remove_project_entry(body["path"])
+                payload = {"removed": body["path"]}
+                if is_served_entry(served, entry):
+                    # 10.4: removing the open project opens the next one,
+                    # or the no-project state.
+                    following = next_served_after_removal()
+                    self._switch_to(following)
+                    payload.update(
+                        current=None if following.no_project else str(following.root),
+                        project_id=following.project_id, blocked=following.blocked,
+                        no_project=following.no_project,
+                    )
+                self._send_json(200, payload)
+            elif parsed.path == "/api/projects/inspect":
+                # 10.2 step 2: look before writing (origin-checked above,
+                # like every endpoint that takes a path from the page).
+                self._send_json(200, inspect_payload(self._read_json_object()))
+            elif parsed.path == "/api/projects/add":
+                # 10.2 step 3: write, then open it as a switch does, then
+                # (a new folder) its first full scan in the background.
+                served, payload, scan = add_payload(self._read_json_object())
+                if served is not None:
+                    self._switch_to(served)
+                    if scan:
+                        try:
+                            self.server.start_scan(served)
+                        except ApiError as exc:  # the addition stands; the scan says why it did not start
+                            payload["scanning"] = False
+                            payload["scan_error"] = {"state": exc.state, "error": str(exc)}
+                self._send_json(200, payload)
+            elif parsed.path == "/api/projects/rescan":
+                # 10.3: the full scan of the served project, in the background.
+                self._read_json_object()
+                self.server.start_scan(self._served())
+                self._send_json(200, {"ok": True, "scanning": True, **self.server.scan_status()})
+            elif parsed.path == "/api/projects/rename":
+                # 10.4: the registry label only, never the folder.
+                self._send_json(200, rename_payload(self._read_json_object()))
             elif parsed.path == "/api/attempts/preview":
                 # Pure dry run (task V3 phase 3) -- but origin-checked like
                 # a write anyway (above), since its twin below mutates and
@@ -2544,8 +2917,21 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal server error"})
 
 
+# What answers with no project served (10.1): the page, the registry and the
+# engine's own state, and what changes the served project.
+_NO_PROJECT_GET = frozenset({"/", "/canvas.js", "/api/projects", "/api/engine", "/api/generation"})
+_NO_PROJECT_POST = frozenset({
+    "/api/projects/switch", "/api/projects/locate", "/api/projects/remove", "/api/projects/inspect",
+    "/api/projects/add", "/api/projects/rename", "/api/shutdown",
+})
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def build_server(
-    project_root: Path,
+    project_root: Path | None,
     port: int,
     watch_interval: float = project_watcher.DEFAULT_INTERVAL_SECONDS,
     served: ServedProject | None = None,
@@ -2555,13 +2941,14 @@ def build_server(
     the actual bound port back from `server_address[1]`. `watch_interval`
     is the auto-refresh watcher's polling period, injectable so tests can
     run a fast real-thread loop -- the watcher itself is created either
-    way but only serve() starts its thread."""
+    way but only serve() starts its thread. `project_root=None` with no
+    `served` starts in the no-project state (DESIGN.md 10.1)."""
     return RceHTTPServer(
         ("127.0.0.1", port), RceRequestHandler, project_root, watch_interval=watch_interval, served=served,
     )
 
 
-def serve(project_root: Path, port: int, open_browser: bool = True, served: ServedProject | None = None) -> None:
+def serve(project_root: Path | None, port: int, open_browser: bool = True, served: ServedProject | None = None) -> None:
     """`rce serve`'s entry point: validate the project, print the one
     startup line the task spec requires verbatim, optionally open a browser
     tab, then block serving requests until Ctrl+C. `_require_db` runs before
@@ -2580,9 +2967,12 @@ def serve(project_root: Path, port: int, open_browser: bool = True, served: Serv
     folder is gone -- does not stop the server: it serves the question
     (module docstring, "Project identity") and writes nothing."""
     if served is None:
-        served = served_for(Path(project_root))
+        served = no_project_served() if project_root is None else served_for(Path(project_root))
     try:
-        if served.blocked is None:
+        if served.no_project:
+            # 10.1, 10.5: no project yet -- the page offers 「添加项目…」.
+            print("RCE: no project yet -- the app offers to add one", file=sys.stderr)
+        elif served.blocked is None:
             _served_db(served)
         else:
             print(

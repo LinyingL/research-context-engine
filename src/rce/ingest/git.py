@@ -63,6 +63,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Connection
+from typing import Iterator
 
 from rce import db
 from rce.ingest import scan as scan_mod
@@ -308,11 +309,36 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
     is the one shared source of truth for the "data" category, see its
     definition above).
     """
-    repo_path = Path(repo_path)
-    output = _run_git(repo_path, ["ls-files", "-z"])
     inventory: dict[str, list[str]] = {
         "tex": [], "bib": [], "image": [], "py": [], "md": [], "r": [], "rmd": [], "data": [],
     }
+    for path, category in iter_tracked(repo_path):
+        if category is not None:
+            inventory[category].append(path)
+    return inventory
+
+
+def category_for(suffix: str) -> str | None:
+    """The inventory category of a lowercased file suffix, or None for a
+    file no extractor reads -- one rule for both inventories."""
+    if suffix in (".tex", ".bib", ".py", ".md", ".r", ".rmd"):
+        return suffix[1:]
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in DATA_EXTENSIONS:
+        return "data"
+    return None
+
+
+def iter_tracked(repo_path: str | Path) -> Iterator[tuple[str, str | None]]:
+    """Every file `git ls-files` tracks under `repo_path` that is present in
+    the working tree, as `(path, category or None)` -- what
+    `list_source_files` keeps the categorized part of, and what the
+    add-project preview (DESIGN.md 10.2) counts. Raises like `_run_git`
+    (`NotAGitRepositoryError` for a folder git does not know). Runs git
+    and `lexists` only; never opens a file."""
+    repo_path = Path(repo_path)
+    output = _run_git(repo_path, ["ls-files", "-z"])
     for path in output.split("\x00"):
         # No .strip(): `ls-files -z` entries are byte-exact, and leading or
         # trailing whitespace is a legal part of a filename.
@@ -331,24 +357,23 @@ def list_source_files(repo_path: str | Path) -> dict[str, list[str]]:
             # stuck in 「来源文件暂不可读」, `rce rebuild` and migration
             # refused) instead of what it is: not here -- ABSENT (9.6).
             continue
-        suffix = Path(path).suffix.lower()
-        if suffix == ".tex":
-            inventory["tex"].append(path)
-        elif suffix == ".bib":
-            inventory["bib"].append(path)
-        elif suffix in IMAGE_EXTENSIONS:
-            inventory["image"].append(path)
-        elif suffix == ".py":
-            inventory["py"].append(path)
-        elif suffix == ".md":
-            inventory["md"].append(path)
-        elif suffix == ".r":
-            inventory["r"].append(path)
-        elif suffix == ".rmd":
-            inventory["rmd"].append(path)
-        elif suffix in DATA_EXTENSIONS:
-            inventory["data"].append(path)
-    return inventory
+        yield path, category_for(Path(path).suffix.lower())
+
+
+def count_untracked(repo_path: str | Path, limit: int | None = None) -> tuple[int, bool]:
+    """How many files sit in the working tree untracked and not ignored
+    (`git ls-files --others --exclude-standard`) -- counted only, never
+    read: the scan does not read them, and the add-project preview says
+    so (DESIGN.md 10.2). Returns `(count, truncated)`; `limit` caps it."""
+    output = _run_git(Path(repo_path), ["ls-files", "--others", "--exclude-standard", "-z"])
+    count = 0
+    for path in output.split("\x00"):
+        if not path:
+            continue
+        if limit is not None and count >= limit:
+            return count, True
+        count += 1
+    return count, False
 
 
 def read_head_sha(repo_path: str | Path) -> str | None:
