@@ -2278,3 +2278,182 @@ positional path or as `--path`.
 - **RCE runs on Python 3.11 and on Linux as it says it does.** The path
   convention must not depend on a later argparse; naming the process that
   holds an index must work from `/proc` where there is no `lsof`.
+
+## Section 10 — Adding a project from the app (task V6)
+
+*Status: APPROVED FOR IMPLEMENTATION, 2026-10-07, at the researcher's
+request ("我需要一个手动增加新项目的功能"). This is the first piece of the
+fourth-phase plan's step 3, lowering the cost of getting a project into
+RCE. Sections 8.8 (product language and errors), 9.4 (identity) and 9.12
+apply throughout.*
+
+### 10.0 What is missing
+
+A folder becomes an RCE project only through the command line (`rce init`,
+then `rce ingest`, then `rce serve <path>`). The app can switch only among
+folders already registered, the switcher appears only once there are two,
+and the app never scans a project in full by itself — the watcher re-reads
+the attempt table, the record files and the step scripts when they change,
+nothing more. With an empty registry the engine refuses to start at all,
+so on a new machine `RCE.app` opens onto an error.
+
+### 10.1 Where it lives
+
+- **The project menu.** The project line in the header becomes one button,
+  「项目：<名称> ▾」, shown always, even with a single project. It opens a
+  small menu: the registered projects (the open one marked; one whose
+  folder cannot be found shown greyed as 「找不到文件夹」 with its own
+  「选择新位置…」); a rule; 「添加项目…」; 「重新扫描这个项目」;
+  「重命名显示名称…」; 「从列表中移除…」. It replaces the `<select>` and the
+  separate 「移除失效项目」 button.
+- **The native menu.** 文件 → 「添加项目… ⌘O」 (a whitelisted command,
+  `add-project`).
+- **No project yet.** With an empty registry the engine starts anyway, in a
+  no-project state, and the page shows only this: two sentences on what RCE
+  does (it reads a research folder's scripts, data and drafts, and keeps
+  the researcher's judgments about them), 「添加项目…」, and one line saying
+  that a project is simply the folder that holds a piece of research.
+
+### 10.2 Adding: choose, look, then write
+
+**1. Choose.** In the native shell, a folder panel (directories only,
+message 「选择要加入 RCE 的项目文件夹」) through the existing bridge, which
+gains a purpose (`add` | `locate`) that changes only the panel's message.
+In a plain browser, a path field (`~` is expanded).
+
+**2. Look before writing.** The page asks the engine what it sees
+(`POST /api/projects/inspect {path}`). Inspecting writes nothing anywhere,
+reads no file's contents and never makes a cloud file download: it lists
+the folder (or, for a git repository, asks git which files it tracks) and
+stats what it lists. The answer is exactly one of:
+
+| What the folder is | What the researcher is shown |
+|---|---|
+| already in the list | 「这个项目已经在列表里」 — 「切换过去」 |
+| an RCE project (`.rce/project.toml`) | its name and, from the identity check (9.4), what opening it means. Normal, moved, or no index on this machine: 「加入列表并打开」. A copy, a lost or unreadable identity, an original that cannot be checked: the 9.4 question and its answers, here; nothing — the registry included — is written until one is chosen |
+| an RCE project from before V5 | 「这是旧版 RCE 项目：加入后需要先迁移，才能记录判断」 — 「加入列表并打开」; the migration banner (9.5) follows |
+| a folder RCE has not seen | the preview below — 「加入并扫描」 / 「取消」 |
+| something that cannot be a project | why, in one sentence (below), and nothing to press but 「重新选择」 |
+
+**The preview** says, in numbers, what RCE would read — and these are the
+numbers the first scan will in fact read, computed by the same inventory
+the scan uses: scripts (`.py`, `.R`, `.Rmd`), data files, drafts (`.md`,
+`.tex`), images. For a git repository it says that RCE reads the files git
+tracks, how many those are, and how many more files sit in the folder
+untracked and will not be read (「另有 N 个未被 git 跟踪的文件不会被扫描」) —
+a project whose new scripts are not yet committed must not look emptier
+than it is without saying why. Files still in the cloud are counted and
+said to be read once downloaded. Above 5,000 files to scan the preview
+says so and asks a second time; size alone refuses nothing. It says what
+adding writes: a `.rce/` folder inside the project holding its identity
+file and a short README, and an index under `~/.rce` — nothing else in the
+folder is created or changed. The display name defaults to the folder's
+name and can be edited here.
+
+**Refusals**, each one sentence and no write:
+- not a folder, does not exist, cannot be read;
+- a top-level folder rather than a project: `/`, the home folder itself,
+  `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Library`, the iCloud Drive
+  root, a disk's root under `/Volumes`, and anything inside `/System`,
+  `/Library`, `/Applications`, `/usr`, `/bin`, `/sbin`, `/etc` — 「请选择
+  具体的项目文件夹，而不是「文稿」这样的总文件夹」 (matched exactly for the
+  top-level folders, by containment for the system ones);
+- the RCE home (`~/.rce`) or anything inside it;
+- inside a registered project, or containing one: 「这个文件夹在项目「X」
+  里面」 / 「这个文件夹里已经有项目「X」」 — the same files may belong to only
+  one project, otherwise two ledgers would judge the same links.
+
+**Waiting for the system.** Listing a folder under `~/Desktop`,
+`~/Downloads` or another protected place can be held by macOS until the
+researcher answers its permission prompt. Inspecting therefore has a
+deadline (5 seconds); past it the answer is 「正在等待系统授权访问这个
+文件夹……如果系统询问，请点“允许”」 and the page asks again until the listing
+returns. Nothing hangs.
+
+**3. Write** (`POST /api/projects/add {path, label, inspected}`). The
+request carries the token the inspection returned, which names what was
+seen (the kind, the identity if any, the counts); if the folder is no
+longer what was inspected, adding is refused and the page inspects again.
+For a new folder, in order: create `.rce/` and `.rce/project.toml`
+exclusively, the index under the new id, the README; register the folder
+with its display name; open it; then start the first full scan in the
+background. The page is usable at once and shows the scan's progress in
+the header (「正在扫描：<步骤>（<n>/<m>）」); the views fill when it ends.
+Files that cannot be read are reported as such (9.6) — a failed read is
+not a failed addition.
+
+### 10.3 Rescanning
+
+「重新扫描这个项目」 runs that same full scan — every source extractor, the
+attempt table and its check, the hand-drawn links, then the record
+applied — under the project lock, in the background, with the same
+progress line; one scan at a time per project (a second request says one is
+running). A project from before V5 is not rescanned until it is migrated
+(9.12). The command line already has this as `rce ingest`.
+
+### 10.4 The list
+
+- 「重命名显示名称…」 changes the registry label only — never the folder.
+- 「从列表中移除…」 removes the registry entry only. The confirmation says
+  that the folder, its `.rce/` records and its index stay where they are,
+  and that adding the folder again brings everything back. Removing the
+  open project opens the next one, or the no-project state.
+
+### 10.5 Command line
+
+`rce projects add <path> [--label L] [--yes]` (without `--yes`, prints the
+preview and writes nothing), `rce projects rename <path|id> <label>`, and
+the existing `rce projects list | remove`. `rce serve` with an empty
+registry starts in the no-project state instead of exiting.
+
+### 10.6 Safety
+
+These are the first endpoints that let the page name an arbitrary folder
+to write into. Every one of them (`inspect`, `add`, `rename`, `rescan`)
+runs `_check_local_origin` first. The chosen path is resolved, symlinks
+followed, and the resolved folder is the one checked against the refusals
+and the one written into. Adding writes only `.rce/` inside a folder that
+exists, and the index and registry under the RCE home. Inspecting reads
+directory listings and file metadata only, stops counting at 100,000
+entries and says so, and never follows a symlink out of the folder.
+
+### 10.7 The native shell
+
+The bridge's `choose-folder` message gains `purpose`; the panel's message
+is 「选择要加入 RCE 的项目文件夹」 for `add` and 「选择项目文件夹的新位置」 for
+`locate`; any other value is ignored. The 文件 menu gains 「添加项目… ⌘O」.
+This rebuilds the shell, and macOS will ask once more for access to the
+Documents folder (9.12).
+
+### 10.8 Acceptance
+
+1. **First launch.** With an empty registry the app opens on the no-project
+   page; 「添加项目…」 adds a folder; it scans with progress; the views fill.
+2. **A new folder, not a git repository.** The preview's counts equal what
+   the first scan reads. Afterwards the folder holds `.rce/project.toml` and
+   `.rce/README` and is otherwise unchanged — every other file's bytes and
+   modification time compared before and after; the registry has the
+   chosen display name; nothing is under review.
+3. **A git repository with untracked files.** The preview names the tracked
+   count and the untracked count, and the scan reads exactly the tracked.
+4. **Already in the list.** Offered 「切换过去」; nothing written.
+5. **A copy of a V5 project.** The 9.4 question in the add dialog; nothing
+   written, the registry included, until it is answered; each answer then
+   behaves as 9.4 says.
+6. **A project from before V5.** Registered and opened; the migration banner
+   shows; no scan writes into its old index.
+7. **Refusals.** `/`, the home folder, `~/Documents`, a file, a missing
+   path, `~/.rce`, a folder inside a registered project, a folder containing
+   one: each refused with its sentence; nothing written anywhere.
+8. **The folder changed between look and write.** A `project.toml` appears
+   after inspecting: adding is refused and the page inspects again.
+9. **The list.** Rename; remove another project; remove the open one: the
+   next opens, or the no-project page; the folders and their records are
+   untouched.
+10. **Rescan.** From the menu, with progress; a second request while one
+    runs is refused; refused on a project from before V5.
+11. **Origin.** Cross-origin and wrong-Host requests to every new endpoint:
+    403, and nothing written.
+12. **Waiting for the system.** An inspection whose listing blocks (made to
+    block in the test) answers with the waiting state within the deadline
+    and completes when the listing returns.
