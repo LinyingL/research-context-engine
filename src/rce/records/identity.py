@@ -249,6 +249,10 @@ def create_identity(
     if not root.is_dir():
         raise IdentityError(f"{root} is not an existing folder; not creating it")
     path = identity_path(root)
+    if os.path.islink(path.parent):
+        # Writing through it would put the identity wherever it points
+        # (DESIGN.md 10.6: never a symlink out of the folder).
+        raise IdentityError(f"{path.parent} is a symlink; not creating an identity through it")
     if os.path.lexists(path) or files.read_record(path).state is not RecordState.ABSENT:
         raise IdentityExistsError(f"{path} already exists; an identity is never overwritten")
     identity = ProjectIdentity(
@@ -298,13 +302,23 @@ def _link_exclusively(path: Path, data: bytes) -> None:
             pass
 
 
+class SnapshotInCloud(Exception):
+    """A snapshot of `project.toml` is still in the cloud and downloads are
+    suppressed (`paths.downloads_suppressed`): what it says cannot be known
+    without the download. Deliberately not an `OSError` -- a caller that
+    skips unreadable snapshots must not take this for "no snapshot"."""
+
+
 def identity_snapshots(project_root: str | Path) -> list[tuple[Path, ProjectIdentity]]:
     """The snapshots of `project.toml` in `.rce/backups/` that read as a
     valid identity, newest first (an unreadable one is skipped, never
-    guessed at)."""
+    guessed at). Inside `paths.downloads_suppressed()` a snapshot still in
+    the cloud is never opened: `SnapshotInCloud`."""
     root = Path(project_root)
     found = []
     for snap in reversed(files.snapshots(root, identity_path(root))):
+        if not paths.downloads_allowed() and paths.is_dataless(snap):
+            raise SnapshotInCloud(f"{snap} is in the cloud")
         try:
             text = snap.read_bytes().decode("utf-8")
             found.append((snap, parse_identity(text)))

@@ -183,7 +183,7 @@ def test_first_launch_add_scans_with_progress_as_the_page_drives_it(engine, tmp_
 
 _WORDING_RUNNER = r"""
 const block = require("fs").readFileSync(0, "utf8");
-eval(block + "; global.W = { groupedNumber, addPreviewText, addWritesText, scanProgressText, scanDoneText };");
+eval(block + "; global.W = { groupedNumber, addPreviewText, addWritesText, scanProgressText, scanDoneText, unreadableFilesText };");
 const calls = JSON.parse(process.argv[1]);
 process.stdout.write(JSON.stringify(calls.map(([fn, args]) => W[fn](...args))));
 """
@@ -279,8 +279,8 @@ def test_what_adding_writes_is_said_per_kind():
         ("addWritesText", [{"kind": "rce_project", "can_add": False, "situation": {"situation": "copy"}}]),
         ("addWritesText", [{"kind": "refused"}]),
     )
-    assert out[0] == ("加入会写入：这个文件夹里的 .rce/（项目身份文件 project.toml 和一份简短的 README），"
-                      "以及 ~/.rce 下的索引。文件夹里别的东西都不会被创建或改动。")
+    assert out[0] == ("加入会写入：这个文件夹里的 .rce/（项目身份文件 project.toml、它的一份备份 .rce/backups/，"
+                      "和一份简短的 README），以及 ~/.rce 下的索引。文件夹里别的东西都不会被创建或改动。")
     assert out[1].startswith("加入只会把它写进项目列表。迁移旧记录")
     assert out[2] == "加入只会把它写进项目列表。"
     assert "新位置" in out[3] and "重新建立" in out[4]
@@ -305,7 +305,9 @@ def test_the_scan_line_reads_step_and_count_then_done():
         "扫描完成，有 2 个文件暂时读不了", "扫描没有完成", "扫描没有完成",
     ]
     done = _function("showScanDone")
-    assert "openRecordsPanel();" in done  # 「…暂时读不了」 links to the record view
+    # 「…暂时读不了」 names the files behind 「详情」 and stays until dismissed
+    # (tests/test_v6_review_fixes.py)
+    assert "unreadableFilesText(last.unreadable_sources)" in done
     assert "setTimeout(hideScanChip, SCAN_DONE_MS)" in done
     assert "renderBlockingError(text, scanDoneText(last)" in done  # a scan that did not finish: 详情
 

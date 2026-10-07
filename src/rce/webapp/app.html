@@ -242,7 +242,7 @@ body {
   padding: 0.18rem 0.6rem; align-self: center; white-space: nowrap;
 }
 .scan-chip.done { color: var(--olive); border-color: var(--olive); background: var(--olive-soft); }
-.scan-chip.warn { color: var(--ink); border-color: var(--ochre); background: var(--ochre-soft); }
+.scan-chip.warn { color: var(--ink); border-color: var(--ochre); background: var(--ochre-soft); white-space: normal; max-width: 28rem; }
 .scan-chip.err { color: var(--ink); border-color: var(--clay); background: var(--clay-soft); white-space: normal; max-width: 28rem; }
 .scan-chip-link {
   font: inherit; color: inherit; background: none; border: none; padding: 0; cursor: pointer;
@@ -287,6 +287,8 @@ body {
 body.no-project .welcome { display: block; }
 body.no-project .view, body.no-project .notices, body.no-project #new-attempt-btn,
 body.no-project #records-btn { display: none !important; }
+/* 10.1: with no project the page shows only the welcome -- no view tabs. */
+body.no-project .tabs { display: none !important; }
 .welcome p { margin: 0 0 0.6rem; font-size: 0.95rem; }
 .welcome .welcome-what { color: var(--ink-soft); font-size: 0.84rem; margin-top: 1.1rem; }
 .welcome .btn { margin-top: 0.6rem; font-size: 0.88rem; padding: 0.45rem 1rem; }
@@ -1545,10 +1547,11 @@ async function loadProjects() {
   state.projects = projects;
   state.currentPath = current;
   state.currentId = currentId;
-  state.currentEntry = noProject ? null : (projects.find((p) => (currentId && p.id ? p.id === currentId : p.path === current)) || null);
+  state.currentBlocked = !!data.blocked;
+  state.currentEntry = noProject ? null : (projects.find(matchesCurrent) || null);
   // Registry label, else the folder's name -- never the raw path, which
   // lives on as the button's hover title.
-  state.projectLabel = noProject ? "" : (state.currentEntry ? state.currentEntry.label : basename(current));
+  state.projectLabel = noProject ? "" : (state.currentEntry ? state.currentEntry.label : (data.current_label || basename(current)));
   state.projectCount = projects.length;
   setProjectMenuLabel(state.projectLabel, current);
   setNoProject(noProject);
@@ -1566,9 +1569,17 @@ function projectMenuOpen() {
 }
 
 function isCurrentEntry(p) {
-  if (state.noProject) return false;
-  if (state.currentId && p.id) return p.id === state.currentId;
-  return p.path === state.currentPath;
+  return !state.noProject && matchesCurrent(p);
+}
+
+// Whether the registry entry `p` is the served folder (state.currentPath /
+// currentId / currentBlocked, as loadProjects just set them).
+function matchesCurrent(p) {
+  if (p.path === state.currentPath && (!state.currentId || !p.id || p.id === state.currentId)) return true;
+  // The same project at another spelling of its folder -- but never while
+  // a question is open: a copy carries its original's id from another
+  // folder, and is not that entry (10.2: it shows the name chosen for it).
+  return !state.currentBlocked && !!(state.currentId && p.id && p.id === state.currentId);
 }
 
 function menuItems() {
@@ -1628,7 +1639,7 @@ function renderProjectMenu() {
   if (!state.noProject && !state.currentEntry && state.currentPath) {
     // Served, but not in the list (a folder opened read-only from the add
     // dialog, say): said, so the menu never claims another one is open.
-    const it = pmItem(basename(state.currentPath), () => closeProjectMenu(true), {
+    const it = pmItem(state.projectLabel || basename(state.currentPath), () => closeProjectMenu(true), {
       role: "menuitemradio", mark: "✓", flag: "不在列表里", title: state.currentPath,
     });
     it.setAttribute("aria-checked", "true");
@@ -2067,8 +2078,9 @@ async function pollGeneration() {
 // -- The full scan's progress (DESIGN.md 10.2 step 3, 10.3; task V6) ----------
 // From the generation poll's `scanning` / `last_scan`: 「正在扫描：<步骤>
 // （n/m）」 while a scan runs; when one ends, a quiet 「扫描完成」 for a few
-// seconds -- or 「扫描完成，有 N 个文件暂时读不了」, a link to 记录 (9.2:
-// a failed read is not a failed addition) -- or, when it did not finish,
+// seconds -- or 「扫描完成，有 N 个文件暂时读不了」 with the files named
+// behind 「详情」, until dismissed (10.2: a failed read is not a failed
+// addition) -- or, when it did not finish,
 // its sentence with the engine's text behind 「详情」, until dismissed.
 // The views themselves reload on the generation bump the scan's end makes.
 
@@ -2121,11 +2133,23 @@ function showScanDone(last) {
     return;
   }
   if (last.ok) {
+    // 10.2: a failed read is not a failed addition -- but the files are
+    // named (behind 「详情」), and the line stays until dismissed.
     scanChip.classList.add("warn");
-    const link = mkButton(scanDoneText(last), "scan-chip-link", () => { hideScanChip(); openRecordsPanel(); });
-    link.title = "查看这个项目的记录";
-    scanChip.appendChild(link);
-    scanChipTimer = setTimeout(hideScanChip, SCAN_DONE_MS * 2);
+    const text = mk("span", "err-text", scanDoneText(last));
+    const files = unreadableFilesText(last.unreadable_sources);
+    const toggle = mkButton("详情", "err-detail-toggle", null);
+    toggle.setAttribute("aria-expanded", "false");
+    const detail = mk("span", "err-detail hidden", files);
+    toggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const open = detail.classList.toggle("hidden") === false;
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    const close = mkButton("×", "scan-chip-close", hideScanChip);
+    close.setAttribute("aria-label", "关闭");
+    close.title = "关闭";
+    scanChip.append(text, toggle, detail, close);
     return;
   }
   scanChip.classList.add("err");
@@ -4983,7 +5007,10 @@ function addPreviewText(p) {
 function addWritesText(insp) {
   if (!insp) return "";
   if (insp.kind === "new_folder") {
-    return "加入会写入：这个文件夹里的 .rce/（项目身份文件 project.toml 和一份简短的 README），以及 ~/.rce 下的索引。文件夹里别的东西都不会被创建或改动。";
+    return "加入会写入：这个文件夹里的 .rce/（项目身份文件 project.toml、它的一份备份 .rce/backups/，和一份简短的 README），以及 ~/.rce 下的索引。文件夹里别的东西都不会被创建或改动。";
+  }
+  if (insp.kind === "pre_v5" && insp.moves_graph) {
+    return "加入会把它写进项目列表；打开时，.rce/ 里的旧图谱 graph.db 会移到 ~/.rce 下（先复制并核对，再删除原文件），并在 .rce/ 里留一份简短的 README 说明去向。迁移旧记录要等你在页面上方确认之后才会进行。";
   }
   if (insp.kind === "pre_v5") {
     return "加入只会把它写进项目列表。迁移旧记录要等你在页面上方确认之后才会进行。";
@@ -5009,6 +5036,21 @@ function scanDoneText(last) {
   if (!last.ok) return last.message || "扫描没有完成";
   const n = Array.isArray(last.unreadable_sources) ? last.unreadable_sources.length : 0;
   return n ? "扫描完成，有 " + n + " 个文件暂时读不了" : "扫描完成";
+}
+
+// 10.2 / 9.6: which files the scan could not read, by name -- what the
+// scan chip's 「详情」 reveals. `unreadable_sources` entries are
+// "<extractor>: <file>"; a file read by two extractors is named once.
+function unreadableFilesText(sources) {
+  const files = [];
+  (Array.isArray(sources) ? sources : []).forEach((s) => {
+    const text = String(s);
+    const at = text.indexOf(": ");
+    const file = at >= 0 ? text.slice(at + 2) : text;
+    if (file && !files.includes(file)) files.push(file);
+  });
+  if (!files.length) return "";
+  return "读不了的文件：" + files.join("、") + "。它们恢复可读后，下次扫描会读到。";
 }
 // -- end of add-project wording
 

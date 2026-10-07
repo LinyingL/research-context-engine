@@ -116,8 +116,18 @@ class NotAGitRepositoryError(GitIngestError):
     `GitIngestError` to them."""
 
 
+# A folder's own `.git/config` can name a command git runs on read-only
+# calls: `core.fsmonitor` is executed by `ls-files` itself. RCE runs git on
+# folders it has only been asked to LOOK at (the add-project preview,
+# DESIGN.md 10.2 / 10.6) and on every scan, so it never lets the repository
+# pick a program to run: the hook is switched off for every call, and
+# `GIT_OPTIONAL_LOCKS=0` keeps git from refreshing `.git/index` on the way.
+HARDENING = ("-c", "core.fsmonitor=false")
+
+
 def _run_git(repo_path: Path, args: list[str]) -> str:
-    """Run `git <args>` and return stdout, decoded as UTF-8.
+    """Run `git <args>` and return stdout, decoded as UTF-8. Hardened
+    (`HARDENING`): no command the repository configures is executed.
 
     `encoding="utf-8", errors="surrogateescape"` (rather than `text=True`,
     which would decode using the locale's preferred encoding -- not
@@ -132,10 +142,11 @@ def _run_git(repo_path: Path, args: list[str]) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_path), *args],
+            ["git", *HARDENING, "-C", str(repo_path), *args],
             capture_output=True,
             encoding="utf-8",
             errors="surrogateescape",
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except FileNotFoundError as exc:
         raise GitIngestError(f"git executable not found: {exc}") from exc

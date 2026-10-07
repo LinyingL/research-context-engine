@@ -1519,12 +1519,15 @@ def _print_add_preview(insp: addproject.Inspection) -> None:
         if pv.large:
             print(f"  This is a large folder (more than {addproject.LARGE_THRESHOLD:,} files to scan).")
         print(
-            f"Adding writes .rce/ inside the folder (project.toml, a short README) and an index under "
+            f"Adding writes .rce/ inside the folder (project.toml, its snapshot in .rce/backups/, a short README) and an index under "
             f"{paths.rce_home() / paths.GRAPHS_DIRNAME}; nothing else in the folder is created or changed. "
             f"Then the first full scan runs."
         )
     elif insp.kind == addproject.PRE_V5:
         print("An RCE project from before V5: adding registers and opens it; record judgments after 'rce migrate'.")
+        if insp.moves_graph:
+            print(f"  Opening it moves its in-project .rce/{paths.DB_FILENAME} to {paths.legacy_graph_dir(insp.root)} "
+                  f"(copied and verified first) and writes .rce/README saying where it went.")
     elif insp.kind == addproject.RCE_PROJECT and insp.classification is not None:
         c = insp.classification
         if insp.can_add:

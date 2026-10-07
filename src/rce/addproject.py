@@ -12,11 +12,16 @@ listing has not come back within the deadline because macOS is holding it
 behind a permission prompt -- `waiting_permission`. It writes nothing
 anywhere. Of the folder it reads only directory listings, `lstat`, and git
 (`git ls-files`, counted); the one file it reads is RCE's own identity file
-`.rce/project.toml`, through the identity check, and not even that when it
-is still in the cloud (it is then reported as 9.4 reports it, without the
-download `classify` would ask for). It never follows a symlink out of the
-folder: the chosen path itself is resolved, symlinks followed (10.6), and
-the walk below it follows none.
+`.rce/project.toml` (and, as the identity check needs them, its snapshots
+in `.rce/backups/` and the identity file of a moved project's old home),
+and none of these when it is still in the cloud: the identity check runs
+inside `paths.downloads_suppressed()`, so it is reported as 9.4 reports
+it, without the download `classify` would ask for. Git runs hardened
+(`rce.ingest.git.HARDENING`): no command the folder's `.git/config` names
+is executed. It never follows a symlink out of the folder: the chosen
+path itself is resolved, symlinks followed (10.6), the walk below it
+follows none, and a `.rce` that is a symlink is refused before anything
+reads through it.
 
 The preview's counts are the scan's: the git inventory
 (`rce.ingest.git.iter_tracked`) when git knows the folder, the filesystem
@@ -39,7 +44,10 @@ engine serves it blocked and the answer goes through `POST
 /api/project/resolve`); a pre-V5 project -> registered; a new folder ->
 `rce init`'s own creation (`.rce/project.toml` exclusively, under the
 path-keyed project lock, the index under the new id, the README), then
-registered. Never the folder itself.
+registered. Never the folder itself. The folder written into is pinned
+by its (device, inode) at the inspection and checked again under the
+project lock just before the identity file is created: a folder swapped
+for a symlink in between is refused, nothing written.
 
 `start_scan(root)` / `rescan(root)` -- **the full scan** (10.3): the same
 calls `rce ingest` (every source extractor), `rce attempts --check` (when
@@ -122,6 +130,7 @@ REFUSAL_MESSAGES = {
     "rce_home": "这是 RCE 自己保存数据的文件夹，不能作为项目",
     "inside_project": "这个文件夹在项目「{label}」里面",
     "contains_project": "这个文件夹里已经有项目「{label}」",
+    "rce_link": "这个文件夹里的 .rce 是指向别处的链接，RCE 不会通过它读写",
 }
 
 # The preview's groups (10.2) over the inventory's categories.
@@ -201,6 +210,11 @@ class Inspection:
     entry: dict[str, Any] | None = None  # already_registered: the registry entry
     preview: Preview | None = None
     refusal: Refusal | None = None
+    # pre_v5: opening it moves its in-project `.rce/graph.db` out (8.10)
+    moves_graph: bool = False
+    # the folder's (st_dev, st_ino) when it was inspected (10.6: the folder
+    # checked is the folder written into)
+    pin: tuple[int, int] | None = None
     token: str = ""
 
     @property
@@ -250,14 +264,29 @@ class Inspection:
                 "project_label": self.refusal.project_label,
             },
             "writes": _writes(self),
+            "moves_graph": self.moves_graph,
             "inspected": self.token,
         }
 
 
+IDENTITY_SNAPSHOT = ".rce/backups/project.toml.<time>.toml"
+
+
 def _writes(insp: Inspection) -> list[str] | None:
-    """What adding writes (10.2: "It says what adding writes")."""
+    """What adding writes (10.2: "It says what adding writes"), opening
+    included: a new folder's identity file, its 9.12 snapshot and README;
+    a pre-V5 folder whose in-project graph opening moves out (8.10) loses
+    `.rce/graph.db` and gains the README saying where it went."""
     if insp.kind == NEW_FOLDER:
-        return [".rce/project.toml", ".rce/README", str(paths.rce_home() / paths.GRAPHS_DIRNAME / "<id>")]
+        return [
+            ".rce/project.toml", IDENTITY_SNAPSHOT, ".rce/README",
+            str(paths.rce_home() / paths.GRAPHS_DIRNAME / "<id>"),
+        ]
+    if insp.kind == PRE_V5 and insp.moves_graph:
+        return [
+            str(project_registry.registry_path()), ".rce/README",
+            f".rce/{paths.DB_FILENAME} -> {paths.rce_home() / paths.GRAPHS_DIRNAME / '<path hash>'}",
+        ]
     if insp.kind in (PRE_V5, RCE_PROJECT) and insp.can_add:
         return [str(project_registry.registry_path())]
     return None
@@ -280,6 +309,8 @@ def _token(insp: Inspection) -> str:
         "preview": insp.preview.payload() if insp.preview is not None else None,
         "refusal": insp.refusal.code if insp.refusal is not None else None,
         "refusal_label": insp.refusal.project_label if insp.refusal is not None else None,
+        "moves_graph": insp.moves_graph,
+        "pin": list(insp.pin) if insp.pin is not None else None,
     }
     data = json.dumps(seen, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hmac.new(_TOKEN_KEY, data, hashlib.sha256).hexdigest()
@@ -431,7 +462,36 @@ def _classify(root: Path) -> Classification:
         return Classification(
             Situation.UNREADABLE_ID, root, reason="identity_in_cloud", detail="the file is in the cloud",
         )
-    return records_situation.classify(root)
+    try:
+        with paths.downloads_suppressed():
+            return records_situation.classify(root)
+    except identity_mod.SnapshotInCloud as exc:
+        # No project.toml, and a snapshot of one still in the cloud: once an
+        # identity (9.12), so never a new folder; which one cannot be said
+        # without the download. Unreadable, like the file itself in the cloud.
+        return Classification(
+            Situation.UNREADABLE_ID, root, reason="identity_snapshot_in_cloud",
+            detail=f"no project.toml, and a snapshot of one is in the cloud ({exc})",
+        )
+
+
+def _rce_link(root: Path) -> bool:
+    """`.rce` is a symlink: reading or writing through it would leave the
+    folder (10.6). Refused whatever it points at."""
+    try:
+        return stat_module.S_ISLNK(os.lstat(root / paths.RCE_DIRNAME).st_mode)
+    except OSError:
+        return False
+
+
+def _pin_of(path: str | Path) -> tuple[int, int] | None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(st.st_mode):
+        return None
+    return (st.st_dev, st.st_ino)
 
 
 def _entry_folders(entries: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
@@ -453,13 +513,15 @@ def _inspect_now(requested: str, entries: list[dict[str, Any]]) -> Inspection:
     """The inspection itself, run to the end (in the worker thread)."""
     if not requested:
         return _refused(requested, "missing", detail="no path given")
+    if "\x00" in requested:
+        return _refused(requested, "missing", detail="the path contains a NUL character; no folder has such a name")
     chosen = Path(requested)
     try:
         resolved = chosen.resolve()
         st = os.stat(resolved)
     except FileNotFoundError:
         return _refused(requested, "missing", detail=f"{requested} does not exist")
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         return _refused(requested, "unreadable", detail=f"{requested}: {exc}")
     if not stat_module.S_ISDIR(st.st_mode):
         return _refused(requested, "not_a_folder", root=str(resolved), detail=f"{resolved} is not a folder")
@@ -473,6 +535,10 @@ def _inspect_now(requested: str, entries: list[dict[str, Any]]) -> Inspection:
         return _refused(requested, "unreadable", root=canonical, detail=f"{canonical}: {exc}")
     root = Path(canonical)
     name = root.name
+    if _rce_link(root):
+        return _refused(requested, "rce_link", root=canonical,
+                        detail=f"{root / paths.RCE_DIRNAME} is a symlink; RCE neither reads nor writes through it")
+    pin = _pin_of(root)
 
     registered = _entry_folders(entries)
     classification = _classify(root)
@@ -493,10 +559,42 @@ def _inspect_now(requested: str, entries: list[dict[str, Any]]) -> Inspection:
                             detail=f"{canonical} contains the registered project {folder}")
 
     if classification.situation is Situation.LEGACY:
-        return _sealed(Inspection(PRE_V5, requested, root=canonical, name=name, classification=classification))
+        return _sealed(Inspection(
+            PRE_V5, requested, root=canonical, name=name, classification=classification,
+            moves_graph=_moves_graph(root), pin=pin,
+        ))
     if classification.situation is not Situation.NOT_A_PROJECT:
-        return _sealed(Inspection(RCE_PROJECT, requested, root=canonical, name=name, classification=classification))
-    return _sealed(Inspection(NEW_FOLDER, requested, root=canonical, name=name, preview=_preview(root)))
+        return _sealed(Inspection(RCE_PROJECT, requested, root=canonical, name=name, classification=classification, pin=pin))
+    return _sealed(Inspection(NEW_FOLDER, requested, root=canonical, name=name, preview=_preview(root), pin=pin))
+
+
+def _moves_graph(root: Path) -> bool:
+    """Opening this pre-V5 folder moves its in-project `.rce/graph.db` out
+    (`paths.migrate_legacy_graph`, 8.10): the same conditions, stat only."""
+    try:
+        return (
+            any(key == paths.IN_PROJECT_SOURCE for key, _db in paths.legacy_sources(root))
+            and not paths.legacy_index_db_path(root).exists()
+        )
+    except OSError:
+        return False
+
+
+def _still_the_folder(insp: Inspection) -> None:
+    """Raise `AddRefused` unless the folder at `insp.root` is still the
+    directory inspected (same device and inode, not a symlink, spelled the
+    same when resolved) and its `.rce` is no symlink -- checked under the
+    project lock, just before the first write (10.6: the resolved folder
+    is the one checked and the one written into)."""
+    root = insp.root or ""
+    try:
+        resolved = os.path.realpath(root)
+    except (OSError, ValueError):
+        resolved = None
+    if insp.pin is None or _pin_of(root) != insp.pin or resolved is None or paths._canonical_path(resolved) != root:
+        raise _changed(insp, f"{root} is no longer the folder that was inspected; nothing written")
+    if _rce_link(Path(root)):
+        raise _changed(insp, f"{Path(root) / paths.RCE_DIRNAME} is now a symlink; nothing written")
 
 
 # -- the deadline (10.2 "Waiting for the system") -----------------------------------
@@ -656,6 +754,7 @@ def add(
             # 9.4: nothing -- the registry included -- is written until the
             # question is answered.
             return Added(insp.kind, root, c.project_id, chosen, None, False, False, insp, classification=c)
+        _still_the_folder(insp)
         try:
             opened = project_identity.open_project(root)
         except (project_identity.ProjectBlocked, project_identity.AnswerRefused) as exc:
@@ -665,11 +764,12 @@ def add(
         project_registry.register(root, opened.project_id, label=chosen)
         return Added(insp.kind, root, opened.project_id, chosen, _entry(opened.project_id, root), True, False, insp)
     if insp.kind == PRE_V5:
+        _still_the_folder(insp)
         project_registry.register(root, label=chosen)
         return Added(insp.kind, root, None, chosen, _entry(None, root), True, False, insp)
     assert insp.kind == NEW_FOLDER
     try:
-        result = project_identity.init_project(root)
+        result = project_identity.init_project(root, before_write=lambda: _still_the_folder(insp))
     except (
         project_identity.ProjectBlocked, project_identity.AnswerRefused,
         identity_mod.IdentityError, records_situation.WriteRefused,

@@ -668,6 +668,30 @@ _DOWNLOADS_REQUESTED: set[str] = set()
 _DOWNLOADS_LOCK = threading.Lock()
 
 
+_NO_DOWNLOADS = threading.local()
+
+
+@contextlib.contextmanager
+def downloads_suppressed() -> Iterator[None]:
+    """Within this block, on this thread, nothing asks macOS to bring a
+    file back from iCloud: `_request_download` does nothing, and readers
+    that would open a dataless file to get at it (`downloads_allowed()`
+    false) say "in the cloud" instead. For looking at a folder the
+    researcher has not added yet (DESIGN.md 10.2: inspecting "never makes
+    a cloud file download")."""
+    previous = getattr(_NO_DOWNLOADS, "on", False)
+    _NO_DOWNLOADS.on = True
+    try:
+        yield
+    finally:
+        _NO_DOWNLOADS.on = previous
+
+
+def downloads_allowed() -> bool:
+    """False inside `downloads_suppressed()` on this thread."""
+    return not getattr(_NO_DOWNLOADS, "on", False)
+
+
 def _request_download(path: Path) -> None:
     """Ask macOS to bring a dataless file back from iCloud WITHOUT blocking
     the caller: a daemon thread does the one `open()` + 1-byte read that
@@ -676,7 +700,10 @@ def _request_download(path: Path) -> None:
     graph, the download would never start, and 「图谱文件正在从云端下载…」
     would stay true forever. At most one such thread per path at a time;
     a failure is logged, never raised -- the next first-touch simply asks
-    again."""
+    again. Does nothing inside `downloads_suppressed()`."""
+    if not downloads_allowed():
+        logger.debug("not asking for %s from iCloud: downloads are suppressed here", path)
+        return
     key = str(path)
     with _DOWNLOADS_LOCK:
         if key in _DOWNLOADS_REQUESTED:

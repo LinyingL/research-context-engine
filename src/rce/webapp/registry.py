@@ -249,7 +249,8 @@ def register(path: Path, project_id: str | None = None, *, label: str | None = N
     """Record `path` (resolved to absolute) as the most recently served
     project. Keyed by `project_id` when the project has one (an entry with
     that id is moved to the front and follows the folder: a new path gets
-    the new basename as its label; an id-less entry at the same path is
+    the new basename as its label unless the label was chosen
+    (`_label_after_move`); an id-less entry at the same path is
     replaced), else by path as before V5. Idempotent.
 
     A registry file that exists but cannot be read makes this a logged
@@ -269,6 +270,8 @@ def register(path: Path, project_id: str | None = None, *, label: str | None = N
             entries.remove(entry)
         if existing is not None and existing["path"] == resolved:
             entry = existing
+        elif existing is not None:
+            entry = {"id": project_id, "path": resolved, "label": _label_after_move(existing, resolved)}
         else:
             entry = {"id": project_id, "path": resolved, "label": Path(resolved).name}
         if label is not None:
@@ -338,8 +341,8 @@ def rename(id_or_path: str, label: str) -> dict[str, str | None] | None:
 
 
 def relocate(project_id: str, path: Path) -> bool:
-    """A moved project (9.4, adoption): its entry's path and label follow
-    the folder, in place -- no recency bump, since adoption happens on any
+    """A moved project (9.4, adoption): its entry's path and (unless one was
+    chosen, `_label_after_move`) label follow the folder, in place -- no recency bump, since adoption happens on any
     entry point, not only on a serve. Returns whether an entry changed.
     An id-less entry at the new path is replaced by it."""
     resolved = str(Path(path).resolve())
@@ -351,11 +354,22 @@ def relocate(project_id: str, path: Path) -> bool:
         stale = [e for e in entries if e.get("id") is None and e["path"] == resolved]
         for entry in stale:
             entries.remove(entry)
+        existing["label"] = _label_after_move(existing, resolved)
         existing["path"] = resolved
-        existing["label"] = Path(resolved).name
         return True
 
     return _update(change)
+
+
+def _label_after_move(entry: dict, new_path: str) -> str:
+    """The label of an entry whose folder moved to `new_path`: a name the
+    researcher chose (「重命名显示名称…」 or the add dialog, 10.4 -- the
+    label only, never undone by the folder moving) stays; a label that was
+    only the old folder's name follows the folder (9.4)."""
+    label = entry.get("label")
+    if not label or label == Path(entry["path"]).name:
+        return Path(new_path).name
+    return label
 
 
 def find(project_id: str) -> dict[str, str | None] | None:

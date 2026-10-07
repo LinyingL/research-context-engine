@@ -449,6 +449,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1362,6 +1363,9 @@ def projects_payload(current: Path | ServedProject) -> dict[str, Any]:
         "projects": projects,
         "current": None if served.no_project else str(served.root),
         "current_id": served.project_id,
+        # The served folder's display name when it is not (yet) in the list:
+        # the one chosen in the add dialog while its question is open.
+        "current_label": None if served.no_project else served.label,
         "no_project": served.no_project,
         "blocked": served.blocked,
         "read_only": served.read_only,
@@ -1460,7 +1464,9 @@ def locate_payload(body: dict[str, Any]) -> tuple[ServedProject, dict[str, Any]]
         err.extra = {"found": found.payload()}
         raise err
     served = served_for(root, expected_id=project_id, label=entry["label"], register=True)
-    return served, {"current": str(root), "label": root.name, "project_id": project_id, "blocked": served.blocked}
+    # The entry as the move left it: a chosen display name stays (10.4).
+    label = (project_registry.find(project_id) or entry)["label"]
+    return served, {"current": str(root), "label": label, "project_id": project_id, "blocked": served.blocked}
 
 
 _ANSWERS = {
@@ -1507,6 +1513,11 @@ def resolve_payload(served: ServedProject, body: dict[str, Any]) -> tuple[Served
     except records_situation.WriteRefused as exc:
         raise AnswerRefusedError(str(exc)) from exc
     new_served = served_for(served.root, register=True, label=served.label)
+    if served.adding and new_served.blocked is not None:
+        # The answer led to a second question (a restored identity that is
+        # a copy, say): still the add dialog's folder, so its answer, too,
+        # registers it under the name chosen there.
+        new_served = dataclasses.replace(new_served, adding=True)
     if served.adding and served.label and new_served.blocked is None and new_served.project_id is not None:
         # 10.2: a folder added from the app, whose question this answered,
         # is registered under the display name chosen in the add dialog.

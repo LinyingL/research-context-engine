@@ -310,11 +310,19 @@ class Initialized:
     readme: Path
 
 
-def init_project(project_root: str | Path, *, probes: Probes | None = None) -> Initialized:
+def init_project(
+    project_root: str | Path,
+    *,
+    probes: Probes | None = None,
+    before_write: Callable[[], None] | None = None,
+) -> Initialized:
     """`rce init`: create `.rce/project.toml` (exclusively) and the index
     under the id; idempotent on a project that already has one. A pre-V5
     folder is refused (`AnswerRefused`): giving it an id would strand its
-    judgments in the old index, and migration is an explicit act (9.5)."""
+    judgments in the old index, and migration is an explicit act (9.5).
+    `before_write` runs under the project lock just before the identity
+    file is created, and may raise to stop it (adding from the app checks
+    there that the folder is still the one inspected, 10.6)."""
     root = Path(project_root)
     c = classify(root, probes=probes)
     if c.blocked:
@@ -329,6 +337,8 @@ def init_project(project_root: str | Path, *, probes: Probes | None = None) -> I
     if c.situation is Situation.NOT_A_PROJECT:
         with project_lock(root, None):
             c = _reclassify_same(root, c, probes)
+            if before_write is not None:
+                before_write()
             ident = identity.create_identity(root)
             created_identity = True
             with project_lock(root, ident.id):
@@ -359,7 +369,8 @@ def _git_tracks(project_root: Path, rel: str) -> bool:
     git, no repository, or the file is untracked)."""
     try:
         result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", rel], cwd=project_root,
+            # Never the repository's own fsmonitor hook (rce.ingest.git.HARDENING).
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", rel], cwd=project_root,
             capture_output=True, timeout=10, check=False,
         )
     except (OSError, subprocess.SubprocessError):
