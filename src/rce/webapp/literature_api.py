@@ -131,11 +131,17 @@ def citations_payload(conn: Connection, root: Path) -> dict[str, Any]:
             for t in c["targets"]:
                 node = t["node"]
                 # A candidate's links: what 确认 / 否决 write (one ledger entry each).
-                t["links"] = [
+                # A link another citation of the same section or claim resolved
+                # by an identifier (`auto`: a DOI, the draft's one entry) is
+                # that citation's, not this candidate's: links are keyed
+                # (from, reference), so a verdict here would overrule it.
+                own = [f for f in froms if (f, node) in statuses] if candidates else []
+                t["linked_by_identifier"] = any(statuses[(f, node)] == "auto" for f in own)
+                t["links"] = [] if t["linked_by_identifier"] else [
                     {"src": f, "dst": node, "type": "cites", "extractor": citations_ingest.EXTRACTOR,
                      "status": statuses[(f, node)]}
-                    for f in froms if (f, node) in statuses
-                ] if candidates else []
+                    for f in own
+                ]
                 t["judged"] = _judged(t["links"]) if candidates else None
                 t["doi_url"] = doi_url(t["doi"]) if t.get("doi") else None
                 key = t.get("zotero_key")

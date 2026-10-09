@@ -309,6 +309,64 @@ def test_fetch_runs_no_hook_and_refuses_a_repository_that_names_a_program(tmp_pa
     assert not marker.exists()
 
 
+def test_state_without_a_fetch_is_dated_by_the_push_or_said_never_fetched(tmp_path, stand_in, linked):
+    """11.5 scenario 2 (review fix): refs a `push -u` wrote, then a local
+    commit -> 「本地领先 1 个提交，落后 0 个（<日期> 推送）」, dated, never
+    passed off as a fetch; remote-tracking refs nothing dated (written with
+    reflogs off) -> 「还没有从 GitHub 获取过」; a clone is a fetch."""
+    _git(linked, "commit", "-q", "--allow-empty", "-m", "local")
+    st = github.state(linked)
+    assert st["fetched_at"] is None and st["known_by"] == "push"
+    assert st["message"].startswith("本地领先 1 个提交，落后 0 个（") and st["message"].endswith(" 推送）")
+
+    quiet = tmp_path / "quiet"
+    quiet.mkdir()
+    _git(quiet, "init", "-q", "-b", "main")
+    _git(quiet, "config", "core.logAllRefUpdates", "false")
+    _git(quiet, "remote", "add", "origin", GITHUB_URL)
+    _git(quiet, "fetch", "-q", "origin")
+    (quiet / ".git" / "FETCH_HEAD").unlink()
+    _git(quiet, "reset", "-q", "--hard", "origin/main")
+    _git(quiet, "branch", "-q", "--set-upstream-to", "origin/main")
+    st = github.state(quiet)
+    assert st["commit"] is not None and st["known_at"] is None
+    assert st["message"] == "还没有从 GitHub 获取过"
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", GITHUB_URL, str(clone)], check=True, capture_output=True)
+    st = github.state(clone)
+    assert st["known_by"] == "fetch" and st["message"] == "与 GitHub 一致"
+
+
+def test_fetch_refuses_a_program_named_in_the_worktree_config(tmp_path, stand_in, linked):
+    """11.5 scenario 2 / 11.2 (review fix): `.git/config.worktree`, which git
+    applies once `extensions.worktreeConfig` is set, is the repository's own
+    config too -- an upload-pack (which the stand-in's local transport would
+    run) or an ssh command named there is refused and never runs; so is one
+    in a file `.git/config` includes."""
+    marker = tmp_path / "ran"
+    script = tmp_path / "evil.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\nexec git-upload-pack \"$@\"\n")
+    script.chmod(0o755)
+    _git(linked, "config", "extensions.worktreeConfig", "true")
+    for key in ("remote.origin.uploadpack", "core.sshCommand"):
+        _git(linked, "config", "--worktree", key, str(script))
+        assert "--local" not in github.OWN_CONFIG_ARGS
+        with pytest.raises(github.GitHubError) as refused:
+            github.fetch(linked)
+        assert refused.value.code == "unsafe_config" and key.lower() in refused.value.detail
+        _git(linked, "config", "--worktree", "--unset", key)
+    included = tmp_path / "included.cfg"
+    included.write_text(f'[remote "origin"]\n\tuploadpack = {script}\n')
+    _git(linked, "config", "--local", "include.path", str(included))
+    with pytest.raises(github.GitHubError) as refused:
+        github.fetch(linked)
+    assert refused.value.code == "unsafe_config"
+    assert not marker.exists()
+    # The researcher's own (global) settings still apply: they are not refused.
+    assert github._program_keys(linked) == ["remote.origin.uploadpack"]
+
+
 # -- the server: 11.2's endpoints and the file panel --------------------------------------
 
 

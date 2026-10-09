@@ -2359,7 +2359,9 @@ def cmd_citations(args: argparse.Namespace) -> int:
     print(f"DOI lookup online: {'on' if rep['lookup']['enabled'] else 'off'}")
     t = rep["totals"]
     print(f"{t['citations']} citation(s): {t['resolved']} resolved, {t['pending']} with candidates to confirm, "
-          f"{t['unresolved']} not found" + (f"; {t['unreadable']} draft(s) unreadable" if t["unreadable"] else ""))
+          f"{t['unresolved']} not found"
+          + (f", {t['unanchored']} before the first heading (not linked)" if t["unanchored"] else "")
+          + (f"; {t['unreadable']} draft(s) unreadable" if t["unreadable"] else ""))
     for draft in rep["drafts"]:
         if not draft["readable"]:
             print(f"  {draft['file']}: not read")
@@ -2368,7 +2370,8 @@ def cmd_citations(args: argparse.Namespace) -> int:
         if not c["citations"]:
             continue
         print(f"  {draft['file']}: {c['citations']} citation(s), {c['resolved']} resolved, {c['pending']} pending, "
-              f"{c['unresolved']} not found" + (f"; reference list: {draft['entries']} entries" if draft["reference_list"] else ""))
+              f"{c['unresolved']} not found" + (f", {c['unanchored']} not linked" if c["unanchored"] else "")
+              + (f"; reference list: {draft['entries']} entries" if draft["reference_list"] else ""))
         for item in draft["citations"]:
             if item["state"] == "unresolved":
                 print(f"      line {item['line']}: {item['text']}")

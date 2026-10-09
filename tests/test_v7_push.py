@@ -97,7 +97,8 @@ if args[:2] == ["auth", "status"]:
     sys.stdout.write("github.com\n  ✓ Logged in to github.com account rce-test (keyring)\n  - Token: gho_************************************\n")
     sys.exit(0)
 if args[:2] == ["repo", "create"]:
-    full = args[2]
+    assert args[-2] == "--", args  # the name only after `--`: never an option
+    full = args[-1]
     owner, name = full.split("/", 1)
     src = args[args.index("--source") + 1]
     root = os.environ["GH_DOUBLE_ROOT"]
@@ -300,7 +301,7 @@ def test_no_remote_a_private_repository_is_requested_then_pushed(unlinked, gh_do
     calls = _gh_argvs(recorded["gh_log"])
     assert calls == [
         ["auth", "status", "--hostname", "github.com"],
-        ["repo", "create", "rce-test/rmb-hysteresis", "--private", "--source", str(unlinked), "--remote", "origin"],
+        ["repo", "create", "--private", "--source", str(unlinked), "--remote", "origin", "--", "rce-test/rmb-hysteresis"],
     ]
     after = created["plan"]
     assert after["remote"]["owner"] == "rce-test" and after["set_upstream"] and after["can_push"]
@@ -660,7 +661,7 @@ def test_cli_push_creates_a_private_repository_only_when_told(unlinked, gh_doubl
     assert cli.main(["github", "push", str(unlinked), "--create-repo", "rmb-hysteresis", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "Created the private repository rce-test/rmb-hysteresis" in out and "Pushed 1 commit(s) to origin/main." in out
-    assert ["repo", "create", "rce-test/rmb-hysteresis", "--private", "--source", str(unlinked), "--remote", "origin"] in _gh_argvs(recorded["gh_log"])
+    assert ["repo", "create", "--private", "--source", str(unlinked), "--remote", "origin", "--", "rce-test/rmb-hysteresis"] in _gh_argvs(recorded["gh_log"])
 
 
 def test_cli_push_of_a_folder_that_is_not_a_repository_explains(tmp_path, monkeypatch, capsys):
@@ -799,3 +800,82 @@ def test_commit_records_refuses_a_repository_naming_a_filter_program(stand_in, l
         githubpush.commit_records(linked)
     assert refused.value.code == "unsafe_config"
     assert _git(linked, "rev-parse", "HEAD").strip() == head
+
+
+# -- review fixes (V7): nothing the folder names runs, names never options ------------
+
+
+def _logging_script(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    log = tmp_path / f"{name}.log"
+    script = tmp_path / f"{name}.sh"
+    script.write_text(f"#!/bin/sh\necho \"ran $*\" >> '{log}'\ncat\n")
+    script.chmod(0o755)
+    return script, log
+
+
+def test_worktree_config_programs_refuse_the_push_and_the_records_commit(tmp_path, stand_in, linked, recorded):
+    """11.5 scenario 3 / 11.2 (review fix): a program named in
+    `.git/config.worktree` (applied once `extensions.worktreeConfig` is
+    set) blocks the push like one in `.git/config`, and a filter named
+    there refuses the records commit -- the program never runs."""
+    script, log = _logging_script(tmp_path, "worktree")
+    _commit(linked, "b.py", "b\n", "b")
+    _git(linked, "config", "extensions.worktreeConfig", "true")
+    _git(linked, "config", "--worktree", "core.sshCommand", str(script))
+    _refused(linked, "unsafe_config", stand_in, recorded)
+    _git(linked, "config", "--worktree", "--unset", "core.sshCommand")
+
+    _git(linked, "config", "--worktree", "filter.x.clean", f"{script} %f")
+    (linked / ".git" / "info").mkdir(exist_ok=True)
+    (linked / ".git" / "info" / "attributes").write_text("* filter=x\n")
+    (linked / ".rce").mkdir()
+    (linked / ".rce" / "rec.json").write_text("{}\n")
+    head = _git(linked, "rev-parse", "HEAD").strip()
+    with pytest.raises(githubpush.PushError) as refused:
+        githubpush.commit_records(linked)
+    assert refused.value.code == "unsafe_config"
+    assert _git(linked, "rev-parse", "HEAD").strip() == head
+    assert not log.exists()
+
+
+def test_planning_runs_no_filter_the_repository_names(tmp_path, stand_in, linked, recorded):
+    """11.5 scenario 3 / 11.2 (review fix): opening the push dialog runs
+    `git status`, which would run a clean filter named by the repository's
+    own config (`.git/config` or `.git/config.worktree`) and by
+    `.gitattributes` on a file whose stat changed -- RCE switches those
+    filters off; the plan still counts the changed file."""
+    script, log = _logging_script(tmp_path, "clean")
+    _git(linked, "config", "filter.x.clean", f"{script} %f")
+    _git(linked, "config", "filter.x.process", str(script))
+    _git(linked, "config", "filter.x.required", "true")
+    _git(linked, "config", "extensions.worktreeConfig", "true")
+    _git(linked, "config", "--worktree", "filter.y=z.clean", f"{script} %f")
+    (linked / ".gitattributes").write_text("*.py filter=x\n*.md filter=y=z\n")
+    os.utime(linked / "a.py", (1577836800, 1577836800))  # stat dirty, content unchanged
+    (linked / "数据 说明.md").write_text("# 说明（改）\n")
+    plan = githubpush.plan(linked)
+    assert not log.exists()
+    assert plan["uncommitted"] == 2  # the changed draft and the new .gitattributes
+    assert githubpush._filters_off(linked) == (
+        ("filter.x.clean", ""), ("filter.x.smudge", ""), ("filter.x.process", ""), ("filter.x.required", "false"),
+        ("filter.y=z.clean", ""), ("filter.y=z.smudge", ""), ("filter.y=z.process", ""), ("filter.y=z.required", "false"),
+    )
+
+
+def test_a_repository_name_is_never_read_as_an_option(unlinked, gh_double, monkeypatch, recorded):
+    """11.5 scenario 3 (review fix): names starting with `-` (`--push`,
+    `--public`, `-h`) or `.` are refused; and when `gh auth status` names
+    no account, the name still reaches gh only after `--`."""
+    plan = githubpush.plan(unlinked)
+    for bad in ("--push", "--public", "-h", "-x", ".x"):
+        assert not githubpush.valid_repo_name(bad)
+        with pytest.raises(githubpush.PushError) as refused:
+            githubpush.create_repo(unlinked, bad, plan["token"])
+        assert refused.value.code == "invalid_name"
+    assert _gh_argvs(recorded["gh_log"]) == []
+    monkeypatch.setattr(githubpush, "gh_login", lambda: {"available": True, "logged_in": True, "account": None})
+    with pytest.raises(githubpush.PushError):
+        githubpush.create_repo(unlinked, "plain-name", plan["token"])  # the double needs owner/name
+    [argv] = _gh_argvs(recorded["gh_log"])
+    assert argv == ["repo", "create", "--private", "--source", str(unlinked), "--remote", "origin", "--", "plain-name"]
+    assert _pushes(recorded) == []

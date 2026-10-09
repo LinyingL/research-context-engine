@@ -496,13 +496,178 @@ def test_11_5_5_the_request_carries_only_the_doi(monkeypatch):
         def read(self):
             return b'{"message": {}}'
 
-    def fake_urlopen(request, timeout):
-        seen.append((request.full_url, request.get_method(), request.data, dict(request.header_items()), timeout))
-        return Answer()
+    class Opener:
+        def open(self, request, timeout):
+            seen.append((request.full_url, request.get_method(), request.data, dict(request.header_items()), timeout))
+            return Answer()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    def no_urlopen(*a, **k):
+        raise AssertionError("the lookup goes through the redirect-restricted opener only")
+
+    monkeypatch.setattr(literature, "_OPENER", Opener())
+    monkeypatch.setattr(urllib.request, "urlopen", no_urlopen)
     literature._fetch_crossref(literature.crossref_url("10.2307/1884852"), 10.0)
     assert seen == [("https://api.crossref.org/works/10.2307/1884852", "GET", None, {}, 10.0)]
+
+
+
+# -- review fixes (V7): DOI recall and precision, the lookup's network ---------------------
+
+
+@pytest.mark.parametrize("text, dois", [
+    # LaTeX: braces and backslashes end a DOI (the link text never joins it)
+    ("\\url{https://doi.org/10.2307/1884852}", ["10.2307/1884852"]),
+    ("\\doi{10.2307/1884852}", ["10.2307/1884852"]),
+    ("\\href{https://doi.org/10.1257/jep.27.1.173}{Barberis}", ["10.1257/jep.27.1.173"]),
+    ("doi:10.1000/abc\\\\", ["10.1000/abc"]),
+    # right after Chinese prose
+    ("…DOI为10.2478/foli-2023-0028。", ["10.2478/foli-2023-0028"]),
+    ("见10.1000/abc", ["10.1000/abc"]),
+    ("DOI是10.1000/abc。", ["10.1000/abc"]),
+    # only percent-encoded, in a URL's query
+    ("aeaweb.org/articles?id=10.1257%2Faer.20160216&x=1", ["10.1257/aer.20160216"]),
+    ("https://www.aeaweb.org/articles?id=10.1257%2Fjep.31.3.29", ["10.1257/jep.31.3.29"]),
+    # a remark in brackets after the DOI is not part of it; a DOI's own brackets are
+    ("10.2307/2390654(JSTOR)、10.2307/2088594(SAGE)", ["10.2307/2390654", "10.2307/2088594"]),
+    ("10.1016/S0022-1996(00)00067-X).", ["10.1016/s0022-1996(00)00067-x"]),
+    ("(see 10.1016/S0140-6736(97)11096-0)", ["10.1016/s0140-6736(97)11096-0"]),
+    # an Oxford Academic URL's article number is not part of the DOI
+    ("academic.oup.com/restud/advance-article/doi/10.1093/restud/rdag011/8501247", ["10.1093/restud/rdag011"]),
+    # still not glued to a Latin word or a longer number
+    ("x10.1000/abc 1.10.1000/a", []),
+])
+def test_11_5_5_review_doi_recall_and_precision(text, dois):
+    """11.5 #5 (review fix): every DOI found, normalised to one that exists."""
+    found = literature.find_dois(text)
+    assert [d for _s, _e, d in found] == dois
+    for start, end, doi in found:
+        assert "%" in text[start:end] or text[start:end].lower() == doi
+
+
+def test_11_5_5_review_latex_link_text_never_reaches_crossref(tmp_path, monkeypatch):
+    """11.5 #5 (review fix): a .tex draft's `\\url{}`, `\\doi{}` and
+    `\\href{}{}` give the plain DOIs -- one node each, the same as in a .md
+    draft -- and only those DOIs are sent once the lookup is on."""
+    (tmp_path / "paper.tex").write_text(
+        "\\section{Intro}\n"
+        "See \\url{https://doi.org/10.2307/1884852} and \\doi{10.2307/1884852}.\n"
+        "Also \\href{https://doi.org/10.1257/jep.27.1.173}{Barberis}.\n",
+        encoding="utf-8",
+    )
+    draft = C.parse_draft(tmp_path, "paper.tex")
+    assert sorted({c.doi for c in draft.citations}) == ["10.1257/jep.27.1.173", "10.2307/1884852"]
+    rec = Recorder()
+    monkeypatch.setattr(literature, "FETCH", rec)
+    literature.set_doi_lookup(True)
+    literature.lookup_dois(C.dois_to_describe(C.resolve(draft, literature.ZoteroLibrary(None, literature.LIBRARY_ABSENT))))
+    assert sorted(rec.urls) == [
+        "https://api.crossref.org/works/10.1257/jep.27.1.173", "https://api.crossref.org/works/10.2307/1884852",
+    ]
+
+
+def _serve(handler_cls):
+    import http.server
+    import threading
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_11_5_5_review_a_redirect_elsewhere_is_never_followed(monkeypatch):
+    """11.5 #5 (review fix): the lookup follows a redirect only to
+    https://api.crossref.org; one to http:// (or any other host) is not
+    followed -- the DOI never reaches it -- and is a failure asked again
+    later, not "not found"."""
+    import http.server
+
+    landed = []
+
+    class B(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            landed.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"message": {"title": ["evil"]}}')
+
+        def log_message(self, *a):
+            pass
+
+    b = _serve(B)
+
+    class A(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            target = f"http://127.0.0.1:{b.server_port}/landed{self.path}" if "ftp" not in self.path else "ftp://127.0.0.1/x"
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    a = _serve(A)
+    monkeypatch.setattr(literature, "_OPENER", urllib.request.build_opener(literature._CrossrefRedirectsOnly()))
+    try:
+        for path in ("/works/10.1234/abc", "/works/ftp"):
+            with pytest.raises(literature.LookupFailed) as failed:
+                literature._fetch_crossref(f"http://127.0.0.1:{a.server_port}{path}", 5)
+            assert not failed.value.network and "302" in str(failed.value)
+        assert landed == []
+    finally:
+        a.shutdown()
+        b.shutdown()
+
+
+def test_11_5_5_review_a_reply_cut_off_is_a_failure_and_never_fails_the_scan(tmp_path, monkeypatch):
+    """11.5 #5 (review fix): a reply cut off mid-body
+    (`http.client.IncompleteRead`) is a network failure; any other error of
+    the lookup ends this scan's lookups -- retried later -- and the scan
+    finishes."""
+    import http.client
+    import http.server
+
+    class Cut(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"message": ')
+
+        def log_message(self, *a):
+            pass
+
+    cut = _serve(Cut)
+    monkeypatch.setattr(literature, "_OPENER", urllib.request.build_opener(literature._CrossrefRedirectsOnly()))
+    try:
+        with pytest.raises(literature.LookupFailed) as failed:
+            literature._fetch_crossref(f"http://127.0.0.1:{cut.server_port}/works/10.1234/abc", 5)
+        assert failed.value.network
+    finally:
+        cut.shutdown()
+
+    calls = []
+
+    def broken(url, timeout):
+        calls.append(url)
+        raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr(literature, "FETCH", broken)
+    literature.set_doi_lookup(True)
+    assert literature.lookup_dois(["10.1/aaaa", "10.2/bbbb"]) == {}
+    assert len(calls) == 1 and not literature.cache_path().exists()
+    (tmp_path / "paper.md").write_text("# 一\n\n见 doi:10.1234/aaaa。\n", encoding="utf-8")
+    assert cli.main(["init", str(tmp_path)]) == 0
+    assert cli.main(["ingest", str(tmp_path)]) == 0  # the scan finished
+    assert calls[-1] == "https://api.crossref.org/works/10.1234/aaaa"
+    assert [e[1] for e in _edges(tmp_path)] == ["ref:doi:10.1234/aaaa"]
+
+    def unexpected(url, timeout):
+        calls.append(url)
+        raise RuntimeError("a stand-in's own error")
+
+    monkeypatch.setattr(literature, "FETCH", unexpected)
+    assert cli.main(["ingest", str(tmp_path)]) == 0
+    assert calls[-1] == "https://api.crossref.org/works/10.1234/aaaa"
 
 
 # -- the graph -----------------------------------------------------------------------------------------
@@ -553,7 +718,8 @@ def test_11_5_5_graph_nodes_edges_statuses_and_basis(tmp_path, zotero):
     assert (sec, "ref:entry:paper.md#2") in edges  # Simon 1955 via the entry, auto
     st, ev, basis, source = edges[(sec, "ref:entry:paper.md#2")]
     assert st == "auto" and source == "paper.md"
-    assert basis == {"cited": ["simon|1955"], "entry_dois": []}
+    assert basis == {"cited": ["simon|1955"], "entry_dois": [],
+                     "entries": ["Simon, H. A. (1955). A behavioral model of rational choice. *QJE*, 69(1), 99–118."]}
     assert ev["occurrences"] == [{"file": "paper.md", "line": 3, "text": "Simon（1955）"}]
     assert edges[(sec, "ref:doi:10.1007/bf00055564")][2] == {"cited": ["samuelson|1988"], "entry_dois": ["10.1007/bf00055564"]}
     assert edges[(sec, "ref:doi:10.9999/direct.1")][0] == "auto"
@@ -708,7 +874,7 @@ def test_11_5_5_cli_report_and_setting(tmp_path, zotero, capsys):
     rep = json.loads(capsys.readouterr().out)
     draft = rep["drafts"][0]
     assert draft["file"] == "paper.md" and draft["reference_list"] and draft["entries"] == 5
-    assert draft["counts"] == {"citations": 7, "resolved": 3, "pending": 3, "unresolved": 1}
+    assert draft["counts"] == {"citations": 7, "resolved": 3, "pending": 3, "unresolved": 1, "unanchored": 0}
     assert rep["zotero"]["status"] == "read" and rep["lookup"]["enabled"] is False
     assert cli.main(["citations", str(root)]) == 0
     out = capsys.readouterr().out
@@ -738,3 +904,122 @@ def test_11_5_5_a_rescan_names_the_unreadable_library_not_the_draft(tmp_path, zo
     report = addproject.rescan(root)
     assert not any("paper.md" in s for s in report.unreadable_sources)
     assert any("Zotero library not read" in n for n in report.notes)
+
+
+# -- review fixes (V7): the graph never moves a judgment, recall gaps ---------------------
+
+
+AMBIGUOUS = """# Intro
+
+Liquidity matters (He, 2019).
+
+# 参考文献
+
+- He, Z., Krishnamurthy, A., & Milbradt, K. (2019). A model of safe asset determination. *AER*.
+- He, Z., Kelly, B., & Manela, A. (2019). Intermediary asset pricing. *JFE*.
+"""
+
+
+def test_11_5_5_review_an_entry_inserted_above_never_moves_a_judgment(tmp_path):
+    """11.5 #5 / 9.6 (review fix): two DOI-less entries share surname and
+    year; the researcher confirms one and rejects the other; an entry is then
+    inserted at the top of the list. `ref:entry:<draft>#<n>` is a position,
+    so the link's basis holds the entry's text: neither verdict lands on
+    the other paper -- both come under review."""
+    root = _project(tmp_path, AMBIGUOUS)
+    sec = _section(root)
+    first = (sec, "ref:entry:paper.md#1", "cites", "citations")
+    second = (sec, "ref:entry:paper.md#2", "cites", "citations")
+    assert {d: st for _s, d, st, *_ in _edges(root)} == {first[1]: "pending", second[1]: "pending"}
+    judgements.judge(root, first, "confirmed", via="cli")  # Krishnamurthy-Milbradt
+    judgements.judge(root, second, "rejected", via="cli")  # Kelly-Manela
+    (root / "paper.md").write_text(
+        AMBIGUOUS.replace("# 参考文献\n\n", "# 参考文献\n\n- Andrews, D. W. K. (1993). Tests. *Econometrica*.\n"),
+        encoding="utf-8",
+    )
+    _scan(root)
+    conn = _conn(root)
+    try:
+        statuses = db.edge_statuses(conn)
+        states = db.judgement_states(conn)
+    finally:
+        conn.close()
+    # Krishnamurthy-Milbradt is now #2, Kelly-Manela #3: neither carries a verdict.
+    assert statuses[second][0] == "pending"
+    assert statuses[(sec, "ref:entry:paper.md#3", "cites", "citations")][0] == "pending"
+    assert states[second]["outcome"] == "review" and states[second]["reason"] == judgements.BASIS_CHANGED
+    assert states[first]["outcome"] == "review"
+
+
+@pytest.mark.parametrize("line, expected", [
+    # a nested bracket (volume(issue)) after the year
+    ("Zhang, Cui & Campbell-Verduyn (2024, Journal of Chinese Political Science, 29(3), 483–508) and Chen & Peng (2010, x)",
+     [("author_year", "Zhang", 2024, ""), ("author_year", "Chen", 2010, "")]),
+    ("Pandolfi & Williams (2019, JFE 132(2):384-403)", [("author_year", "Pandolfi", 2019, "")]),
+    ("Lang & Lundholm (1993, JAR 31(2): 246) and Core (2001, *JAE* 31(1–3): 441–456)",
+     [("author_year", "Lang", 1993, ""), ("author_year", "Core", 2001, "")]),
+    # a Markdown link inside the bracket: the URL ends before the citation's `)`
+    ("Li, Zhang, Pan & Duan (2023, *A&F*, DOI: [10.1111/acfi.13191](https://doi.org/10.1111/acfi.13191))",
+     [("author_year", "Li", 2023, ""), ("doi", "10.1111/acfi.13191", None, "")]),
+    # a further year after a semicolon
+    ("Manski (1990, *AER P&P* 80: 319–323; 1994)", [("author_year", "Manski", 1990, ""), ("author_year", "Manski", 1994, "")]),
+    # the same citation twice on one line is one occurrence (as the graph keeps it)
+    ("doi:10.1146/annurev-psych-120709-145346 — https://www.annualreviews.org/doi/10.1146/annurev-psych-120709-145346",
+     [("doi", "10.1146/annurev-psych-120709-145346", None, "")]),
+    ("Simon (1955) and again Simon (1955)", [("author_year", "Simon", 1955, "")]),
+])
+def test_11_5_5_review_recall_and_one_occurrence_per_line(line, expected):
+    assert _cites(line) == expected
+
+
+def test_11_5_5_review_hyphen_joined_author_lists_resolve_in_the_draft(tmp_path):
+    """11.5 #5 (review fix): `Matthes-Kohring (2008)` matches the draft's
+    one entry 'Matthes & Kohring (2008)' (its first part the first author,
+    the other part named in the entry); a hyphenated surname written as one
+    (`Campbell-Verduyn`) still matches its own entry; a list whose other
+    names the entry lacks matches nothing."""
+    text = """# Intro
+
+As shown (Matthes-Kohring 2008) and by Campbell-Verduyn (2021), not Matthes-Smith (2008).
+
+# References
+
+- Matthes, J., & Kohring, M. (2008). The content analysis of media frames. *J. Communication*.
+- Campbell-Verduyn, M. (2021). Bitcoin and beyond. Routledge.
+"""
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "paper.md").write_text(text, encoding="utf-8")
+    draft = C.parse_draft(root, "paper.md")
+    got = {r.citation.surname: (r.status, [t.node_id for t in r.targets])
+           for r in C.resolve(draft, literature.ZoteroLibrary(None, literature.LIBRARY_ABSENT))}
+    assert got["Matthes-Kohring"] == ("auto", ["ref:entry:paper.md#1"])
+    assert got["Campbell-Verduyn"] == ("auto", ["ref:entry:paper.md#2"])
+    assert got["Matthes-Smith"] == (None, [])
+
+
+def test_11_5_5_review_latin_names_joined_to_chinese_text_are_only_candidates(tmp_path):
+    """11.5 #5 (review fix): `张川川与 Simon（2020）` -- the first author may
+    be the Chinese-script name V7 does not read (11.4), or `与` may be prose
+    (`增加与 Fatum et al. (2017)`): the citation is read but never resolved
+    by that Latin name alone -- even the draft's one 'Simon (2020)' entry is
+    only a candidate; with no Chinese text before it, the same citation
+    resolves to the entry."""
+    text = """# Intro
+
+张川川与 Simon（2020）指出了这一点。（李四与 Simon, 2020）也是。
+
+另见 Simon（2020）。
+
+# 参考文献
+
+- Simon, X. (2020). A paper.
+"""
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "paper.md").write_text(text, encoding="utf-8")
+    draft = C.parse_draft(root, "paper.md")
+    res = C.resolve(draft, literature.ZoteroLibrary(None, literature.LIBRARY_ABSENT))
+    assert [(r.citation.cjk_joined, r.status, r.how) for r in res] == [
+        (True, "pending", C.HOW_ENTRY_CANDIDATES), (True, "pending", C.HOW_ENTRY_CANDIDATES), (False, "auto", C.HOW_ENTRY),
+    ]

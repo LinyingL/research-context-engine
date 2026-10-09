@@ -48,6 +48,7 @@ replace it with a recording stand-in.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -71,24 +72,54 @@ logger = logging.getLogger(__name__)
 
 # -- DOIs ------------------------------------------------------------------------
 
-# A DOI starts "10.<4-9 digits>/" not glued to a longer number or word; its
-# suffix runs to whitespace, a CJK / full-width character, a table bar, a
-# quote, an angle or square bracket, or a URL's query/fragment.
-_DOI_STOP = "\\s\"'<>|?#\\[\\]\u2018-\u201f\u3000-\u303f\u3400-\u9fff\uff00-\uffef"
-DOI_RE = re.compile(rf"(?<![\w.])10\.\d{{4,9}}/[^{_DOI_STOP}]+", re.IGNORECASE)
+# A DOI starts "10.<4-9 digits>/" (or, inside a URL's query, `/` written
+# `%2F`) not glued to a longer number or a Latin word -- a CJK character
+# right before it is prose (`DOI为10.x/y`); its suffix runs to whitespace,
+# a CJK / full-width character, a table bar, a quote, an angle, square or
+# curly bracket, a backslash (LaTeX: `\url{..}`, `\doi{..}`, `\\`), or a
+# URL's query/fragment.
+_DOI_STOP = "\\s\"'<>|?#\\[\\]{}\\\\\u2018-\u201f\u3000-\u303f\u3400-\u9fff\uff00-\uffef"
+_DOI_BEFORE = "(?<![0-9A-Za-z_.\u00c0-\u024f\u1e00-\u1eff])"
+DOI_RE = re.compile(rf"{_DOI_BEFORE}10\.\d{{4,9}}(?:/|%2[Ff])[^{_DOI_STOP}]+", re.IGNORECASE)
 
 #: Trailing characters a DOI never ends in as written in prose (11.4).
 _TRAILING = ".,;:)）。，；：`]*_!"
+#: A trailing parenthetical of letters only -- a remark after the DOI
+#: (`10.2307/2390654(JSTOR)`), never part of one (a DOI's own brackets
+#: hold digits or sit inside it: `10.1016/s0022-1996(00)00067-x`).
+_REMARK_RE = re.compile(r"\([A-Za-z][A-Za-z .&-]*\)$")
+#: Oxford Academic article URLs carry the article's number after the DOI
+#: (`academic.oup.com/<journal>/article/doi/10.1093/<journal>/<id>/<number>`).
+_OUP_URL_RE = re.compile(r"academic\.oup\.com/\S*$", re.IGNORECASE)
+_OUP_DOI_RE = re.compile(r"(10\.1093/[^/]+/[^/]+)/\d+$")
+
+
+def _trim(raw: str) -> str:
+    """`raw` with the trailing punctuation and remarks 11.4 removes (case
+    kept, so its length is where the DOI as written ends)."""
+    doi = raw.strip()
+    while doi:
+        if doi[-1] in _TRAILING:
+            if doi[-1] == ")" and doi.count("(") >= doi.count(")"):
+                remark = _REMARK_RE.search(doi)
+                if remark is None or "/" not in doi[:remark.start()]:
+                    break
+                doi = doi[:remark.start()]
+                continue
+            doi = doi[:-1]
+            continue
+        break
+    return doi
 
 
 def normalize_doi(raw: str) -> str:
     """11.4's normal form: lower case, trailing punctuation removed; a
-    closing parenthesis is kept only when the DOI opened it."""
-    doi = raw.strip().lower()
-    while doi and doi[-1] in _TRAILING:
-        if doi[-1] == ")" and doi.count("(") >= doi.count(")"):
-            break
-        doi = doi[:-1]
+    closing parenthesis is kept only when the DOI opened it, and then not
+    when it closes a remark of letters only (`(JSTOR)`); a `%2F` written
+    for the `/` is decoded."""
+    doi = _trim(raw).lower()
+    if re.match(r"10\.\d{4,9}%2f", doi):
+        doi = urllib.parse.unquote(doi)
     return doi
 
 
@@ -113,13 +144,25 @@ def find_dois(text: str) -> list[tuple[int, int, str]]:
     """(start, end, normalised DOI) of every DOI in `text`; `end` is where
     the DOI as written ends, trailing punctuation excluded. A Markdown link
     whose text and target carry the same DOI (`[10.x/y](https://doi.org/
-    10.x/y)`) is one DOI, found once (the text's)."""
+    10.x/y)`) is one DOI, found once (the text's). A DOI written `%2F`
+    (a URL's query) ends at the query's next `&`; one in an Oxford Academic
+    article URL leaves out the article number the URL adds."""
     found = []
     for m in DOI_RE.finditer(text):
-        doi = normalize_doi(_balanced(m.group(0)))
+        raw = _balanced(m.group(0))
+        if "%" in raw[:16] and re.match(r"10\.\d{4,9}%2[Ff]", raw):
+            raw = raw.split("&", 1)[0]
+        written = _trim(raw)
+        doi = normalize_doi(written)
         if "/" not in doi or doi.endswith("/"):
             continue
-        found.append((m.start(), m.start() + len(doi), doi))
+        token = re.split(r"\s", text[max(0, m.start() - 300):m.start()])[-1]
+        if _OUP_URL_RE.search(token):
+            oup = _OUP_DOI_RE.match(doi)
+            if oup:
+                doi = oup.group(1)
+                written = written[:len(doi)]  # ASCII: as long as the DOI
+        found.append((m.start(), m.start() + len(written), doi))
     repeated: set[int] = set()
     for link in _MD_LINK_RE.finditer(text):
         in_text = {d for s, _e, d in found if link.start(1) <= s < link.end(1)}
@@ -586,17 +629,45 @@ def crossref_url(doi: str) -> str:
     return CROSSREF_WORKS + urllib.parse.quote(doi, safe="/:;()")
 
 
+CROSSREF_HOST = "api.crossref.org"
+
+
+class _CrossrefRedirectsOnly(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to https://api.crossref.org: the DOI is never
+    sent in clear, nor to a host a redirect names (11.4: lookups go to
+    doi.org / Crossref). Any other redirect ends the request (an HTTP
+    error: the DOI is asked again on a later scan)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 -- urllib's signature
+        target = urllib.parse.urlsplit(newurl)
+        try:
+            port = target.port
+        except ValueError:
+            return None
+        if target.scheme != "https" or (target.hostname or "").lower() != CROSSREF_HOST or port not in (None, 443):
+            logger.info("DOI lookup: a redirect to another place was not followed (%s %s)", code, target.scheme)
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_CrossrefRedirectsOnly())
+
+
 def _fetch_crossref(url: str, timeout: float) -> bytes:
     """GET `url` with nothing but urllib's own headers -- no email, no
-    identifying user agent, no body."""
+    identifying user agent, no body; a redirect is followed only to
+    https://api.crossref.org. Every failure is a `LookupFailed` (a reply
+    cut off mid-body too: `http.client.IncompleteRead`)."""
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 -- fixed https host
+        with _OPENER.open(request, timeout=timeout) as response:
             return response.read()
     except urllib.error.HTTPError as exc:
         raise LookupFailed(f"HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise LookupFailed(str(exc), network=True) from exc
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        raise LookupFailed(f"{type(exc).__name__}: {exc}", network=True) from exc
+    except ValueError as exc:
+        raise LookupFailed(f"{type(exc).__name__}: {exc}") from exc
 
 
 #: The one function that touches the network (tests replace it).
@@ -658,6 +729,9 @@ def lookup_dois(dois: Iterable[str], *, today: date | None = None) -> dict[str, 
             if exc.network:
                 break
             continue
+        except Exception:  # noqa: BLE001 -- an opt-in lookup never fails the scan (11.4: retried later)
+            logger.warning("DOI lookup of %s failed unexpectedly; the rest are asked on a later scan", doi, exc_info=True)
+            break
         meta["fetched"] = stamp
         cache[doi] = meta
         found[doi] = dict(meta)

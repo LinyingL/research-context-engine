@@ -64,7 +64,8 @@ its evidence the occurrences (`file`, `line`, `text`). A citation with
 neither a section nor a claim (before the first heading) is counted
 `unanchored` and links nothing. Basis (9.6): `{"cited": [normalised
 "surname|year" or "doi:<doi>"], "entry_dois": [the matched entries'
-DOIs]}`. Source (9.6): the draft; for a Zotero candidate the pair
+DOIs]}`, plus `"entries": [the entry's text]` for a link to a
+`ref:entry:` node, whose id is only a position in the list. Source (9.6): the draft; for a Zotero candidate the pair
 `<draft>\\x1fzotero` (`scan.citations_zotero_source`), reported unreadable
 when the library could not be read, so those links then keep their state.
 A link a scan that read its source no longer produces is removed (its
@@ -112,7 +113,22 @@ _PAGE = r"(?:\s*(?:[,，]\s*pp?\.|[:：])\s*\d+(?:\s*[-–]\s*\d+)?)?"
 _YEARS = rf"{_YEAR}{_PAGE}(?:\s*[,，;；]\s*{_YEAR}{_PAGE})*"
 
 _YEAR_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})([a-z]?)(?![0-9A-Za-z])")
-_NARRATIVE_BRACKET_RE = re.compile(rf"[（(]\s*(?P<years>{_YEARS})\s*(?:[,，;；][^()（）]*)?[)）]")
+#: The bracket after a narrative citation's names: the years, then -- after a
+#: comma or semicolon -- anything, one level of brackets included (a
+#: volume's issue: `(2019, JFE 132(2):384-403)`).
+_NARRATIVE_BRACKET_RE = re.compile(
+    rf"[（(]\s*(?P<years>{_YEARS})\s*(?P<rest>[,，;；](?:[^()（）]|[（(][^()（）]*[)）])*)?[)）]"
+)
+#: A further year in that rest, after a semicolon: `Manski (1990, ...; 1994)`.
+_REST_YEAR_RE = re.compile(rf"[;；]\s*(?P<years>{_YEAR}{_PAGE})\s*(?=[;；)）]|$)")
+#: Latin names joined by `与` `和` `及` `、` to Chinese text before them
+#: (`张川川与 Simon（2020）`): the Chinese text may be the first author,
+#: whose name V7 does not read (11.4) -- or prose (`增加与 Fatum et al.
+#: (2017) 的对话`, `AES三部曲、Ferranti(2025)`): the two cannot be told
+#: apart. The citation is read, its first Latin name kept as written, and
+#: it is never resolved by that name alone: even one matching entry of
+#: the draft is only a candidate (`cjk_joined`).
+_CJK_JOINED_RE = re.compile(r"[\u3400-\u9fff]\s*(?:与|和|及|、)\s*$")
 _NARRATIVE_AUTHORS_RE = re.compile(rf"{_AUTHORS}(?:{_ETAL})?\s*$")
 _GROUP_RE = re.compile(r"[（(]([^()（）]{1,400})[)）]")
 #: A part of a parenthetical group: names, then the years -- after a comma,
@@ -126,6 +142,13 @@ _PART_RES = (
 )
 _NAME_TOKEN_RE = re.compile(rf"{_START}{_NAME}")
 _URL_RE = re.compile(r"(?:https?://|www\.)[^\s\u3000-\u303f\u3400-\u9fff\uff00-\uffef<>\"|]+")
+
+
+def _url_spans(text: str) -> list[tuple[int, int]]:
+    """Where the URLs of `text` are: each up to the first closing bracket
+    it did not open (a Markdown link's `](https://x)` and the citation's
+    own `)` after it are not the URL's)."""
+    return [(m.start(), m.start() + len(literature._balanced(m.group(0)))) for m in _URL_RE.finditer(text)]
 #: How far before a narrative bracket the names may start.
 _NARRATIVE_WINDOW = 200
 
@@ -214,6 +237,20 @@ class Citation:
     letter: str = ""
     section_id: str | None = None
     claim_ids: tuple[str, ...] = ()
+    #: Joined to Chinese text before it (`张川川与 Simon（2020）`): the first
+    #: author may be a Chinese-script name V7 does not read -- resolved only
+    #: as candidates (`_CJK_JOINED_RE`).
+    cjk_joined: bool = False
+
+    @property
+    def hyphen_list(self) -> tuple[str, ...]:
+        """The surname read as authors joined by hyphens (`Pesaran-Shin-Smith`,
+        `Matthes-Kohring`) -- or a hyphenated surname (`Campbell-Verduyn`):
+        the text cannot tell. Its parts when each is a surname, else ()."""
+        if self.kind != "author_year" or not self.surname or "-" not in self.surname:
+            return ()
+        parts = tuple(self.surname.split("-"))
+        return parts if all(len(p) > 1 and is_surname(p, month_ok=True) for p in parts) else ()
 
     @property
     def key(self) -> str:
@@ -228,6 +265,7 @@ class Citation:
             "file": self.file, "line": self.line, "col": self.col, "text": self.text, "kind": self.kind,
             "doi": self.doi, "surname": self.surname, "year": self.year, "letter": self.letter,
             "section": self.section_id, "claims": list(self.claim_ids), "key": self.key,
+            "cjk_joined": self.cjk_joined,
         }
 
 
@@ -302,7 +340,7 @@ def find_in_line(line: str) -> list[tuple[int, str, str, dict[str, Any]]]:
     dois = literature.find_dois(line)
     for start, end, doi in dois:
         found.append((start, "doi", line[start:end], {"doi": doi}))
-    text = _blank(line, [m.span() for m in _URL_RE.finditer(line)] + [(s, e) for s, e, _d in dois])
+    text = _blank(line, _url_spans(line) + [(s, e) for s, e, _d in dois])
     taken: list[tuple[int, int]] = []
     for m in _NARRATIVE_BRACKET_RE.finditer(text):
         window_start = max(0, m.start() - _NARRATIVE_WINDOW)
@@ -316,8 +354,16 @@ def find_in_line(line: str) -> list[tuple[int, str, str, dict[str, Any]]]:
         start = window_start + a.start() + offset
         exact = line[start:m.end()]
         taken.append((start, m.end()))
-        for year, letter, col in _years(m.group("years"), m.start("years")):
-            found.append((col, "author_year", exact, {"surname": surname, "year": year, "letter": letter}))
+        joined = offset == 0 and bool(_CJK_JOINED_RE.search(text[:start]))
+        years = _years(m.group("years"), m.start("years"))
+        if m.group("rest"):
+            for y in _REST_YEAR_RE.finditer(m.group("rest")):
+                years += _years(y.group("years"), m.start("rest") + y.start("years"))
+        for year, letter, col in years:
+            fields = {"surname": surname, "year": year, "letter": letter}
+            if joined:
+                fields["cjk_joined"] = True
+            found.append((col, "author_year", exact, fields))
     for g in _GROUP_RE.finditer(text):
         if any(s <= g.start() < e for s, e in taken):
             continue
@@ -336,11 +382,26 @@ def find_in_line(line: str) -> list[tuple[int, str, str, dict[str, Any]]]:
                     break
                 start = pos + m.start() + offset
                 exact = line[start:pos + m.end("years")]
+                joined = offset == 0 and bool(_CJK_JOINED_RE.search(part[:m.start()]))
                 for year, letter, col in _years(m.group("years"), pos + m.start("years")):
-                    found.append((col, "author_year", exact, {"surname": surname, "year": year, "letter": letter}))
+                    fields = {"surname": surname, "year": year, "letter": letter}
+                    if joined:
+                        fields["cjk_joined"] = True
+                    found.append((col, "author_year", exact, fields))
                 break
             pos += len(part)
-    return sorted(found, key=lambda f: (f[0], f[1]))
+    # The same citation written twice on one line (`doi:X — https://.../X`)
+    # is one occurrence, as the graph keeps it (file, line, text): the first.
+    seen: set[tuple[str, str, str]] = set()
+    unique = []
+    for f in sorted(found, key=lambda f: (f[0], f[1])):
+        fields = f[3]
+        ident = (f[1], f[2] if f[1] == "author_year" else "", fields.get("doi") or f"{fields.get('surname')}|{fields.get('year')}{fields.get('letter', '')}")
+        if ident in seen:
+            continue
+        seen.add(ident)
+        unique.append(f)
+    return unique
 
 
 # -- reference lists ------------------------------------------------------------------
@@ -363,7 +424,7 @@ def parse_entry(file: str, n: int, line: int, text: str) -> RefEntry:
     if m and is_surname(m.group(1), month_ok=True):  # an entry's head is never a date
         surname = m.group(1)
     scan_from = m.end(1) if m else 0
-    blanked = _blank(clean, [u.span() for u in _URL_RE.finditer(clean)] + [(s, e) for s, e, _d in dois])
+    blanked = _blank(clean, _url_spans(clean) + [(s, e) for s, e, _d in dois])
     year_m = _YEAR_TOKEN_RE.search(blanked, scan_from)
     return RefEntry(
         file=file, n=n, line=line, text=text.strip(), surname=surname,
@@ -481,7 +542,7 @@ def _inside_identifier(line: str, raw: str) -> bool:
     """Whether every occurrence of a claim's printed number on the line is
     part of a DOI or a URL (`10.1016` of a DOI is not a claim's number):
     such a "claim" covers no sentence of the citation's."""
-    spans = [m.span() for m in _URL_RE.finditer(line)] + [(s, e) for s, e, _d in literature.find_dois(line)]
+    spans = _url_spans(line) + [(s, e) for s, e, _d in literature.find_dois(line)]
     starts = [m.start() for m in re.finditer(re.escape(raw), line)]
     return bool(starts) and all(any(s <= p < e for s, e in spans) for p in starts)
 
@@ -560,12 +621,28 @@ def drafts_of(inventory: Mapping[str, Iterable[str]]) -> list[str]:
 # -- resolution (11.4 steps 1-4) -----------------------------------------------------------
 
 
+def _names_in(text: str) -> set[str]:
+    return {literature.fold_name(m.group(0)) for m in _NAME_TOKEN_RE.finditer(text)}
+
+
 def resolve_in_draft(citation: Citation, entries: Iterable[RefEntry]) -> list[RefEntry]:
     """Step 1: the entries of the same draft with the citation's first
-    surname, year and letter. One is the entry; several are candidates."""
+    surname, year and letter. One is the entry; several are candidates.
+    A hyphenated surname that matches no entry as written is read as a
+    hyphen-joined author list (`Matthes-Kohring (2008)`): the entries whose
+    first author is its first part and which name every other part too."""
     if citation.kind != "author_year" or citation.surname is None:
         return []
-    return [e for e in entries if e.matches(citation.surname, citation.year, citation.letter)]
+    entries = list(entries)
+    exact = [e for e in entries if e.matches(citation.surname, citation.year, citation.letter)]
+    parts = citation.hyphen_list
+    if exact or not parts:
+        return exact
+    others = {literature.fold_name(p) for p in parts[1:]}
+    return [
+        e for e in entries
+        if e.matches(parts[0], citation.year, citation.letter) and others <= _names_in(e.text)
+    ]
 
 
 def zotero_item_for_doi(doi: str, library: literature.ZoteroLibrary) -> literature.ZoteroItem | None:
@@ -578,7 +655,15 @@ def zotero_candidates(citation: Citation, library: literature.ZoteroLibrary) -> 
     author-year citation (the year's letter is not in Zotero)."""
     if citation.kind != "author_year" or citation.surname is None or citation.year is None:
         return []
-    return library.by_surname_year(citation.surname, citation.year)
+    exact = library.by_surname_year(citation.surname, citation.year)
+    parts = citation.hyphen_list
+    if exact or not parts:
+        return exact
+    others = {literature.fold_name(p) for p in parts[1:]}
+    return [
+        i for i in library.by_surname_year(parts[0], citation.year)
+        if others <= {literature.fold_name(c) for c in i.creators}
+    ]
 
 
 def zotero_node_id(item: literature.ZoteroItem) -> str:
@@ -621,7 +706,7 @@ def resolve(draft: DraftCitations, library: literature.ZoteroLibrary) -> list[Re
             out.append(Resolution(c, AUTO, HOW_DOI, (Target(f"ref:doi:{c.doi}", "doi", zotero=zotero_item_for_doi(c.doi, library)),)))
             continue
         matched = resolve_in_draft(c, draft.entries)
-        if len(matched) == 1:
+        if len(matched) == 1 and not c.cjk_joined:
             e = matched[0]
             item = zotero_item_for_doi(e.doi, library) if e.doi else None
             out.append(Resolution(c, AUTO, HOW_ENTRY, (Target(e.node_id, "entry", entry=e, zotero=item),)))
@@ -705,11 +790,19 @@ def node_title(node_id: str, attrs: Mapping[str, Any]) -> str:
 # -- the graph ------------------------------------------------------------------------------
 
 
+def entry_basis_text(entry: RefEntry) -> str:
+    """A reference-list entry as its link's basis holds it: the entry's
+    text, whitespace collapsed (9.6: nothing positional -- an entry
+    inserted above it changes which entry `#n` names, and the basis says so)."""
+    return " ".join(entry.text.split())
+
+
 @dataclass
 class _Edge:
     status: str = PENDING
     cited: set[str] = field(default_factory=set)
     entry_dois: set[str] = field(default_factory=set)
+    entries: set[str] = field(default_factory=set)
     occurrences: list[dict[str, Any]] = field(default_factory=list)
     hows: set[str] = field(default_factory=set)
     candidate_count: int = 0
@@ -741,6 +834,10 @@ def _edges_of(resolutions: Iterable[Resolution], existing: Callable[[str], bool]
                 e.cited.add(c.key)
                 if t.entry is not None and t.entry.doi:
                     e.entry_dois.add(t.entry.doi)
+                if t.entry is not None and t.node_id.startswith("ref:entry:"):
+                    # The id `ref:entry:<draft>#<n>` is a position: the
+                    # entry's text makes the basis say WHICH entry it was.
+                    e.entries.add(entry_basis_text(t.entry))
                 occurrence = {"file": c.file, "line": c.line, "text": c.text}
                 if occurrence not in e.occurrences:
                     e.occurrences.append(occurrence)
@@ -821,7 +918,7 @@ def _ingest(
     for (src, dst), e in sorted(edges.items()):
         for source in sorted(e.sources):
             sc.node(dst, EXTRACTOR, source)
-        basis = scan_mod.basis(EXTRACTOR, "cites", cited=e.cited, entry_dois=e.entry_dois)
+        basis = scan_mod.basis(EXTRACTOR, "cites", cited=e.cited, entry_dois=e.entry_dois, entries=e.entries)
         source = e.source
         source_ok = zotero_status if scan_mod.SOURCE_SEPARATOR in source else scan_mod.READ_AND_PARSED
         mark = sc.mark(EXTRACTOR, source, basis) if source_ok == scan_mod.READ_AND_PARSED else {}
@@ -902,14 +999,16 @@ def report(
     root = Path(repo_root)
     library = literature.load_library() if library is None else library
     drafts_out: list[dict[str, Any]] = []
-    totals = {"citations": 0, "resolved": 0, "pending": 0, "unresolved": 0, "unreadable": 0}
+    totals = {"citations": 0, "resolved": 0, "pending": 0, "unresolved": 0, "unanchored": 0, "unreadable": 0}
     all_res: list[Resolution] = []
     per_draft: list[tuple[str, DraftCitations | None, list[Resolution]]] = []
+    unreadable: dict[str, OSError] = {}
     for rel in sorted(set(draft_paths)):
         try:
             d = parse_draft(root, rel)
         except OSError as exc:
             per_draft.append((rel, None, []))
+            unreadable[rel] = exc
             logger.info("cannot read draft %s: %s", rel, exc)
             continue
         res = resolve(d, library)
@@ -921,10 +1020,17 @@ def report(
     for rel, d, res in per_draft:
         if d is None:
             totals["unreadable"] += 1
-            drafts_out.append({"file": rel, "readable": False, "citations": [], "entries": 0, "counts": {}})
+            exc = unreadable[rel]
+            drafts_out.append({
+                "file": rel, "readable": False, "citations": [], "entries": 0, "counts": {},
+                # 11.1: a draft only in a synced folder's cloud, its client not
+                # running, says so in the provider's sentence.
+                "message_zh": exc.message if isinstance(exc, cloud.CloudOnlyError) else None,
+                "detail": str(exc),
+            })
             continue
         items = []
-        c_counts = {"citations": 0, "resolved": 0, "pending": 0, "unresolved": 0}
+        c_counts = {"citations": 0, "resolved": 0, "pending": 0, "unresolved": 0, "unanchored": 0}
         for r in res:
             state = _state_of(r, statuses)
             c_counts["citations"] += 1
@@ -940,8 +1046,9 @@ def report(
             "citations": items, "counts": c_counts,
         })
     drafts_out.sort(key=lambda x: (-(x["counts"].get("unresolved", 0) + x["counts"].get("pending", 0)), x["file"]))
+    cloud_messages = sorted({e.message for e in unreadable.values() if isinstance(e, cloud.CloudOnlyError)})
     return {
-        "drafts": drafts_out, "totals": totals,
+        "drafts": drafts_out, "totals": totals, "cloud": cloud_messages,
         "zotero": {"status": library.status, "data_dir": str(library.data_dir) if library.data_dir else None,
                    "items": len(library.items), "reason": library.reason},
         "lookup": {"enabled": literature.doi_lookup_enabled()},
@@ -949,9 +1056,13 @@ def report(
 
 
 def _state_of(r: Resolution, statuses: Mapping[tuple[str, str], str] | None) -> str:
-    """resolved | pending | unresolved for one citation, a researcher's
-    confirmation of one candidate making it resolved (and every candidate
-    rejected, unresolved)."""
+    """resolved | pending | unresolved | unanchored for one citation, a
+    researcher's confirmation of one candidate making it resolved (and every
+    candidate rejected, unresolved). `unanchored`: before the draft's first
+    heading, in no section and no claim -- the graph links nothing from it
+    (`_edges_of`), so it is neither resolved nor waiting for a decision."""
+    if not r.citation.section_id and not r.citation.claim_ids:
+        return "unanchored"
     if r.status == AUTO:
         return "resolved"
     if r.status is None:

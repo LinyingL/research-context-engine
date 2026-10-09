@@ -62,3 +62,17 @@ def no_engine_probe(monkeypatch) -> None:
     real engine on this machine, so the probe is off (`RCE_ENGINE_PORT=0`)
     for every test; the tests of the probe itself bind their own port."""
     monkeypatch.setenv("RCE_ENGINE_PORT", "0")
+
+
+@pytest.fixture(autouse=True)
+def no_real_doi_lookup(monkeypatch) -> None:
+    """The opt-in DOI lookup (DESIGN.md 11.4) talks to Crossref through
+    `rce.literature._OPENER`; no test may reach it. A test that needs the
+    opener's behaviour builds its own against a local stand-in."""
+    from rce import literature
+
+    class _NoNetwork:
+        def open(self, request, timeout=None):  # noqa: ANN001
+            raise AssertionError(f"a test tried to reach the network: {request.full_url}")
+
+    monkeypatch.setattr(literature, "_OPENER", _NoNetwork())

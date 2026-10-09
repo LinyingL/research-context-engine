@@ -1191,8 +1191,25 @@ function basisLines(basis) {
       const names = v && typeof v === "object" ? Object.keys(v).map((n) => n + " = " + v[n]) : [];
       return "指标：" + (names.length ? names.join("、") : "没有对得上的指标");
     }
+    // 11.4: a `cites` link rests on how the draft wrote the citation, the
+    // DOI of the reference-list entry it matched, and that entry's text.
+    if (k === "cited") return "文中的引用：" + [].concat(v).map(citedText).join("、");
+    if (k === "entry_dois") {
+      const dois = [].concat(v).filter(Boolean);
+      return dois.length ? "文末条目的 DOI：" + dois.join("、") : "";
+    }
+    if (k === "entries") return "文末条目：" + [].concat(v).map((e) => "「" + e + "」").join("、");
     return k + "：" + (typeof v === "string" ? v : JSON.stringify(v));
-  });
+  }).filter(Boolean);
+}
+
+// One citation as a `cites` basis holds it -- `doi:<doi>` or the folded
+// `surname|year` -- in the reader's terms: 「DOI 10.x/y」, 「holland 1986」.
+function citedText(key) {
+  const s = String(key || "");
+  if (s.startsWith("doi:")) return "DOI " + s.slice(4);
+  const bar = s.lastIndexOf("|");
+  return bar > 0 ? s.slice(0, bar) + " " + s.slice(bar + 1) : s;
 }
 
 function basisText(basis) {
@@ -1201,9 +1218,12 @@ function basisText(basis) {
 }
 
 // One end of a link, as a person names it: the file's basename, or for a
-// claim / experiment / ... its kind and file.
-function endName(id) {
+// claim / experiment / ... its kind and file; a reference (11.4) by its
+// title when the payload carries it, else by what its id says -- the whole
+// DOI, the draft's reference-list entry, or 「Zotero 里的一篇文献」.
+function endName(id, title) {
   const s = String(id || "");
+  if (s.startsWith("ref:")) return refEndName(s, title);
   const colon = s.indexOf(":");
   const kind = colon > 0 ? s.slice(0, colon) : "";
   const rest = colon > 0 ? s.slice(colon + 1) : s;
@@ -1212,10 +1232,24 @@ function endName(id) {
   return Object.prototype.hasOwnProperty.call(NODE_KIND_WORDS, kind) ? NODE_KIND_WORDS[kind] + "（" + base + "）" : base;
 }
 
+function refEndName(id, title) {
+  const shown = title ? String(title) : "";
+  if (shown) return "文献《" + (shown.length > 60 ? shown.slice(0, 59) + "…" : shown) + "》";
+  if (id.startsWith("ref:doi:")) return "文献（DOI " + id.slice("ref:doi:".length) + "）";
+  if (id.startsWith("ref:entry:")) {
+    const rest = id.slice("ref:entry:".length);
+    const hash = rest.lastIndexOf("#");
+    const draft = hash >= 0 ? rest.slice(0, hash) : rest;
+    const base = draft.split("/").filter(Boolean).pop() || draft;
+    return base + " 的文末条目" + (hash >= 0 ? "第 " + rest.slice(hash + 1) + " 条" : "");
+  }
+  return "Zotero 里的一篇文献";
+}
+
 // A link {src, dst, type} in product language: 「17.Rmd 读取 panel.csv」.
 function linkText(key) {
   const verb = Object.prototype.hasOwnProperty.call(LINK_VERBS, key.type) ? LINK_VERBS[key.type] : key.type;
-  return endName(key.src) + " " + verb + " " + endName(key.dst);
+  return endName(key.src, key.src_title) + " " + verb + " " + endName(key.dst, key.dst_title);
 }
 
 // Who did what, when, from where: 「2026-10-04 21:15 · 你在画布上否决」.
@@ -2030,8 +2064,8 @@ function renderCreateRepoStep(subject, plan) {
 async function createRepo(subject, button) {
   if (pushDialog.busy) return;
   const name = (pushDialog.name || "").trim();
-  if (!/^[A-Za-z0-9._-]{1,100}$/.test(name)) {
-    pushStatus("err", "仓库名只能用英文字母、数字和 . _ -，不超过 100 个字符");
+  if (!/^[A-Za-z0-9._-]{1,100}$/.test(name) || /^[.-]/.test(name)) {
+    pushStatus("err", "仓库名只能用英文字母、数字和 . _ -，不能以 . 或 - 开头，不超过 100 个字符");
     return;
   }
   pushDialog.busy = true;
@@ -4880,7 +4914,8 @@ function renderVariableCard(host, card) {
 function litSummaryText(totals) {
   const t = totals || {};
   return (t.citations || 0) + " 处引用：已对上 " + (t.resolved || 0) + "，待确认 " + (t.pending || 0) +
-    "，未找到 " + (t.unresolved || 0);
+    "，未找到 " + (t.unresolved || 0) +
+    (t.unanchored ? "；另有 " + t.unanchored + " 处在文稿第一个标题之前，不建立关联" : "");
 }
 
 function litDraftCountText(counts) {
@@ -4889,6 +4924,7 @@ function litDraftCountText(counts) {
   if (c.resolved) parts.push("已对上 " + c.resolved);
   if (c.pending) parts.push("待确认 " + c.pending);
   if (c.unresolved) parts.push("未找到 " + c.unresolved);
+  if (c.unanchored) parts.push("标题前 " + c.unanchored);
   return parts.join(" · ");
 }
 
@@ -4911,6 +4947,7 @@ function litHowText(c, t) {
 
 function litBadge(c) {
   const n = (c.targets || []).length;
+  if (c.state === "unanchored") return { text: "不建立关联", tone: "dead" };
   if (c.state === "resolved") return { text: "已对上", tone: "in-use" };
   if (c.state === "pending") return { text: n + " 个候选，待确认", tone: "wait" };
   if (n && (c.targets || []).every((t) => t.judged === "rejected")) return { text: "未找到（候选都已否决）", tone: "dead" };
@@ -5011,7 +5048,12 @@ function renderLiterature(host, data) {
     return;
   }
   host.appendChild(mk("p", "lit-summary", litSummaryText(totals)));
-  if (totals.unreadable) host.appendChild(mk("p", "lit-note", totals.unreadable + " 份文稿这次没能读取，不在上面的数字里。"));
+  if (totals.unreadable) {
+    // 11.1: a draft only in a synced folder's cloud, its client not running,
+    // says so in the provider's own sentence.
+    const clouds = (Array.isArray(data.cloud) ? data.cloud : []).filter(Boolean).map((m) => m + "。").join("");
+    host.appendChild(mk("p", "lit-note", totals.unreadable + " 份文稿这次没能读取，不在上面的数字里。" + clouds));
+  }
   const list = mk("div", "lit-drafts");
   const quiet = [];
   drafts.forEach((d) => {
@@ -5086,7 +5128,11 @@ function renderLitDraft(d) {
   const fill = () => {
     body.innerHTML = "";
     if (!d.readable) {
-      body.appendChild(mk("p", "empty-note", "这份文稿这次没能读取（可能只在云端），它的引用没有列出。"));
+      const note = mk("p", "empty-note");
+      renderBlockingError(note, d.message_zh
+        ? d.message_zh + "。这份文稿的引用没有列出。"
+        : "这份文稿这次没能读取，它的引用没有列出。", d.detail ? { detail: d.detail } : null);
+      body.appendChild(note);
       return;
     }
     (d.citations || []).forEach((c) => body.appendChild(renderLitCitation(c)));
@@ -5113,7 +5159,12 @@ function renderLitCitation(c) {
   row.appendChild(top);
   const status = mk("div", "notice-status");
   const targets = c.targets || [];
-  if (c.status === "auto") {
+  if (c.state === "unanchored") {
+    // 11.4: a `cites` link starts at a section or a claim; before the
+    // first heading there is neither, so nothing is linked -- or offered.
+    row.appendChild(mk("div", "lit-hint", "这处引用在文稿的第一个标题之前，不属于任何一节，RCE 不为它建立关联；把它移到某个标题下面，重新扫描后就会列入。"));
+    targets.forEach((t) => row.appendChild(renderLitRef(c, t, status, false)));
+  } else if (c.status === "auto") {
     targets.forEach((t) => row.appendChild(renderLitRef(c, t, status, false)));
   } else if (targets.length) {
     const cands = mk("div", "lit-cands");
@@ -5166,7 +5217,12 @@ function renderLitJudge(t, status) {
     actions.append(yes, no);
   }
   if (blocked) actions.appendChild(mk("span", "lit-hint", blocked));
-  else if (!(t.links || []).length) actions.appendChild(mk("span", "lit-hint", "这处引用在上次扫描之后有了变化，重新扫描后才能确认"));
+  else if (t.linked_by_identifier) {
+    // The link (this section → this reference) is another citation's,
+    // resolved by its DOI or the draft's one entry: a verdict here would
+    // overrule it (11.4: only candidates are the researcher's to confirm).
+    actions.appendChild(mk("span", "lit-hint", "同一节里另一处引用已经凭 DOI 或文末条目对上了这篇文献，这个候选不能单独确认或否决"));
+  } else if (!(t.links || []).length) actions.appendChild(mk("span", "lit-hint", "这处引用在上次扫描之后有了变化，重新扫描后才能确认"));
   return actions;
 }
 
@@ -5824,14 +5880,16 @@ function scanProgressText(s) {
 function scanDoneText(last) {
   if (!last) return "";
   if (!last.ok) return last.message || "扫描没有完成";
-  const n = Array.isArray(last.unreadable_sources) ? last.unreadable_sources.length : 0;
+  const n = unreadableFiles(last.unreadable_sources).length;
   return n ? "扫描完成，有 " + n + " 个文件暂时读不了" : "扫描完成";
 }
 
 // 10.2 / 9.6: which files the scan could not read, by name -- what the
 // scan chip's 「详情」 reveals. `unreadable_sources` entries are
 // "<extractor>: <file>"; a file read by two extractors is named once.
-function unreadableFilesText(sources) {
+// The files of `unreadable_sources` ("<extractor>: <file>"), each once: a
+// draft three extractors could not read is one file (10.2, 11.1).
+function unreadableFiles(sources) {
   const files = [];
   (Array.isArray(sources) ? sources : []).forEach((s) => {
     const text = String(s);
@@ -5839,6 +5897,11 @@ function unreadableFilesText(sources) {
     const file = at >= 0 ? text.slice(at + 2) : text;
     if (file && !files.includes(file)) files.push(file);
   });
+  return files;
+}
+
+function unreadableFilesText(sources) {
+  const files = unreadableFiles(sources);
   if (!files.length) return "";
   return "读不了的文件：" + files.join("、") + "。它们恢复可读后，下次扫描会读到。";
 }

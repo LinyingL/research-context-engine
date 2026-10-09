@@ -20,8 +20,10 @@ configured URL is never echoed -- it may carry a token.
 `state(root)` -- from local refs only, no network: the commit GitHub is
 known to have (the upstream branch's tip when the upstream is on the linked
 remote, else the remote's default branch, `refs/remotes/<remote>/HEAD`),
-how far the local branch is ahead of and behind it, and when the remote was
-last fetched (`FETCH_HEAD`'s modification time).
+how far the local branch is ahead of and behind it, and when that was
+learnt: the last fetch (`FETCH_HEAD`'s modification time) or, newer, a
+clone or push the reflog records (「（<日期> 获取）」 / 「（<日期> 推送）」).
+Remote-tracking refs with no such date read 「还没有从 GitHub 获取过」.
 
 `fetch(root)` -- `git fetch <remote>`, the only network RCE does here, only
 on the researcher's click; never `pull`, never a merge. Under the project
@@ -305,6 +307,56 @@ def _fetched_at(root: Path) -> datetime | None:
         return None
 
 
+def _reflog_last(root: Path, ref: str) -> tuple[datetime, str] | None:
+    """(when, how) of the newest reflog entry of `ref` that a fetch, a
+    clone or a push made -- how GitHub's state came to be known -- else
+    None. The reflog line is `<old> <new> <who> <unix time> <zone>\t<message>`."""
+    out = _git_ok(root, ["rev-parse", "--git-path", f"logs/{ref}"])
+    if not out:
+        return None
+    path = Path(out.strip())
+    if not path.is_absolute():
+        path = root / path
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        head, _, message = line.partition("\t")
+        parts = head.split()
+        if len(parts) < 2:
+            continue
+        how = "push" if message.startswith("update by push") else (
+            "fetch" if message.startswith(("fetch", "clone:", "pull")) else None)
+        if how is None:
+            continue
+        try:
+            return datetime.fromtimestamp(int(parts[-2])), how
+        except (ValueError, OverflowError, OSError):
+            continue
+    return None
+
+
+def _known_at(root: Path, remote: str, base_ref: str | None) -> tuple[datetime, str] | None:
+    """When the remote's state was last learnt, and how (`fetch` or
+    `push`): the newest of the last fetch (`FETCH_HEAD`) and the reflog
+    entries a fetch, a clone or a push wrote for the compared branch or the
+    remote's default branch. None: never -- remote-tracking refs from an
+    unknown source are not presented as GitHub's state."""
+    found: list[tuple[datetime, str]] = []
+    fetched = _fetched_at(root)
+    if fetched is not None:
+        found.append((fetched, "fetch"))
+    for ref in dict.fromkeys(r for r in (base_ref, f"refs/remotes/{remote}/HEAD") if r):
+        entry = _reflog_last(root, ref)
+        if entry is not None:
+            found.append(entry)
+    return max(found, key=lambda e: e[0]) if found else None
+
+
+_KNOWN_WORDS = {"fetch": "获取", "push": "推送"}
+
+
 def _has_remote_refs(root: Path, remote: str) -> bool:
     out = _git_ok(root, ["for-each-ref", "--count=1", "--format=%(refname)", f"refs/remotes/{remote}/"])
     return bool((out or "").strip())
@@ -334,12 +386,17 @@ def state(root: str | Path) -> dict[str, Any]:
             ahead, behind = (int(n) for n in (out or "").split())
         except ValueError:
             ahead = behind = None
-    when = f"（{_date_text(fetched)} 获取）" if fetched else ""
+    known = _known_at(root, linked.remote, base_ref)
+    when = f"（{_date_text(known[0])} {_KNOWN_WORDS[known[1]]}）" if known else ""
     if sha is None:
         if fetched is None and not _has_remote_refs(root, linked.remote):
             message = NEVER_FETCHED
         else:
             message = "GitHub 上没有可以对比的分支" + when
+    elif known is None:
+        # Remote-tracking refs no fetch, clone or push of this repository
+        # is known to have written: not presented as GitHub's state.
+        message = NEVER_FETCHED
     elif ahead == 0 and behind == 0:
         message = IN_SYNC
     elif ahead is None:
@@ -358,6 +415,8 @@ def state(root: str | Path) -> dict[str, Any]:
         "ahead": ahead,
         "behind": behind,
         "fetched_at": fetched.isoformat(timespec="seconds") if fetched else None,
+        "known_at": known[0].isoformat(timespec="seconds") if known else None,
+        "known_by": known[1] if known else None,
         "message": message,
     }
 
@@ -365,15 +424,32 @@ def state(root: str | Path) -> dict[str, Any]:
 # -- fetching -------------------------------------------------------------------------
 
 
+#: Every config key git applies, with the file's scope, NUL-separated
+#: (`scope\0key\0...`): the repository's own are `local` (`.git/config` and
+#: what it includes) and `worktree` (`.git/config.worktree`, which git
+#: applies once `extensions.worktreeConfig` is set -- `--local` alone never
+#: lists it).
+OWN_CONFIG_ARGS = ["config", "--includes", "--list", "--show-scope", "--name-only", "-z"]
+_NOT_OWN_SCOPES = {"system", "global", "command"}
+
+
+def own_config_keys(out: str) -> set[str]:
+    """The keys of `OWN_CONFIG_ARGS`'s output that come from the
+    repository's own config (any scope but the researcher's system / global
+    files and the command line), lower case."""
+    fields = out.split("\0")
+    keys: set[str] = set()
+    for i in range(0, len(fields) - 1, 2):
+        scope, key = fields[i].strip().lower(), fields[i + 1].strip().lower()
+        if key and scope not in _NOT_OWN_SCOPES:
+            keys.add(key)
+    return keys
+
+
 def _program_keys(root: Path) -> list[str]:
     """The repository's OWN config keys that name a program for a fetch."""
-    out = _git_ok(root, ["config", "--local", "--includes", "--name-only", "-z", "--list"]) or ""
-    found = []
-    for key in out.split("\0"):
-        name = key.strip().lower()
-        if name and any(p.fullmatch(name) for p in _PROGRAM_KEYS):
-            found.append(name)
-    return sorted(set(found))
+    keys = own_config_keys(_git_ok(root, OWN_CONFIG_ARGS) or "")
+    return sorted(k for k in keys if any(p.fullmatch(k) for p in _PROGRAM_KEYS))
 
 
 def _run_fetch(root: Path, remote: str) -> None:

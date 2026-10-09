@@ -2359,6 +2359,25 @@ def _held_cloud_notes(project_root: Path | None, held: list[dict[str, Any]]) -> 
             item["cloud"] = notes[0]["message"]
 
 
+def _reference_titles(conn: Connection, items: list[dict[str, Any]]) -> None:
+    """A reference end (11.4: `ref:doi:` / `ref:zotero:` / `ref:entry:`)
+    of a listed link -- or of one of its candidates -- gets its node's
+    title (`src_title` / `dst_title`), so the page names the paper, never
+    the engine's id. An end the index no longer holds gets none."""
+    titles: dict[str, str | None] = {}
+    for item in items:
+        for link in (item, *(item.get("candidates") or [])):
+            for end in ("src", "dst"):
+                node_id = str(link.get(end) or "")
+                if not node_id.startswith("ref:"):
+                    continue
+                if node_id not in titles:
+                    node = db.get_node(conn, node_id)
+                    titles[node_id] = node["title"] if node else None
+                if titles[node_id]:
+                    link[f"{end}_title"] = titles[node_id]
+
+
 def review_payload(conn: Connection, project_root: Path | None = None) -> dict[str, Any]:
     """`GET /api/review`: 9.6's list of links, plus the variable cards whose
     implementation moved under a confirmed version (9.11 stage (b)) --
@@ -2370,6 +2389,7 @@ def review_payload(conn: Connection, project_root: Path | None = None) -> dict[s
         return {"review": [], "count": 0, "source_unreadable": [], "not_in_index": [], "ledger": None,
                 "cards": card_implementation.review_groups(None), "pre_v5": True}
     payload = judgements.review_items(conn)
+    _reference_titles(conn, [*payload["review"], *payload["source_unreadable"], *payload["not_in_index"]])
     _held_cloud_notes(project_root, payload["source_unreadable"])
     card_items = card_implementation.review_groups(conn)
     payload["cards"] = card_items

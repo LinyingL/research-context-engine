@@ -131,7 +131,8 @@ def basis(extractor: str, edge_type: str, **facts: Any) -> dict[str, Any]:
     | pyfig generates | {"calls": [bare call name]} (`call=`) |
     | mlflow/wandb produces | {"artifacts": [artifact path]} (`artifact=`) |
     | citations cites | {"cited": [normalised "surname|year" or "doi:<doi>"],
-    |                 |  "entry_dois": [the matched reference-list entries' DOIs]} (11.4) |
+    |                 |  "entry_dois": [the matched reference-list entries' DOIs],
+    |                 |  "entries": [the entry's text], for a `ref:entry:` link only} (11.4) |
     | everything else | {} -- the link's identity alone |
 
     Lists, not scalars, wherever one scan can produce a link more than once
@@ -147,7 +148,10 @@ def basis(extractor: str, edge_type: str, **facts: Any) -> dict[str, Any]:
     if extractor in ("mlflow", "wandb") and edge_type == "produces":
         return {"artifacts": [facts["artifact"]]}
     if extractor == "citations" and edge_type == "cites":
-        return {"cited": sorted(facts["cited"]), "entry_dois": sorted(facts.get("entry_dois", ()))}
+        out = {"cited": sorted(facts["cited"]), "entry_dois": sorted(facts.get("entry_dois", ()))}
+        if facts.get("entries"):
+            out["entries"] = sorted(facts["entries"])
+        return out
     return {}
 
 

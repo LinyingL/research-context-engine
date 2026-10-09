@@ -108,7 +108,7 @@ def test_11_5_6_summary_counts_equal_the_graph(lit_server):
     live, root = lit_server
     status, data = live.get("/api/citations")
     assert status == 200 and data["scanned"] is True
-    assert data["totals"] == {"citations": 4, "resolved": 1, "pending": 2, "unresolved": 1, "unreadable": 0}
+    assert data["totals"] == {"citations": 4, "resolved": 1, "pending": 2, "unresolved": 1, "unanchored": 0, "unreadable": 0}
     edges = _graph_edges(root)
     # Every link the view names is in the graph with the status it shows, and
     # every `cites` link of the graph is one the view accounts for.
@@ -173,7 +173,7 @@ def test_11_5_6_confirm_and_reject_a_candidate_one_ledger_entry_each(lit_server)
     assert cites["Jones"]["state"] == "resolved" and cites["Jones"]["targets"][0]["judged"] == "confirmed"
     assert cites["Jones"]["targets"][1]["judged"] is None
     assert cites["Simon"]["state"] == "unresolved" and cites["Simon"]["targets"][0]["judged"] == "rejected"
-    assert after["totals"] == {"citations": 4, "resolved": 2, "pending": 0, "unresolved": 2, "unreadable": 0}
+    assert after["totals"] == {"citations": 4, "resolved": 2, "pending": 0, "unresolved": 2, "unanchored": 0, "unreadable": 0}
     # The graph agrees after a rescan, and the ledger is untouched by it.
     before = ledger_mod.judgements_path(root).read_bytes()
     _scan(root)
@@ -450,3 +450,173 @@ def test_11_5_6_page_tab_setting_lazy_drafts_and_the_one_write_path():
     # The empty states.
     for text in ("还没有读过文稿里的引用", "这个项目里没有文稿", "文稿里没有找到引用"):
         assert text in view
+
+
+# -- review fixes (V7) ---------------------------------------------------------------------------------
+
+EDGE_CASES = """开头一句话没有标题：Rubin (1974) 的潜在结果框架。
+
+# 一
+
+Holland (1986) 讨论过。
+
+# 二
+
+Rubin (1974) 提出，原文见 doi:10.1037/h0037350。
+
+# 参考文献
+
+- Rubin, D. B. (1974). Estimating causal effects. doi:10.1037/h0037350
+- Rubin, D. B. (1974). Another paper the same year.
+- Holland, P. W. (1986). Statistics and causal inference.
+"""
+
+
+def test_11_5_6_review_unanchored_and_identifier_linked_candidates(tmp_path, no_network):
+    """11.5 #6 (review fix): a citation before the first heading is
+    「不建立关联」 -- not counted as 待确认 or 已对上, no buttons, since no
+    scan can link it; a candidate whose (section -> reference) link another
+    citation resolved by a DOI offers no 确认 / 否决 (a verdict would
+    overrule the DOI's `auto` link), and says why."""
+    from test_v7_citations import _conn as conn_of
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "候选测试.md").write_text(EDGE_CASES, encoding="utf-8")
+    project_identity.init_project(root)
+    _scan(root)
+    conn = conn_of(root)
+    try:
+        data = literature_api.citations_payload(conn, root)
+    finally:
+        conn.close()
+    [draft] = data["drafts"]
+    by_line = {c["line"]: c for c in draft["citations"] if c["kind"] == "author_year"}
+    assert by_line[1]["state"] == "unanchored" and all(t["links"] == [] for t in by_line[1]["targets"])
+    rubin = by_line[9]
+    assert rubin["state"] == "pending"
+    doi_target = next(t for t in rubin["targets"] if t["node"] == "ref:doi:10.1037/h0037350")
+    assert doi_target["linked_by_identifier"] and doi_target["links"] == []
+    other = next(t for t in rubin["targets"] if t["node"] != "ref:doi:10.1037/h0037350")
+    assert not other["linked_by_identifier"] and [l["status"] for l in other["links"]] == ["pending"]
+    assert data["totals"]["unanchored"] == 1 and draft["counts"]["unanchored"] == 1
+    t = data["totals"]
+    assert t["citations"] == t["resolved"] + t["pending"] + t["unresolved"] + t["unanchored"]
+    # The graph links nothing from the unanchored citation.
+    assert not any(ev["occurrences"][0]["line"] == 1 for _s, _d, _st, ev in _graph_edges(root))
+    view = _src()[_src().index("function renderLitJudge("):_src().index("async function litJudge(")]
+    assert "else if (t.linked_by_identifier) {" in view
+
+
+def test_11_5_6_review_a_cloud_only_draft_says_so_in_the_view(tmp_path, monkeypatch):
+    """11.1 / 11.5 #1 (review fix): a draft only in OneDrive's cloud with
+    the client not running is named in the 文献 view with 11.1's sentence,
+    not a guess; the engine's text stays behind 「详情」."""
+    from rce import cloud
+    from rce.ingest import citations as citations_ingest
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.md").write_text("# A\n\nSimon (1955).\n", encoding="utf-8")
+    (root / "cloud.md").write_text("", encoding="utf-8")
+    prov = cloud.Provider(kind="OneDrive", name="OneDrive", folder="OneDrive-个人", root=str(tmp_path))
+    real = citations_ingest.parse_draft
+
+    def parse(repo_root, rel):
+        if rel == "cloud.md":
+            raise cloud.CloudOnlyError(Path(repo_root) / rel, prov)
+        return real(repo_root, rel)
+
+    monkeypatch.setattr(citations_ingest, "parse_draft", parse)
+    rep = citations_ingest.report(root, ["a.md", "cloud.md"])
+    gone = next(d for d in rep["drafts"] if d["file"] == "cloud.md")
+    assert gone["message_zh"] == "这些文件只在 OneDrive 云端；OneDrive 客户端没有运行，打开它并登录后 RCE 才能读到"
+    assert "only in the OneDrive cloud" in gone["detail"]
+    assert rep["cloud"] == [gone["message_zh"]] and rep["totals"]["unreadable"] == 1
+    page = _src()
+    assert "可能只在云端" not in page
+    assert "d.message_zh" in page[page.index("function renderLitDraft("):page.index("function renderLitCitation(")]
+
+
+_FN_RUNNER = r"""
+const block = require("fs").readFileSync(0, "utf8");
+const calls = JSON.parse(process.argv[1]);
+eval(block + "; global.W = {" + process.argv[2] + "};");
+process.stdout.write(JSON.stringify(calls.map(([fn, args]) => W[fn](...args))));
+"""
+
+
+def _page_functions(names, consts, *calls):
+    src = _src()
+    parts = []
+    for c in consts:
+        start = src.index(f"const {c} = ")
+        parts.append(src[start:src.index("};", start) + 2])
+    for name in names:
+        start = src.index(f"function {name}(")
+        parts.append(src[start:src.index("\n}\n", start) + 2])
+    result = subprocess.run([NODE, "-e", _FN_RUNNER, json.dumps(list(calls)), ", ".join(names)],
+                            input="\n".join(parts), capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(result.stdout)
+
+
+@needs_node
+def test_11_5_6_review_a_citation_judgment_under_review_reads_in_chinese():
+    """8.8 / 11.4 (review fix): a `cites` judgment in 待复核 names its ends
+    and its basis in product language -- never `entry:<draft>`, a DOI's last
+    segment, or raw `cited：[...]` JSON."""
+    out = _page_functions(
+        ["basisLines", "citedText", "endName", "refEndName", "linkText"], ["LINK_VERBS", "NODE_KIND_WORDS"],
+        ("basisLines", [{"cited": ["holland|1986"], "entry_dois": []}]),
+        ("basisLines", [{"cited": ["doi:10.1037/h0037350", "rubin|1974"], "entry_dois": ["10.1037/h0037350"],
+                         "entries": ["Rubin, D. B. (1974). Estimating causal effects."]}]),
+        ("linkText", [{"src": "section:候选测试.md#一", "dst": "ref:entry:drafts/候选测试.md#1", "type": "cites"}]),
+        ("linkText", [{"src": "section:a.md#x", "dst": "ref:doi:10.1037/h0037350", "type": "cites"}]),
+        ("linkText", [{"src": "section:a.md#x", "dst": "ref:zotero:ABCD1234", "type": "cites",
+                       "dst_title": "Statistics and causal inference"}]),
+        ("linkText", [{"src": "section:a.md#x", "dst": "ref:zotero:ABCD1234", "type": "cites"}]),
+    )
+    assert out[0] == ["文中的引用：holland 1986"]
+    assert out[1] == ["文中的引用：DOI 10.1037/h0037350、rubin 1974", "文末条目的 DOI：10.1037/h0037350",
+                      "文末条目：「Rubin, D. B. (1974). Estimating causal effects.」"]
+    assert out[2] == "候选测试.md 引用文献 候选测试.md 的文末条目第 1 条"
+    assert out[3] == "a.md 引用文献 文献（DOI 10.1037/h0037350）"
+    assert out[4] == "a.md 引用文献 文献《Statistics and causal inference》"
+    assert out[5] == "a.md 引用文献 Zotero 里的一篇文献"
+
+
+def test_11_5_6_review_items_carry_reference_titles(tmp_path):
+    """8.8 (review fix): `GET /api/review` gives a reference end its title."""
+    from rce import db as rce_db
+
+    conn = rce_db.connect(":memory:")
+    rce_db.migrate(conn)
+    rce_db.upsert_node(conn, "ref:doi:10.1/x", "reference", title="A title", attrs={})
+    items = [{"src": "section:a.md#x", "dst": "ref:doi:10.1/x", "candidates": [{"src": "s", "dst": "ref:zotero:GONE1234"}]}]
+    server._reference_titles(conn, items)
+    assert items[0]["dst_title"] == "A title" and "src_title" not in items[0]
+    assert "dst_title" not in items[0]["candidates"][0]
+
+
+@needs_node
+def test_11_5_1_review_the_scan_line_counts_files_not_extractor_pairs():
+    """11.5 #1 / 10.2 (review fix): a cloud-only draft three extractors
+    could not read is one file in 「扫描完成，有 N 个文件暂时读不了」."""
+    out = _page_functions(
+        ["unreadableFiles", "scanDoneText"], [],
+        ("scanDoneText", [{"ok": True, "unreadable_sources": [
+            "citations: drafts/cloud_draft.md", "claims: drafts/cloud_draft.md", "mdpaper: drafts/cloud_draft.md",
+            "dataflow: scripts/cloud_fig.py"]}]),
+    )
+    assert out == ["扫描完成，有 2 个文件暂时读不了"]
+
+
+@needs_node
+def test_11_5_6_review_wording_for_citations_before_the_first_heading():
+    out = _wording(
+        ("litSummaryText", [{"citations": 5, "resolved": 1, "pending": 1, "unresolved": 1, "unanchored": 2}]),
+        ("litDraftCountText", [{"citations": 3, "resolved": 1, "unanchored": 2}]),
+        ("litBadge", [{"state": "unanchored", "targets": [{}]}]),
+    )
+    assert out[0] == "5 处引用：已对上 1，待确认 1，未找到 1；另有 2 处在文稿第一个标题之前，不建立关联"
+    assert out[1] == "3 处 · 已对上 1 · 标题前 2"
+    assert out[2]["text"] == "不建立关联"

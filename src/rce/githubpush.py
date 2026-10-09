@@ -176,13 +176,26 @@ RECORDED: list[list[str]] = []
 
 
 def _run(root: Path, args: list[str], *, input: str | None = None, timeout: float = GIT_TIMEOUT_S,
-         extra_config: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
+         extra_config: tuple[str, ...] = (), config_env: tuple[tuple[str, str], ...] = ()) -> subprocess.CompletedProcess:
+    """`config_env`: (key, value) pairs given to git through
+    `GIT_CONFIG_COUNT` -- any key, even one whose subsection holds `=`,
+    which `-c` cannot carry."""
     argv = ["git", *git_ingest.HARDENING, *_HARDENING, *extra_config, "-C", str(root), *args]
     RECORDED.append(argv)
     del RECORDED[:-500]
+    env = _git_env()
+    if config_env:
+        try:
+            n = int(env.get("GIT_CONFIG_COUNT") or 0)
+        except ValueError:
+            n = 0
+        for key, value in config_env:
+            env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"] = key, value
+            n += 1
+        env["GIT_CONFIG_COUNT"] = str(n)
     try:
         return subprocess.run(
-            argv, capture_output=True, encoding="utf-8", errors="surrogateescape", env=_git_env(),
+            argv, capture_output=True, encoding="utf-8", errors="surrogateescape", env=env,
             timeout=timeout, input=input, stdin=None if input is not None else subprocess.DEVNULL,
         )
     except FileNotFoundError as exc:
@@ -285,10 +298,31 @@ def _prefix(root: Path) -> str:
     return (_out(root, ["rev-parse", "--show-prefix"]) or "").strip()
 
 
+_FILTER_KEY_RE = re.compile(r"filter\.(.+)\.(?:clean|smudge|process|required)")
+
+
+def _filters_off(root: Path) -> tuple[tuple[str, str], ...]:
+    """Config that switches off every filter driver the repository's OWN
+    config defines (`.gitattributes` may name it): `git status` would run
+    a driver's clean program on any file whose stat changed (11.2: linking
+    a folder never runs a program the folder names). The researcher's own
+    (global) drivers, Git LFS's say, stay."""
+    names = sorted({m.group(1) for k in github.own_config_keys(_out(root, github.OWN_CONFIG_ARGS) or "")
+                    if (m := _FILTER_KEY_RE.fullmatch(k))})
+    return tuple(
+        (f"filter.{name}.{part}", "false" if part == "required" else "")
+        for name in names for part in ("clean", "smudge", "process", "required")
+    )
+
+
 def _status(root: Path) -> list[str]:
     """Every changed or untracked path (repository-relative), from `git
-    status --porcelain -z` (no index refresh written)."""
-    out = _out(root, ["status", "--porcelain", "-z", "--untracked-files=all"]) or ""
+    status --porcelain -z` (no index refresh written), with the
+    repository's own filter drivers switched off (`_filters_off`) and
+    submodules' work trees not entered (their own config would apply
+    there): a submodule whose recorded commit changed still counts."""
+    out = _out(root, ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=dirty"],
+               config_env=_filters_off(root)) or ""
     entries = out.split("\0")
     found: list[str] = []
     i = 0
@@ -353,9 +387,11 @@ def _remotes(root: Path) -> dict[str, dict[str, list[str]]]:
 
 
 def _remote_program_keys(root: Path, keys=None) -> list[str]:
-    out = _out(root, ["config", "--local", "--includes", "--name-only", "-z", "--list"]) or ""
+    """The repository's OWN config keys (`.git/config`, what it includes,
+    and `.git/config.worktree`) that match `keys` (default: what a fetch or
+    push would run)."""
+    found = github.own_config_keys(_out(root, github.OWN_CONFIG_ARGS) or "")
     patterns = keys if keys is not None else github._PROGRAM_KEYS
-    found = {k.strip().lower() for k in out.split("\0") if k.strip()}
     return sorted(k for k in found if any(p.fullmatch(k) for p in patterns))
 
 
@@ -525,7 +561,7 @@ def suggested_name(root: Path) -> str:
 def valid_repo_name(name: Any) -> bool:
     return (
         isinstance(name, str) and bool(_REPO_NAME_RE.fullmatch(name)) and name not in (".", "..")
-        and not name.lower().endswith(".git") and not name.startswith(".")
+        and not name.lower().endswith(".git") and not name.startswith((".", "-"))
     )
 
 
@@ -753,7 +789,8 @@ def create_repo(root: str | Path, name: Any, token: Any, project_id: str | None 
             if login["logged_in"] is None:
                 raise PushError("gh_unknown", login.get("detail", ""), extra={"command": STATUS_COMMAND})
             full = f"{login['account']}/{name}" if login["account"] else name
-            argv = ["repo", "create", full, "--private", "--source", str(root), "--remote", "origin"]
+            # Options first, then `--`: the name is never read as an option.
+            argv = ["repo", "create", "--private", "--source", str(root), "--remote", "origin", "--", full]
             result = _gh(argv, cwd=root)
             if result.returncode != 0:
                 text = scrub((result.stderr or "") + (result.stdout or "")).strip()
