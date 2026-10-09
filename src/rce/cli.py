@@ -79,7 +79,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import addproject, consistency, db, inventory, lineage, migration, paths, query
+from rce import addproject, consistency, db, github, githubpush, inventory, lineage, migration, paths, query
 from rce import project as project_identity
 from rce import rebuild as rebuild_mod
 from rce.ingest import attempts as attempts_ingest
@@ -2149,6 +2149,158 @@ def _positive_hops(value: str) -> int:
         raise argparse.ArgumentTypeError(f"--hops must be >= 1, got {parsed}")
     return parsed
 
+# -- rce github (DESIGN.md 11.2, 11.3) ------------------------------------------------
+
+_BLOCKERS_EN = {
+    "not_git": "this folder is not a git repository; RCE does not turn it into one",
+    "detached": "HEAD is detached (not on a branch); check out a branch first",
+    "merge": "a merge is in progress; finish or abort it first",
+    "rebase": "a rebase is in progress; finish or abort it first",
+    "no_branch": "the repository has no commit yet, so there is no branch to push",
+    "not_fast_forward": "GitHub has commits this project does not have; sort it out in a terminal (RCE never force-pushes)",
+    "too_large": "the commits to push contain files over 100 MB, which GitHub refuses",
+    "remote_not_github": "the remote is not on GitHub; RCE pushes only to GitHub",
+    "remote_ambiguous": "there are several GitHub remotes and RCE does not choose; push from a terminal",
+    "upstream_elsewhere": "the branch tracks a differently named branch; push from a terminal",
+    "unsafe_config": "the repository's own git config names a program a push would run; push from a terminal",
+    "gh_missing": "gh (GitHub's command-line tool) is not installed; install it, then run: gh auth login",
+    "gh_logged_out": "gh is not logged in; run: gh auth login",
+    "gh_unknown": "could not tell whether gh is logged in; run: gh auth status",
+}
+
+
+def _github_root(args: argparse.Namespace) -> tuple[Path, str | None]:
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        raise CliError(f"{root} is not a directory")
+    try:
+        pid = paths._project_id_of(root)
+    except paths.IdentityUnavailableError:
+        pid = None
+    return root, pid
+
+
+def _print_github_state(st: dict[str, Any]) -> None:
+    if not st.get("linked"):
+        print("Not linked to GitHub" + ("" if st.get("git") else " (not a git repository)") + ".")
+        return
+    print(f"GitHub: {st['owner']}/{st['repo']} (remote {st['remote']}, {st['url']})")
+    if st.get("ahead") is not None:
+        print(f"  {st['ahead']} ahead, {st['behind']} behind {st.get('base')}"
+              + (f" (fetched {st['fetched_at']})" if st.get("fetched_at") else " (never fetched)"))
+    elif st.get("fetched_at") is None:
+        print("  never fetched from GitHub")
+
+
+def cmd_github_status(args: argparse.Namespace) -> int:
+    """`rce github status [path]`: the linked repository from local refs."""
+    root, _ = _github_root(args)
+    _print_github_state(github.state(root))
+    return 0
+
+
+def cmd_github_fetch(args: argparse.Namespace) -> int:
+    """`rce github fetch [path]`: `git fetch <remote>` -- never a pull."""
+    root, pid = _github_root(args)
+    try:
+        st = github.fetch(root, pid)
+    except github.GitHubError as exc:
+        raise CliError(f"not fetched ({exc.code}): {exc.detail}") from exc
+    _print_github_state(st)
+    return 0
+
+
+def _print_push_plan(plan: dict[str, Any]) -> None:
+    print(f"Project: {plan['root']}")
+    if not plan["git"]:
+        ng = plan["not_git"]
+        print("Not a git repository; RCE does not turn it into one.")
+        if ng["synced"]:
+            print(f"  It is inside a folder {ng['synced']} syncs: sync services and git's internal files do not mix, "
+                  "and a repository there can be damaged by the sync.")
+            print("  Move the project to a folder that is not synced (RCE recognises the move), then run 'git init' there.")
+        else:
+            print("  Run 'git init' in it and make a first commit, then push.")
+        if ng["large_files"]:
+            print(f"  GitHub refuses files over 100 MB; this folder has {len(ng['large_files'])}:")
+            for f in ng["large_files"]:
+                print(f"    {f['path']} ({f['size_text']})")
+        return
+    remote = plan["remote"]
+    if plan["needs_repo"]:
+        print(f"Branch: {plan['branch'] or '(none)'}; no remote yet -- a PRIVATE GitHub repository would be created "
+              f"(suggested name: {plan['suggested_name']}) and added as 'origin'.")
+    elif remote:
+        upstream = " (its upstream will be set)" if plan["set_upstream"] else ""
+        print(f"Branch: {plan['branch'] or '(none)'} -> {plan['target'] or remote['remote']} ({remote['url']}){upstream}")
+    else:
+        print(f"Branch: {plan['branch'] or '(none)'}")
+    print(f"Commits GitHub does not have yet: {plan['commit_count']}")
+    for c in plan["commits"]:
+        print(f"  {c['short']} {c['subject']}")
+    if plan["commits_truncated"]:
+        print(f"  ... and {plan['commit_count'] - len(plan['commits'])} more")
+    if plan["uncommitted"]:
+        print(f"{plan['uncommitted']} other file(s) have changes that are not committed; a push does not carry them.")
+    rec = plan["records"]
+    if rec["changed"]:
+        print(f"Human records (.rce/): {len(rec['changed'])} file(s) not committed (--commit-records commits exactly these).")
+    elif rec["ignored"]:
+        print("Human records (.rce/): ignored by git; a push does not carry them.")
+    elif rec["committed"]:
+        print("Human records (.rce/): committed.")
+    for b in plan["blockers"]:
+        line = _BLOCKERS_EN.get(b["code"], b["code"])
+        if b.get("files"):
+            line += ": " + ", ".join(f"{f['path']} ({f['size_text']})" for f in b["files"])
+        print(f"Refused ({b['code']}): {line}")
+    if plan["nothing_to_push"] and not rec["changed"]:
+        print("GitHub already has every commit; nothing to push.")
+
+
+def cmd_github_push(args: argparse.Namespace) -> int:
+    """`rce github push [path] [--commit-records] [--create-repo NAME]
+    [--yes]` (DESIGN.md 11.3): without --yes it prints the plan and writes
+    nothing; with --yes it commits the records (if asked), creates the
+    private repository (if asked and there is no remote), and pushes --
+    never forced."""
+    root, pid = _github_root(args)
+    try:
+        plan = githubpush.plan(root)
+        _print_push_plan(plan)
+        if plan["blockers"]:
+            print("Nothing pushed; nothing written.", file=sys.stderr)
+            return 1
+        if plan["needs_repo"] and not args.create_repo:
+            print(f"Nothing written. Run again with --create-repo {plan['suggested_name']} --yes "
+                  "to create a private GitHub repository and push.")
+            return 0 if not args.yes else 1
+        if args.create_repo and not plan["needs_repo"]:
+            raise CliError("--create-repo: this project already has a remote; nothing written")
+        if args.create_repo and not githubpush.valid_repo_name(args.create_repo):
+            raise CliError(f"--create-repo: {args.create_repo!r} is not a repository name "
+                           "(ASCII letters, digits, '.', '_', '-'; at most 100); nothing written")
+        if not args.yes:
+            print("Nothing written. Run again with --yes to " + ("create the repository and " if plan["needs_repo"] else "")
+                  + ("commit the records and " if args.commit_records else "") + "push.")
+            return 0
+        if plan["needs_repo"]:
+            created = githubpush.create_repo(root, args.create_repo, plan["token"], pid)
+            print(f"Created the private repository {created['repo']['owner']}/{created['repo']['repo']} ({created['repo']['url']}).")
+            plan = created["plan"]
+        if args.commit_records and not plan["records"]["changed"]:
+            print("The human records are already committed.")
+        result = githubpush.push(root, plan["token"], pid, commit_records=args.commit_records)
+    except githubpush.PushError as exc:
+        raise CliError(f"not pushed ({exc.code}): {exc.detail}") from exc
+    if result.get("records") and result["records"].get("committed"):
+        print(f"Committed {len(result['records']['files'])} record file(s) as 'RCE：人工记录'.")
+    if result["pushed"]:
+        print(f"Pushed {result['count']} commit(s) to {result['plan']['target']}.")
+    else:
+        print("GitHub already has every commit; nothing pushed.")
+    return 0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = PathParser(prog="rce", description="Research Context Engine CLI.")
@@ -2314,6 +2466,29 @@ def build_parser() -> argparse.ArgumentParser:
         q = project_sub.add_parser(name, help=text)
         add_project_path(q)
         q.set_defaults(func=func)
+
+    p = sub.add_parser(
+        "github",
+        help=(
+            "The project's GitHub repository (DESIGN.md 11.2, 11.3): "
+            "'rce github status | fetch | push [--commit-records] [--create-repo NAME] [--yes]'"
+        ),
+    )
+    github_sub = p.add_subparsers(dest="github_command", required=True)
+    q = github_sub.add_parser("status", help="the linked GitHub repository and how far ahead/behind, from local refs (no network)")
+    add_project_path(q)
+    q.set_defaults(func=cmd_github_status)
+    q = github_sub.add_parser("fetch", help="'git fetch' the linked GitHub remote (never a pull or a merge)")
+    add_project_path(q)
+    q.set_defaults(func=cmd_github_fetch)
+    q = github_sub.add_parser(
+        "push", help="show what a push to GitHub would do; with --yes, push it (never forced)",
+    )
+    add_project_path(q)
+    q.add_argument("--commit-records", action="store_true", help="first commit exactly the changed .rce/ record files ('RCE：人工记录')")
+    q.add_argument("--create-repo", metavar="NAME", default=None, help="no remote yet: create a PRIVATE GitHub repository NAME with gh, as 'origin'")
+    q.add_argument("--yes", action="store_true", help="do it; without --yes nothing is written")
+    q.set_defaults(func=cmd_github_push)
 
     p = sub.add_parser(
         "app",

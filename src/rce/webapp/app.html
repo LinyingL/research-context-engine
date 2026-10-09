@@ -321,6 +321,18 @@ body.no-project .tabs { display: none !important; }
 .add-confirm .add-actions { margin-top: 0.55rem; }
 .add-result .notice { max-width: none; }
 
+/* 「推送到 GitHub…」 (DESIGN.md 11.3), in the side panel. */
+.add-note.bad { color: var(--clay); border-left: 2px solid var(--clay); padding-left: 0.6rem; }
+.push-commits { list-style: none; margin: -0.3rem 0 0; padding: 0; border-top: 1px solid var(--line); }
+.push-commits li { font-size: 0.82rem; padding: 0.22rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.push-commits code, .push-cmd { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-soft); margin-right: 0.5rem; }
+.push-cmd { color: var(--ink); background: var(--paper-alt); padding: 0.05rem 0.3rem; user-select: all; }
+.push-remote { font-size: 0.84rem; }
+.push-remote a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
+.push-tick { display: flex; gap: 0.45rem; align-items: center; font-size: 0.84rem; }
+.push-name { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; font-size: 0.84rem; }
+.push-name .form-input { flex: 1; min-width: 10rem; font-family: var(--font-mono); font-size: 0.8rem; }
+
 main#main { flex: 1; padding: 1.75rem 2rem 4rem; max-width: 1080px; width: 100%; margin: 0 auto; }
 
 .guide-card { border: 1px solid var(--line-strong); background: var(--paper-alt); padding: 1.5rem 1.75rem; max-width: 640px; }
@@ -1000,6 +1012,10 @@ function apiError(path, res, body) {
   if (body && body.inspection && typeof body.inspection === "object") err.inspection = body.inspection;
   // 11.2: a file panel refused (a binary file) still carries its GitHub link.
   if (body && body.github && typeof body.github === "object") err.github = body.github;
+  // 11.3: a refused push carries its refusals, the command to run, the new plan.
+  if (body && Array.isArray(body.blockers)) err.blockers = body.blockers;
+  if (body && typeof body.command === "string" && body.command) err.command = body.command;
+  if (body && body.plan && typeof body.plan === "object") err.plan = body.plan;
   return err;
 }
 
@@ -1685,6 +1701,9 @@ function renderProjectMenu() {
     gitRule.setAttribute("role", "separator");
     projectMenu.appendChild(gitRule);
   }
+  // 11.3: for every served project -- linked, without a remote (a private
+  // repository is offered), or not a git repository (the panel explains).
+  projectMenu.appendChild(pmItem("推送到 GitHub…", () => { closeProjectMenu(false); openPushDialog(); }, { disabled: state.noProject }));
   projectMenu.appendChild(pmItem("添加项目…", () => { closeProjectMenu(false); openAddDialog(); }));
   const status = mk("div", "pm-status");
   const rescan = pmItem("重新扫描这个项目", () => rescanFromMenu(status, rescan), { disabled: state.noProject });
@@ -1782,6 +1801,247 @@ async function fetchGitHub(statusEl, button) {
     // 8.8 "Errors": the sentence, git's own text behind 「详情」.
     renderBlockingError(statusEl, "没能从 GitHub 获取", err);
   }
+}
+
+// -- 「推送到 GitHub…」 (DESIGN.md 11.3, task V7) ---------------------------------
+// The side panel shows what a push would do -- GET /api/github/push-plan,
+// which reads only and touches no network -- in plain Chinese: the branch,
+// the commits GitHub does not have yet (their first lines), the uncommitted
+// files a push does not carry, whether the human records (.rce/) are
+// committed with the one tick 「先把人工记录提交一次」, every refusal with its
+// sentence (and the command to run, when there is one), and -- without a
+// remote -- the PRIVATE repository to create, its name editable. 「推送」 is
+// the only control that pushes (POST /api/github/push with the plan's
+// token: a project that changed since is refused and shown again); nothing
+// is remembered as "always push". After a push the GitHub line refreshes.
+
+let pushDialog = null; // {subject, plan, tick, name, nameEdited, busy}
+
+// The plan as lines of plain Chinese: {text, tone, command?, commits?, more?}.
+function pushPlanLines(plan) {
+  const lines = [];
+  if (!plan || typeof plan !== "object") return lines;
+  if (!plan.git) {
+    const ng = plan.not_git || {};
+    lines.push({ text: (ng.message || "这个文件夹还不是 git 仓库，RCE 不会把它变成仓库") + "。", tone: "bad" });
+    if (ng.sync_message) lines.push({ text: ng.sync_message + "。", tone: "warn" });
+    if (ng.way_forward) lines.push({ text: "可以这样做：" + ng.way_forward + "。", tone: "" });
+    if (ng.large_message) lines.push({ text: ng.large_message + "。", tone: "warn" });
+    return lines;
+  }
+  if (plan.needs_repo) {
+    lines.push({ text: "分支 " + (plan.branch || "（无）") + "；这个项目还没有 GitHub 仓库。", tone: "" });
+  } else if (plan.target) {
+    lines.push({ text: "分支 " + plan.branch + " → " + plan.target + (plan.set_upstream ? "（推送后设为它的上游分支）" : ""), tone: "" });
+  } else if (plan.branch) {
+    lines.push({ text: "分支 " + plan.branch, tone: "" });
+  }
+  if (plan.commit_count) {
+    const shown = Array.isArray(plan.commits) ? plan.commits : [];
+    lines.push({ text: "GitHub 还没有的提交：" + plan.commit_count + " 个", tone: "", commits: shown, more: plan.commit_count - shown.length });
+  } else if (plan.nothing_to_push) {
+    lines.push({ text: "GitHub 已经有全部提交，没有要推送的。", tone: "" });
+  }
+  if (plan.uncommitted_message) lines.push({ text: plan.uncommitted_message + "。", tone: "warn" });
+  const rec = plan.records || {};
+  if (rec.message) lines.push({ text: rec.message + "。", tone: (rec.changed && rec.changed.length) ? "warn" : "" });
+  (plan.blockers || []).forEach((b) => lines.push({ text: b.message + "。", tone: "bad", command: b.command || null }));
+  return lines;
+}
+
+// Whether 「推送」 may be pressed: no refusal, a remote on GitHub, and
+// something to send (the planned commits, or the records the tick commits).
+function pushCanSend(plan, tick) {
+  if (!plan || !plan.git || plan.needs_repo || (plan.blockers || []).length) return false;
+  if (plan.can_push) return true;
+  return !!(tick && plan.records && Array.isArray(plan.records.changed) && plan.records.changed.length);
+}
+
+function openPushDialog() {
+  closeProjectMenu(false);
+  const subject = { kind: "github-push" };
+  state.panelSubject = subject;
+  pushDialog = { subject: subject, plan: null, tick: false, name: "", nameEdited: false, busy: false };
+  panelTitle.textContent = "推送到 GitHub";
+  panelTitle.title = "";
+  panelSubtitle.textContent = "先看一看会推送什么；你按「推送」之前，什么都不会发送";
+  panelBody.innerHTML = "";
+  const status = mk("div", "notice-status");
+  status.id = "push-status";
+  const result = mk("div", "add-result");
+  result.id = "push-result";
+  result.appendChild(mk("div", "add-busy", "正在检查这个项目……"));
+  panelBody.append(status, result);
+  openPanel();
+  loadPushPlan(subject);
+}
+
+function pushDialogLive(subject) {
+  return !!pushDialog && pushDialog.subject === subject && state.panelSubject === subject && !panel.classList.contains("hidden");
+}
+
+function pushStatus(cls, text, err) {
+  const el = document.getElementById("push-status");
+  if (el) setStatus(el, cls, text, err);
+}
+
+async function loadPushPlan(subject) {
+  let plan;
+  try {
+    plan = await apiGet("/api/github/push-plan"); // reads only, no network
+  } catch (err) {
+    if (!pushDialogLive(subject)) return;
+    const result = document.getElementById("push-result");
+    if (result) result.innerHTML = "";
+    pushStatus("err", "没能检查这个项目", err);
+    return;
+  }
+  if (!pushDialogLive(subject)) return;
+  showPushPlan(subject, plan);
+}
+
+function showPushPlan(subject, plan) {
+  pushDialog.plan = plan;
+  if (!pushDialog.nameEdited) pushDialog.name = plan.suggested_name || "";
+  const rec = plan.records || {};
+  if (!(Array.isArray(rec.changed) && rec.changed.length)) pushDialog.tick = false;
+  renderPushPlan(subject);
+}
+
+function renderPushPlan(subject) {
+  const result = document.getElementById("push-result");
+  const plan = pushDialog && pushDialog.plan;
+  if (!result || !plan) return;
+  result.innerHTML = "";
+  if (plan.root) result.appendChild(mk("div", "add-root", plan.root));
+  if (plan.remote && githubHref(plan.remote.url)) {
+    const line = mk("div", "push-remote");
+    line.append("GitHub：", externalLink(plan.remote.owner + "/" + plan.remote.repo, plan.remote.url));
+    result.appendChild(line);
+  }
+  pushPlanLines(plan).forEach((l) => {
+    const p = mk("p", "add-note" + (l.tone ? " " + l.tone : ""), l.text);
+    if (l.command) {
+      p.append(" ");
+      p.appendChild(mk("code", "push-cmd", l.command));
+    }
+    result.appendChild(p);
+    if (l.commits && l.commits.length) {
+      const list = mk("ul", "push-commits");
+      l.commits.forEach((c) => {
+        const li = mk("li");
+        li.append(mk("code", null, c.short || ""), c.subject || "");
+        list.appendChild(li);
+      });
+      if (l.more > 0) list.appendChild(mk("li", null, "……还有 " + l.more + " 个"));
+      result.appendChild(list);
+    }
+  });
+  const rec = plan.records || {};
+  if (plan.git && Array.isArray(rec.changed) && rec.changed.length) {
+    const tick = mk("label", "push-tick");
+    const box = mk("input");
+    box.type = "checkbox";
+    box.id = "push-tick";
+    box.checked = !!pushDialog.tick;
+    box.disabled = pushDialog.busy;
+    box.addEventListener("change", () => {
+      pushDialog.tick = box.checked;
+      const go = document.getElementById("push-go");
+      if (go) go.disabled = pushDialog.busy || !pushCanSend(pushDialog.plan, pushDialog.tick);
+    });
+    tick.append(box, "先把人工记录提交一次（只提交 .rce/ 里的 " + rec.changed.length + " 个文件，提交说明「RCE：人工记录」）");
+    result.appendChild(tick);
+  }
+  if (plan.git && plan.needs_repo) result.appendChild(renderCreateRepoStep(subject, plan));
+  const actions = mk("div", "add-actions");
+  if (plan.git && !plan.needs_repo) {
+    const go = mkButton(pushDialog.busy ? "正在推送…" : "推送", "btn", () => sendPush(subject, go));
+    go.id = "push-go";
+    go.disabled = pushDialog.busy || !pushCanSend(plan, pushDialog.tick);
+    actions.appendChild(go);
+  }
+  actions.appendChild(mkButton("关闭", "btn", closePanel));
+  result.appendChild(actions);
+}
+
+// Without a remote (11.3): a PRIVATE repository under the account gh is
+// logged in to, added as origin; RCE never creates a public one.
+function renderCreateRepoStep(subject, plan) {
+  const box = mk("div", "add-confirm");
+  box.appendChild(mk("p", "add-note", "先在 gh 登录的 GitHub 账户下创建一个私有仓库，添加为 origin，然后再推送。RCE 不会创建公开仓库。"));
+  const row = mk("label", "push-name");
+  const input = mk("input", "form-input");
+  input.id = "push-name";
+  input.type = "text";
+  input.value = pushDialog.name;
+  input.setAttribute("aria-label", "仓库名");
+  input.disabled = pushDialog.busy;
+  input.addEventListener("input", () => { pushDialog.name = input.value; pushDialog.nameEdited = true; });
+  row.append("仓库名", input);
+  box.appendChild(row);
+  const actions = mk("div", "add-actions");
+  const create = mkButton("创建私有仓库", "btn", () => createRepo(subject, create));
+  create.id = "push-create";
+  create.disabled = pushDialog.busy || !plan.can_create_repo;
+  actions.appendChild(create);
+  box.appendChild(actions);
+  return box;
+}
+
+async function createRepo(subject, button) {
+  if (pushDialog.busy) return;
+  const name = (pushDialog.name || "").trim();
+  if (!/^[A-Za-z0-9._-]{1,100}$/.test(name)) {
+    pushStatus("err", "仓库名只能用英文字母、数字和 . _ -，不超过 100 个字符");
+    return;
+  }
+  pushDialog.busy = true;
+  button.disabled = true;
+  button.textContent = "正在创建…";
+  pushStatus("", "正在 GitHub 上创建私有仓库……");
+  let res;
+  try {
+    res = await apiPost("/api/github/create-repo", { name: name, token: pushDialog.plan.token });
+  } catch (err) {
+    pushDialog.busy = false;
+    if (!pushDialogLive(subject)) return;
+    renderPushPlan(subject);
+    pushStatus("err", "没能在 GitHub 上创建仓库", err);
+    return;
+  }
+  pushDialog.busy = false;
+  loadGitHub();
+  if (!pushDialogLive(subject)) return;
+  if (res.plan) showPushPlan(subject, res.plan);
+  pushStatus("ok", res.message || "已在 GitHub 上创建私有仓库");
+}
+
+async function sendPush(subject, button) {
+  if (pushDialog.busy || !pushCanSend(pushDialog.plan, pushDialog.tick)) return;
+  pushDialog.busy = true;
+  button.disabled = true;
+  button.textContent = "正在推送…";
+  pushStatus("", "正在推送到 GitHub……");
+  let res;
+  try {
+    res = await apiPost("/api/github/push", { token: pushDialog.plan.token, commit_records: !!pushDialog.tick });
+  } catch (err) {
+    pushDialog.busy = false;
+    if (!pushDialogLive(subject)) return;
+    if (err && err.plan) showPushPlan(subject, err.plan);
+    else renderPushPlan(subject);
+    // 8.8 "Errors": the sentence, git's own text behind 「详情」.
+    pushStatus("err", "没能推送到 GitHub", err);
+    return;
+  }
+  pushDialog.busy = false;
+  if (res.state && typeof res.state === "object") state.github = res.state;
+  loadGitHub(); // 11.3: after a push the GitHub line refreshes
+  if (!pushDialogLive(subject)) return;
+  pushDialog.tick = false;
+  if (res.plan) showPushPlan(subject, res.plan);
+  pushStatus("ok", res.message || "已推送到 GitHub");
 }
 
 // The file panel's 「在 GitHub 上查看」 (11.2): pinned to a commit GitHub

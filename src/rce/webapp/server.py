@@ -54,6 +54,19 @@ Endpoints (all GET unless noted):
     POST /api/github/fetch -- 11.2: `git fetch <remote>` for the linked
                             remote, under the project lock; returns the new
                             state. Errors: `github_<code>` with `message_zh`.
+    GET  /api/github/push-plan -- 11.3: what 「推送」 would do
+                            (`rce.githubpush.plan`): branch, unpushed
+                            commits, uncommitted files, the records, the
+                            refusals, a `token`. Reads only; no network.
+    POST /api/github/commit-records -- 11.3 「先把人工记录提交一次」: commits
+                            exactly the changed `.rce/` files. Body `{}`.
+    POST /api/github/create-repo -- 11.3, no remote: `{name, token}` -> a
+                            PRIVATE repository via `gh`, added as origin.
+    POST /api/github/push -- 11.3: `{token, commit_records?}` -> `git push`
+                            of the planned branch (never forced). Errors of
+                            all three: `github_<code>` with `message_zh`,
+                            `detail`, and `blockers`/`command`/`plan` when
+                            they apply.
     POST /api/open      -- body `{"path": REL, "reveal": bool}`: reveal a
                             project path in Finder (`open -R`) or open it with
                             its default application (`open`). macOS only --
@@ -469,7 +482,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable, Iterator
 
-from rce import addproject, cloud, db, github, inventory, lineage, migration, paths
+from rce import addproject, cloud, db, github, githubpush, inventory, lineage, migration, paths
 from rce.ingest import scan as scan_mod
 from rce import project as project_identity
 from rce.records import judgements
@@ -709,6 +722,25 @@ class GitHubApiError(ApiError):
         self.status = {"not_linked": 409, "unsafe_config": 409, "busy": 503, "timeout": 504}.get(exc.code, 502)
         self.state = "github_" + exc.code
         self.extra = {"message_zh": exc.message, "detail": exc.detail}
+
+
+class GitHubPushApiError(ApiError):
+    """DESIGN.md 11.3: a commit of the records, a repository creation or a
+    push did not happen -- its Chinese sentence (`message_zh`), git's or
+    gh's own text with credentials scrubbed (`detail`), and, when they
+    apply, the refusals (`blockers`), the command to run (`command`) and
+    the new plan (`plan`)."""
+
+    _STATUS = {
+        "invalid_name": 400, "busy": 503, "timeout": 504, "auth": 502, "push_failed": 502,
+        "create_failed": 502, "commit_failed": 500, "records_check": 500, "git_missing": 500,
+    }
+
+    def __init__(self, exc: githubpush.PushError) -> None:
+        super().__init__(exc.detail)
+        self.status = self._STATUS.get(exc.code, 409)
+        self.state = "github_" + exc.code
+        self.extra = {"message_zh": exc.message, "detail": exc.detail, **exc.extra}
 
 
 class CloudOnlyApiError(ApiError):
@@ -1375,6 +1407,62 @@ def github_fetch_payload(served: ServedProject) -> dict[str, Any]:
         return github.fetch(served.root, served.project_id)
     except github.GitHubError as exc:
         raise GitHubApiError(exc) from exc
+
+
+def _push_served(served: ServedProject, *, writes: bool) -> Path:
+    if served.blocked is not None:
+        raise ProjectBlockedError(served.blocked)
+    if writes and served.read_only:
+        raise ReadOnlyError("the project is open read-only; nothing committed, created or pushed")
+    return served.root
+
+
+def github_push_plan_payload(served: ServedProject) -> dict[str, Any]:
+    """`GET /api/github/push-plan` (11.3): reads only, no network."""
+    root = _push_served(served, writes=False)
+    try:
+        return githubpush.plan(root)
+    except githubpush.PushError as exc:
+        raise GitHubPushApiError(exc) from exc
+
+
+def github_commit_records_payload(served: ServedProject, body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/github/commit-records` (11.3): the `.rce/` files only."""
+    root = _push_served(served, writes=True)
+    try:
+        return githubpush.commit_records(root, served.project_id)
+    except githubpush.PushError as exc:
+        raise GitHubPushApiError(exc) from exc
+
+
+def _token_of(body: dict[str, Any]) -> str:
+    token = body.get("token")
+    if not isinstance(token, str) or not token:
+        raise MissingParamError("'token' (from GET /api/github/push-plan) is required")
+    return token
+
+
+def github_create_repo_payload(served: ServedProject, body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/github/create-repo` (11.3): `{name, token}`; private only."""
+    root = _push_served(served, writes=True)
+    token = _token_of(body)
+    try:
+        return githubpush.create_repo(root, body.get("name"), token, served.project_id)
+    except githubpush.PushError as exc:
+        raise GitHubPushApiError(exc) from exc
+
+
+def github_push_payload(served: ServedProject, body: dict[str, Any]) -> dict[str, Any]:
+    """`POST /api/github/push` (11.3): `{token, commit_records?}`."""
+    root = _push_served(served, writes=True)
+    token = _token_of(body)
+    tick = body.get("commit_records", False)
+    if not isinstance(tick, bool):
+        raise MissingParamError("'commit_records' must be true or false")
+    try:
+        return githubpush.push(root, token, served.project_id, commit_records=tick)
+    except githubpush.PushError as exc:
+        raise GitHubPushApiError(exc) from exc
 
 
 # -- POST /api/open -----------------------------------------------------------
@@ -2787,6 +2875,9 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/github":
                 # 11.2: the linked repository's state, from local refs only.
                 self._send_json(200, github_state_payload(self._served()))
+            elif path == "/api/github/push-plan":
+                # 11.3: what a push would do -- reads only, no network.
+                self._send_json(200, github_push_plan_payload(self._served()))
             elif path == "/api/variables" or path.startswith("/api/variables/"):
                 # The 「变量」 view (9.11): the cards are read from their files
                 # (the index adds the trust decision); a blocked or moved
@@ -2923,6 +3014,15 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 # remote, the only network RCE does here, only on this click.
                 self._read_json_object()
                 self._send_json(200, github_fetch_payload(self._served()))
+            elif parsed.path == "/api/github/commit-records":
+                # 11.3 「先把人工记录提交一次」: the `.rce/` files only.
+                self._send_json(200, github_commit_records_payload(self._served(), self._read_json_object()))
+            elif parsed.path == "/api/github/create-repo":
+                # 11.3: a PRIVATE repository via gh, only on this click.
+                self._send_json(200, github_create_repo_payload(self._served(), self._read_json_object()))
+            elif parsed.path == "/api/github/push":
+                # 11.3 「推送」: the only request that pushes; never forced.
+                self._send_json(200, github_push_payload(self._served(), self._read_json_object()))
             elif parsed.path == "/api/projects/rename":
                 # 10.4: the registry label only, never the folder.
                 self._send_json(200, rename_payload(self._read_json_object()))
