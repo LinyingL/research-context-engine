@@ -2686,10 +2686,12 @@ claim's side — belongs to the result-review phase.
   form — `Simon, H. A. (1976). From substantive…`, `Gigerenzer, G., &
   Goldstein, D. G. (1996). Reasoning…` — is a reference-list entry of that
   draft, whether or not it sits under a 参考文献 heading, and is never
-  counted as an in-text citation. (On the researcher's drafts, 46 such
-  references sat outside a recognised heading — 15 of them in a table — and
-  were being reported as 46 citations 「未找到」.) The format itself is the
-  evidence; the heading was only a shortcut to it.
+  counted as an in-text citation. (On the researcher's drafts, 93 such
+  references in 7 drafts sat outside a recognised heading, several in
+  tables, and were being reported as citations 「未找到」; recognising them
+  raised the resolved citations from 464 to 569.) The format itself is the
+  evidence; the heading was only a shortcut to it. A list item's trailing
+  commentary is part of its entry's text in V7.
 - **A citation next to a DOI for the same work.** When one section cites a
   work by DOI and also by author–year, the graph holds one link (section →
   reference), and the author–year occurrence cannot be judged separately.
