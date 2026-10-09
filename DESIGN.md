@@ -2481,3 +2481,200 @@ Documents folder (9.12).
   checking, for the same reason, in the scans that follow consent.
 - **A project's display name survives a move.** Re-attaching a moved
   project keeps the name the researcher gave it.
+
+## Section 11 — Connections: OneDrive, GitHub, Zotero (task V7)
+
+*Status: APPROVED FOR IMPLEMENTATION, 2026-10-09. The researcher asked for
+connections to OneDrive, GitHub and Zotero and, shown what each could mean
+on their own machine, chose: OneDrive folders used as projects; a project
+linked to its GitHub repository, and pushed there as a backup; citations in
+the drafts tied to the literature they cite. Sections 0, 8.8, 9 and 10
+apply throughout. No connection stores a password or a token; RCE uses the
+logins the researcher already has (the OneDrive client, `gh`, git's own
+credential helper) or none.*
+
+### 11.0 What the researcher's machine looks like (2026-10-09)
+
+- `~/Library/CloudStorage/OneDrive-个人` exists (376 files, mostly books and
+  papers), but the OneDrive client is no longer installed: files that are
+  only in the cloud cannot be downloaded.
+- A Zotero data directory exists (`~/Zotero`, 18 items, last changed June
+  2023); the Zotero program is not installed.
+- The drafts cite in prose: about 950 author–year citations in half- and
+  full-width brackets (`Simon（1955）`, `（Kahneman & Tversky, 1979）`,
+  `Chen & Peng (2010)`), 94 distinct DOIs, 8 drafts with a reference list,
+  no citation keys and no `.bib` file.
+- `gh` is logged in with repo scope. `rmb-hysteresis` is a git repository
+  with no remote. The thesis project is not a git repository, is 2.2 GB, has
+  six data files of 146–172 MB, and lives in the iCloud-synced Documents
+  folder.
+
+### 11.1 OneDrive (and other synced folders) as project locations
+
+A folder inside `~/Library/CloudStorage/<provider>-<account>` is added like
+any other (Section 10). What changes:
+
+- The provider's root (`OneDrive-个人` itself) and `~/Library/CloudStorage`
+  itself are top-level folders and are refused with 10.2's sentence.
+- RCE knows which provider holds a folder (from the directory name under
+  `CloudStorage`) and whether its client is running. When files are only in
+  the cloud and the client is not running, RCE does not try to read them —
+  a read would wait forever — and says so wherever those files are counted:
+  in the add preview and in 「来源文件暂不可读」 (「这些文件只在 OneDrive 云端；
+  OneDrive 客户端没有运行，打开它并登录后 RCE 才能读到」). With the client
+  running, a cloud file is read the same way an iCloud one is (8.10).
+- Nothing else: the index is already outside the project (9.1), the lock is
+  in `~/.rce/locks` (9.7), records are plain files the provider syncs.
+
+### 11.2 GitHub: a project linked to its repository
+
+A project whose git remote is on `github.com` (https, `git@` or `ssh://`
+forms; the owner and name checked against GitHub's character set) is
+*linked*. Nothing is configured; nothing is stored.
+
+- **Where it shows.** The project menu gains one line, 「GitHub：owner/repo」,
+  and under it the state as of the last fetch: 「本地领先 N 个提交，落后 M
+  个（<日期> 获取）」, or 「与 GitHub 一致」, or 「还没有从 GitHub 获取过」.
+  「从 GitHub 获取最新状态」 runs `git fetch` for that remote — the only
+  network RCE does here, only on that click, never `pull`, never a merge.
+- **Links.** A script, data file or draft that git tracks gets 「在 GitHub
+  上查看」, pinned to a commit so the link never changes under the reader:
+  the newest commit that GitHub already has (the upstream branch's tip, or
+  the remote's default branch). If that commit does not contain the file,
+  there is no link and the reason is said: 「这个文件还没有推送到 GitHub」. If
+  the local file differs from that version: 「本地有未推送或未提交的改动」.
+  A commit gets a link only when GitHub has it.
+- **Every git command RCE runs** has the repository's `core.fsmonitor`
+  disabled and takes no optional locks (10.9), so linking a folder never
+  runs a program the folder names.
+
+### 11.3 GitHub: pushing a project as a backup
+
+「推送到 GitHub…」 in the project menu. Pushing is the first thing RCE does
+that writes somewhere other than this machine; every push is shown before
+it happens and needs its own confirmation — nothing is remembered as "always
+push".
+
+**The dialog shows**: the branch; the commits GitHub does not have yet (count
+and their first lines); uncommitted changes, which a push does not carry
+(「另有 N 个文件的改动还没有提交，推送不包括它们」); and whether the
+project's human records (`.rce/`) are committed. One tick, 「先把人工记录提交
+一次」, commits exactly the record files under `.rce/` — never any other file,
+never the researcher's own staged changes — with the message 「RCE：人工记录」.
+
+**Without a GitHub remote**, the dialog first creates a **private**
+repository under the account `gh` is logged in to (name defaults to the
+folder name, ASCII-only, editable), adds it as `origin`, then pushes. RCE
+never creates a public repository.
+
+**Refused, with the reason and no push:**
+- `gh` is missing or not logged in (for creating a repository) — the exact
+  command to run is shown; RCE never asks for a password or token;
+- detached HEAD, a merge or rebase in progress, no branch;
+- the push is not a fast-forward (「GitHub 上有你本地没有的提交，请先在终端里
+  处理」) — RCE never force-pushes;
+- a file over 100 MB in the commits to be pushed (GitHub rejects it): the
+  files are named;
+- the remote is not on GitHub.
+
+**A folder that is not a git repository** is not turned into one in V7. The
+dialog says so and, when the folder is inside an iCloud, OneDrive or other
+synced folder, why: sync services and git's internal files do not mix, and
+a repository there can be damaged by the sync. The way forward it names: move
+the project to a folder that is not synced (9.4 recognises the move), then
+`git init` there. For the thesis project it also names the six data files
+over 100 MB that GitHub would refuse.
+
+### 11.4 Citations: the drafts tied to the literature
+
+A new extractor, `citations`, reads every draft (`.md`, `.tex`).
+
+**What it finds.**
+- **DOIs**, normalised: lower case; trailing punctuation removed, half- and
+  full-width (`.,;:)）。，；`, backticks, markdown brackets).
+- **Author–year citations** in Latin script: narrative (`Simon (1955)`,
+  `Simon（1955）`, `Chen & Peng (2010)`, `Chen and Peng (2010)`, `Hassan et al.
+  (2019)`) and parenthetical (`(Hansen, 2000)`, `（Samuelson & Zeckhauser,
+  1988）`, several separated by `;` or `；`), years 1900–2099 with an
+  optional letter. Each occurrence keeps its file, line, the exact text, the
+  section, and — when a claim (Section 4) covers that sentence — the claim.
+  Chinese-script names (`张川川（2020）`) are not read in V7: the bracketed-
+  year pattern alone cannot tell a name from an ordinary phrase, and V7
+  does not guess.
+- **The draft's own reference list** — the entries under a heading 「参考文献」,
+  `References` or `Bibliography` — each entry with its first author's
+  surname, year (and letter), and DOI if it has one.
+
+**How a citation is resolved**, in this order, each step deterministic:
+1. **Within the draft.** An author–year citation that matches exactly one
+   entry of the same draft's reference list by first surname and year (and
+   letter) is that entry — the convention the citation itself relies on.
+   Two entries matching is ambiguous, and both are offered as candidates.
+2. **By DOI** — written in the text, or carried by the matched entry — to the
+   item in the researcher's Zotero library with that DOI. The library is
+   read from Zotero's data directory (from Zotero's preferences, else
+   `~/Zotero`), opened read-only and never written; when Zotero is running
+   and holds its lock, a copy is read.
+3. **By DOI, online — only when the researcher turns it on.** A setting,
+   off by default, 「用 DOI 联网查文献信息」, with the sentence 「只发送 DOI，
+   不发送文稿内容」; lookups go to doi.org / Crossref, are cached under the
+   RCE home with their date, and a failure is retried later, never recorded
+   as "not found".
+4. **Author–year without a DOI path** — Zotero items whose first creator's
+   surname and year match are *candidates* (`pending`, as claims' are):
+   RCE does not decide that "Simon 1955" is a particular item; the
+   researcher confirms one, through the ledger (9.3).
+
+**In the graph.** References become nodes — `ref:doi:<doi>` when a DOI is
+known, `ref:zotero:<item key>` otherwise, `ref:entry:<draft>#<n>` for a
+reference-list entry with neither — and each citation an edge `cites` from
+its section and, when there is one, its claim, with extractor `citations`.
+Resolved by an identifier (steps 1–3): `auto`. Candidates (step 1 when
+ambiguous, step 4): `pending`. The basis (9.6) of a `cites` link is the
+citation's normalised surname and year or its DOI, and the matched entry's
+DOI — so a citation whose reference-list entry changes its DOI comes under
+review.
+
+**The app gets one view, 「文献」.** Per draft, its citations: the text as
+written, what it was resolved to (authors, year, title, journal) and how —
+「Zotero」, 「文末条目」, 「DOI 联网」 — or 「未找到」 or 「N 个候选，待确认」 with
+确认 / 否决 per candidate (ledger entries). A summary at the top: 「N 处
+引用：已对上 X，待确认 Y，未找到 Z」, with the drafts that have the most
+unresolved first. Actions: open the DOI; 「在 Zotero 中打开」 only when the
+Zotero program is installed; 「打开 PDF」 for a Zotero attachment — the one
+place RCE opens a file outside the project, so it opens only a file that
+the Zotero database names for that item, inside Zotero's storage
+directory, never a path the page supplies. The setting for online lookups
+lives at the top of this view. Showing which claims cite what — from the
+claim's side — belongs to the result-review phase.
+
+### 11.5 Acceptance
+
+1. **OneDrive.** A folder in a CloudStorage fixture with cloud-only files
+   and no client running: added; the preview and the scan say why those
+   files are not read; nothing waits. The provider root is refused.
+2. **GitHub link.** A repository whose remote is a local stand-in for
+   GitHub: the menu line, the state after 「获取最新状态」, a link pinned to
+   the pushed commit, no link for a file not yet pushed, the local-changes
+   note. A remote URL with an owner or name outside GitHub's character set
+   is not linked.
+3. **Push.** Into a local bare repository standing in for GitHub, with `gh`
+   replaced by a test double: the dialog lists exactly the unpushed commits
+   and the uncommitted files; 「先把人工记录提交一次」 commits only `.rce/`
+   files even with other changes staged; no remote → a private repository is
+   requested and then pushed; each refusal of 11.3 triggered and nothing
+   pushed; never a force push. No test or check pushes to github.com.
+4. **Not a git repository.** The dialog explains; inside a synced folder it
+   says why; the large files are named; nothing is written.
+5. **Citations, on a copy of the researcher's drafts.** Every DOI and every
+   Latin author–year citation found (checked against a hand count on two
+   drafts); in-draft resolution against the reference list; DOI → Zotero on
+   a copy of their library; ambiguity offered as candidates; nothing
+   resolved by surname alone without being `pending`; Chinese-script names
+   not read; the online lookup does nothing until turned on and sends only
+   DOIs (checked with a recording stand-in for the network).
+6. **文献 view.** Summary counts equal the graph; confirm and reject a
+   candidate (a ledger entry each); 「打开 PDF」 refuses any path that is not
+   the item's attachment inside Zotero's storage directory.
+7. **Origin and secrets.** Every new endpoint answers 403 cross-origin; no
+   token, password or credential is written anywhere RCE writes.
