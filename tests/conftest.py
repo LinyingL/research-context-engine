@@ -46,6 +46,16 @@ def isolated_rce_home(tmp_path_factory, monkeypatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def no_real_zotero(tmp_path_factory, monkeypatch) -> Path:
+    """Every scan reads a Zotero library (DESIGN.md 11.4); no test may read
+    the developer's own. `RCE_ZOTERO_DATA_DIR` points at an empty folder
+    (an absent library) unless a test sets its own."""
+    empty = tmp_path_factory.mktemp("zotero-none")
+    monkeypatch.setenv("RCE_ZOTERO_DATA_DIR", str(empty))
+    return empty
+
+
+@pytest.fixture(autouse=True)
 def no_engine_probe(monkeypatch) -> None:
     """The migration's retire step asks whether an RCE engine answers on
     the app's fixed port (DESIGN.md 9.5 step 5). No test may ever touch a

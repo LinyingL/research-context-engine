@@ -972,10 +972,16 @@ def _run_scan(root: Path, project_id: str, progress: Progress, echo: Echo) -> Sc
                     echo(f"  mappings: not read ({exc})")
                 progress("judgements", 4, m)
                 judgements.apply_after_scan(conn, root, echo)
+                unreadable = [row for row in db.all_scan_sources(conn) if row["status"] == scan_mod.UNREADABLE]
+                zotero_pair = scan_mod.SOURCE_SEPARATOR + scan_mod.ZOTERO_STORE
+                # 11.4: a citations source `<draft>\x1fzotero` that could not be
+                # read is the Zotero library, not the draft -- said once, apart.
                 report.unreadable_sources = sorted(
                     f"{row['extractor']}: {scan_mod.file_of(row['source'])}"
-                    for row in db.all_scan_sources(conn) if row["status"] == scan_mod.UNREADABLE
+                    for row in unreadable if not row["source"].endswith(zotero_pair)
                 )
+                if any(row["source"].endswith(zotero_pair) for row in unreadable):
+                    report.notes.append("Zotero library not read; citation candidates from it keep their previous state")
                 report.cloud = cloud.notes(root, {s.split(": ", 1)[1] for s in report.unreadable_sources})
             finally:
                 conn.close()

@@ -79,10 +79,12 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
-from rce import addproject, consistency, db, github, githubpush, inventory, lineage, migration, paths, query
+from rce import addproject, consistency, db, github, githubpush, inventory, lineage, literature, migration, paths, query
 from rce import project as project_identity
 from rce import rebuild as rebuild_mod
 from rce.ingest import attempts as attempts_ingest
+from rce.ingest import citations as citations_ingest
+from rce.ingest import files as files_ingest
 # `git_ingest` stays importable as `rce.cli.git_ingest` (tests patch it);
 # the scan itself is `rce.ingest.pipeline`.
 from rce.ingest import git as git_ingest  # noqa: F401
@@ -2302,6 +2304,77 @@ def cmd_github_push(args: argparse.Namespace) -> int:
     return 0
 
 
+def _citation_statuses(root: Path) -> dict[tuple[str, str], str]:
+    """{(src, dst): status} of the index's `citations` links, read-only;
+    empty when the folder has no index here."""
+    try:
+        db_path = paths.graph_db_path(root)
+    except paths.GraphMigrationError:
+        return {}
+    if not db_path.exists():
+        return {}
+    import sqlite3  # noqa: PLC0415 -- leaf use
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute("SELECT src, dst, status FROM edges WHERE extractor = 'citations'").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {(src, dst): status for src, dst, status in rows}
+
+
+def cmd_citations(args: argparse.Namespace) -> int:
+    """`rce citations [path] [--json]` (DESIGN.md 11.4): per draft, what it
+    cites and how each citation resolves -- read only, nothing written,
+    the network not asked (online answers only from the cache).
+    `rce citations lookup [--on | --off]`: the machine setting for DOI
+    lookups online (off by default; only the DOI is sent)."""
+    if args.path == "lookup":
+        if args.on or args.off:
+            literature.set_doi_lookup(bool(args.on))
+        state = "on" if literature.doi_lookup_enabled() else "off"
+        print(f"DOI lookup online: {state} (only the DOI is sent, to api.crossref.org; nothing from the drafts). "
+              f"Setting: {literature.settings_path()}")
+        return 0
+    if args.on or args.off:
+        raise CliError("--on/--off belong to 'rce citations lookup'")
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        raise CliError(f"{root} is not a directory")
+    try:
+        files = git_ingest.list_source_files(root)
+    except git_ingest.NotAGitRepositoryError:
+        files = files_ingest.list_source_files(root)
+    except git_ingest.GitIngestError as exc:
+        raise CliError(f"cannot list the project's files: {exc}") from exc
+    rep = citations_ingest.report(root, citations_ingest.drafts_of(files), statuses=_citation_statuses(root))
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    z = rep["zotero"]
+    print(f"Zotero library: {z['status']} ({z['data_dir']}, {z['items']} item(s))" + (f" -- {z['reason']}" if z["reason"] else ""))
+    print(f"DOI lookup online: {'on' if rep['lookup']['enabled'] else 'off'}")
+    t = rep["totals"]
+    print(f"{t['citations']} citation(s): {t['resolved']} resolved, {t['pending']} with candidates to confirm, "
+          f"{t['unresolved']} not found" + (f"; {t['unreadable']} draft(s) unreadable" if t["unreadable"] else ""))
+    for draft in rep["drafts"]:
+        if not draft["readable"]:
+            print(f"  {draft['file']}: not read")
+            continue
+        c = draft["counts"]
+        if not c["citations"]:
+            continue
+        print(f"  {draft['file']}: {c['citations']} citation(s), {c['resolved']} resolved, {c['pending']} pending, "
+              f"{c['unresolved']} not found" + (f"; reference list: {draft['entries']} entries" if draft["reference_list"] else ""))
+        for item in draft["citations"]:
+            if item["state"] == "unresolved":
+                print(f"      line {item['line']}: {item['text']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = PathParser(prog="rce", description="Research Context Engine CLI.")
     # Global, precedes the subcommand (e.g. `rce -v attempts --check`): every
@@ -2489,6 +2562,20 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--create-repo", metavar="NAME", default=None, help="no remote yet: create a PRIVATE GitHub repository NAME with gh, as 'origin'")
     q.add_argument("--yes", action="store_true", help="do it; without --yes nothing is written")
     q.set_defaults(func=cmd_github_push)
+
+    p = sub.add_parser(
+        "citations",
+        help=(
+            "The drafts' citations (DESIGN.md 11.4): per draft, what is cited and how it resolves "
+            "(read only); 'rce citations lookup --on|--off' sets the DOI lookup online (off by default)"
+        ),
+    )
+    add_project_path(p)
+    p.add_argument("--json", action="store_true", help="print the whole report as JSON")
+    onoff = p.add_mutually_exclusive_group()
+    onoff.add_argument("--on", action="store_true", help="with 'lookup': look DOIs up online (only the DOI is sent)")
+    onoff.add_argument("--off", action="store_true", help="with 'lookup': never look DOIs up online")
+    p.set_defaults(func=cmd_citations)
 
     p = sub.add_parser(
         "app",

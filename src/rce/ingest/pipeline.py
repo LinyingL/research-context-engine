@@ -6,8 +6,10 @@ the same extractors in the same order. Moved here verbatim from
 pass their own.
 
 Order: git -> latex/.bib -> dataflow -> pyfig -> mlflow -> wandb ->
-mdpaper -> claims (claims last: it matches claim numbers against
-experiment metrics, so mlflow/wandb must have written those nodes first).
+mdpaper -> claims -> citations (claims after the trackers: it matches
+claim numbers against experiment metrics, so mlflow/wandb must have
+written those nodes first; citations last: its `cites` links start at the
+sections and claims mdpaper/latex/claims wrote, DESIGN.md 11.4).
 A project that is not a git repository degrades to a filesystem walk for
 its inventory (W1); any other git failure stops the scan
 (`IngestFailed`).
@@ -27,6 +29,7 @@ from sqlite3 import Connection
 from typing import Callable, Iterator
 
 from rce.ingest import attempts as attempts_ingest
+from rce.ingest import citations as citations_ingest
 from rce.ingest import claims as claims_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import files as files_ingest
@@ -209,6 +212,12 @@ def _scan_sources(
         )
         claims_counts = claims_ingest.ingest_claims_repo(conn, project_root, inventory["tex"], scan=sc)
         echo(f"  claims: {_format_counts(claims_counts)}")
+        # 11.4: citations last -- its links start at the sections and claims
+        # the extractors above wrote in this scan.
+        citation_counts = citations_ingest.ingest_citations_repo(
+            conn, project_root, citations_ingest.drafts_of(inventory), scan=sc, complete=True,
+        )
+        echo(f"  citations: {_format_counts(citation_counts)}")
         return warnings.count
 
 

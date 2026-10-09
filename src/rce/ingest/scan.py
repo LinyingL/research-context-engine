@@ -85,11 +85,16 @@ INVENTORY = "inventory"
 
 #: Extractors whose sources are project files, so a file missing from a
 #: successfully read inventory is `ABSENT` for them.
-FILE_EXTRACTORS = frozenset({"dataflow", "pyfig", "latex", "mdpaper", "claims"})
+FILE_EXTRACTORS = frozenset({"dataflow", "pyfig", "latex", "mdpaper", "claims", "citations"})
 
 #: Separator of a claims link's compound source `<file>\x1f<store>`
 #: (module docstring); a control character no file name carries.
 SOURCE_SEPARATOR = "\x1f"
+
+#: The Zotero half of a `citations` candidate's source (11.4):
+#: `<draft>\x1fzotero`, reported unreadable when the library could not be
+#: read, so the candidates it would have offered keep their state.
+ZOTERO_STORE = "zotero"
 
 GIT_SOURCE = "commits"
 CHECK_SOURCE = "check"
@@ -125,6 +130,8 @@ def basis(extractor: str, edge_type: str, **facts: Any) -> dict[str, Any]:
     | claims backed_by | {"sentence", "number", "metrics": {name: rounded}} |
     | pyfig generates | {"calls": [bare call name]} (`call=`) |
     | mlflow/wandb produces | {"artifacts": [artifact path]} (`artifact=`) |
+    | citations cites | {"cited": [normalised "surname|year" or "doi:<doi>"],
+    |                 |  "entry_dois": [the matched reference-list entries' DOIs]} (11.4) |
     | everything else | {} -- the link's identity alone |
 
     Lists, not scalars, wherever one scan can produce a link more than once
@@ -139,6 +146,8 @@ def basis(extractor: str, edge_type: str, **facts: Any) -> dict[str, Any]:
         }
     if extractor in ("mlflow", "wandb") and edge_type == "produces":
         return {"artifacts": [facts["artifact"]]}
+    if extractor == "citations" and edge_type == "cites":
+        return {"cited": sorted(facts["cited"]), "entry_dois": sorted(facts.get("entry_dois", ()))}
     return {}
 
 
@@ -149,6 +158,12 @@ def file_of(source: str) -> str:
 
 def claims_source(file: str, store: str) -> str:
     return f"{file}{SOURCE_SEPARATOR}{store}"
+
+
+def citations_zotero_source(file: str) -> str:
+    """The source of a `citations` link offered from the Zotero library
+    for a citation in `file` (`ZOTERO_STORE`)."""
+    return f"{file}{SOURCE_SEPARATOR}{ZOTERO_STORE}"
 
 
 # -- recording -------------------------------------------------------------------
