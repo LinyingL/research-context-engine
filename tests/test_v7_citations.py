@@ -1023,3 +1023,139 @@ def test_11_5_5_review_latin_names_joined_to_chinese_text_are_only_candidates(tm
     assert [(r.citation.cjk_joined, r.status, r.how) for r in res] == [
         (True, "pending", C.HOW_ENTRY_CANDIDATES), (True, "pending", C.HOW_ENTRY_CANDIDATES), (False, "auto", C.HOW_ENTRY),
     ]
+
+
+# -- 11.6: a full reference is an entry wherever it is written ----------------------------------
+
+
+FULL_REFS = """# Intro
+
+Simon (1976) and (Gigerenzer & Goldstein, 1996) argue it; Wu et al. (2014) too.
+
+| 文献 | 功能 | 核验 |
+|---|---|---|
+| Simon, H. A. (1976). From substantive to procedural rationality. In S. J. Latsis (Ed.), *Method*. | 程序理性 | [URL](https://example.org/simon) |
+| Gigerenzer, G., & Goldstein, D. G. (1996). Reasoning the fast and frugal way. *Psychological Review*. doi:10.1037/0033-295X.103.4.650 | 决策形式 | 见 Hansen (2000) |
+| Berardi (2022) "Beliefs…" | Berardi, M. (2022). Uncertainty and sentiments in asset prices. *JEBO*. | Lucas (1976) |
+
+1. Payne, J. W., Bettman, J. R., & Johnson, E. J. (1993). *The Adaptive Decision Maker*. Cambridge University Press.
+- Wu, F., et al. (2014). Regional Monetary Anchoring of the Renminbi
+- Simon, H. A. （1955a）。A behavioral model of rational choice. *QJE*.
+  Reprinted in Simon (1982), *Models of Bounded Rationality*.
+
+## 参考文献
+
+- Hansen, B. E. (2000). Sample splitting and threshold estimation. *Econometrica*.
+"""
+
+
+def test_11_6_a_full_reference_outside_a_heading_is_an_entry():
+    """11.6: a line, a list item (with its indented continuation) or a
+    table cell -- the first or any other -- that begins with a full
+    reference in author-initials form is an entry of the draft, joining the
+    entries under 参考文献, all numbered in document order. Its text gives
+    no citation (the DOI in it is the entry's); the row's other cells are
+    read."""
+    d = C.parse_lines("paper.md", FULL_REFS.splitlines(), [])
+    assert [(e.n, e.surname, e.year, e.letter, e.doi, e.line) for e in d.entries] == [
+        (1, "Simon", 1976, "", None, 7),
+        (2, "Gigerenzer", 1996, "", "10.1037/0033-295x.103.4.650", 8),
+        (3, "Berardi", 2022, "", None, 9),
+        (4, "Payne", 1993, "", None, 11),
+        (5, "Wu", 2014, "", None, 12),
+        (6, "Simon", 1955, "a", None, 13),
+        (7, "Hansen", 2000, "", None, 18),
+    ]
+    assert d.entries[0].text.startswith("Simon, H. A. (1976). From substantive") and d.entries[0].text.endswith("*Method*.")
+    assert d.entries[5].text.endswith("*Models of Bounded Rationality*.")
+    assert [(c.line, c.kind, c.surname or c.doi, c.year) for c in d.citations] == [
+        (3, "author_year", "Simon", 1976), (3, "author_year", "Gigerenzer", 1996), (3, "author_year", "Wu", 2014),
+        (8, "author_year", "Hansen", 2000), (9, "author_year", "Berardi", 2022), (9, "author_year", "Lucas", 1976),
+    ]
+    res = {(r.citation.surname, r.citation.year): (r.status, [t.node_id for t in r.targets])
+           for r in C.resolve(d, literature.ZoteroLibrary(None, literature.LIBRARY_ABSENT))}
+    assert res == {
+        ("Simon", 1976): ("auto", ["ref:entry:paper.md#1"]),
+        ("Gigerenzer", 1996): ("auto", ["ref:doi:10.1037/0033-295x.103.4.650"]),
+        ("Wu", 2014): ("auto", ["ref:entry:paper.md#5"]),
+        ("Hansen", 2000): ("auto", ["ref:entry:paper.md#7"]),
+        ("Berardi", 2022): ("auto", ["ref:entry:paper.md#3"]),
+        ("Lucas", 1976): (None, []),
+    }
+
+
+@pytest.mark.parametrize("text", [
+    "Simon, H. A. (1976). From substantive to procedural rationality.",
+    "Gigerenzer, G., & Goldstein, D. G. (1996). Reasoning the fast and frugal way.",
+    "Payne, J. W., Bettman, J. R., & Johnson, E. J. (1993). *The Adaptive Decision Maker*.",
+    "Wu, F., et al. (2014). Regional Monetary Anchoring of the Renminbi",
+    "Simon, H. A. （1955a）。A behavioral model of rational choice.",
+    "**Nyman, R., Kapadia, S., & Tuckett, D. (2021). News and narratives in financial systems.**",
+    "[3] Cheung, Y.-W., & Rime, D. (2014). The offshore renminbi exchange rate.",
+    "van Dijk, T. A. (1988). News as discourse.",
+])
+def test_11_6_full_reference_forms(text):
+    assert C.is_full_reference(text)
+
+
+@pytest.mark.parametrize("lines, cited", [
+    # a narrative sentence that starts with a citation: no initials
+    (["Simon (1955) argued that satisficing replaces optimisation."], [("author_year", "Simon")]),
+    (["Chen & Peng (2010) find that the renminbi's share rises."], [("author_year", "Chen")]),
+    (["Hassan et al. (2019). This shows the effect of political risk."], [("author_year", "Hassan")]),
+    # initials, but no period and text after the year
+    (["Simon, H. A. (1955) argued that the bound is cognitive."], [("author_year", "Simon")]),
+    (["1. Barberis, N. (2013)：末尾追加 https://doi.org/10.1257/jep.27.1.173"],
+     [("author_year", "Barberis"), ("doi", "10.1257/jep.27.1.173")]),
+    (["| 原引文 | 状态 |", "|---|---|", "| Du, J., Li, D., & Wang, Y. (2003) | NOT_FOUND |"], [("author_year", "Du")]),
+    # not at the start of the line
+    (["**VERIFIED** — Funke, M., & Shu, C. (2015). Assessing the CNH–CNY pricing differential."],
+     [("author_year", "Funke")]),
+    # a sentence-opening word is never a first author
+    (["However, A. (2010). The point stands."], []),
+])
+def test_11_6_a_sentence_that_starts_with_a_citation_is_not_an_entry(lines, cited):
+    """11.6 precision guard: only `Surname, X.` followed by the bracketed
+    year, a period and more text makes an entry; anything else stays prose
+    and its citations are read as before."""
+    d = C.parse_lines("p.md", ["# Intro", "", *lines], [])
+    assert d.entries == ()
+    assert [(c.kind, c.surname or c.doi) for c in d.citations] == cited
+
+
+def test_11_6_latex_items_outside_thebibliography_are_entries():
+    lines = [
+        r"\section{Intro}", r"As Simon (1976) argued.",
+        r"\begin{itemize}", r"\item Simon, H. A. (1976). From substantive to procedural rationality.",
+        r"\end{itemize}",
+    ]
+    d = C.parse_lines("p.tex", lines, [], tex=True)
+    assert [(e.n, e.surname, e.year, e.line) for e in d.entries] == [(1, "Simon", 1976, 4)]
+    assert [(c.surname, c.line) for c in d.citations] == [("Simon", 2)]
+
+
+def test_11_6_a_table_entry_link_carries_the_cell_text_in_its_basis(tmp_path):
+    """11.6 / 9.6: a link to an entry found in a table is `ref:entry:<draft>#<n>`
+    like any DOI-less entry, its basis the cell's text -- so a judgment on
+    it comes under review if the numbering moves it to another entry."""
+    root = _project(tmp_path, FULL_REFS)
+    sec = _section(root)
+    edges = {(s, d): (st, json.loads(b)) for s, d, st, _ev, b, _src in _edges(root)}
+    assert edges[(sec, "ref:entry:paper.md#1")] == ("auto", {
+        "cited": ["simon|1976"], "entry_dois": [],
+        "entries": ["Simon, H. A. (1976). From substantive to procedural rationality. In S. J. Latsis (Ed.), *Method*."],
+    })
+    assert edges[(sec, "ref:doi:10.1037/0033-295x.103.4.650")][0] == "auto"
+
+
+def test_11_6_a_run_of_initials_is_read_in_linear_time():
+    """The initials pattern reads the gap between two initials one way
+    only: a line of many initials that is no citation and no entry used to
+    backtrack 2^n times (22 initials took seconds, 24 over ten)."""
+    import time
+
+    line = "Simon, H. " + "A. " * 22 + "x (1976)"
+    start = time.perf_counter()
+    assert not C.is_full_reference(line)
+    C.find_in_line(line)
+    assert time.perf_counter() - start < 1.0

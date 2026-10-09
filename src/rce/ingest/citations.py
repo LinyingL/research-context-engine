@@ -44,6 +44,16 @@ prose does).
   entries. Each entry: first author's surname, year (+ letter), DOI if it
   has one, the text. Citations and DOIs inside the reference list are its
   entries, not citations.
+  **A full reference is an entry wherever it is written** (11.6): a line,
+  a list item (with its indented continuation lines) or a Markdown table
+  cell -- any cell, under the heading too -- whose text begins with a
+  reference in author-initials form (`Simon, H. A. (1976). From...`,
+  `Gigerenzer, G., & Goldstein, D. G. (1996). Reasoning...`, `Wu, F., et
+  al. (2014). Regional...`: the first author `Surname, X.`, the year in
+  brackets, a period, more text -- `_FULL_REFERENCE_RE`) joins the list.
+  Its text gives no citation and its DOI is the entry's; a table row's
+  other cells are read. A sentence that starts with a citation (`Simon
+  (1955) argued`, `Chen & Peng (2010) find`) has no initials and is prose.
 
 **Resolution** (11.4, each step its own function): 1. `resolve_in_draft`:
 exactly one entry of the same draft with the same first surname and year
@@ -57,8 +67,9 @@ creator's surname (case/diacritics-insensitive) and year match are
 candidates, `pending`. A DOI written in the text is an identifier: `auto`.
 
 **The graph.** Nodes `ref:doi:<doi>`, `ref:zotero:<item key>` (no DOI),
-`ref:entry:<draft>#<n>` (an entry with neither; n counts the entries of
-the list from 1). Edges `cites` from the citation's section and from each
+`ref:entry:<draft>#<n>` (an entry with neither; n counts the draft's
+entries from 1 in document order -- a draft whose entries are all under
+its heading numbers them as before 11.6). Edges `cites` from the citation's section and from each
 claim covering it, extractor `citations`; one edge per (from, reference),
 its evidence the occurrences (`file`, `line`, `text`). A citation with
 neither a section nor a claim (before the first heading) is counted
@@ -78,7 +89,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable, Iterable, Mapping
@@ -101,7 +112,10 @@ EXTRACTOR = "citations"
 _L = "A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff"
 _PARTICLE = r"(?:[Vv]an|[Vv]on|[Dd]e|[Dd]er|[Dd]en|[Dd]el|[Dd]ella|[Dd]i|[Dd]u|[Dd]a|[Dd]os|[Dd]as|[Ll]e|[Ll]a|[Tt]en|[Tt]er)"
 _NAME = rf"(?:{_PARTICLE}\s+){{0,2}}[{_L}](?:[{_L}]|['’][{_L}]|-[{_L}])*"
-_INITIALS = r"[A-Z]\.(?:\s*-?\s*[A-Z]\.)*"
+#: `H. A.`, `Y.-W.`, `D.G.`: one way only to read the gap between two
+#: initials (`\s*-?\s*` read a space two ways, and a failed match on a run
+#: of initials backtracked 2^n times).
+_INITIALS = r"[A-Z]\.(?:\s*(?:-\s*)?[A-Z]\.)*"
 _AUTHOR = rf"{_NAME}(?:\s*,\s*{_INITIALS})?"
 _CONJ = r"(?:&|\band\b|与|和|及)"
 _SEP = rf"(?:\s*[,，]\s*(?:{_CONJ}\s*)?|\s*[、/–—]\s*|\s*{_CONJ}\s*)"
@@ -179,6 +193,27 @@ _TEX_REF_HEADING_RE = re.compile(r"\\(?:part|chapter|section|subsection|subsubse
 _TEX_ANY_HEADING_RE = re.compile(r"\\(part|chapter|section|subsection|subsubsection)\*?\{")
 _TEX_LEVELS = {"part": 0, "chapter": 1, "section": 2, "subsection": 3, "subsubsection": 4}
 _TEX_ITEM_RE = re.compile(r"\\(?:bibitem|item)(?:\[[^\]]*\])?(?:\{[^{}]*\})?\s*")
+#: What an entry's text may start with before its first author: a number
+#: in brackets (`[3]`), emphasis markers.
+_ENTRY_LEAD_RE = re.compile(r"^\s*(?:\[\d{1,3}\]\s*)?[*_]*\s*")
+#: A list item's marker at any indentation (a full reference outside a
+#: reference list may sit in a nested list).
+_ANY_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)]|\[\d{1,3}\])\s+")
+#: A full reference in author-initials form (11.6): the first author
+#: `Surname, X.` (initials -- a narrative `Simon (1955) argued` or `Chen &
+#: Peng (2010) find` never has them), further authors `Surname, X. Y.` (or
+#: `X. Y. Surname`) after `,` `&` `and`, an optional `et al.`, the year (and
+#: letter) in half- or full-width brackets, a period, and more text:
+#: `Simon, H. A. (1976). From substantive...`, `Gigerenzer, G., &
+#: Goldstein, D. G. (1996). Reasoning...`, `Wu, F., et al. (2014). Regional...`.
+_ENTRY_NEXT_AUTHOR = rf"(?:{_NAME}\s*,\s*{_INITIALS}|{_INITIALS}\s*{_NAME})"
+_ENTRY_AUTHOR_SEP = r"(?:\s*[,，]\s*(?:(?:&|\band\b)\s*)?|\s*(?:&|\band\b)\s*)"
+_FULL_REFERENCE_RE = re.compile(
+    rf"(?P<first>{_NAME})\s*,\s*{_INITIALS}"
+    rf"(?:{_ENTRY_AUTHOR_SEP}{_ENTRY_NEXT_AUTHOR}){{0,30}}"
+    rf"(?:\s*,?\s*et\s*al\.)?"
+    rf"\s*[（(]\s*{_YEAR}\s*[)）]\s*[.．。]\s*\S"
+)
 
 
 #: One part of a surname: capitalised, and capitalised inside only after a
@@ -417,7 +452,7 @@ def parse_entry(file: str, n: int, line: int, text: str) -> RefEntry:
     """One reference-list entry: first author's surname (Latin script
     only), year and letter (the first year after the names; DOIs and URLs
     are not read for it), DOI."""
-    clean = re.sub(r"^\s*(?:\[\d{1,3}\]\s*)?[*_]*\s*", "", text)
+    clean = _ENTRY_LEAD_RE.sub("", text, count=1)
     dois = literature.find_dois(clean)
     surname = None
     m = re.match(rf"({_NAME})\s*(?:[,，(（]|&|\band\b|et\s*al|等)", clean)
@@ -528,6 +563,72 @@ def _tex_reference_region(lines: list[str]) -> tuple[bool, set[int], list[tuple[
     return found, indexes, region
 
 
+def is_full_reference(text: str) -> bool:
+    """Whether `text` begins with a full reference in author-initials form
+    (`_FULL_REFERENCE_RE`; a `[3]` or emphasis before it is allowed)."""
+    m = _FULL_REFERENCE_RE.match(_ENTRY_LEAD_RE.sub("", text, count=1))
+    return m is not None and is_surname(m.group("first"), month_ok=True)
+
+
+def _table_cells(row: str) -> list[tuple[int, int]]:
+    """(start, end) of each non-blank cell of a GFM table row: the row
+    split at every `|` not escaped by a backslash."""
+    bars = [m.start() for m in re.finditer(r"(?<!\\)\|", row)]
+    edges = [-1, *bars, len(row)]
+    return [(a + 1, b) for a, b in zip(edges, edges[1:]) if row[a + 1:b].strip()]
+
+
+def _entries_by_format(
+    file: str, lines: list[str], region: set[int], table_rows: set[int], *, tex: bool,
+) -> tuple[list[tuple[int, int, RefEntry]], set[int], dict[int, list[tuple[int, int]]]]:
+    """The full references written outside a reference-list heading (11.6):
+    a line or list item (with its indented continuation lines, as under the
+    heading), or a Markdown table cell -- any cell, inside the heading's
+    region too -- whose text begins with a full reference. Returns
+    [(0-based line, column, entry)] (n not yet given), the 0-based lines
+    that are entries, and {0-based line: [(start, end)]} of the table cells
+    that are: none of it is read for citations."""
+    found: list[tuple[int, int, RefEntry]] = []
+    entry_lines: set[int] = set()
+    cells: dict[int, list[tuple[int, int]]] = {}
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        if i in table_rows:
+            for start, end in _table_cells(raw):
+                if is_full_reference(raw[start:end]):
+                    found.append((i, start, parse_entry(file, 0, i + 1, raw[start:end])))
+                    cells.setdefault(i, []).append((start, end))
+            i += 1
+            continue
+        stripped = raw.strip()
+        if i in region or not stripped or (not tex and (_MD_HEADING_RE.match(raw) or stripped.startswith("<!--"))):
+            i += 1
+            continue
+        if tex:
+            item = _TEX_ITEM_RE.match(stripped)
+            text = stripped[item.end():] if item else stripped
+        else:
+            item = _ANY_LIST_ITEM_RE.match(raw)
+            text = raw[item.end():] if item else raw
+        if not is_full_reference(text):
+            i += 1
+            continue
+        parts, j = [text.strip()], i + 1
+        while (
+            j < len(lines) and j not in region and j not in table_rows and lines[j].strip()
+            and lines[j][:1] in (" ", "\t")
+            and not (_TEX_ITEM_RE.match(lines[j].strip()) if tex else _LIST_ITEM_RE.match(lines[j]))
+            and (tex or _MD_HEADING_RE.match(lines[j]) is None)
+        ):
+            parts.append(lines[j].strip())
+            j += 1
+        found.append((i, 0, parse_entry(file, 0, i + 1, " ".join(parts))))
+        entry_lines.update(range(i, j))
+        i = j
+    return found, entry_lines, cells
+
+
 # -- one draft --------------------------------------------------------------------------
 
 
@@ -562,11 +663,19 @@ def parse_lines(
     if tex:
         found, ref_indexes, region = _tex_reference_region(lines)
         prose = list(lines)
+        table_rows: set[int] = set()
     else:
         prose = mdpaper_ingest._blank_code_fences(lines)
         found, ref_indexes, region = _md_reference_region(prose)
-    entries, prose_lines = _entries_from_lines(file, region, tex=tex)
-    ref_indexes = ref_indexes - {n - 1 for n in prose_lines}
+        tabled = mdpaper_ingest._blank_md_table_rows(prose)
+        table_rows = {i for i, (a, b) in enumerate(zip(prose, tabled)) if a.strip() and not b.strip()}
+    listed, prose_lines = _entries_from_lines(file, region, tex=tex)
+    elsewhere, entry_lines, entry_cells = _entries_by_format(file, prose, set(ref_indexes), table_rows, tex=tex)
+    # One list, numbered in document order: a draft whose entries are all
+    # under its heading keeps the numbers it had before 11.6.
+    ordered = sorted([(e.line - 1, 0, e) for e in listed] + elsewhere, key=lambda t: (t[0], t[1]))
+    entries = [replace(e, n=k) for k, (_i, _col, e) in enumerate(ordered, 1)]
+    ref_indexes = (ref_indexes - {n - 1 for n in prose_lines}) | entry_lines
     by_line = _claims_by_line(claims or [])
     citations: list[Citation] = []
     sec_idx, section_id = 0, None
@@ -579,7 +688,9 @@ def parse_lines(
             continue
         if not tex and _MD_HEADING_RE.match(line) is None and line.lstrip().startswith("<!--"):
             continue
-        for col, kind, exact, fields in find_in_line(line):
+        # A table cell that is an entry is not read for citations; the
+        # row's other cells are.
+        for col, kind, exact, fields in find_in_line(_blank(line, entry_cells[i]) if i in entry_cells else line):
             claim_ids: tuple[str, ...] = ()
             here = by_line.get(lineno)
             if here and claim_lines is not None and i < len(claim_lines):

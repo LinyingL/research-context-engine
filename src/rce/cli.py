@@ -2371,7 +2371,7 @@ def cmd_citations(args: argparse.Namespace) -> int:
             continue
         print(f"  {draft['file']}: {c['citations']} citation(s), {c['resolved']} resolved, {c['pending']} pending, "
               f"{c['unresolved']} not found" + (f", {c['unanchored']} not linked" if c["unanchored"] else "")
-              + (f"; reference list: {draft['entries']} entries" if draft["reference_list"] else ""))
+              + (f"; reference list: {draft['entries']} entries" if draft["reference_list"] or draft["entries"] else ""))
         for item in draft["citations"]:
             if item["state"] == "unresolved":
                 print(f"      line {item['line']}: {item['text']}")
