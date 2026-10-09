@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Connection
 
+from rce import cloud
 from rce import db
 from rce.ingest import git as git_ingest
 from rce.ingest import pyconst
@@ -105,7 +106,7 @@ def scan_py_file(repo_root: str | Path, py_rel_path: str) -> tuple[str, list[Sav
     file (T9) so every call site can fold against the same table."""
     path = Path(repo_root) / py_rel_path
     try:
-        text = path.read_text(errors="replace")
+        text = cloud.read_text(path)
     except OSError as exc:
         logger.warning("cannot read %s: %s", py_rel_path, exc)
         return scan_mod.UNREADABLE, []

@@ -67,6 +67,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
+from rce import cloud
 from rce import db
 from rce.ingest import scan as scan_mod
 from rce.ingest.latex import ParsedSection, _strip_comment, parse_tex_file
@@ -439,7 +440,7 @@ def parse_tex_claims(repo_root: str | Path, tex_rel_path: str) -> list[ParsedCla
     duplicated here. The actual number-matching happens in
     `_scan_claims_in_lines`, shared with the Markdown extractor (see there)."""
     repo_root = Path(repo_root)
-    text = (repo_root / tex_rel_path).read_text(errors="replace")
+    text = cloud.read_text(repo_root / tex_rel_path)
     raw_lines = text.splitlines()
     stripped = [_strip_comment(line) for line in raw_lines]
     no_command_args = [_blank_command_args(line) for line in stripped]

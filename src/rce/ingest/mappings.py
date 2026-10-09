@@ -154,6 +154,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
+from rce import cloud
 from rce import db
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import scan as scan_mod
@@ -439,7 +440,7 @@ def _parse_text(text: str) -> list[Any]:
 def _read_text(path: Path) -> str | None:
     """The file's text, None when it does not exist."""
     try:
-        raw = path.read_bytes()
+        raw = cloud.read_bytes(path)
     except FileNotFoundError:
         return None
     except OSError as exc:

@@ -1512,7 +1512,13 @@ def _print_add_preview(insp: addproject.Inspection) -> None:
             f"  To scan: {pv.to_scan} file(s) -- scripts (.py/.R/.Rmd) {counts['scripts']}, data {counts['data']}, "
             f"drafts (.md/.tex/.bib) {counts['drafts']}, images {counts['images']}; other files (not read) {counts['other']}"
         )
-        if pv.dataless:
+        if pv.cloud and pv.cloud.get("blocked"):
+            name = pv.cloud["name"]
+            print(
+                f"  {pv.dataless} of them are only in the {name} cloud and the {name} client is not running: "
+                f"RCE will not read them until {name} is opened and signed in."
+            )
+        elif pv.dataless:
             print(f"  {pv.dataless} of them are still in the cloud and are read once downloaded.")
         if pv.truncated:
             print(f"  Counting stopped at {addproject.ENTRY_CAP:,} entries; the folder holds more.")
@@ -1581,6 +1587,11 @@ def cmd_projects_add(args: argparse.Namespace) -> int:
         raise CliError(f"the project was added, but its scan did not run: {exc.detail}; run 'rce ingest {added.root}'") from exc
     if report.unreadable_sources:
         print(f"Could not be read ({len(report.unreadable_sources)}): " + ", ".join(report.unreadable_sources))
+    for note in report.cloud:
+        print(
+            f"  {len(note['files'])} of them are only in the {note['name']} cloud and the {note['name']} client "
+            f"is not running; open it and sign in, then rescan."
+        )
     if not report.ok:
         print(f"Warning: the scan did not finish ({report.error}); run 'rce ingest {added.root}'.", file=sys.stderr)
         return 1

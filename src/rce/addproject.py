@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from rce import consistency, db, paths
+from rce import cloud, consistency, db, paths
 from rce import project as project_identity
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import files as files_ingest
@@ -167,6 +167,9 @@ class Preview:
     untracked: int | None = None  # git: untracked, not ignored -- not read
     untracked_truncated: bool = False
     git_error: str | None = None
+    # 11.1: the synced folder holding it, its client, and -- when files are
+    # only in the cloud and the client is not running -- the sentence
+    cloud: dict[str, Any] | None = None
 
     @property
     def counts(self) -> dict[str, int]:
@@ -197,6 +200,7 @@ class Preview:
                 "untracked_truncated": self.untracked_truncated,
                 "error": self.git_error,
             },
+            "cloud": self.cloud,
         }
 
 
@@ -306,7 +310,9 @@ def _token(insp: Inspection) -> str:
         "situation": c.situation.value if c is not None else None,
         "reason": c.reason if c is not None else None,
         "entry": insp.entry,
-        "preview": insp.preview.payload() if insp.preview is not None else None,
+        # The client's state is not the folder's: starting OneDrive between
+        # looking and adding does not make the folder another one.
+        "preview": _sealed_preview(insp.preview),
         "refusal": insp.refusal.code if insp.refusal is not None else None,
         "refusal_label": insp.refusal.project_label if insp.refusal is not None else None,
         "moves_graph": insp.moves_graph,
@@ -314,6 +320,14 @@ def _token(insp: Inspection) -> str:
     }
     data = json.dumps(seen, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hmac.new(_TOKEN_KEY, data, hashlib.sha256).hexdigest()
+
+
+def _sealed_preview(preview: Preview | None) -> dict[str, Any] | None:
+    if preview is None:
+        return None
+    seen = preview.payload()
+    seen.pop("cloud", None)
+    return seen
 
 
 def _sealed(insp: Inspection) -> Inspection:
@@ -378,7 +392,7 @@ def _volume_root(canonical: str) -> bool:
 
 
 def _location_refusal(requested: str, canonical: str) -> Inspection | None:
-    if canonical in _top_level_folders() or _volume_root(canonical):
+    if canonical in _top_level_folders() or _volume_root(canonical) or cloud.is_top_level(canonical):
         return _refused(requested, "top_level", root=canonical, detail=f"{canonical} is a top-level folder, not a project")
     for system in _system_folders():
         if _inside(canonical, system):
@@ -441,7 +455,25 @@ def _preview(root: Path) -> Preview:
     return Preview(
         source=source, inventory=inventory, other=other, dataless=dataless, truncated=truncated,
         tracked=tracked, untracked=untracked, untracked_truncated=untracked_truncated, git_error=git_error,
+        cloud=_cloud_state(root, dataless),
     )
+
+
+def _cloud_state(root: Path, dataless: int) -> dict[str, Any] | None:
+    """11.1: which provider holds the folder, whether its client runs, and
+    -- files only in the cloud, the client not running -- that those files
+    are not read, in 11.1's sentence. None outside a synced folder."""
+    prov = cloud.provider(root)
+    if prov is None:
+        return None
+    running = cloud.client_running(prov.kind)
+    blocked = dataless if running is not True else 0
+    return {
+        **prov.payload(),
+        "client_running": running,
+        "blocked": blocked,
+        "message": cloud.message(prov) if blocked else None,
+    }
 
 
 def _identity_in_cloud(root: Path) -> bool:
@@ -844,6 +876,9 @@ class ScanReport:
     findings: int | None = None  # the attempt check's findings (None: not run)
     unreadable_sources: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # 11.1: of the unreadable files, those only in a synced folder's cloud
+    # whose client is not running -- per provider, with its sentence
+    cloud: list[dict[str, Any]] = field(default_factory=list)
 
 
 _SCANNING: set[str] = set()
@@ -941,6 +976,7 @@ def _run_scan(root: Path, project_id: str, progress: Progress, echo: Echo) -> Sc
                     f"{row['extractor']}: {scan_mod.file_of(row['source'])}"
                     for row in db.all_scan_sources(conn) if row["status"] == scan_mod.UNREADABLE
                 )
+                report.cloud = cloud.notes(root, {s.split(": ", 1)[1] for s in report.unreadable_sources})
             finally:
                 conn.close()
     except records_lock.ProjectLockTimeout as exc:

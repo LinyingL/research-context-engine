@@ -109,6 +109,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
+from rce import cloud
 from rce import db
 from rce.ingest import scan as scan_mod
 
@@ -619,7 +620,7 @@ def _ingest_attempts(
     }
     source_path = project_root / config.file
     try:
-        text = source_path.read_text(errors="replace")
+        text = cloud.read_text(source_path)
     except OSError as exc:
         logger.error("cannot read %s: %s", source_path, exc)
         sc.source("attempts", config.file, scan_mod.UNREADABLE)

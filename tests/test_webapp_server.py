@@ -321,6 +321,7 @@ def test_file_payload_returns_utf8_content(tmp_path):
     payload = server.file_payload(tmp_path, "a.txt")
     assert payload == {
         "path": "a.txt", "content": "héllo", "truncated": False, "size": len("héllo".encode("utf-8")),
+        "github": None,  # 11.2: not a repository linked to GitHub
     }
 
 

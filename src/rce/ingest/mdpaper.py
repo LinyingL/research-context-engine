@@ -66,6 +66,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
+from rce import cloud
 from rce import db
 from rce.ingest import claims as claims_ingest
 from rce.ingest import scan as scan_mod
@@ -229,7 +230,7 @@ def parse_md_file(repo_root: str | Path, md_rel_path: str) -> MdParseResult:
     before any slug is assigned -- hence the lightweight first pass below,
     mirroring `parse_tex_file`'s own two-pass structure.
     """
-    text = (Path(repo_root) / md_rel_path).read_text(errors="replace")
+    text = cloud.read_text(Path(repo_root) / md_rel_path)
     raw_lines = text.splitlines()
     fenced = _blank_code_fences(raw_lines)  # headings/images must not see fenced-code content
 
@@ -284,7 +285,7 @@ def parse_md_claims(repo_root: str | Path, md_rel_path: str) -> list[claims_inge
     blocks and GFM table rows here, LaTeX commands/environments there.
     """
     repo_root = Path(repo_root)
-    text = (repo_root / md_rel_path).read_text(errors="replace")
+    text = cloud.read_text(repo_root / md_rel_path)
     raw_lines = text.splitlines()
     fenced = _blank_code_fences(raw_lines)
     tabled = _blank_md_table_rows(fenced)

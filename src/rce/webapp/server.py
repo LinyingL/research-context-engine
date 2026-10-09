@@ -41,7 +41,19 @@ Endpoints (all GET unless noted):
     GET  /api/file      -- one project text file's content, UTF-8, capped at
                             `_FILE_SIZE_LIMIT` bytes (truncation flagged, never
                             silent); binary content is refused, not garbled
-                            (see `file_payload`).
+                            (see `file_payload`). Carries `github`: the
+                            11.2 link `{url, commit, local_changes,
+                            message}` or reason `{reason, message,
+                            local_changes}`, null when not linked (also on
+                            the binary refusal). A file only in a synced
+                            folder's cloud whose client is not running is
+                            not read: 503 `cloud_only` (11.1).
+    GET  /api/github    -- 11.2: the linked GitHub repository's state from
+                            local refs (`rce.github.state`) or
+                            `{"linked": false, "git": bool}`.
+    POST /api/github/fetch -- 11.2: `git fetch <remote>` for the linked
+                            remote, under the project lock; returns the new
+                            state. Errors: `github_<code>` with `message_zh`.
     POST /api/open      -- body `{"path": REL, "reveal": bool}`: reveal a
                             project path in Finder (`open -R`) or open it with
                             its default application (`open`). macOS only --
@@ -127,7 +139,7 @@ Endpoints (all GET unless noted):
                             "last_error": str|null, "scanning": {step,
                             label, n, m, started}|null, "last_scan":
                             {finished, ok, unreadable_sources, error,
-                            message, findings}|null}` (the last two: the
+                            message, findings, cloud}|null}` (the last two: the
                             served project's full scan, 10.2/10.3). The frontend polls
                             this and re-fetches its views whenever the
                             generation moved -- see "Auto-refresh" below.
@@ -457,7 +469,8 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Callable, Iterator
 
-from rce import addproject, db, inventory, lineage, migration, paths
+from rce import addproject, cloud, db, github, inventory, lineage, migration, paths
+from rce.ingest import scan as scan_mod
 from rce import project as project_identity
 from rce.records import judgements
 from rce.records import ledger as ledger_mod
@@ -465,6 +478,7 @@ from rce.records import lock as records_lock
 from rce.records import situation as records_situation
 from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
+from rce.ingest import git as git_ingest
 from rce.ingest import mappings as mappings_ingest
 from rce.webapp import canvas, mapedit, variables_api
 from rce.records import implementation as card_implementation
@@ -683,6 +697,31 @@ class NeedsMigrationApiError(ApiError):
 
     status = 409
     state = "needs_migration"
+
+
+class GitHubApiError(ApiError):
+    """DESIGN.md 11.2: 「从 GitHub 获取最新状态」 did not complete -- its
+    Chinese sentence (`message_zh`) and git's own text, with any credential
+    in a URL removed (`github.scrub`), behind 「详情」."""
+
+    def __init__(self, exc: github.GitHubError) -> None:
+        super().__init__(exc.detail)
+        self.status = {"not_linked": 409, "unsafe_config": 409, "busy": 503, "timeout": 504}.get(exc.code, 502)
+        self.state = "github_" + exc.code
+        self.extra = {"message_zh": exc.message, "detail": exc.detail}
+
+
+class CloudOnlyApiError(ApiError):
+    """DESIGN.md 11.1: the file is only in a synced folder's cloud and the
+    provider's client is not running -- not opened (a read would wait for a
+    download nobody makes). 503: it becomes readable once the client runs."""
+
+    status = 503
+    state = "cloud_only"
+
+    def __init__(self, exc: cloud.CloudOnlyError, extra: dict[str, Any] | None = None) -> None:
+        super().__init__(str(exc))
+        self.extra = {"message_zh": exc.message, "detail": str(exc), **(extra or {})}
 
 
 class ReadOnlyError(ApiError):
@@ -1267,26 +1306,75 @@ def lineage_payload(conn: Connection, project_root: Path) -> dict[str, Any]:
 # -- /api/file ----------------------------------------------------------------
 
 
+def github_link_payload(project_root: Path, target: Path) -> dict[str, Any] | None:
+    """DESIGN.md 11.2: the file panel's 「在 GitHub 上查看」 -- a link pinned
+    to the newest commit GitHub has, or the reason there is none; None for
+    a project not linked to GitHub. `target` is already confined to the
+    project; the path git is asked about is its position under the root."""
+    try:
+        rel = target.relative_to(project_root.resolve()).as_posix()
+        return github.link_for(project_root, rel)
+    except (ValueError, OSError, github.GitHubError, git_ingest.GitIngestError):
+        logger.info("no GitHub link for %s", target, exc_info=True)
+        return None
+
+
 def file_payload(project_root: Path, rel_path: str) -> dict[str, Any]:
     target = _resolve_within_root(project_root, rel_path)
     if not target.is_file():
         if not target.exists():
             raise NotFoundError(f"no such file: {rel_path}")
         raise NotAFileError(f"not a regular file: {rel_path}")
-    raw = target.read_bytes()
+    link = github_link_payload(project_root, target)
+    try:
+        raw = cloud.read_bytes(target)
+    except cloud.CloudOnlyError as exc:
+        raise CloudOnlyApiError(exc, {"github": link}) from exc
     if b"\x00" in raw[:8192]:
-        raise BinaryFileError(f"{rel_path} looks like a binary file; refusing to return its content")
+        error = BinaryFileError(f"{rel_path} looks like a binary file; refusing to return its content")
+        error.extra = {"github": link}
+        raise error
     truncated = len(raw) > _FILE_SIZE_LIMIT
     content_bytes = raw[:_FILE_SIZE_LIMIT] if truncated else raw
     try:
         content = content_bytes.decode("utf-8")
     except UnicodeDecodeError:
         if not truncated:
-            raise BinaryFileError(f"{rel_path} is not valid UTF-8 text; refusing to return its content") from None
+            error = BinaryFileError(f"{rel_path} is not valid UTF-8 text; refusing to return its content")
+            error.extra = {"github": link}
+            raise error from None
         # The 200KB cut can land mid multi-byte character; that is a
         # truncation artifact, not evidence the file is binary.
         content = content_bytes.decode("utf-8", errors="ignore")
-    return {"path": rel_path, "content": content, "truncated": truncated, "size": len(raw)}
+    return {"path": rel_path, "content": content, "truncated": truncated, "size": len(raw), "github": link}
+
+
+# -- GitHub (DESIGN.md 11.2) ----------------------------------------------------
+
+
+def github_state_payload(served: ServedProject) -> dict[str, Any]:
+    """`GET /api/github`: `rce.github.state` for the served project, or
+    `{"linked": false}`. Reads local refs only; writes nothing."""
+    if served.no_project:
+        return {"linked": False, "git": False}
+    try:
+        return github.state(served.root)
+    except git_ingest.GitIngestError:
+        logger.info("no GitHub state for %s", served.root, exc_info=True)
+        return {"linked": False, "git": False}
+
+
+def github_fetch_payload(served: ServedProject) -> dict[str, Any]:
+    """`POST /api/github/fetch`: refused for a project whose question is
+    open or that is opened read-only (a fetch writes into `.git`)."""
+    if served.blocked is not None:
+        raise ProjectBlockedError(served.blocked)
+    if served.read_only:
+        raise ReadOnlyError("the project is open read-only; nothing fetched")
+    try:
+        return github.fetch(served.root, served.project_id)
+    except github.GitHubError as exc:
+        raise GitHubApiError(exc) from exc
 
 
 # -- POST /api/open -----------------------------------------------------------
@@ -2117,7 +2205,24 @@ def judgement_payload(conn: Connection, served: ServedProject, body: dict[str, A
     return _judged_payload(conn, key, judged)
 
 
-def review_payload(conn: Connection) -> dict[str, Any]:
+def _held_cloud_notes(project_root: Path | None, held: list[dict[str, Any]]) -> None:
+    """DESIGN.md 11.1: a 「来源文件暂不可读」 item whose files are only in a
+    synced folder's cloud, its client not running, says why (`cloud`)."""
+    if project_root is None:
+        return
+    for item in held:
+        detail = item.get("detail") or {}
+        sources = detail.get("sources") if isinstance(detail.get("sources"), list) else None
+        if not sources:
+            src = str(item.get("src", ""))
+            sources = [src.split(":", 1)[1]] if ":" in src else []
+        files = {scan_mod.file_of(str(s)).split("#", 1)[0] for s in sources}
+        notes = cloud.notes(project_root, files)
+        if notes:
+            item["cloud"] = notes[0]["message"]
+
+
+def review_payload(conn: Connection, project_root: Path | None = None) -> dict[str, Any]:
     """`GET /api/review`: 9.6's list of links, plus the variable cards whose
     implementation moved under a confirmed version (9.11 stage (b)) --
     one list, one count. A pre-V5 index (a project frozen until it is
@@ -2128,6 +2233,7 @@ def review_payload(conn: Connection) -> dict[str, Any]:
         return {"review": [], "count": 0, "source_unreadable": [], "not_in_index": [], "ledger": None,
                 "cards": card_implementation.review_groups(None), "pre_v5": True}
     payload = judgements.review_items(conn)
+    _held_cloud_notes(project_root, payload["source_unreadable"])
     card_items = card_implementation.review_groups(conn)
     payload["cards"] = card_items
     payload["count"] = payload["count"] + card_items["count"]
@@ -2465,7 +2571,7 @@ class RceHTTPServer(ThreadingHTTPServer):
                 result = {
                     "ok": report.ok, "unreadable_sources": report.unreadable_sources,
                     "error": report.error, "message": None if report.ok else "扫描没有完成",
-                    "findings": report.findings,
+                    "findings": report.findings, "cloud": report.cloud,
                 }
             except addproject.ScanRefused as exc:
                 result = {"ok": False, "unreadable_sources": [], "error": exc.code, "message": exc.message, "findings": None}
@@ -2676,7 +2782,11 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 frozen = served.needs_migration or served.read_only
                 self._json_from_conn(lambda conn: {**canvas_payload(conn, self._project_root(), scope), "frozen": frozen})
             elif path == "/api/review":
-                self._json_from_conn(review_payload)
+                root = self._project_root()
+                self._json_from_conn(lambda conn: review_payload(conn, root))
+            elif path == "/api/github":
+                # 11.2: the linked repository's state, from local refs only.
+                self._send_json(200, github_state_payload(self._served()))
             elif path == "/api/variables" or path.startswith("/api/variables/"):
                 # The 「变量」 view (9.11): the cards are read from their files
                 # (the index adds the trust decision); a blocked or moved
@@ -2808,6 +2918,11 @@ class RceRequestHandler(BaseHTTPRequestHandler):
                 self._read_json_object()
                 self.server.start_scan(self._served())
                 self._send_json(200, {"ok": True, "scanning": True, **self.server.scan_status()})
+            elif parsed.path == "/api/github/fetch":
+                # 11.2: 「从 GitHub 获取最新状态」 -- `git fetch` for the linked
+                # remote, the only network RCE does here, only on this click.
+                self._read_json_object()
+                self._send_json(200, github_fetch_payload(self._served()))
             elif parsed.path == "/api/projects/rename":
                 # 10.4: the registry label only, never the folder.
                 self._send_json(200, rename_payload(self._read_json_object()))

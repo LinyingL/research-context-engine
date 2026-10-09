@@ -19,6 +19,7 @@ from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
 
+from rce import cloud
 from rce import db
 from rce.ingest import scan as scan_mod
 from rce.ingest import git as git_ingest
@@ -301,7 +302,7 @@ def parse_tex_file(repo_root: str | Path, tex_rel_path: str) -> TexParseResult:
     The `setdefault`/dedup guards below remain a second, defensive layer
     against the residual (astronomically unlikely) case of a hash collision.
     """
-    text = (Path(repo_root) / tex_rel_path).read_text(errors="replace")
+    text = cloud.read_text(Path(repo_root) / tex_rel_path)
     stripped_lines = [_strip_comment(raw_line) for raw_line in text.splitlines()]
 
     # Pass 1 (lightweight): collect every heading's title in document order,
@@ -469,7 +470,7 @@ def parse_bib_entries(text: str) -> list[BibEntry]:
     return entries
 
 def parse_bib_file(bib_path: str | Path) -> list[BibEntry]:
-    return parse_bib_entries(Path(bib_path).read_text(errors="replace"))
+    return parse_bib_entries(cloud.read_text(bib_path))
 
 def ingest_latex_repo(
     conn: Connection, repo_root: str | Path, tex_paths: list[str], bib_paths: list[str],

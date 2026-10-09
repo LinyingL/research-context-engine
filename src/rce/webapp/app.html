@@ -208,6 +208,15 @@ body {
 .pm-form-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .pm-status { font-size: 0.78rem; color: var(--clay); min-height: 0; }
 .pm-status:empty { display: none; }
+/* DESIGN.md 11.2: the GitHub line, its state as of the last fetch, and
+   「从 GitHub 获取最新状态」. The state is a quiet second line. */
+.pm-github { padding: 0.32rem 0.9rem 0.1rem 1.7rem; font-size: 0.82rem; }
+.pm-github a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--line); }
+.pm-github a:hover { border-bottom-color: var(--clay); }
+.pm-github-state { padding: 0 0.9rem 0.25rem 1.7rem; font-size: 0.76rem; color: var(--ink-soft); }
+.github-link-row { font-size: 0.8rem; margin: -0.3rem 0 0.7rem; color: var(--ink-soft); }
+.github-link-row a { color: var(--ink); }
+.github-link-row .github-note { margin-left: 0.6rem; color: var(--clay); }
 
 .refresh-chip {
   font-size: 0.76rem;
@@ -941,6 +950,9 @@ const state = {
   // (undefined: take the next status as the baseline; null: none yet).
   projects: [], currentPath: "", currentId: null, currentEntry: null, noProject: false,
   scanSeen: undefined,
+  // DESIGN.md 11.2 (task V7): GET /api/github as last read (null: not yet),
+  // and whether 「从 GitHub 获取最新状态」 is running.
+  github: null, githubFetching: false,
 };
 
 // -- fetch wrappers: every failure becomes a readable Error, never a console-only one --
@@ -986,6 +998,8 @@ function apiError(path, res, body) {
   if (body && typeof body.message === "string" && body.message) err.engineMessage = body.message;
   if (body && typeof body.detail === "string" && body.detail) err.detail = body.detail;
   if (body && body.inspection && typeof body.inspection === "object") err.inspection = body.inspection;
+  // 11.2: a file panel refused (a binary file) still carries its GitHub link.
+  if (body && body.github && typeof body.github === "object") err.github = body.github;
   return err;
 }
 
@@ -1598,6 +1612,7 @@ function openProjectMenu(focusFirst) {
   projectMenuBtn.setAttribute("aria-expanded", "true");
   if (focusFirst) focusMenuItem(0);
   loadProjects(); // a folder can come back or go away between two opens
+  loadGitHub(); // 11.2: local refs only, no network
 }
 
 function closeProjectMenu(returnFocus) {
@@ -1665,6 +1680,11 @@ function renderProjectMenu() {
   const rule = mk("hr", "pm-rule");
   rule.setAttribute("role", "separator");
   projectMenu.appendChild(rule);
+  if (renderGitHubMenu()) {
+    const gitRule = mk("hr", "pm-rule");
+    gitRule.setAttribute("role", "separator");
+    projectMenu.appendChild(gitRule);
+  }
   projectMenu.appendChild(pmItem("添加项目…", () => { closeProjectMenu(false); openAddDialog(); }));
   const status = mk("div", "pm-status");
   const rescan = pmItem("重新扫描这个项目", () => rescanFromMenu(status, rescan), { disabled: state.noProject });
@@ -1678,6 +1698,107 @@ function renderProjectMenu() {
     renderProjectMenu();
   }, { disabled: !projects.length }));
   projectMenu.appendChild(status);
+}
+
+// -- GitHub in the project menu (DESIGN.md 11.2, task V7) ----------------------
+// A project whose git remote is on GitHub gets one line, 「GitHub：owner/repo」
+// (a link to the repository, opened outside the app), its state as of the
+// last fetch, and 「从 GitHub 获取最新状态」 -- the only network RCE does
+// here, only on that click (POST /api/github/fetch; `git fetch`, never a
+// pull or a merge). Nothing for a project that is not linked.
+
+// Only a link the engine built for github.com is ever put in an href.
+function githubHref(url) {
+  if (typeof url !== "string") return null;
+  let u;
+  try {
+    u = new URL(url);
+  } catch (err) {
+    return null;
+  }
+  return (u.protocol === "https:" && u.host === "github.com" && !u.username && !u.password) ? u.href : null;
+}
+
+function externalLink(text, url) {
+  const href = githubHref(url);
+  if (!href) return mk("span", null, text);
+  const a = mk("a", null, text);
+  a.href = href;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  return a;
+}
+
+async function loadGitHub() {
+  if (state.noProject) { state.github = null; return; }
+  const epoch = state.dataEpoch;
+  let data;
+  try {
+    data = await apiGet("/api/github");
+  } catch (err) {
+    return; // the menu simply has no GitHub line; the views say their own errors
+  }
+  if (epoch !== state.dataEpoch) return;
+  state.github = data && typeof data === "object" ? data : null;
+  if (projectMenuOpen() && projectMenuMode === "list") {
+    const focused = menuItems().indexOf(document.activeElement);
+    renderProjectMenu();
+    if (focused >= 0) focusMenuItem(focused);
+  }
+}
+
+// Appends the GitHub lines; true when there were any.
+function renderGitHubMenu() {
+  const gh = state.github;
+  if (state.noProject || !gh || !gh.linked) return false;
+  const line = mk("div", "pm-github");
+  line.append("GitHub：", externalLink(gh.owner + "/" + gh.repo, gh.url));
+  projectMenu.appendChild(line);
+  projectMenu.appendChild(mk("div", "pm-github-state", state.githubFetching ? "正在从 GitHub 获取…" : (gh.message || "")));
+  const status = mk("div", "pm-status");
+  const fetchItem = pmItem(state.githubFetching ? "正在从 GitHub 获取…" : "从 GitHub 获取最新状态",
+    () => fetchGitHub(status, fetchItem), { disabled: state.githubFetching });
+  projectMenu.appendChild(fetchItem);
+  projectMenu.appendChild(status);
+  return true;
+}
+
+async function fetchGitHub(statusEl, button) {
+  if (state.githubFetching) return;
+  state.githubFetching = true;
+  button.disabled = true;
+  button.querySelector(".pm-label").textContent = "正在从 GitHub 获取…";
+  const epoch = state.dataEpoch;
+  try {
+    const data = await apiPost("/api/github/fetch", {});
+    state.githubFetching = false;
+    if (epoch !== state.dataEpoch) return;
+    state.github = data;
+    if (projectMenuOpen() && projectMenuMode === "list") renderProjectMenu();
+  } catch (err) {
+    state.githubFetching = false;
+    button.disabled = false;
+    button.querySelector(".pm-label").textContent = "从 GitHub 获取最新状态";
+    // 8.8 "Errors": the sentence, git's own text behind 「详情」.
+    renderBlockingError(statusEl, "没能从 GitHub 获取", err);
+  }
+}
+
+// The file panel's 「在 GitHub 上查看」 (11.2): pinned to a commit GitHub
+// has, with the local-changes note; or the reason there is no link.
+function renderGitHubLink(host, link) {
+  if (!link || typeof link !== "object") return;
+  const row = mk("div", "github-link-row");
+  if (githubHref(link.url)) {
+    row.appendChild(externalLink("在 GitHub 上查看", link.url));
+    if (typeof link.commit === "string") row.title = "提交 " + link.commit.slice(0, 12);
+    if (link.local_changes) row.appendChild(mk("span", "github-note", link.message || "本地有未推送或未提交的改动"));
+  } else if (link.message) {
+    row.textContent = link.message;
+  } else {
+    return;
+  }
+  host.appendChild(row);
 }
 
 function backToMenuList() {
@@ -1896,6 +2017,7 @@ async function reloadAllViews(opts) {
   state.migrationInfo = null;
   state.projectMoved = false;
   state.reviewOffer = null;
+  state.github = null;
   renderNotices();
   delete views.tree.dataset.loaded;
   delete views.lineage.dataset.loaded;
@@ -2137,7 +2259,7 @@ function showScanDone(last) {
     // named (behind 「详情」), and the line stays until dismissed.
     scanChip.classList.add("warn");
     const text = mk("span", "err-text", scanDoneText(last));
-    const files = unreadableFilesText(last.unreadable_sources);
+    const files = unreadableFilesText(last.unreadable_sources) + cloudNotesText(last.cloud);
     const toggle = mkButton("详情", "err-detail-toggle", null);
     toggle.setAttribute("aria-expanded", "false");
     const detail = mk("span", "err-detail hidden", files);
@@ -2693,6 +2815,11 @@ function buildFileActions(path, statusEl) {
   return actions;
 }
 
+function isCurrentFilePanel(path) {
+  const s = state.panelSubject;
+  return !!s && s.kind === "file" && s.path === path;
+}
+
 async function openFilePanel(path, hint) {
   state.panelSubject = { kind: "file", path: path };
   panelTitle.textContent = path;
@@ -2702,6 +2829,8 @@ async function openFilePanel(path, hint) {
   const status = document.createElement("div");
   status.className = "panel-status";
   panelBody.appendChild(buildFileActions(path, status));
+  const githubHost = document.createElement("div");
+  panelBody.appendChild(githubHost);
   panelBody.appendChild(status);
   const contentHost = document.createElement("div");
   contentHost.innerHTML = '<p class="empty-note">预览载入中…</p>';
@@ -2712,9 +2841,21 @@ async function openFilePanel(path, hint) {
   try {
     data = await apiGet("/api/file?path=" + encodeURIComponent(path));
   } catch (err) {
+    if (!isCurrentFilePanel(path)) return;
+    renderGitHubLink(githubHost, err && err.github);
+    if (err && err.messageZh) {
+      // 11.1: a file only in the cloud -- the sentence, the engine's text behind 「详情」.
+      contentHost.innerHTML = "";
+      const box = mk("div", "panel-status err");
+      renderBlockingError(box, "无法读取这个文件", err);
+      contentHost.appendChild(box);
+      return;
+    }
     renderErrorBox(contentHost, err);
     return;
   }
+  if (!isCurrentFilePanel(path)) return;
+  renderGitHubLink(githubHost, data.github);
   contentHost.innerHTML = "";
   if (data.truncated) {
     const note = document.createElement("div");
@@ -3476,7 +3617,9 @@ async function renderReviewPanel(subject) {
     held.forEach((item) => {
       const row = mk("div", "review-quiet");
       row.append(mk("span", "review-link", linkText(item)),
-        " · 来源文件暂不可读：" + sourceFiles(item).join("、") + " · 判断照旧（" + verdictWord(item.verdict) + "）");
+        " · 来源文件暂不可读：" + sourceFiles(item).join("、") + " · 判断照旧（" + verdictWord(item.verdict) + "）" +
+        // 11.1: only in a synced folder's cloud, its client not running
+        (typeof item.cloud === "string" && item.cloud ? " · " + item.cloud : ""));
       panelBody.appendChild(row);
     });
     absent.forEach((item) => {
@@ -4987,8 +5130,12 @@ function addPreviewText(p) {
       out.notes.push({ text: "没能数出有多少文件未被 git 跟踪；未被跟踪的文件不会被扫描。", tone: "warn" });
     }
   }
-  if (p.dataless > 0) {
-    out.notes.push({ text: "其中 " + groupedNumber(p.dataless) + " 个文件还在 iCloud 云端，下载到这台电脑之后才会被读取。", tone: "" });
+  if (p.dataless > 0 && p.cloud && p.cloud.message) {
+    // 11.1: only in the cloud and nobody can download them -- never read.
+    out.notes.push({ text: "其中 " + groupedNumber(p.dataless) + " 个文件不会被读取：" + p.cloud.message + "。", tone: "warn" });
+  } else if (p.dataless > 0) {
+    const where = p.cloud && p.cloud.name ? p.cloud.name : "iCloud";
+    out.notes.push({ text: "其中 " + groupedNumber(p.dataless) + " 个文件还在 " + where + " 云端，下载到这台电脑之后才会被读取。", tone: "" });
   }
   if (p.truncated) {
     out.notes.push({ text: "文件太多：数到 " + groupedNumber(ADD_ENTRY_CAP) + " 个就停下了，实际还有更多。", tone: "warn" });
@@ -5051,6 +5198,15 @@ function unreadableFilesText(sources) {
   });
   if (!files.length) return "";
   return "读不了的文件：" + files.join("、") + "。它们恢复可读后，下次扫描会读到。";
+}
+// 11.1: why some of them cannot be read -- only in a synced folder's cloud,
+// its client not running -- one sentence per provider.
+function cloudNotesText(notes) {
+  const out = [];
+  (Array.isArray(notes) ? notes : []).forEach((n) => {
+    if (n && typeof n.message === "string" && n.message) out.push(n.message + "。");
+  });
+  return out.length ? " " + out.join(" ") : "";
 }
 // -- end of add-project wording
 

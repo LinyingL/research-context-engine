@@ -704,6 +704,14 @@ def _request_download(path: Path) -> None:
     if not downloads_allowed():
         logger.debug("not asking for %s from iCloud: downloads are suppressed here", path)
         return
+    from rce import cloud  # noqa: PLC0415 -- cloud imports this module
+
+    blocked = cloud.download_blocked(path)
+    if blocked is not None:
+        # 11.1: in a synced folder whose client is not running, a read would
+        # wait forever -- no download is asked for.
+        logger.info("not asking for %s: the %s client is not running", path, blocked.name)
+        return
     key = str(path)
     with _DOWNLOADS_LOCK:
         if key in _DOWNLOADS_REQUESTED:
