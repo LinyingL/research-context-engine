@@ -848,6 +848,40 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
 .var-history .var-line.chosen { box-shadow: inset 2px 0 0 var(--olive); padding-left: 0.45rem; }
 .var-line.off { color: var(--ink-soft); text-decoration: line-through; text-decoration-color: var(--line-strong); }
 
+/* -- 文献 (DESIGN.md 11.4): per draft, its citations. Olive = 已对上, ochre =
+   waits for you (candidates), gray = 未找到; the text as written in the
+   serif, the reference beneath it in small sans. */
+.lit-setting { border: 1px solid var(--line-strong); background: var(--paper-alt); padding: 0.6rem 0.85rem; margin: 0 0 0.9rem; max-width: 820px; }
+.lit-setting-label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; cursor: pointer; }
+.lit-setting-note { font-size: 0.8rem; color: var(--ink-soft); margin: 0.2rem 0 0 1.6rem; }
+.lit-zotero { font-size: 0.82rem; color: var(--ink-soft); margin: 0 0 0.6rem; }
+.lit-summary { font-family: var(--font-serif); font-size: 1.08rem; margin: 0.4rem 0 0.8rem; }
+.lit-note { font-size: 0.82rem; color: var(--clay); margin: -0.4rem 0 0.8rem; }
+.lit-draft { border-bottom: 1px solid var(--line); }
+.lit-draft-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; width: 100%; text-align: left; font: inherit; color: inherit; background: none; border: none; padding: 0.6rem 0.35rem; cursor: pointer; }
+.lit-draft-head:hover { background: var(--paper-alt); }
+.lit-draft-head:focus-visible { outline: 1px solid var(--clay); outline-offset: -1px; }
+.lit-caret { flex: none; width: 1em; color: var(--ink-soft); }
+.lit-file { font-family: var(--font-mono); font-size: 0.82rem; word-break: break-all; }
+.lit-counts { font-size: 0.78rem; color: var(--ink-soft); }
+.lit-cites { padding: 0 0 0.6rem 1.6rem; }
+.lit-cite { padding: 0.5rem 0; border-top: 1px dashed var(--line); }
+.lit-cite:first-child { border-top: none; }
+.lit-cite-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
+.lit-line { font-size: 0.74rem; color: var(--ink-soft); white-space: nowrap; }
+.lit-text { font-family: var(--font-serif); font-size: 0.98rem; word-break: break-word; }
+.lit-ref { margin: 0.25rem 0 0 0; padding-left: 0.7rem; border-left: 2px solid var(--olive); }
+.lit-cands .lit-ref { border-left-color: var(--ochre); margin-top: 0.35rem; }
+.lit-ref-text { font-size: 0.84rem; word-break: break-word; }
+.lit-ref-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.8rem; font-size: 0.76rem; margin-top: 0.1rem; }
+.lit-how { color: var(--ink-soft); }
+.lit-link, .lit-link-btn { font: inherit; font-size: 0.76rem; color: var(--clay); background: none; border: none; padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.lit-link:hover, .lit-link-btn:hover { color: var(--ink); }
+.lit-judge { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin-top: 0.3rem; }
+.lit-hint { font-size: 0.76rem; color: var(--ink-soft); }
+.lit-quiet { font-size: 0.8rem; color: var(--ink-soft); margin: 0.3rem 0 1rem; }
+.lit-quiet-file { font-family: var(--font-mono); font-size: 0.78rem; padding: 0.1rem 0; word-break: break-all; }
+
 @media (max-width: 720px) {
   main#main { padding: 1.25rem 1rem 3rem; }
   .topbar { padding: 1rem 1rem 0.75rem; }
@@ -871,6 +905,7 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
       <button class="tab" data-view="lineage" role="tab" aria-selected="false">血缘</button>
       <button class="tab" data-view="canvas" role="tab" aria-selected="false">画布</button>
       <button class="tab" data-view="variables" role="tab" aria-selected="false">变量</button>
+      <button class="tab" data-view="literature" role="tab" aria-selected="false">文献</button>
     </nav>
     <div class="project-line" id="project-line">
       <span class="project-menu-wrap" id="project-menu-wrap">
@@ -895,6 +930,7 @@ body.canvas-mode .notices { margin: 0; padding: 0.75rem 1rem; border-bottom: 1px
     <section id="view-lineage" class="view hidden"></section>
     <section id="view-canvas" class="view hidden"></section>
     <section id="view-variables" class="view hidden"></section>
+    <section id="view-literature" class="view hidden"></section>
   </main>
   <footer class="pagefoot">
     <button id="records-btn" class="shutdown-btn" type="button" title="查看这个项目的人工记录放在哪里">记录</button>
@@ -1392,6 +1428,7 @@ const views = {
   lineage: document.getElementById("view-lineage"),
   canvas: document.getElementById("view-canvas"),
   variables: document.getElementById("view-variables"),
+  literature: document.getElementById("view-literature"),
 };
 let currentView = null;
 
@@ -1430,6 +1467,7 @@ function activateView(name) {
   if (name === "tree" && !views.tree.dataset.loaded) loadTreeView();
   if (name === "lineage" && !views.lineage.dataset.loaded) loadLineageView();
   if (name === "variables" && !views.variables.dataset.loaded) loadVariablesView();
+  if (name === "literature" && !views.literature.dataset.loaded) loadLiteratureView();
   if (name === "canvas") {
     if (!views.canvas.dataset.loaded) return RCECanvas.load(views.canvas);
     RCECanvas.activate();
@@ -2283,6 +2321,10 @@ async function reloadAllViews(opts) {
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
   delete views.variables.dataset.loaded;
+  delete views.literature.dataset.loaded;
+  litState.data = null;
+  litState.open.clear();
+  litState.quiet = false;
   varState.card = null;
   varState.version = null;
   varState.asking = null;
@@ -2301,6 +2343,7 @@ async function reloadAllViews(opts) {
   else if (currentView === "lineage") loadLineageView();
   else if (currentView === "canvas") RCECanvas.load(views.canvas);
   else if (currentView === "variables") loadVariablesView();
+  else if (currentView === "literature") loadLiteratureView();
 }
 
 // -- Auto-refresh (task V3 phase 2) -----------------------------------------
@@ -2396,6 +2439,7 @@ async function refreshCurrentView() {
   delete views.lineage.dataset.loaded;
   delete views.canvas.dataset.loaded;
   delete views.variables.dataset.loaded;
+  delete views.literature.dataset.loaded;
   if (currentView === "tree") {
     await loadTreeView(true);
   } else if (currentView === "lineage") {
@@ -2406,6 +2450,8 @@ async function refreshCurrentView() {
     await RCECanvas.load(views.canvas);
   } else if (currentView === "variables") {
     await loadVariablesView();
+  } else if (currentView === "literature") {
+    await loadLiteratureView();
   }
   await revalidatePanel();
   loadProjectSummary(); // the pending count may have moved with the graph
@@ -4817,6 +4863,343 @@ function renderVariableCard(host, card) {
 }
 // -- end of the 变量 view --------------------------------------------------------
 
+// -- 文献 (DESIGN.md 11.4, last paragraph; task V7 phase D) -----------------------
+// Per draft, its citations: the text as written, what it was resolved to and
+// how, or 「未找到」, or 「N 个候选，待确认」 with 确认 / 否决 per candidate --
+// ledger entries through POST /api/judgements (the one write path), one per
+// link the candidate has in the graph. The summary at the top, drafts with
+// the most not yet resolved first; each draft renders its citations only
+// when opened (a thousand citations stay fast). 打开 DOI is a plain https
+// link; 在 Zotero 中打开 (only when the program is installed) and 打开 PDF
+// (only when the attachment is on this machine) go through the engine,
+// which takes keys, never a path. The online setting lives at the top.
+// Draft text and reference metadata are inserted as text, never as HTML.
+
+// -- Literature wording (pure; 11.4) ------------------------------------------------
+// tests/test_v7_literature_view.py loads this block into node.
+function litSummaryText(totals) {
+  const t = totals || {};
+  return (t.citations || 0) + " 处引用：已对上 " + (t.resolved || 0) + "，待确认 " + (t.pending || 0) +
+    "，未找到 " + (t.unresolved || 0);
+}
+
+function litDraftCountText(counts) {
+  const c = counts || {};
+  const parts = [(c.citations || 0) + " 处"];
+  if (c.resolved) parts.push("已对上 " + c.resolved);
+  if (c.pending) parts.push("待确认 " + c.pending);
+  if (c.unresolved) parts.push("未找到 " + c.unresolved);
+  return parts.join(" · ");
+}
+
+const LIT_SOURCE_WORDS = { zotero: "Zotero", crossref: "DOI 联网", entry: "文末条目" };
+
+// How one reference was reached: 「Zotero」「文末条目」「DOI 联网」 (11.4), a
+// DOI written in the text that nothing describes yet as 「文中 DOI」, and a
+// candidate the researcher confirmed as such.
+function litHowText(c, t) {
+  const words = [];
+  if (c.how === "entry" || c.how === "entry_candidates") words.push("文末条目");
+  else if (c.how === "zotero_candidates") words.push("Zotero");
+  else if (c.how === "doi") words.push(LIT_SOURCE_WORDS[t && t.source] || "文中 DOI");
+  if (t && (c.how === "entry" || c.how === "entry_candidates") && (t.source === "zotero" || t.source === "crossref")) {
+    words.push(LIT_SOURCE_WORDS[t.source]);
+  }
+  if (t && t.judged === "confirmed") words.push("你已确认");
+  return words.join(" · ");
+}
+
+function litBadge(c) {
+  const n = (c.targets || []).length;
+  if (c.state === "resolved") return { text: "已对上", tone: "in-use" };
+  if (c.state === "pending") return { text: n + " 个候选，待确认", tone: "wait" };
+  if (n && (c.targets || []).every((t) => t.judged === "rejected")) return { text: "未找到（候选都已否决）", tone: "dead" };
+  return { text: "未找到", tone: "dead" };
+}
+
+// A reference as one line: authors, year, title, journal -- or the entry's
+// own text, or the bare DOI when nothing describes it.
+function litRefText(t) {
+  if (!t) return "";
+  const authors = Array.isArray(t.authors) ? t.authors.filter(Boolean) : [];
+  const parts = [];
+  if (t.title || t.venue) {
+    if (authors.length) parts.push(authors.slice(0, 3).join("、") + (authors.length > 3 ? " 等" : ""));
+    if (t.year) parts.push(String(t.year) + (t.letter || ""));
+    if (t.title) parts.push(t.title);
+    if (t.venue) parts.push(t.venue);
+    return parts.join(" · ");
+  }
+  if (t.entry_text) return t.entry_text;
+  if (t.doi) return "DOI " + t.doi;
+  return t.node || "";
+}
+
+function litZoteroText(z) {
+  if (!z) return "";
+  if (z.status === "read") return "Zotero 文献库：" + (z.items || 0) + " 个条目";
+  if (z.status === "absent") return "没有找到 Zotero 文献库：只用文稿自己的参考文献和 DOI 对照";
+  return "Zotero 文献库这次没能读取：只用文稿自己的参考文献和 DOI 对照";
+}
+
+// The links a 确认 / 否决 / 撤销 writes for one candidate: one ledger entry
+// each. 撤销 undoes only the links whose last act was the researcher's.
+function litLinksFor(t, verdict) {
+  const links = (t && t.links) || [];
+  if (verdict === "undone") return links.filter((l) => l.status === "confirmed" || l.status === "rejected");
+  return links.filter((l) => l.status !== verdict);
+}
+// -- end of literature wording ----------------------------------------------------
+
+const litState = {
+  data: null,
+  open: new Set(),   // drafts shown opened, kept across re-renders
+  quiet: false,      // the drafts without citations, shown
+};
+
+async function loadLiteratureView() {
+  const host = views.literature;
+  const epoch = state.dataEpoch;
+  views.literature.dataset.loaded = "1";
+  if (!host.childElementCount) host.appendChild(mk("p", "empty-note", "载入中…"));
+  let data;
+  try {
+    data = await apiGet("/api/citations");
+  } catch (err) {
+    if (epoch !== state.dataEpoch) return;
+    renderViewFailure(host, err);
+    return;
+  }
+  if (epoch !== state.dataEpoch || currentView !== "literature") {
+    if (epoch === state.dataEpoch) delete views.literature.dataset.loaded;
+    return;
+  }
+  clearProjectState();
+  litState.data = data;
+  const top = window.scrollY;
+  host.innerHTML = "";
+  renderLiterature(host, data);
+  window.scrollTo(0, top);
+}
+
+function renderLiterature(host, data) {
+  host.appendChild(mk("h2", "section-title", "文献"));
+  host.appendChild(renderLookupSetting(data.lookup || {}));
+  const zline = mk("p", "lit-zotero", litZoteroText(data.zotero));
+  if (data.zotero && data.zotero.data_dir) zline.title = data.zotero.data_dir;
+  if (data.zotero && data.zotero.status === "unreadable" && data.zotero.reason) {
+    renderBlockingError(zline, litZoteroText(data.zotero), { detail: data.zotero.reason });
+  }
+  host.appendChild(zline);
+  const drafts = data.drafts || [];
+  if (!data.scanned) {
+    host.appendChild(litEmpty("还没有读过文稿里的引用", [
+      "在项目菜单里「重新扫描」一次，这里就会列出每份文稿引用了什么、各自对上了哪篇文献。",
+    ]));
+    return;
+  }
+  if (!drafts.length) {
+    host.appendChild(litEmpty("这个项目里没有文稿", ["RCE 读取项目里的 Markdown（.md）和 LaTeX（.tex）文稿中的引用。"]));
+    return;
+  }
+  const totals = data.totals || {};
+  if (!totals.citations && !totals.unreadable) {
+    host.appendChild(litEmpty("文稿里没有找到引用", [
+      "RCE 读取 DOI 和拉丁字母的作者–年份引用，例如 Simon（1955）、（Hansen, 2000）。",
+      "中文作者名的引用（如 张川川（2020））暂不读取。",
+    ]));
+    return;
+  }
+  host.appendChild(mk("p", "lit-summary", litSummaryText(totals)));
+  if (totals.unreadable) host.appendChild(mk("p", "lit-note", totals.unreadable + " 份文稿这次没能读取，不在上面的数字里。"));
+  const list = mk("div", "lit-drafts");
+  const quiet = [];
+  drafts.forEach((d) => {
+    if (d.readable && !(d.counts && d.counts.citations)) quiet.push(d);
+    else list.appendChild(renderLitDraft(d));
+  });
+  host.appendChild(list);
+  if (quiet.length) {
+    const more = mkButton((litState.quiet ? "收起" : "另有 " + quiet.length + " 份文稿没有找到引用"), "var-back", () => {
+      litState.quiet = !litState.quiet;
+      host.innerHTML = "";
+      renderLiterature(host, data);
+    });
+    host.appendChild(more);
+    if (litState.quiet) {
+      const box = mk("div", "lit-quiet");
+      quiet.forEach((d) => box.appendChild(mk("div", "lit-quiet-file", d.file)));
+      host.appendChild(box);
+    }
+  }
+}
+
+function litEmpty(title, lines) {
+  const card = mk("div", "guide-card");
+  card.appendChild(mk("h2", null, title));
+  lines.forEach((l) => card.appendChild(mk("p", null, l)));
+  return card;
+}
+
+function renderLookupSetting(lookup) {
+  const box = mk("div", "lit-setting");
+  const label = mk("label", "lit-setting-label");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.id = "lit-lookup";
+  input.checked = !!lookup.enabled;
+  label.append(input, mk("span", null, "用 DOI 联网查文献信息"));
+  box.appendChild(label);
+  box.appendChild(mk("div", "lit-setting-note", "只发送 DOI，不发送文稿内容。打开后，下次扫描时向 Crossref 查询还没有描述的 DOI，结果保存在本机。"));
+  const status = mk("div", "notice-status");
+  box.appendChild(status);
+  input.addEventListener("change", async () => {
+    const wanted = input.checked;
+    input.disabled = true;
+    setStatus(status, "", "正在保存…");
+    try {
+      const res = await apiPost("/api/citations/lookup-setting", { on: wanted });
+      input.checked = !!(res && res.lookup && res.lookup.enabled);
+      setStatus(status, "ok", input.checked ? "已打开：下次扫描时查询" : "已关闭：不会联网查询");
+    } catch (err) {
+      input.checked = !wanted;
+      setStatus(status, "err", "没能保存这个设置", err);
+    }
+    input.disabled = false;
+  });
+  return box;
+}
+
+function renderLitDraft(d) {
+  const box = mk("div", "lit-draft");
+  const head = mk("button", "lit-draft-head");
+  head.type = "button";
+  const opened = litState.open.has(d.file);
+  head.setAttribute("aria-expanded", opened ? "true" : "false");
+  head.appendChild(mk("span", "lit-caret", opened ? "▾" : "▸"));
+  head.appendChild(mk("span", "lit-file", d.file));
+  if (!d.readable) head.appendChild(mk("span", "var-chip bad", "这次没能读取"));
+  else head.appendChild(mk("span", "lit-counts", litDraftCountText(d.counts)));
+  box.appendChild(head);
+  const body = mk("div", "lit-cites");
+  box.appendChild(body);
+  const fill = () => {
+    body.innerHTML = "";
+    if (!d.readable) {
+      body.appendChild(mk("p", "empty-note", "这份文稿这次没能读取（可能只在云端），它的引用没有列出。"));
+      return;
+    }
+    (d.citations || []).forEach((c) => body.appendChild(renderLitCitation(c)));
+  };
+  if (opened) fill();
+  else body.classList.add("hidden");
+  head.addEventListener("click", () => {
+    const nowOpen = !litState.open.has(d.file);
+    if (nowOpen) { litState.open.add(d.file); fill(); } else { litState.open.delete(d.file); body.innerHTML = ""; }
+    body.classList.toggle("hidden", !nowOpen);
+    head.setAttribute("aria-expanded", nowOpen ? "true" : "false");
+    head.firstChild.textContent = nowOpen ? "▾" : "▸";
+  });
+  return box;
+}
+
+function renderLitCitation(c) {
+  const row = mk("div", "lit-cite");
+  const top = mk("div", "lit-cite-head");
+  top.appendChild(mk("span", "lit-line", "第 " + c.line + " 行"));
+  top.appendChild(mk("span", "lit-text", c.text));
+  const badge = litBadge(c);
+  top.appendChild(mk("span", "var-chip " + badge.tone, badge.text));
+  row.appendChild(top);
+  const status = mk("div", "notice-status");
+  const targets = c.targets || [];
+  if (c.status === "auto") {
+    targets.forEach((t) => row.appendChild(renderLitRef(c, t, status, false)));
+  } else if (targets.length) {
+    const cands = mk("div", "lit-cands");
+    targets.forEach((t) => cands.appendChild(renderLitRef(c, t, status, true)));
+    row.appendChild(cands);
+  }
+  row.appendChild(status);
+  return row;
+}
+
+function renderLitRef(c, t, status, candidate) {
+  const box = mk("div", candidate ? "lit-ref lit-cand" : "lit-ref");
+  box.appendChild(mk("div", "lit-ref-text", litRefText(t)));
+  const line = mk("div", "lit-ref-line");
+  line.appendChild(mk("span", "lit-how", litHowText(c, t)));
+  if (t.doi_url) {
+    const a = mk("a", "lit-link", "打开 DOI");
+    a.href = t.doi_url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    line.appendChild(a);
+  }
+  const data = litState.data || {};
+  if (t.zotero_url && data.zotero && data.zotero.installed) {
+    line.appendChild(mkButton("在 Zotero 中打开", "lit-link-btn", () =>
+      litOpen("/api/zotero/open-item", { item_key: t.zotero_key }, status, "没能在 Zotero 中打开")));
+  }
+  if (t.pdf) {
+    line.appendChild(mkButton("打开 PDF", "lit-link-btn", () =>
+      litOpen("/api/zotero/open-attachment", { item_key: t.pdf.item_key, attachment_key: t.pdf.attachment_key }, status, "没能打开这个 PDF")));
+  }
+  box.appendChild(line);
+  if (candidate) box.appendChild(renderLitJudge(t, status));
+  return box;
+}
+
+function renderLitJudge(t, status) {
+  const actions = mk("div", "lit-judge");
+  const blocked = humanRecordsBlocked();
+  if (t.judged) {
+    actions.appendChild(mk("span", "var-chip " + (t.judged === "confirmed" ? "in-use" : "dead"),
+      t.judged === "confirmed" ? "已确认" : "已否决"));
+    const undo = mkButton("撤销", "btn btn-small", () => litJudge(t, "undone", status, [undo]));
+    undo.disabled = !!blocked;
+    actions.appendChild(undo);
+  } else {
+    const yes = mkButton("确认", "btn btn-small", () => litJudge(t, "confirmed", status, [yes, no]));
+    const no = mkButton("否决", "btn btn-small", () => litJudge(t, "rejected", status, [yes, no]));
+    yes.disabled = no.disabled = !!blocked || !(t.links || []).length;
+    actions.append(yes, no);
+  }
+  if (blocked) actions.appendChild(mk("span", "lit-hint", blocked));
+  else if (!(t.links || []).length) actions.appendChild(mk("span", "lit-hint", "这处引用在上次扫描之后有了变化，重新扫描后才能确认"));
+  return actions;
+}
+
+async function litJudge(t, verdict, status, buttons) {
+  const links = litLinksFor(t, verdict);
+  if (!links.length) return;
+  buttons.forEach((b) => { b.disabled = true; });
+  setStatus(status, "", "正在记录…");
+  const framing = { confirmed: "没能确认这个候选", rejected: "没能否决这个候选", undone: "没能撤销" }[verdict];
+  for (const link of links) {
+    let res;
+    try {
+      res = await postJudgement(link, verdict);
+    } catch (err) {
+      buttons.forEach((b) => { b.disabled = false; });
+      setStatus(status, "err", framing, err);
+      return;
+    }
+    if (res && typeof res.generation === "number") lastGeneration = res.generation;
+  }
+  await refreshCurrentView();
+}
+
+async function litOpen(path, body, status, framing) {
+  setStatus(status, "", "");
+  try {
+    await apiPost(path, body);
+  } catch (err) {
+    setStatus(status, "err", framing, err);
+  }
+}
+// -- end of the 文献 view ----------------------------------------------------------
+
 // -- Notices above the views ------------------------------------------------------
 // One place for what the record needs from the researcher, rebuilt from
 // state.summary on every summary refresh -- but only when what it shows
@@ -5902,6 +6285,7 @@ function shellZoom(step) {
   const z = TEXT_ZOOM_STEPS[textZoomIndex];
   views.tree.style.zoom = z === 1 ? "" : String(z);
   views.lineage.style.zoom = z === 1 ? "" : String(z);
+  views.literature.style.zoom = z === 1 ? "" : String(z);
 }
 
 // A failed Finder command reports in the header line, the same spot a

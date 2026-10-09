@@ -416,6 +416,114 @@ def load_library(data_dir: str | Path | None = None) -> ZoteroLibrary:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# -- the Zotero program and its attachments (the 文献 view, 11.4) ------------------
+
+#: A Zotero item or attachment key: 8 characters of Zotero's own alphabet
+#: (upper-case letters and digits). Anything else is never used.
+ZOTERO_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
+ZOTERO_BUNDLE_ID = "org.zotero.zotero"
+_INSTALLED_TTL_S = 60.0
+_installed_cache: tuple[float, bool] | None = None
+
+
+def valid_zotero_key(key: Any) -> bool:
+    return isinstance(key, str) and ZOTERO_KEY_RE.fullmatch(key) is not None
+
+
+def zotero_select_url(key: str) -> str:
+    """「在 Zotero 中打开」: `zotero://select/library/items/<key>`, for a
+    key that passed `valid_zotero_key` only."""
+    if not valid_zotero_key(key):
+        raise ValueError(f"not a Zotero item key: {key!r}")
+    return f"zotero://select/library/items/{key}"
+
+
+def _zotero_app_found() -> bool:
+    """Whether macOS knows an application with Zotero's bundle id -- a
+    Spotlight query (`mdfind`), which launches nothing and opens nothing."""
+    if sys.platform != "darwin":
+        return False
+    import subprocess  # noqa: PLC0415 -- leaf use
+
+    try:
+        result = subprocess.run(
+            ["mdfind", f"kMDItemCFBundleIdentifier == '{ZOTERO_BUNDLE_ID}'"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(line.strip().endswith(".app") for line in result.stdout.splitlines())
+
+
+def zotero_installed() -> bool:
+    """Whether the Zotero program is installed (cached for a minute)."""
+    global _installed_cache
+    import time  # noqa: PLC0415 -- leaf use
+
+    now = time.monotonic()
+    if _installed_cache is None or now - _installed_cache[0] > _INSTALLED_TTL_S:
+        _installed_cache = (now, _zotero_app_found())
+    return _installed_cache[1]
+
+
+class AttachmentRefused(Exception):
+    """「打开 PDF」 refused: nothing is opened. `code` names the cause,
+    `message` is the page's sentence, `str(self)` the detail."""
+
+    def __init__(self, code: str, message: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.message = message
+
+
+def is_pdf(attachment: ZoteroAttachment) -> bool:
+    return attachment.content_type == "application/pdf" and attachment.filename.lower().endswith(".pdf")
+
+
+def attachment_file(item_key: Any, attachment_key: Any = None, *, library: ZoteroLibrary | None = None) -> Path:
+    """The PDF to open for 「打开 PDF」 (11.4): ONLY a file the Zotero
+    database names as an imported PDF attachment of `item_key` (and, when
+    given, the attachment `attachment_key` of that item), at
+    `<data dir>/storage/<attachment key>/<file name>`, which -- symlinks
+    resolved -- must be a regular file inside the storage directory and
+    on this machine (not only in the cloud). The library is read afresh;
+    no path from the caller is ever used. Raises `AttachmentRefused`."""
+    if not valid_zotero_key(item_key):
+        raise AttachmentRefused("bad_key", "这不是一个 Zotero 条目", f"not a Zotero item key: {item_key!r}")
+    if attachment_key is not None and not valid_zotero_key(attachment_key):
+        raise AttachmentRefused("bad_key", "这不是一个 Zotero 附件", f"not a Zotero attachment key: {attachment_key!r}")
+    library = load_library() if library is None else library
+    if library.status != LIBRARY_READ or library.data_dir is None:
+        raise AttachmentRefused("library", "没能读取 Zotero 文献库", library.reason or f"library {library.status}")
+    item = library.item(item_key)
+    if item is None:
+        raise AttachmentRefused("no_item", "Zotero 文献库里没有这个条目", f"no item {item_key} in {library.data_dir}")
+    own = [a for a in item.attachments if attachment_key is None or a.key == attachment_key]
+    if not own and attachment_key is not None:
+        raise AttachmentRefused("no_attachment", "这个附件不属于这个条目", f"item {item_key} has no attachment {attachment_key}")
+    pdfs = [a for a in own if is_pdf(a)]
+    if not pdfs:
+        raise AttachmentRefused("not_pdf", "这个条目没有 PDF 附件", f"item {item_key}: no application/pdf attachment")
+    att = next((a for a in pdfs if a.available), pdfs[0])
+    storage = library.data_dir / "storage"
+    try:
+        storage_real = storage.resolve(strict=True)
+        real = (storage / att.key / att.filename).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AttachmentRefused(
+            "missing", "这个 PDF 不在本机的 Zotero 存储目录里", f"{storage / att.key / att.filename}: {exc}",
+        ) from exc
+    if not real.is_relative_to(storage_real) or real == storage_real:
+        raise AttachmentRefused(
+            "outside", "这个附件指向 Zotero 存储目录之外，RCE 不打开它", f"{real} is not inside {storage_real}",
+        )
+    if not real.is_file():
+        raise AttachmentRefused("missing", "这个 PDF 不在本机的 Zotero 存储目录里", f"{real} is not a regular file")
+    if paths.is_dataless(real):
+        raise AttachmentRefused("cloud", "这个 PDF 只在云端，还没有下载到本机", f"{real} is only in the cloud")
+    return real
+
+
 # -- DOI online (opt-in) -----------------------------------------------------------
 
 SETTINGS_FILENAME = "settings.json"

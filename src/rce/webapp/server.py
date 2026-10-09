@@ -204,6 +204,18 @@ Endpoints (all GET unless noted):
          full-compare>   -- only what RCE authors on a card, through
                             `rce.records.cards` (never the researcher's
                             text); see `rce.webapp.variables_api`.
+    GET  /api/citations -- the 「文献」 view (11.4): per draft, its citations
+                            and how each resolves, candidates with the
+                            links 确认 / 否决 write through /api/judgements;
+                            see `rce.webapp.literature_api`.
+    POST /api/citations/lookup-setting -- `{"on": bool}`: 「用 DOI 联网查文献
+                            信息」, RCE's own setting; nothing is asked here.
+    POST /api/zotero/open-attachment -- `{"item_key", "attachment_key"?}`:
+                            「打开 PDF」, only the file the Zotero database
+                            names for that item, inside its storage
+                            directory; never a path from the request.
+    POST /api/zotero/open-item -- `{"item_key"}`: 「在 Zotero 中打开」
+                            (`zotero://select/...` from a validated key).
     GET  /api/history   -- `?src&dst&type&extractor`: every ledger entry
                             for one link, in order (9.9 #12), each with
                             the basis it was made on.
@@ -493,7 +505,7 @@ from rce.ingest import attempts as attempts_ingest
 from rce.ingest import dataflow as dataflow_ingest
 from rce.ingest import git as git_ingest
 from rce.ingest import mappings as mappings_ingest
-from rce.webapp import canvas, mapedit, variables_api
+from rce.webapp import canvas, literature_api, mapedit, variables_api
 from rce.records import implementation as card_implementation
 from rce.webapp import registry as project_registry
 from rce.webapp import watcher as project_watcher
@@ -754,6 +766,19 @@ class CloudOnlyApiError(ApiError):
     def __init__(self, exc: cloud.CloudOnlyError, extra: dict[str, Any] | None = None) -> None:
         super().__init__(str(exc))
         self.extra = {"message_zh": exc.message, "detail": str(exc), **(extra or {})}
+
+
+class LiteratureApiError(ApiError):
+    """An action of the 「文献」 view refused (`rce.webapp.literature_api.
+    LiteratureRefused`): nothing opened or written. `state` is
+    `literature_<code>`; `message_zh` the page's sentence, `detail` the
+    engine's text."""
+
+    def __init__(self, exc: literature_api.LiteratureRefused) -> None:
+        super().__init__(str(exc))
+        self.status = exc.status
+        self.state = exc.state
+        self.extra = exc.extra
 
 
 class ReadOnlyError(ApiError):
@@ -1489,6 +1514,30 @@ def open_payload(project_root: Path, rel_path: str, reveal: bool) -> dict[str, A
     args = ["open", "-R", str(target)] if reveal else ["open", str(target)]
     subprocess.run(args, check=False)
     return {"opened": str(target), "reveal": reveal}
+
+
+def open_external(target: str) -> None:
+    """The 文献 view's two openers (11.4): `open` with one argument that
+    `rce.webapp.literature_api` built and checked -- a Zotero storage PDF
+    or a `zotero://select/...` address. A plain argument list, never a
+    shell. macOS only."""
+    if not _is_macos():
+        raise UnsupportedPlatformError(
+            "'open' is only available on macOS; this server is running on a different platform"
+        )
+    subprocess.run(["open", target], check=False)
+
+
+def literature_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """The 文献 view's POST endpoints (`rce.webapp.literature_api`)."""
+    try:
+        if path == "/api/citations/lookup-setting":
+            return literature_api.lookup_setting_payload(body)
+        if path == "/api/zotero/open-attachment":
+            return literature_api.open_attachment_payload(body, open_external)
+        return literature_api.open_item_payload(body, open_external)
+    except literature_api.LiteratureRefused as exc:
+        raise LiteratureApiError(exc) from exc
 
 
 # -- /api/projects + POST /api/projects/switch (task V3 phase 1) --------------
@@ -2878,6 +2927,10 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/github/push-plan":
                 # 11.3: what a push would do -- reads only, no network.
                 self._send_json(200, github_push_plan_payload(self._served()))
+            elif path == "/api/citations":
+                # 11.4: the 「文献」 view -- reads only, no network.
+                root = self._project_root()
+                self._json_from_conn(lambda conn: literature_api.citations_payload(conn, root))
             elif path == "/api/variables" or path.startswith("/api/variables/"):
                 # The 「变量」 view (9.11): the cards are read from their files
                 # (the index adds the trust decision); a blocked or moved
@@ -3023,6 +3076,10 @@ class RceRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/github/push":
                 # 11.3 「推送」: the only request that pushes; never forced.
                 self._send_json(200, github_push_payload(self._served(), self._read_json_object()))
+            elif parsed.path in ("/api/citations/lookup-setting", "/api/zotero/open-attachment", "/api/zotero/open-item"):
+                # 11.4: the 「文献」 view's setting and its two openers; a
+                # judgment on a candidate is POST /api/judgements.
+                self._send_json(200, literature_post(parsed.path, self._read_json_object()))
             elif parsed.path == "/api/projects/rename":
                 # 10.4: the registry label only, never the folder.
                 self._send_json(200, rename_payload(self._read_json_object()))

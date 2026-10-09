@@ -690,8 +690,10 @@ def test_served_app_tabs_read_in_product_language(live_server):
     mark stays RCE, and the old English tab labels are gone."""
     html = _get_raw(live_server[0], "/")[1].decode("utf-8")
     tabs = re.findall(r'<button class="tab[^"]*" data-view="(\w+)"[^>]*>([^<]+)</button>', html)
-    # V5 phase 9 (9.11 "In the app"): a fourth tab, 「变量」.
-    assert tabs == [("tree", "决策树"), ("lineage", "血缘"), ("canvas", "画布"), ("variables", "变量")]
+    # V5 phase 9 (9.11 "In the app"): a fourth tab, 「变量」; V7 (11.4) a fifth, 「文献」.
+    assert tabs == [
+        ("tree", "决策树"), ("lineage", "血缘"), ("canvas", "画布"), ("variables", "变量"), ("literature", "文献"),
+    ]
     assert '<span class="brand-mark">RCE</span>' in html
     assert ">Decision Tree<" not in html and ">Lineage<" not in html
 
