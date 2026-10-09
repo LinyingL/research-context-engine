@@ -2678,3 +2678,47 @@ claim's side — belongs to the result-review phase.
    the item's attachment inside Zotero's storage directory.
 7. **Origin and secrets.** Every new endpoint answers 403 cross-origin; no
    token, password or credential is written anywhere RCE writes.
+
+### 11.6 Rulings made while building V7
+
+- **A full reference is an entry wherever it is written.** A line, list
+  item or table cell that begins with a full reference in author–initials
+  form — `Simon, H. A. (1976). From substantive…`, `Gigerenzer, G., &
+  Goldstein, D. G. (1996). Reasoning…` — is a reference-list entry of that
+  draft, whether or not it sits under a 参考文献 heading, and is never
+  counted as an in-text citation. (On the researcher's drafts, 46 such
+  references sat outside a recognised heading — 15 of them in a table — and
+  were being reported as 46 citations 「未找到」.) The format itself is the
+  evidence; the heading was only a shortcut to it.
+- **A citation next to a DOI for the same work.** When one section cites a
+  work by DOI and also by author–year, the graph holds one link (section →
+  reference), and the author–year occurrence cannot be judged separately.
+  The view says so (「同一节里另一处引用已经凭 DOI 或文末条目对上了这篇文献」)
+  and counts it with 「待确认」. Per-occurrence judgments belong to the
+  result-review phase.
+- **Chinese name joined to a Latin one.** 「张川川与 Simon（2020）」 cannot be
+  told from prose such as 「增加与 Fatum et al. (2017)」 (14 real citations on
+  the drafts, the hazard 0 times). Such citations are read but never
+  resolved by that name alone: even a unique match is only a candidate.
+- **Hyphen-joined author lists** (`Pesaran-Shin-Smith (2001)`) are matched
+  as lists when the whole name matches no entry as written.
+- **A reference-list entry without a DOI** is identified by its position
+  (`ref:entry:<draft>#<n>`), so the link's basis carries the entry's text:
+  inserting an entry above it puts a judgment on it under review instead of
+  carrying the judgment to another paper.
+- **GitHub.** The repository's own git configuration — `.git/config`, its
+  includes and `config.worktree` — may not name a program RCE would run
+  (ssh command, upload-pack, credential helper, filter drivers): fetch and
+  push are refused with a sentence telling the researcher to run them in a
+  terminal, and status reads switch the repository's own filters off.
+  Creating a repository and pushing are two clicks (「创建私有仓库」, then
+  「推送」), so the only control that pushes is 「推送」. Whether `gh` is
+  logged in is checked only when 「创建私有仓库」 is pressed, because checking
+  it touches the network. A cherry-pick, revert or bisect in progress
+  refuses a push like a merge does.
+- **Zotero.** 「在 Zotero 中打开」 goes through the engine (`open`), because
+  the shell sends only web links out; it is shown only when the Zotero
+  program is installed. Group libraries are not addressed in V7.
+- **Drafts are not watched.** Citations are read by the full scan
+  (「重新扫描这个项目」, `rce ingest`), as the other draft extractors are
+  (10.0).
